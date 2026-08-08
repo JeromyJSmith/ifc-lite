@@ -39,6 +39,7 @@
   },
   "dependencies": {
     "@ifc-lite/spatial": "workspace:^",
+    "@ifc-lite/data": "workspace:^",
     "@ifc-lite/geometry": "workspace:^",
     "@ifc-lite/parser": "workspace:^",
     "@ifc-lite/query": "workspace:^",

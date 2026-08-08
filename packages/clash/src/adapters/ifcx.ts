@@ -30,13 +30,27 @@
  * builds from the USD `children` structure). This is the IFCX analogue of the
  * STEP void/host/assembly exclusions; it fabricates no relationships.
  *
+ * Non-physical / non-product tags (openings, virtual elements, grids,
+ * annotations, materials, spatial containers) are dropped from the candidate
+ * set via the shared `isNonClashableTag` predicate — see `../nonClashable.ts`
+ * for why: the IFCX geometry extractor associates a `Body` mesh with its
+ * nearest ancestor entity with no regard for that entity's IFC class, so a
+ * storey/space/site can carry a tessellated extent exactly as it can in a
+ * STEP file. (#1464, ifcx follow-up)
+ *
  * This module is reached via the `@ifc-lite/clash/ifcx` subpath so the core
- * stays representation- and parser-neutral.
+ * stays representation-neutral. It depends on `@ifc-lite/data` (for the
+ * schema-derived half of `isNonClashableTag`) but deliberately NOT on
+ * `@ifc-lite/parser` — `@ifc-lite/data` is pure schema/data tables with no
+ * wasm and no parsing pipeline, already a dependency of `@ifc-lite/ifcx`
+ * itself, so an IFCX-only consumer of this subpath doesn't pull in the much
+ * heavier STEP parser.
  */
 
 import { parseIfcx, type MeshData } from '@ifc-lite/ifcx';
 import { makeExclusionSet, qualifiedKey } from '../exclude.js';
 import { fromPositions } from '../math/aabb.js';
+import { isNonClashableTag } from '../nonClashable.js';
 import type { ClashElement, ExclusionSet } from '../types.js';
 
 /**
@@ -111,13 +125,25 @@ export async function elementsFromIfcx(options: IfcxAdapterOptions): Promise<Ifc
     // (It was present at grouping time; re-check to narrow without a cast.)
     const key = idToPath.get(expressId);
     if (!key) continue;
+
+    const tag = resolveTag(group[0], entities, expressId);
+    // Drop non-physical / non-product geometry up front so it never becomes a
+    // clash candidate — openings, virtual elements, grids, annotations,
+    // material associations, and spatial containers (storeys, spaces, sites,
+    // IFC4.3 road/bridge/facility, ...) can carry a tessellated `Body` in an
+    // IFCX export exactly as they can in STEP, and no rule should have to
+    // exclude them by hand. Shared with the STEP adapter via
+    // `isNonClashableTag` so the two representations can't drift. (#1464,
+    // ifcx follow-up)
+    if (isNonClashableTag(tag)) continue;
+
     const merged = mergeMeshes(group);
 
     const element: ClashElement = {
       key,
       ref: refFromPath(key),
       model: modelId,
-      tag: resolveTag(group[0], entities, expressId),
+      tag,
       name: resolveName(entities, expressId),
       bounds: fromPositions(merged.positions),
       positions: merged.positions,

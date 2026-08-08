@@ -134,6 +134,78 @@ function ifcxBuffer(): ArrayBuffer {
   return new TextEncoder().encode(json).buffer as ArrayBuffer;
 }
 
+/**
+ * A storey that carries tessellated geometry (routine in IFC4.3
+ * infrastructure exports, and equally possible in an IFCX export — the
+ * geometry extractor associates any `Body` mesh with its nearest ancestor
+ * entity regardless of that entity's IFC class) plus a wall it spatially
+ * contains, sized so the wall genuinely sits inside the storey volume. The
+ * storey is a spatial *container*, not a clash body — this is the IFCX
+ * analogue of the STEP fixture in `step.test.ts`'s
+ * `STOREY_WITH_GEOMETRY_IFC`. (ifcx follow-up to #1464)
+ */
+function buildStoreyWithGeometryFile() {
+  const ifcClass = (code: string) => ({
+    code,
+    uri: `https://identifier.buildingsmart.org/uri/buildingsmart/ifc/5/class/${code}`,
+  });
+
+  return {
+    header: {
+      id: 'clash-ifcx-storey-fixture',
+      ifcxVersion: 'ifcx_alpha',
+      dataVersion: '1.0.0',
+      author: 'ifc-lite clash adapter test',
+      timestamp: '2025-01-01T00:00:00Z',
+    },
+    imports: [],
+    schemas: {
+      'bsi::ifc::class': { value: SCHEMA_VALUE },
+      'bsi::ifc::name': { value: { dataType: 'String' as const } },
+      'usd::usdgeom::mesh': { value: SCHEMA_VALUE },
+    },
+    data: [
+      {
+        path: 'Project',
+        attributes: { 'bsi::ifc::class': ifcClass('IfcProject') },
+        children: { Storey: 'Project/Storey' },
+      },
+      {
+        path: 'Project/Storey',
+        attributes: {
+          'bsi::ifc::class': ifcClass('IfcBuildingStorey'),
+          'bsi::ifc::name': 'Level 0',
+        },
+        // A tessellated storey extent, as IFC4.3 infra exporters routinely
+        // emit, PLUS the wall it spatially contains.
+        children: { Body: 'Project/Storey/Body', Wall: 'Project/Storey/Wall' },
+      },
+      {
+        path: 'Project/Storey/Body',
+        attributes: { 'usd::usdgeom::mesh': cubeMesh(0, 0, 0, 10) },
+      },
+      {
+        path: 'Project/Storey/Wall',
+        attributes: {
+          'bsi::ifc::class': ifcClass('IfcWall'),
+          'bsi::ifc::name': 'Interior Wall',
+        },
+        children: { Body: 'Project/Storey/Wall/Body' },
+      },
+      {
+        path: 'Project/Storey/Wall/Body',
+        // Fully inside the storey's 10x10x10 extent.
+        attributes: { 'usd::usdgeom::mesh': cubeMesh(2, 2, 2, 1) },
+      },
+    ],
+  };
+}
+
+function storeyWithGeometryBuffer(): ArrayBuffer {
+  const json = JSON.stringify(buildStoreyWithGeometryFile());
+  return new TextEncoder().encode(json).buffer as ArrayBuffer;
+}
+
 function isDegenerate(bounds: { min: number[]; max: number[] }): boolean {
   // Degenerate if ANY axis has zero/negative extent (a flat or empty mesh).
   return (
@@ -222,5 +294,44 @@ describe('elementsFromIfcx', () => {
     // elements. The sibling walls are correctly NOT excluded.
     expect(exclusions.size).toBe(0);
     expect(elements.every((e) => e.tag === 'IfcWall')).toBe(true);
+  });
+
+  // ifcx follow-up to #1464: the STEP adapter drops spatial containers
+  // (storeys, spaces, sites, IFC4.3 road/bridge/facility) and other
+  // non-physical types (openings, virtual elements, grids, annotations,
+  // materials) from the clash candidate set. The ifcx geometry extractor
+  // associates a `Body` mesh with its nearest ancestor entity with NO regard
+  // for that entity's IFC class, so an IfcBuildingStorey with a tessellated
+  // extent — routine in IFC4.3 infrastructure exports — becomes exactly as
+  // real a mesh on the ifcx path as it does on the STEP path.
+  it('drops a tessellated spatial container (IfcBuildingStorey) from the candidate set', async () => {
+    const { elements } = await elementsFromIfcx({
+      buffer: storeyWithGeometryBuffer(),
+      modelId: 'ifcx-storey-model',
+    });
+
+    // Only the physically real element (the wall) becomes a candidate; the
+    // storey's own tessellated body must not.
+    expect(elements).toHaveLength(1);
+    expect(elements[0].tag).toBe('IfcWall');
+    expect(elements.some((e) => e.tag === 'IfcBuildingStorey')).toBe(false);
+  });
+
+  it('a storey containing a wall produces zero clashes end-to-end (no false storey-vs-wall hit)', async () => {
+    const { elements, exclusions } = await elementsFromIfcx({
+      buffer: storeyWithGeometryBuffer(),
+      modelId: 'ifcx-storey-model',
+    });
+
+    const rule: ClashRule = {
+      id: 'detect-all',
+      name: 'Detect all',
+      a: '*',
+      mode: 'hard',
+    };
+
+    const engine = createClashEngine({ backend: 'ts' });
+    const result = await engine.run(elements, [rule], { exclusions });
+    expect(result.clashes.length).toBe(0);
   });
 });
