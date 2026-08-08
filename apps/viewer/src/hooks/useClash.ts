@@ -12,7 +12,7 @@
 
 import { useCallback, useRef } from 'react';
 import { useViewerStore } from '@/store';
-import type { ClashFocusMode } from '@/store/slices/clashSlice';
+import type { ClashFocusMode, ClashIssueGroupBy } from '@/store/slices/clashSlice';
 import {
   createClashEngine,
   rulesFromPresets,
@@ -98,9 +98,11 @@ function contactLineList(clusters: readonly SharedFaceCluster[]): number[] {
  */
 export type { ClashFocusMode };
 
-/** How clashes collapse into BCF topics. `storey` is omitted — Clash has no
- *  storey, so it degrades to `rule` (see grouping.ts) and would only confuse. */
-export type ClashBcfGroupBy = 'cluster' | 'rule' | 'typePair' | 'element';
+/** How clashes collapse into BCF topics — the same modes the panel's issues
+ *  view offers, so "group into topics by" and "group the list by" can't drift.
+ *  `storey` is omitted: Clash has no storey, so it degrades to `rule` (see
+ *  grouping.ts) and would only confuse. */
+export type ClashBcfGroupBy = ClashIssueGroupBy;
 
 /** User-controllable settings for a BCF export — "what gets created". */
 export interface ClashBcfConfig {
@@ -219,8 +221,11 @@ export function useClash() {
         state.setClashResult(res);
         // Completed-run signal for baseline consumers (clash tour run gate).
         state.bumpClashRunSeq();
-        // Spatial clustering is the sensible BCF unit; the panel list groups by
-        // its own dimension separately. Radius is the user's cluster epsilon.
+        // Spatial clustering is the sensible default unit, and the only mode
+        // that needs the run's epsilon — so it's the one computed here. The
+        // panel's issues view reuses this for `cluster` and derives the other
+        // `groupClashes` modes itself (they re-partition the same clashes and
+        // need no radius); BCF export re-groups per its own `config.groupBy`.
         state.setClashGroups(groupClashes(res, { by: 'cluster', epsilon: state.clashClusterEpsilon }));
         state.setClashSelectedId(null);
         posthog.capture('clash_detection_run', {

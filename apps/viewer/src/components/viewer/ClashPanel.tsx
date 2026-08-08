@@ -29,10 +29,12 @@ import { useClash, type ClashFocusMode } from '@/hooks/useClash';
 import { useBCF } from '@/hooks/useBCF';
 import { useViewerStore } from '@/store';
 import { ModelBadge } from './ModelBadge';
-import { ClashBcfExportDialog } from '@/components/viewer/ClashBcfExportDialog';
+import { ClashBcfExportDialog, CLASH_GROUPINGS } from '@/components/viewer/ClashBcfExportDialog';
 import { ClashSettingsDialog } from '@/components/viewer/ClashSettingsDialog';
 import { createBCFProject, createBCFTopic } from '@ifc-lite/bcf';
+import type { ClashIssueGroupBy } from '@/store/slices/clashSlice';
 import {
+  groupClashes,
   isTouching,
   penetrationDepth,
   sortClashes,
@@ -209,6 +211,10 @@ export function ClashPanel({ onClose }: ClashPanelProps) {
    *  state: it doesn't change what was detected, only how it's displayed. */
   const [resultView, setResultView] = useState<'pairs' | 'issues'>('pairs');
   const clusterEpsilon = useViewerStore((s) => s.clashClusterEpsilon);
+  /** Which `groupClashes` mode the issues view uses. In the store (not local
+   *  state) so the BCF export dialog can open on the same grouping. */
+  const issueGroupBy = useViewerStore((s) => s.clashIssueGroupBy);
+  const setIssueGroupBy = useViewerStore((s) => s.setClashIssueGroupBy);
   // View settings live in the store so they survive a panel switch (#1464).
   const sortBy = useViewerStore((s) => s.clashSortBy);
   const setSortBy = useViewerStore((s) => s.setClashSortBy);
@@ -320,17 +326,33 @@ export function ClashPanel({ onClose }: ClashPanelProps) {
   }, [result, visibleClashes, groupBy]);
 
   /**
-   * The same (filtered, sorted) clashes re-organized along the existing spatial
-   * clustering (`groups`, from `groupClashes({ by: 'cluster' })`) instead of
-   * severity/rule/type-pair — one section per coordination issue rather than per
-   * raw pair. A group can straddle the current filters (touching/status), so
-   * only its VISIBLE members are shown and empty groups are dropped; the pairs
-   * inside are never removed, only re-organized (issue #groupClashes-ui).
+   * The coordination issues to list, under the user's chosen mode.
+   *
+   * `cluster` reuses the grouping the run already computed into the store, so
+   * the default path stays exactly what it was (same groups, same ids, same
+   * epsilon — the one the run was made with; changing the radius still takes a
+   * re-run, as before). The other three modes are derived here: they need no
+   * radius and no engine work, just a re-partition of the SAME clashes.
+   */
+  const issueGroups = useMemo(() => {
+    if (issueGroupBy === 'cluster') return groups;
+    if (!result) return null;
+    // Only `cluster` reads `epsilon`; omitting it here is the point — the radius
+    // has no meaning in these modes.
+    return groupClashes(result, { by: issueGroupBy });
+  }, [issueGroupBy, groups, result]);
+
+  /**
+   * The same (filtered, sorted) clashes re-organized along `issueGroups`
+   * instead of severity/rule/type-pair — one section per coordination issue
+   * rather than per raw pair. A group can straddle the current filters
+   * (touching/status), so only its VISIBLE members are shown and empty groups
+   * are dropped; the pairs inside are never removed, only re-organized.
    */
   const issueSections = useMemo(() => {
-    if (!groups) return [] as Array<{ key: string; label: string; color?: string; items: Clash[] }>;
+    if (!issueGroups) return [] as Array<{ key: string; label: string; color?: string; items: Clash[] }>;
     const visibleIds = new Set(visibleClashes.map((c) => c.id));
-    return groups
+    return issueGroups
       .map((g) => ({
         key: g.id,
         label: g.title,
@@ -341,13 +363,13 @@ export function ClashPanel({ onClose }: ClashPanelProps) {
         ),
       }))
       .filter((s) => s.items.length > 0);
-  }, [groups, visibleClashes, sortBy]);
+  }, [issueGroups, visibleClashes, sortBy]);
 
   const activeSections = resultView === 'issues' ? issueSections : sections;
 
   const total = result?.summary.total ?? 0;
   const shown = visibleClashes.length;
-  const issueCount = groups?.length ?? 0;
+  const issueCount = issueGroups?.length ?? 0;
   const bySeverity = result?.summary.bySeverity;
 
   // Flatten sections → a single row list (group header, clash row, and an
@@ -356,16 +378,20 @@ export function ClashPanel({ onClose }: ClashPanelProps) {
   // header. (#1277 list handling)
   type ClashDisplayRow =
     | { kind: 'group'; key: string; label: string; color?: string; count: number }
-    | { kind: 'clash'; clash: Clash }
-    | { kind: 'detail'; clash: Clash };
+    // `section` disambiguates the row's identity: under `element` grouping one
+    // clash belongs to BOTH participating elements' groups, so the clash id
+    // alone is not a unique list key and React would collapse the two rows into
+    // one (dropping a group's contents from the virtualized list).
+    | { kind: 'clash'; section: string; clash: Clash }
+    | { kind: 'detail'; section: string; clash: Clash };
   const displayRows = useMemo<ClashDisplayRow[]>(() => {
     const rows: ClashDisplayRow[] = [];
     for (const section of activeSections) {
       rows.push({ kind: 'group', key: section.key, label: section.label, color: section.color, count: section.items.length });
       if (collapsed.has(section.key)) continue;
       for (const clash of section.items) {
-        rows.push({ kind: 'clash', clash });
-        if (expanded.has(clash.id)) rows.push({ kind: 'detail', clash });
+        rows.push({ kind: 'clash', section: section.key, clash });
+        if (expanded.has(clash.id)) rows.push({ kind: 'detail', section: section.key, clash });
       }
     }
     return rows;
@@ -383,7 +409,11 @@ export function ClashPanel({ onClose }: ClashPanelProps) {
     overscan: 16,
     getItemKey: (i) => {
       const r = displayRows[i];
-      return r.kind === 'group' ? `g:${r.key}` : r.kind === 'detail' ? `d:${r.clash.id}` : `c:${r.clash.id}`;
+      return r.kind === 'group'
+        ? `g:${r.key}`
+        : r.kind === 'detail'
+          ? `d:${r.section}:${r.clash.id}`
+          : `c:${r.section}:${r.clash.id}`;
     },
   });
 
@@ -690,10 +720,14 @@ export function ClashPanel({ onClose }: ClashPanelProps) {
               element pairs on one clash of geometry read as one coordination
               issue instead of N rows. Only shown once there's something to
               cluster. */}
-          {total > 0 && groups && (
+          {total > 0 && issueGroups && (
             <div
               className="mb-1.5 inline-flex rounded-md border border-border overflow-hidden text-[11px]"
-              title={`Issues group nearby pairs within ${clusterEpsilon}m (adjustable in Clash settings)`}
+              title={
+                issueGroupBy === 'cluster'
+                  ? `Issues group nearby pairs within ${clusterEpsilon}m (adjustable in Clash settings)`
+                  : `Issues group pairs by ${(CLASH_GROUPINGS.find((g) => g.key === issueGroupBy) ?? CLASH_GROUPINGS[0]).label.toLowerCase()}`
+              }
             >
               <button
                 type="button"
@@ -717,7 +751,7 @@ export function ClashPanel({ onClose }: ClashPanelProps) {
               {resultView === 'issues'
                 ? `${issueCount === 1 ? 'issue' : 'issues'} · ${total} ${total === 1 ? 'pair' : 'pairs'}`
                 : `${total === 1 ? 'clash' : 'clashes'}${hideTouching && touchingCount > 0 ? ` · ${shown} shown` : ''}${
-                    groups ? ` · ${issueCount} ${issueCount === 1 ? 'issue' : 'issues'}` : ''
+                    issueGroups ? ` · ${issueCount} ${issueCount === 1 ? 'issue' : 'issues'}` : ''
                   }`}
             </span>
           </div>
@@ -752,9 +786,31 @@ export function ClashPanel({ onClose }: ClashPanelProps) {
           <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
             <Layers className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
             {resultView === 'issues' ? (
-              <span className="text-muted-foreground" title={`Spatial cluster radius: ${clusterEpsilon}m (Clash settings)`}>
-                Grouped by proximity
-              </span>
+              <>
+                {/* The four `groupClashes` modes — the same set BCF export
+                    offers. Spatial proximity can't express every real grouping
+                    (a row of clashes along one wall can sit further apart than
+                    the gap to the next wall, so no radius separates them),
+                    which is exactly what `element` / `typePair` are for. */}
+                <select
+                  value={issueGroupBy}
+                  onChange={(e) => setIssueGroupBy(e.target.value as ClashIssueGroupBy)}
+                  aria-label="Group issues by"
+                  className="min-w-0 rounded border border-border bg-transparent px-1.5 py-0.5"
+                >
+                  {CLASH_GROUPINGS.map((g) => (
+                    <option key={g.key} value={g.key}>{`By ${g.label.toLowerCase()}`}</option>
+                  ))}
+                </select>
+                {/* The radius drives `cluster` and nothing else — showing it
+                    under element/rule/type-pair grouping would claim an
+                    influence it doesn't have. */}
+                {issueGroupBy === 'cluster' && (
+                  <span className="text-muted-foreground" title="Cluster radius — adjustable in Clash settings (⚙)">
+                    within {clusterEpsilon} m
+                  </span>
+                )}
+              </>
             ) : (
               <select
                 value={groupBy}

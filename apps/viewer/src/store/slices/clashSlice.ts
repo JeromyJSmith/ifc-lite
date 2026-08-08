@@ -48,6 +48,14 @@ import {
 import { reportClashSettingsSaveFailure } from '@/lib/clash/settings-save-notice';
 
 export type ClashGroupBy = ClashSettingsGroupBy;
+
+/**
+ * How the results list collapses element pairs into coordination issues — the
+ * modes `groupClashes` (packages/clash) implements, minus `storey` (which has
+ * no storey to group by and silently degrades to `rule`). Distinct from
+ * `ClashGroupBy`, which only sections the FLAT pair list for display.
+ */
+export type ClashIssueGroupBy = 'cluster' | 'rule' | 'typePair' | 'element';
 export type { ClashPreset, ClashGlobalSettings, SaveResult };
 
 /** Fields a user supplies when adding a custom rule (id/flags filled in here). */
@@ -83,6 +91,13 @@ export interface ClashSlice {
   clashReportTouch: boolean;
   /** How the result list is organized (persisted). */
   clashGroupBy: ClashGroupBy;
+  /**
+   * How the issues view collapses pairs into coordination issues. View state
+   * like `clashSortBy` — session-scoped, not in the persisted settings blob —
+   * but in the store rather than the panel so the BCF export dialog can open on
+   * the grouping the user is currently looking at.
+   */
+  clashIssueGroupBy: ClashIssueGroupBy;
   /** Result-list sort key - view state, kept in the store so it survives a
    *  panel switch instead of resetting to default each time. (#1464) */
   clashSortBy: ClashSortBy;
@@ -147,6 +162,7 @@ export interface ClashSlice {
   setClashClusterEpsilon: (epsilon: number) => void;
   setClashReportTouch: (reportTouch: boolean) => void;
   setClashGroupBy: (groupBy: ClashGroupBy) => void;
+  setClashIssueGroupBy: (groupBy: ClashIssueGroupBy) => void;
   setClashSortBy: (sortBy: ClashSortBy) => void;
   setClashHideTouching: (hide: boolean) => void;
   setClashFocusMode: (mode: ClashFocusMode) => void;
@@ -236,6 +252,9 @@ export const createClashSlice: StateCreator<ClashSlice, [], [], ClashSlice> = (s
     clashClusterEpsilon: initial.clusterEpsilon,
     clashReportTouch: initial.reportTouch,
     clashGroupBy: initial.groupBy,
+    // Spatial clustering as before: the default must stay byte-identical to the
+    // grouping every existing run already produced.
+    clashIssueGroupBy: 'cluster',
     clashSortBy: 'severity',
     clashHideTouching: false,
     // Ghost (X-Ray context) by default so clicking a clash immediately reveals
@@ -278,6 +297,7 @@ export const createClashSlice: StateCreator<ClashSlice, [], [], ClashSlice> = (s
     setClashGroupBy: (clashGroupBy) => { set({ clashGroupBy }); persistSettings(); },
     // View-state setters: kept in the store (not localStorage) so they survive a
     // panel switch within the session without growing the persisted blob. (#1464)
+    setClashIssueGroupBy: (clashIssueGroupBy) => set({ clashIssueGroupBy }),
     setClashSortBy: (clashSortBy) => set({ clashSortBy }),
     setClashHideTouching: (clashHideTouching) => set({ clashHideTouching }),
     setClashFocusMode: (clashFocusMode) => set({ clashFocusMode }),

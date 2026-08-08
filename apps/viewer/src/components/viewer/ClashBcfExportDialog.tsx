@@ -37,6 +37,7 @@ import {
 import { cn } from '@/lib/utils';
 import { toast } from '@/components/ui/toast';
 import { useClash, type ClashBcfConfig, type ClashBcfGroupBy } from '@/hooks/useClash';
+import { useViewerStore } from '@/store';
 import type { ClashSeverity } from '@ifc-lite/clash';
 
 interface ClashBcfExportDialogProps {
@@ -50,7 +51,12 @@ const SEVERITIES: { key: ClashSeverity; label: string; color: string }[] = [
   { key: 'info', label: 'Info', color: '#7aa2f7' },
 ];
 
-const GROUPINGS: { key: ClashBcfGroupBy; label: string; hint: string }[] = [
+/**
+ * The `groupClashes` modes offered to the user, with their labels. Exported so
+ * the results panel's issue-grouping selector reads from the same list — a mode
+ * added here shows up in both places, or in neither.
+ */
+export const CLASH_GROUPINGS: { key: ClashBcfGroupBy; label: string; hint: string }[] = [
   { key: 'cluster', label: 'Spatial cluster', hint: 'Nearby clashes of the same kind merge into one topic — the sensible default.' },
   { key: 'rule', label: 'Discipline rule', hint: 'One topic per rule (MEP × Structure, HVAC × Architecture, …).' },
   { key: 'typePair', label: 'Element-type pair', hint: 'One topic per type pair (IfcDuct × IfcWall, …).' },
@@ -67,8 +73,17 @@ const DEFAULT_CONFIG: ClashBcfConfig = {
 export function ClashBcfExportDialog({ trigger }: ClashBcfExportDialogProps) {
   const { result, exportBcf, bcfPreview } = useClash();
 
+  /**
+   * How the results panel is currently grouping issues on screen. The dialog
+   * OPENS on it — a user looking at "one issue per affected element" shouldn't
+   * have to notice that the export silently reverts to spatial clusters — but
+   * doesn't lock to it: the selector below stays authoritative and is right
+   * there, so the export grouping is always visible before it happens.
+   */
+  const issueGroupBy = useViewerStore((s) => s.clashIssueGroupBy);
+
   const [open, setOpen] = useState(false);
-  const [config, setConfig] = useState<ClashBcfConfig>(DEFAULT_CONFIG);
+  const [config, setConfig] = useState<ClashBcfConfig>({ ...DEFAULT_CONFIG, groupBy: issueGroupBy });
   const [exporting, setExporting] = useState(false);
   const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
 
@@ -83,7 +98,7 @@ export function ClashBcfExportDialog({ trigger }: ClashBcfExportDialogProps) {
     });
   }, []);
 
-  const grouping = GROUPINGS.find((g) => g.key === config.groupBy) ?? GROUPINGS[0];
+  const grouping = CLASH_GROUPINGS.find((g) => g.key === config.groupBy) ?? CLASH_GROUPINGS[0];
   const canExport = preview.topics > 0 && !exporting;
 
   const handleExport = useCallback(async () => {
@@ -110,6 +125,11 @@ export function ClashBcfExportDialog({ trigger }: ClashBcfExportDialogProps) {
         // is driving the live renderer (camera + isolation), and there's no UI to
         // resume into if the dialog vanishes. Mirrors the IDS export dialog.
         if (exporting) return;
+        // Re-seed the grouping on each open so the dialog reflects the panel as
+        // the user left it. Everything else (severities, cap, snapshots) keeps
+        // its previous value — only the grouping has an on-screen counterpart
+        // that could contradict it.
+        if (v) setConfig((p) => ({ ...p, groupBy: issueGroupBy }));
         setOpen(v);
       }}
     >
@@ -147,7 +167,7 @@ export function ClashBcfExportDialog({ trigger }: ClashBcfExportDialogProps) {
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                {GROUPINGS.map((g) => (
+                {CLASH_GROUPINGS.map((g) => (
                   <SelectItem key={g.key} value={g.key}>{g.label}</SelectItem>
                 ))}
               </SelectContent>
