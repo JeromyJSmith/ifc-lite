@@ -170,6 +170,104 @@ function createAssemblyDataStore(): IfcDataStore {
   } as unknown as IfcDataStore;
 }
 
+/** Storey #4 contains an IfcElementAssembly #10 with Representation = $ (no
+ *  geometry of its own — the case reported as "IfcElementAssembly does not
+ *  show" for a real model where all IfcElementAssembly instances have no
+ *  Representation). It decomposes (IfcRelAggregates) into two parts, #11 and
+ *  #12, which carry the actual geometry. This datastore mock, like the rest of
+ *  this file, has no notion of Representation at all — the tree builder never
+ *  reads it — so "no geometry" is modeled the same way emptiness would be:
+ *  the assembly is a spatial-hierarchy leaf whose parts hang off it via
+ *  aggregation, exactly the #1133 shape but for the actual reported class.
+ *  Legacy mode → globalId === expressId. */
+function createElementAssemblyDataStore(): IfcDataStore {
+  const storeyNode = createSpatialNode(4, IfcTypeEnum.IfcBuildingStorey, 'GROUND');
+  const buildingNode = createSpatialNode(3, IfcTypeEnum.IfcBuilding, 'MY_BUILDING', [storeyNode]);
+  const siteNode = createSpatialNode(2, IfcTypeEnum.IfcSite, 'MY_SITE', [buildingNode]);
+  const projectNode = createSpatialNode(1, IfcTypeEnum.IfcProject, 'MY_PROJECT', [siteNode]);
+
+  const spatialHierarchy: SpatialHierarchy = {
+    project: projectNode,
+    byStorey: new Map([[4, [10]]]), // only the assembly is contained, not its parts
+    byBuilding: new Map(),
+    bySite: new Map(),
+    bySpace: new Map(),
+    storeyElevations: new Map(),
+    storeyHeights: new Map(),
+    elementToStorey: new Map([[10, 4]]),
+    getStoreyElements: () => [],
+    getStoreyByElevation: () => null,
+    getContainingSpace: () => null,
+    getPath: () => [],
+  };
+
+  const names: Record<number, string> = {
+    10: 'Precast Column Assembly', 11: 'Column Segment', 12: 'Baseplate',
+  };
+  const types: Record<number, string> = {
+    10: 'IfcElementAssembly', 11: 'IfcColumn', 12: 'IfcPlate',
+  };
+
+  return {
+    spatialHierarchy,
+    entities: {
+      count: 0,
+      getName: (id: number) => names[id] ?? '',
+      getTypeName: (id: number) => types[id] ?? 'Unknown',
+    },
+    relationships: {
+      getRelated: (id: number, relType: RelationshipType, direction: 'forward' | 'inverse') => {
+        if (relType === RelationshipType.Aggregates && direction === 'forward' && id === 10) {
+          return [11, 12];
+        }
+        return [];
+      },
+    },
+  } as unknown as IfcDataStore;
+}
+
+/** Storey #4 contains a lone IfcElementAssembly #20 that is genuinely empty:
+ *  no Representation of its own (mirrors #10 above) AND no IfcRelAggregates
+ *  parts at all — the degenerate case the background measurement found (2 of
+ *  7 assemblies in the sample model had neither geometry nor parts). It must
+ *  still be listed as a leaf under its storey rather than silently vanish
+ *  from the tree, since that's the only place a user could ever find and
+ *  select it. Legacy mode → globalId === expressId. */
+function createEmptyAssemblyDataStore(): IfcDataStore {
+  const storeyNode = createSpatialNode(4, IfcTypeEnum.IfcBuildingStorey, 'GROUND');
+  const buildingNode = createSpatialNode(3, IfcTypeEnum.IfcBuilding, 'MY_BUILDING', [storeyNode]);
+  const siteNode = createSpatialNode(2, IfcTypeEnum.IfcSite, 'MY_SITE', [buildingNode]);
+  const projectNode = createSpatialNode(1, IfcTypeEnum.IfcProject, 'MY_PROJECT', [siteNode]);
+
+  const spatialHierarchy: SpatialHierarchy = {
+    project: projectNode,
+    byStorey: new Map([[4, [20]]]),
+    byBuilding: new Map(),
+    bySite: new Map(),
+    bySpace: new Map(),
+    storeyElevations: new Map(),
+    storeyHeights: new Map(),
+    elementToStorey: new Map([[20, 4]]),
+    getStoreyElements: () => [],
+    getStoreyByElevation: () => null,
+    getContainingSpace: () => null,
+    getPath: () => [],
+  };
+
+  return {
+    spatialHierarchy,
+    entities: {
+      count: 0,
+      getName: (id: number) => (id === 20 ? 'Empty Assembly' : ''),
+      getTypeName: (id: number) => (id === 20 ? 'IfcElementAssembly' : 'Unknown'),
+    },
+    relationships: {
+      // No IfcRelAggregates edges anywhere — the assembly has no parts.
+      getRelated: () => [],
+    },
+  } as unknown as IfcDataStore;
+}
+
 function createModel(idOffset: number): FederatedModel {
   return {
     id: 'model-1',
@@ -321,6 +419,53 @@ describe('buildTreeData', () => {
     assert.strictEqual(railing.ifcType, 'IfcRailing');
     assert.strictEqual(flight.depth, stair.depth + 1, 'parts nest one level under the assembly');
     assert.strictEqual(flight.hasChildren, false, 'leaf parts are not expandable');
+  });
+
+  it('nests an IfcElementAssembly (no Representation of its own) under the storey and exposes its parts', () => {
+    useViewerStore.setState({ models: new Map() });
+    const ds = createElementAssemblyDataStore();
+
+    // Storey expanded but the assembly collapsed: the geometry-less assembly
+    // must still appear as a leaf row and advertise its parts for one-click
+    // highlight/isolate, exactly as the stair case does for #1133.
+    const collapsed = buildTreeData(new Map(), ds, new Set(['root-1', 'root-1-2', 'root-1-2-3', 'root-1-2-3-4']), false, []);
+    const assembly = collapsed.find((n) => n.id === 'element-legacy-10');
+    assert.ok(assembly, 'the IfcElementAssembly appears under the storey despite no geometry of its own');
+    assert.strictEqual(assembly.ifcType, 'IfcElementAssembly');
+    assert.strictEqual(assembly.hasChildren, true, 'assembly is expandable');
+    assert.strictEqual(assembly.elementCount, 2, 'badge shows direct part count');
+    assert.deepStrictEqual(assembly.assemblyChildGlobalIds, [11, 12], 'parts carried for highlight/isolate');
+    // Parts are hidden until the assembly row itself is expanded.
+    assert.strictEqual(collapsed.some((n) => n.id === 'element-legacy-11'), false);
+
+    // Expand the assembly → its parts become nested rows one level deeper.
+    const expanded = buildTreeData(
+      new Map(),
+      ds,
+      new Set(['root-1', 'root-1-2', 'root-1-2-3', 'root-1-2-3-4', 'element-legacy-10']),
+      false,
+      [],
+    );
+    const segment = expanded.find((n) => n.id === 'element-legacy-11');
+    const baseplate = expanded.find((n) => n.id === 'element-legacy-12');
+    assert.ok(segment && baseplate, 'both parts render when the assembly is expanded');
+    assert.strictEqual(segment.ifcType, 'IfcColumn');
+    assert.strictEqual(baseplate.ifcType, 'IfcPlate');
+    assert.strictEqual(segment.depth, assembly.depth + 1, 'parts nest one level under the assembly');
+    assert.strictEqual(segment.hasChildren, false, 'leaf parts are not expandable');
+  });
+
+  it('does not drop a genuinely empty IfcElementAssembly (no geometry, no parts) from the spatial tree', () => {
+    const ds = createEmptyAssemblyDataStore();
+    const nodes = buildTreeData(new Map(), ds, new Set(['root-1', 'root-1-2', 'root-1-2-3', 'root-1-2-3-4']), false, []);
+
+    const assembly = nodes.find((n) => n.id === 'element-legacy-20');
+    assert.ok(assembly, 'the empty assembly still appears as a leaf under its storey, not silently vanished');
+    assert.strictEqual(assembly.ifcType, 'IfcElementAssembly');
+    assert.strictEqual(assembly.name, 'Empty Assembly');
+    assert.strictEqual(assembly.hasChildren, false, 'no IfcRelAggregates parts, so nothing to expand');
+    assert.strictEqual(assembly.elementCount, undefined, 'no part-count badge when there are no parts');
+    assert.strictEqual(assembly.assemblyChildGlobalIds, undefined, 'nothing to carry for isolate/highlight');
   });
 });
 
