@@ -196,9 +196,9 @@ mod tests {
         // quote-blind string search. A header field whose string VALUE
         // embeds the literal text "FILE_SCHEMA" before the real entry
         // causes the scan to match inside the quoted field instead.
-        let content = format!(
+        let content =
             "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION(('mentions FILE_SCHEMA in passing'),'2;1');\nFILE_SCHEMA(('IFC4X3'));\nENDSEC;\nDATA;\nENDSEC;\nEND-ISO-10303-21;\n"
-        );
+                .to_string();
         assert_eq!(detect_schema(content.as_bytes()), "IFC4X3");
     }
 
@@ -207,9 +207,9 @@ mod tests {
         // A header field value containing a literal apostrophe, escaped per
         // ISO 10303-21 by doubling (''), must not desynchronize a
         // quote-tracking scan's in/out-of-string state.
-        let content = format!(
+        let content =
             "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION(('O''Brien''s model'),'2;1');\nFILE_SCHEMA(('IFC2X3'));\nENDSEC;\nDATA;\nENDSEC;\nEND-ISO-10303-21;\n"
-        );
+                .to_string();
         assert_eq!(detect_schema(content.as_bytes()), "IFC2X3");
     }
 
