@@ -9,6 +9,7 @@
 //! valid `IfcProject` tree. Deeper shared-infrastructure dedup (units, contexts) and
 //! spatial unification by name/elevation are the P2 follow-on.
 
+use crate::step_text::detect_schema;
 use ifc_lite_core::EntityScanner;
 
 /// Options for merged export.
@@ -36,22 +37,6 @@ pub struct MergedStats {
 
 fn escape(s: &str) -> String {
     s.replace('\'', "''").replace(['\n', '\r', '\t'], " ")
-}
-
-fn detect_schema(content: &[u8]) -> String {
-    let head = String::from_utf8_lossy(&content[..content.len().min(4096)]);
-    if let Some(i) = head.find("FILE_SCHEMA") {
-        let r = &head[i..];
-        if let Some(q1) = r.find('\'') {
-            if let Some(q2) = r[q1 + 1..].find('\'') {
-                let l = &r[q1 + 1..q1 + 1 + q2];
-                if !l.is_empty() {
-                    return l.to_string();
-                }
-            }
-        }
-    }
-    "IFC4".to_string()
 }
 
 /// First `IfcProject` express id in a model, if any.
@@ -186,6 +171,58 @@ mod tests {
             ids.push(id);
         }
         ids
+    }
+
+    #[test]
+    fn detect_schema_finds_file_schema_past_the_old_4096_byte_cutoff() {
+        // Bug: this module's detect_schema() only looked at the first 4096
+        // bytes of the file. A real STEP header can push FILE_SCHEMA past
+        // that point when an earlier header field (e.g. DESCRIPTION) carries
+        // long text, silently falling back to the IFC4 default.
+        let padding = "x".repeat(5000);
+        let content = format!(
+            "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION(('{padding}'),'2;1');\nFILE_SCHEMA(('IFC2X3'));\nENDSEC;\nDATA;\nENDSEC;\nEND-ISO-10303-21;\n"
+        );
+        assert!(
+            content.len() > 4096,
+            "test fixture must exceed the old 4096-byte cutoff"
+        );
+        assert_eq!(detect_schema(content.as_bytes()), "IFC2X3");
+    }
+
+    #[test]
+    fn detect_schema_ignores_file_schema_literal_text_inside_a_quoted_string() {
+        // Bug: this module's detect_schema() located FILE_SCHEMA with a raw,
+        // quote-blind string search. A header field whose string VALUE
+        // embeds the literal text "FILE_SCHEMA" before the real entry
+        // causes the scan to match inside the quoted field instead.
+        let content = format!(
+            "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION(('mentions FILE_SCHEMA in passing'),'2;1');\nFILE_SCHEMA(('IFC4X3'));\nENDSEC;\nDATA;\nENDSEC;\nEND-ISO-10303-21;\n"
+        );
+        assert_eq!(detect_schema(content.as_bytes()), "IFC4X3");
+    }
+
+    #[test]
+    fn detect_schema_handles_doubled_apostrophe_escape_before_the_real_entry() {
+        // A header field value containing a literal apostrophe, escaped per
+        // ISO 10303-21 by doubling (''), must not desynchronize a
+        // quote-tracking scan's in/out-of-string state.
+        let content = format!(
+            "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION(('O''Brien''s model'),'2;1');\nFILE_SCHEMA(('IFC2X3'));\nENDSEC;\nDATA;\nENDSEC;\nEND-ISO-10303-21;\n"
+        );
+        assert_eq!(detect_schema(content.as_bytes()), "IFC2X3");
+    }
+
+    #[test]
+    fn detect_schema_bounding_control_well_formed_headers() {
+        // Bounding control: ordinary well-formed headers for each schema
+        // must still detect correctly (must pass before AND after the fix).
+        for schema in ["IFC2X3", "IFC4", "IFC4X3"] {
+            let content = format!(
+                "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\nFILE_NAME('','',(''),(''),'','','');\nFILE_SCHEMA(('{schema}'));\nENDSEC;\nDATA;\n#1=IFCPROJECT('guid',$,$,$,$,$,$,$,$);\nENDSEC;\nEND-ISO-10303-21;\n"
+            );
+            assert_eq!(detect_schema(content.as_bytes()), schema);
+        }
     }
 
     #[test]
