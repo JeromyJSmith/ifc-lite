@@ -1076,7 +1076,15 @@ export function getRawNamedAttributes(
     entity: IfcEntity
 ): Array<{ name: string; raw: IfcAttributeValue }> {
     const attrs = entity.attributes || [];
-    const attrNames = getAttributeNames(entity.type);
+    // Across the bundled schema union, for the same reason as
+    // `extractAllEntityAttributes` above: the IFC4 pin answers an EMPTY list
+    // for the ~251 classes it does not carry, so the query layer's
+    // `EntityNode.allAttributes` — and the viewer attributes panel it feeds —
+    // showed nothing at all for IFC4.3 infrastructure entities. Additive for
+    // pinned classes (the union is only consulted when the pin is empty; the
+    // sole divergence, IfcObjectPlacement, is abstract in every schema and so
+    // never appears as an entity's type).
+    const attrNames = getAttributeNamesAcrossSchemas(entity.type);
 
     const result: Array<{ name: string; raw: IfcAttributeValue }> = [];
     const len = Math.min(attrs.length, attrNames.length);

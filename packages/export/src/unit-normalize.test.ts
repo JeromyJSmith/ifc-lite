@@ -118,6 +118,20 @@ describe('getEntityLengthPlan (schema-derived)', () => {
     expect(getEntityLengthPlan('IFCDIRECTION').empty).toBe(true);
     expect(getEntityLengthPlan('IFCAXIS2PLACEMENT3D').empty).toBe(true);
   });
+
+  it('plans length attributes of IFC4.3 classes outside the IFC4 pin', () => {
+    // IfcAlignmentCant.RailHeadDistance (IfcPositiveLengthMeasure) is slot 7.
+    expect(getEntityLengthPlan('IFCALIGNMENTCANT').scalarIdx).toEqual([7]);
+    // IfcAlignmentHorizontalSegment: StartRadiusOfCurvature(4), EndRadiusOfCurvature(5),
+    // SegmentLength(6), GravityCenterLineHeight(7) are all length measures.
+    expect(getEntityLengthPlan('IFCALIGNMENTHORIZONTALSEGMENT').scalarIdx).toEqual([4, 5, 6, 7]);
+    // IfcClothoid.ClothoidConstant (IfcLengthMeasure) is slot 1.
+    expect(getEntityLengthPlan('IFCCLOTHOID').scalarIdx).toEqual([1]);
+  });
+
+  it('still excludes IFC4.3 georeferencing (IfcMapConversionScaled) from rescale', () => {
+    expect(getEntityLengthPlan('IFCMAPCONVERSIONSCALED').empty).toBe(true);
+  });
 });
 
 describe('rescaleEntityLengths (full entity lines)', () => {
@@ -184,6 +198,26 @@ describe('rescaleEntityLengths (full entity lines)', () => {
   it('never corrupts a unit-definition entity', () => {
     expect(rescaleEntityLengths('#15=IFCMEASUREWITHUNIT(IFCLENGTHMEASURE(0.3048),#5);', 'IFCMEASUREWITHUNIT', 0.001, 1, 1))
       .toBe('#15=IFCMEASUREWITHUNIT(IFCLENGTHMEASURE(0.3048),#5);');
+  });
+
+  it('rescales the lengths of an IFC4.3 entity outside the IFC4 pin (mm→m)', () => {
+    // IfcAlignmentCant: GlobalId,OwnerHistory,Name,Description,ObjectType,
+    // ObjectPlacement,Representation,RailHeadDistance(7).
+    expect(rescaleEntityLengths("#40=IFCALIGNMENTCANT('g',$,$,$,$,$,$,1500.);", 'IFCALIGNMENTCANT', 0.001, 1, 1))
+      .toBe("#40=IFCALIGNMENTCANT('g',$,$,$,$,$,$,1.5);");
+    // IfcClothoid: Position(0), ClothoidConstant(1).
+    expect(rescaleEntityLengths('#41=IFCCLOTHOID(#1,2500.);', 'IFCCLOTHOID', 0.001, 1, 1))
+      .toBe('#41=IFCCLOTHOID(#1,2.5);');
+    // IfcAlignmentHorizontalSegment: StartTag,EndTag,StartPoint,StartDirection(angle),
+    // StartRadiusOfCurvature(4),EndRadiusOfCurvature(5),SegmentLength(6),
+    // GravityCenterLineHeight(7),PredefinedType — the angle at 3 must survive.
+    expect(rescaleEntityLengths('#42=IFCALIGNMENTHORIZONTALSEGMENT($,$,#2,1.5708,1000.,2000.,50.,$,.CIRCULARARC.);', 'IFCALIGNMENTHORIZONTALSEGMENT', 0.001, 1, 1))
+      .toBe('#42=IFCALIGNMENTHORIZONTALSEGMENT($,$,#2,1.5708,1.,2.,0.05,$,.CIRCULARARC.);');
+  });
+
+  it('never rescales IFC4.3 georeferencing offsets (IfcMapConversionScaled)', () => {
+    const line = '#43=IFCMAPCONVERSIONSCALED(#1,#2,400000.,5000000.,310.,$,$,$,$,$);';
+    expect(rescaleEntityLengths(line, 'IFCMAPCONVERSIONSCALED', 0.001, 1, 1)).toBe(line);
   });
 
   it('is a no-op when all factors are 1', () => {

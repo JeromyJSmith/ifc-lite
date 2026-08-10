@@ -37,6 +37,8 @@
     "check:tla-chunk-await": "node scripts/check-tla-chunk-await.mjs",
     "generate:server-attr-indices": "pnpm turbo build --filter=@ifc-lite/parser && node scripts/generate-server-attr-indices.mjs",
     "check:server-attr-indices": "pnpm turbo build --filter=@ifc-lite/parser && node scripts/generate-server-attr-indices.mjs --check",
+    "generate:union-attr-types": "node scripts/generate-union-attr-types.mjs",
+    "check:union-attr-types": "node scripts/generate-union-attr-types.mjs --check",
     "test:regression": "node scripts/test-geometry-regression.mjs",
     "test:esm": "node scripts/verify-esm-entrypoints.mjs",
     "test:ids-corpus": "node scripts/test-ids-corpus.mjs",

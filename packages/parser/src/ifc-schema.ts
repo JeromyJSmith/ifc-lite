@@ -9,7 +9,8 @@
  * Do NOT hardcode entity types or attributes here; regenerate instead.
  */
 
-import { SCHEMA_REGISTRY, getAllAttributesForEntity, isKnownEntity, getInheritanceChainForEntity, getEntityMetadata } from './generated/schema-registry.js';
+import { SCHEMA_REGISTRY, getAllAttributesForEntity, isKnownEntity, getInheritanceChainForEntity, getEntityMetadata, type AttributeMetadata } from './generated/schema-registry.js';
+import { IFC4X3_DELTA_ATTR_TYPES } from './generated/attr-types-union.js';
 import { ENTITIES_IFC2X3, ENTITIES_IFC4, ENTITIES_IFC4X3, IFC_DATA_TYPES, type IfcEntityInfo } from '@ifc-lite/data';
 
 // Union map across every bundled IFC schema (2X3 + 4 + 4X3). The parser
@@ -150,6 +151,44 @@ export function getAttributeNamesAcrossSchemas(type: string): string[] {
     const canonical = resolveEntityNameAlias(type);
     const info = ENTITY_INFO_BY_UPPER.get(canonical.toUpperCase());
     return info ? [...info.attributes] : [];
+}
+
+// Hydrated-row cache for `getAllAttributesForEntityAcrossSchemas` — one
+// AttributeMetadata[] per IFC4X3-delta class ever asked about, so repeated
+// lookups (one per STEP line during export) don't re-allocate.
+const unionAttrCache = new Map<string, AttributeMetadata[]>();
+
+/**
+ * Like the generated `getAllAttributesForEntity`, but resolves across the
+ * bundled IFC4X3 schema when the parser's IFC4-pinned registry does not know
+ * the type — the TYPED counterpart of {@link getAttributeNamesAcrossSchemas}.
+ * Attribute names AND EXPRESS types (with aggregate flags) stay available for
+ * IFC4.3-only classes (`IfcAlignmentCant`, `IfcClothoid`, …), so type-driven
+ * consumers (the STEP exporter's unit normalization) can classify their slots
+ * instead of silently seeing an empty list. Known types keep the exact
+ * pinned-registry result; `arrayBounds` is not carried for delta classes.
+ * IFC2X3-only classes (`IfcMove`, …) still answer empty — no IFC2X3 EXPRESS
+ * source is bundled to type them from.
+ */
+export function getAllAttributesForEntityAcrossSchemas(type: string): AttributeMetadata[] {
+    const pinned = getAllAttributesForEntity(type);
+    if (pinned.length > 0) return pinned;
+    const upper = resolveEntityNameAlias(type).toUpperCase();
+    const cached = unionAttrCache.get(upper);
+    if (cached) return cached;
+    const rows = IFC4X3_DELTA_ATTR_TYPES[upper];
+    const attrs: AttributeMetadata[] = rows
+        ? rows.map(([name, attrType, flags]) => ({
+            name,
+            type: attrType,
+            optional: (flags & 1) !== 0,
+            isArray: (flags & 2) !== 0,
+            isList: (flags & 4) !== 0,
+            isSet: (flags & 8) !== 0,
+        }))
+        : [];
+    unionAttrCache.set(upper, attrs);
+    return attrs;
 }
 
 /**

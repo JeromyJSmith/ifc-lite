@@ -17,7 +17,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { ArrowLeft, ChevronRight, FileBox, Info, Sparkles } from 'lucide-react';
-import { getAttributeNames } from '@ifc-lite/parser';
+import { getAttributeNamesAcrossSchemas } from '@ifc-lite/parser';
 import type { EntityRef } from '@ifc-lite/parser';
 import type { IfcDataStore } from '@ifc-lite/parser';
 import type { IfcAttributeValue } from '@ifc-lite/mutations';
@@ -29,6 +29,17 @@ import { extractRawStepTokens, serializeStepToken } from './raw-step-format';
  *  loop in case of cyclic STEP graphs (shouldn't happen in valid
  *  IFC, but stay defensive). */
 const AUTO_FOLLOW_DEPTH = 16;
+
+/**
+ * Schema attribute names for a STEP type — the labels for the Raw STEP rows.
+ * Resolved across the bundled schema union (2X3 + 4 + 4X3): the IFC4 pin
+ * answers an empty list for IFC4.3 infrastructure classes, which labeled
+ * every row of an IfcCourse/IfcSignal/… "Arg N". Rows past the resolved
+ * list still render as "Arg N" (vendor extensions). Exported for tests.
+ */
+export function rawStepAttributeNames(type: string): string[] {
+  return getAttributeNamesAcrossSchemas(type) ?? [];
+}
 
 /**
  * Apply per-index overlay overrides on top of the base STEP tokens.
@@ -176,7 +187,7 @@ export function RawStepCard({
 
   // Schema attribute names for the current type. Falls back to
   // "Arg N" for entities the generated registry doesn't know.
-  const attributeNames = useMemo(() => getAttributeNames(currentType) ?? [], [currentType]);
+  const attributeNames = useMemo(() => rawStepAttributeNames(currentType), [currentType]);
 
   // Per-row mutation indicator — drives the purple dot.
   const mutatedIndices = useMemo(() => {
