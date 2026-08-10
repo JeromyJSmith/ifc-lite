@@ -14,7 +14,8 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
 import type { ProcessParallelOptions } from './geometry-parallel.js';
@@ -84,13 +85,22 @@ describe('#666 wasm package exports the binary at a resolvable subpath', () => {
   // but the package's `exports` map only exposed `.`, so bundlers honoring
   // exports would reject the subpath import. This test fails if anyone
   // re-collapses the exports to just `.` again.
+  //
+  // #2434: behavioural form — instead of asserting the `exports` map's string
+  // value, ask the actual Node resolver to resolve the subpath, exactly as an
+  // exports-honoring consumer would. Collapsing the map throws
+  // ERR_PACKAGE_PATH_NOT_EXPORTED; remapping it to the wrong file fails the
+  // path equality. Skipped when `packages/wasm/pkg/` hasn't been built
+  // (gitignored; CI's build job provides it — from source or as a prebuilt
+  // fetch — before the test job runs) because the CJS resolver requires the
+  // target file to exist.
   const repoRoot = resolve(__dirname, '../../..');
+  const builtWasm = resolve(repoRoot, 'packages/wasm/pkg/ifc-lite_bg.wasm');
+  const hasWasmBuild = existsSync(builtWasm);
 
-  it('@ifc-lite/wasm exports ./ifc-lite_bg.wasm', () => {
-    const pkgPath = resolve(repoRoot, 'packages/wasm/package.json');
-    const pkg = JSON.parse(readFileSync(pkgPath, 'utf8')) as {
-      exports?: Record<string, unknown>;
-    };
-    expect(pkg.exports?.['./ifc-lite_bg.wasm']).toBe('./pkg/ifc-lite_bg.wasm');
+  (hasWasmBuild ? it : it.skip)('the Node resolver maps @ifc-lite/wasm/ifc-lite_bg.wasm to the built binary', () => {
+    const require = createRequire(import.meta.url);
+    const resolved = require.resolve('@ifc-lite/wasm/ifc-lite_bg.wasm');
+    expect(realpathSync(resolved)).toBe(realpathSync(builtWasm));
   });
 });

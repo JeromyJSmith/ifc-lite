@@ -18,9 +18,9 @@
  *     ~225 KB; a single-digit-KB result means esbuild only emitted the
  *     decode-worker shell and lost the format sources (regression on the
  *     bundling step's `splitting: false` / `treeShaking: false` config).
- *  3. The bundled string is a function expression / IIFE — it must NOT
- *     start with an `import` keyword or `export`, because we feed it
- *     verbatim into a `Blob` worker that can't host module syntax.
+ *  3. The bundled string compiles as a CLASSIC script — no top-level
+ *     `import`/`export` anywhere — because we feed it verbatim into a
+ *     `Blob` worker that can't host module syntax.
  *
  * The test is import-by-file-path so it runs against the published shape
  * even when the package isn't installed via npm. It's skipped when the
@@ -32,6 +32,7 @@ import { describe, it, expect } from 'vitest';
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { Script } from 'node:vm';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const distInlineWorker = resolve(__dirname, '../../dist/streaming/inline-worker.js');
@@ -64,20 +65,22 @@ describe('inline-worker bundle (dist)', () => {
     }
   });
 
-  (hasBuild ? it : it.skip)('bundle string is an IIFE — no module syntax that would break Blob workers', () => {
+  (hasBuild ? it : it.skip)('bundle string compiles as a classic script — no module syntax that would break Blob workers', () => {
     const text = readFileSync(distInlineWorker, 'utf8');
     // Extract the actual bundled-worker string (it's JSON-encoded inside
     // the `export const INLINE_WORKER_CODE = "…";` declaration).
     const match = text.match(/export const INLINE_WORKER_CODE = (".*");\s*$/s);
     expect(match, 'failed to locate INLINE_WORKER_CODE declaration').toBeTruthy();
     const decoded = JSON.parse(match![1]) as string;
-    // IIFE bundles open with either `(()` or `"use strict";\n(()` — both
-    // start with the function-expression paren after at most one
-    // directive. They MUST NOT start with `import` or `export` keywords
-    // because the consumer feeds this string directly to `new Worker(Blob)`
-    // which can't host module syntax under any `worker.format`.
-    const head = decoded.trimStart().slice(0, 40);
-    expect(head.startsWith('import ')).toBe(false);
-    expect(head.startsWith('export ')).toBe(false);
+    // #2434: behavioural form of the old starts-with-`import`/`export` head
+    // check. The consumer feeds this string verbatim to `new Worker(Blob)`,
+    // which evaluates it as a CLASSIC script under any `worker.format` — so
+    // compile it here the same way. Top-level `import`/`export` anywhere in
+    // the string (not just the first line) is a SyntaxError in a classic
+    // script, which is exactly the failure a Blob worker would hit.
+    expect(
+      () => new Script(decoded, { filename: 'inline-worker-blob.js' }),
+      'bundle contains module syntax (or is otherwise not compilable as a classic script)',
+    ).not.toThrow();
   });
 });
