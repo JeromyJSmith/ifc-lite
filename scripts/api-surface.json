@@ -3502,6 +3502,7 @@
     "generateHeader: function",
     "generateStepFile: function",
     "getAllAttributesForEntity: function",
+    "getAllAttributesForEntityAcrossSchemas: function",
     "getAttributeNameAt: function",
     "getAttributeNames: function",
     "getAttributeNamesAcrossSchemas: function",

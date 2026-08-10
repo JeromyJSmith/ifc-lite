@@ -14,9 +14,11 @@
  * This module is the pure, text-level rescaler. It knows WHICH numeric attributes
  * of a STEP entity carry a length (and which carry an area/volume) by deriving the
  * answer from the generated IFC schema registry (`@ifc-lite/parser`
- * `getAllAttributesForEntity`) — the 0-based index into an entity's `allAttributes`
- * is exactly its 0-based STEP attribute index, and each attribute is typed. This
- * avoids a hand-maintained per-entity table and stays correct as the schema evolves.
+ * `getAllAttributesForEntityAcrossSchemas` — the IFC4 pin plus the IFC4X3 delta
+ * table, so IFC4.3-only classes like `IfcAlignmentCant` are planned too) — the
+ * 0-based index into an entity's `allAttributes` is exactly its 0-based STEP
+ * attribute index, and each attribute is typed. This avoids a hand-maintained
+ * per-entity table and stays correct as the schema evolves.
  *
  * ## Factors
  * The caller passes three *independent* factors (a length datum × `lengthFactor`,
@@ -54,7 +56,7 @@
  *   length/area/volume measure, so they are excluded automatically.
  */
 
-import { getAllAttributesForEntity } from '@ifc-lite/parser';
+import { getAllAttributesForEntityAcrossSchemas } from '@ifc-lite/parser';
 import { formatStepReal } from '@ifc-lite/data';
 import { splitTopLevelStepArguments } from './step-serialization.js';
 
@@ -144,7 +146,7 @@ export function getEntityLengthPlan(typeUpper: string): EntityLengthPlan {
 function buildEntityLengthPlan(typeUpper: string): EntityLengthPlan {
   if (isRescaleExcluded(typeUpper)) return EMPTY_PLAN;
 
-  const attrs = getAllAttributesForEntity(typeUpper);
+  const attrs = getAllAttributesForEntityAcrossSchemas(typeUpper);
   if (!attrs || attrs.length === 0) return EMPTY_PLAN;
 
   const listIdx: number[] = [];

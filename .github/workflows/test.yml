@@ -354,6 +354,11 @@ jobs:
       # toolchain needed (issue #1780).
       - name: Check server attr-indices freshness
         run: node scripts/generate-server-attr-indices.mjs --check
+      # The parser's IFC4X3-delta attribute-TYPE table (attr-types-union.ts) is
+      # generated from the committed codegen registries; guard that it can't
+      # drift from them (unit normalization plans IFC4.3 slots from it).
+      - name: Check union attr-types freshness
+        run: node scripts/generate-union-attr-types.mjs --check
       # The sandbox `bim` ambient type surface (apps/viewer/.../bim-globals.d.ts)
       # is generated from @ifc-lite/sandbox's NAMESPACE_SCHEMAS — the SAME schema
       # the script editor's completions and the LLM system prompt read live.
