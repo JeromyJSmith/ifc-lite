@@ -70,6 +70,18 @@ export {
 } from './apportionment-cache.js';
 
 export {
+  buildZoneApportionmentTable,
+  zoneTableExportModel,
+  zoneTableParquetColumns,
+  ZONE_TABLE_COLUMNS,
+  type ZoneApportionmentTable,
+  type ZoneTableCell,
+  type ZoneTableColumn,
+  type ZoneTableElementSource,
+  type ZoneTableStatus,
+} from './apportionment-table.js';
+
+export {
   allBasisBreakdowns,
   basisBreakdown,
   declaredVolumeBases,

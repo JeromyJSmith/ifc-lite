@@ -17,10 +17,12 @@
  * reasons are different modelling problems with different fixes.
  */
 
-import { Scissors } from 'lucide-react';
+import { Download, Scissors } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { toast } from '@/components/ui/toast';
 import { useViewerStore } from '@/store';
 import { useZoneApportionment, straddlerIdsFor } from '@/hooks/useZoneApportionment';
+import { exportZoneApportionmentCsv, exportZoneApportionmentParquet } from '@/hooks/useZoneTableExport';
 import { coverageOf, validEntry, type ZoneSet } from '@/lib/zones';
 
 export function ZoneApportionSummary({ zoneSet }: { zoneSet: ZoneSet }) {
@@ -67,6 +69,41 @@ export function ZoneApportionSummary({ zoneSet }: { zoneSet: ZoneSet }) {
               rather than to look at the element's geometry. */}
           {coverage.rescaledByAlignment > 0 && ` · ${coverage.rescaledByAlignment} skipped (model rescaled by federation alignment)`}
         </p>
+      )}
+      {/* Item 3's export slice (#2508): the computed per-element × per-zone
+          table as CSV / Parquet — the direct answer to "manual work in Excel".
+          Same download pattern as the panel's zone-set JSON export; only
+          offered once a split exists, because the export ships what was
+          computed rather than clipping behind the user's back. */}
+      {entry && coverage.apportioned > 0 && (
+        <div className="flex gap-1">
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-6 flex-1 text-[10px]"
+            title="Export the per-element × per-zone volume table as CSV"
+            onClick={() => {
+              if (!exportZoneApportionmentCsv(zoneSet)) toast.error('Nothing to export — split volumes first');
+            }}
+          >
+            <Download className="h-3 w-3 mr-1" /> CSV
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-6 flex-1 text-[10px]"
+            title="Export the per-element × per-zone volume table as Parquet"
+            onClick={() => {
+              void exportZoneApportionmentParquet(zoneSet)
+                .then((ok) => { if (!ok) toast.error('Nothing to export — split volumes first'); })
+                .catch((error: unknown) => {
+                  toast.error(`Parquet export failed: ${error instanceof Error ? error.message : String(error)}`);
+                });
+            }}
+          >
+            <Download className="h-3 w-3 mr-1" /> Parquet
+          </Button>
+        </div>
       )}
     </div>
   );
