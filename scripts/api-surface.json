@@ -1432,6 +1432,7 @@
     "applySimplifiedGeometry: function",
     "collectReferencedEntityIds: function",
     "collectStyleEntities: function",
+    "columnsToParquet: function",
     "convertEntityType: function",
     "convertStepLine: function",
     "countGlbMeshes: function",

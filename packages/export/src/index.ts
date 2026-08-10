@@ -9,6 +9,7 @@
 // GLTFExporter removed — glTF/GLB is now assembled in Rust (ifc-lite-export).
 // Use GeometryProcessor.exportGlb (from bytes) / exportGlbFromMeshes (from meshes).
 export { ParquetExporter, type ParquetExportOptions } from './parquet-exporter.js';
+export { columnsToParquet } from './table-parquet.js';
 // CSVExporter removed — CSV is now produced in Rust (ifc-lite-export).
 // Use GeometryProcessor.exportCsv(bytes, mode, …) — mode ∈ entities|properties|quantities|spatial.
 // JSONLDExporter removed — JSON-LD is now produced in Rust (ifc-lite-export).
