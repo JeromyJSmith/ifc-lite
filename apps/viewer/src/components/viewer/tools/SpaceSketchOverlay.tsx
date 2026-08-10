@@ -36,14 +36,10 @@ import {
 } from '@/lib/space-plate-session';
 import { wallRectsFromMeshes, type WallRect } from '@/lib/wall-rects-from-meshes';
 import {
-  polyArea, pointInPoly, centroid, uniqueVerts, distToSeg, projectOnSeg,
-  computeFitFromPoints, zoomFit, sX, sY, wX, wY, PAD, type Fit, type Pt,
+  polyArea, uniqueVerts, distToSeg, projectOnSeg,
+  sX, sY, wX, wY, PAD, type Pt,
 } from '@/lib/space-sketch-geometry';
-import {
-  existingSpaceFootprintsByStorey,
-  GENERATED_SPACE_OBJECTTYPE,
-  type BoundaryMode,
-} from '@ifc-lite/create';
+import { type BoundaryMode } from '@ifc-lite/create';
 import { X, Undo2, Redo2, Layers, Maximize, Magnet, SlidersHorizontal, HelpCircle, Eraser, Square, PenLine, Frame, Check, Minus, Building2 } from 'lucide-react';
 import { toast } from '@/components/ui/toast';
 import { SpaceSketchCanvas } from './space-sketch/SpaceSketchCanvas';
@@ -53,13 +49,11 @@ import { useSpaceGhostPreview, type GhostSpec } from './space-sketch/useSpaceGho
 import { useSpaceSceneFraming } from './space-sketch/useSpaceSceneFraming';
 import { exteriorPerimeter, perimeterWalls } from './space-sketch/storey-footprint';
 import { acquireSession } from './space-sketch/session-registry';
+import { useSpaceViewport } from './space-sketch/useSpaceViewport';
+import { useSpaceBake } from './space-sketch/useSpaceBake';
+import { useUndoRedoKeys, useEscEnterKeys, useModifierRepaintKeys } from './space-sketch/useSpaceKeyboard';
 import type { Hover, SplitTarget, IntentTone } from './space-sketch/types';
-import { eventKey, isTextEntryTarget } from '@/lib/keyboard-event';
 
-const DEFAULT_W = 420;
-const DEFAULT_H = 340;
-const MIN_W = 320;
-const MIN_H = 240;
 const PICK_PX = 12;
 const SNAP_PX = 10;
 const BAKE_HEIGHT = 3;
@@ -73,8 +67,6 @@ function orthoLock(anchor: Pt, p: Pt): Pt {
 
 export function SpaceSketchOverlay() {
   const setActiveTool = useViewerStore((s) => s.setActiveTool);
-  const addSpace = useViewerStore((s) => s.addSpace);
-  const removeEntity = useViewerStore((s) => s.removeEntity);
   const activeModelId = useViewerStore((s) => s.activeModelId);
   const models = useViewerStore((s) => s.models);
   const toGlobalId = useViewerStore((s) => s.toGlobalId);
@@ -104,7 +96,10 @@ export function SpaceSketchOverlay() {
   const sessionRef = useRef<SpacePlateSession | null>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
   const panelRef = useRef<HTMLDivElement | null>(null);
-  const fitRef = useRef<Fit>({ scale: 1, offX: PAD, offY: DEFAULT_H - PAD });
+  // View transform (fit/zoom/pan), the resizable canvas, and the
+  // pointer→world coordinate mapping — see useSpaceViewport for why
+  // `fitRef` and `sizeRef` must stay refs.
+  const { fitRef, size, sizeRef, fitTick, fitToPoints, svgPoint, panningRef, panBy, resizeHandlers } = useSpaceViewport(svgRef);
   const rafRef = useRef<number | null>(null);
   const rebuildTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const buildSeqRef = useRef(0);
@@ -126,8 +121,6 @@ export function SpaceSketchOverlay() {
   const dragStartRef = useRef<Pt | null>(null);
   const otherVertsRef = useRef<Pt[]>([]);
   const draggedRef = useRef(false);
-  const panningRef = useRef(false); // Issue 4: middle-mouse / empty-drag panning
-  const resizeRef = useRef<{ x: number; y: number; w: number; h: number } | null>(null);
   // While drawing, Undo pops the last placed point onto this stack and Redo
   // re-adds it — so point placement uses the panel Undo/Redo, not a separate
   // draw-only control. Cleared when the draw is committed/cancelled.
@@ -174,14 +167,6 @@ export function SpaceSketchOverlay() {
   const [alignGuides, setAlignGuides] = useState<{ vRef: Pt | null; hRef: Pt | null }>({ vRef: null, hRef: null });
   // Live "what will this click do" label, shown top-right of the canvas.
   const [intent, setIntent] = useState<{ text: string; tone: IntentTone } | null>(null);
-  // Issue 4: canvas size (resizable) + a tick that forces a re-render whenever
-  // the view transform in fitRef changes (zoom/pan/fit) without making the
-  // per-frame pointer math go through React state.
-  const [size, setSize] = useState({ w: DEFAULT_W, h: DEFAULT_H });
-  const sizeRef = useRef(size);
-  sizeRef.current = size;
-  const [fitTick, setFitTick] = useState(0);
-  const applyFit = useCallback((next: Fit) => { fitRef.current = next; setFitTick((t) => t + 1); }, []);
   const [derivedStorey, setDerivedStorey] = useState<number | null>(null);
   const [snapTol, setSnapTol] = useState<number | null>(null); // null = auto-escalate
   const [usedTol, setUsedTol] = useState(0.1);
@@ -347,41 +332,12 @@ export function SpaceSketchOverlay() {
     }
   }, [resetInteraction, commit]);
 
-  // Ctrl/Cmd+Z (Shift = redo) must drive THIS overlay's history, not the 3D
-  // model behind the panel. The global handler in useKeyboardShortcuts routes
-  // Ctrl+Z to the active model's mutation stack; a capture-phase listener here
-  // runs before it and stopPropagation()s, so the sketch and the in-panel
-  // Undo/Redo buttons share one history. Skip when a text input is focused so
-  // native field undo (and the global handler, which also skips inputs) is
-  // untouched. The overlay only mounts while the tool is active, so this
-  // listener's lifetime is exactly the tool's.
-  useEffect(() => {
-    const onUndoRedo = (e: KeyboardEvent) => {
-      if (eventKey(e) !== 'z' || !(e.ctrlKey || e.metaKey)) return;
-      if (isTextEntryTarget(e)) return;
-      e.preventDefault();
-      e.stopPropagation();
-      if (e.shiftKey) redo(); else undo();
-    };
-    window.addEventListener('keydown', onUndoRedo, true);
-    return () => window.removeEventListener('keydown', onUndoRedo, true);
-  }, [undo, redo]);
-
-  // Wheel = zoom about the cursor (Issue 4). A native non-passive listener so
-  // preventDefault() actually stops the page from scrolling under the panel.
-  useEffect(() => {
-    const el = svgRef.current;
-    if (!el) return;
-    const onWheel = (e: WheelEvent) => {
-      e.preventDefault();
-      const rect = el.getBoundingClientRect();
-      const factor = Math.exp(-e.deltaY * 0.0015); // scroll up → zoom in
-      const next = zoomFit(fitRef.current, factor, e.clientX - rect.left, e.clientY - rect.top);
-      if (next.scale >= 0.5 && next.scale <= 5000) { fitRef.current = next; setFitTick((t) => t + 1); }
-    };
-    el.addEventListener('wheel', onWheel, { passive: false });
-    return () => el.removeEventListener('wheel', onWheel);
-  }, []);
+  // Ctrl/Cmd+Z (Shift = redo) drives THIS overlay's history, not the 3D model
+  // behind the panel — see useSpaceKeyboard's useUndoRedoKeys for why the
+  // listener must be capture-phase. Kept at this position (before the
+  // session-disposal effect below) as in the pre-extraction file.
+  useUndoRedoKeys(undo, redo);
+  // Wheel-zoom-about-cursor is wired inside useSpaceViewport (declared above).
 
   // Build a face-based plate from the storey's wall RECTANGLES (read from the
   // rendered meshes): rooms are the gaps between walls, so the room boundary IS
@@ -418,7 +374,7 @@ export function SpaceSketchOverlay() {
       const fitPts = snap.length > 0
         ? snap.flatMap((r) => r.outline)
         : rects.flatMap((r) => r.corners);
-      applyFit(computeFitFromPoints(fitPts, sizeRef.current.w, sizeRef.current.h));
+      fitToPoints(fitPts);
       resetInteraction();
       setDerivedStorey(storey);
       setRooms(snap); setHist((v) => v + 1);
@@ -437,7 +393,7 @@ export function SpaceSketchOverlay() {
     } catch (e) {
       setStatus(`Build failed: ${String(e)}`);
     }
-  }, [resetInteraction, applyFit]);
+  }, [resetInteraction, fitToPoints]);
 
   // Manual weld-tolerance override (null → 5 cm default). Rebuilds the current
   // plate from its wall rectangles at the chosen tolerance.
@@ -501,11 +457,11 @@ export function SpaceSketchOverlay() {
     const fitPts = snap.length > 0
       ? snap.flatMap((r) => r.outline)
       : (build?.rects ?? []).flatMap((r) => r.corners);
-    applyFit(computeFitFromPoints(fitPts, sizeRef.current.w, sizeRef.current.h));
+    fitToPoints(fitPts);
     const total = snap.reduce((s, r) => s + r.area, 0);
     setStatus(`${build?.label ?? `Storey ${storey}`}: ${snap.length} room(s), ${total.toFixed(1)} m² (your draft).`);
     return true;
-  }, [resetInteraction, applyFit]);
+  }, [resetInteraction, fitToPoints]);
 
   // On a storey change (and on open): restore that storey's existing draft if we
   // have one, otherwise derive it from the walls. Edits on every storey persist
@@ -566,91 +522,13 @@ export function SpaceSketchOverlay() {
     contextIds: existingSpaceIds,
   });
 
-  /**
-   * IfcSpace is class-hidden by default (TYPE_VISIBILITY_SEMANTIC_DEFAULTS).
-   * Flip the toggle on after creating spaces so the user sees what they just
-   * created — and, since the toggle persists, so the spaces stay visible when
-   * the exported file is reopened.
-   */
-  const revealSpaces = useCallback(() => {
-    const s = useViewerStore.getState();
-    if (!s.typeVisibility.spaces) s.toggleTypeVisibility('spaces');
-  }, []);
-
-  /**
-   * Create one storey's draft rooms as real IfcSpace. (1) Replace: remove the
-   * spaces this tool previously created on the storey. (2) Skip rooms that
-   * overlap an existing authored space (dedup). (3) Emit each via `addSpace`,
-   * which mirrors a mesh into the 3D scene immediately. Net/gross/centre outline,
-   * floor-to-floor height. Returns counts.
-   */
-  const createSpacesForStorey = useCallback((
-    sid: number,
-    rooms: { outline: Pt[]; boundary: Pt[] }[],
-    authored: Pt[][],
-  ): { emitted: number; skipped: number; error: string | null } => {
-    if (!sketchModelId) return { emitted: 0, skipped: 0, error: 'no model to create spaces in' };
-    for (const id of generatedRef.current.get(sid) ?? []) removeEntity(sketchModelId, id);
-    generatedRef.current.delete(sid);
-    const height = floorToFloor(sid);
-    const newIds: number[] = [];
-    let skipped = 0;
-    // An addSpace failure (anchor resolution, missing mutation view, …) is
-    // NOT an "already a space" skip — keep the first error so the status
-    // line tells the user the truth instead of silently dropping spaces
-    // that would then be missing from the export.
-    let error: string | null = null;
-    for (const room of rooms) {
-      const [cx, cy] = centroid(room.outline);
-      if (authored.some((fp) => pointInPoly(cx, cy, fp))) { skipped++; continue; }
-      // `boundary` is the engine's net/gross/centre outline; gross area stays on
-      // the centreline so the quantity reflects the room, not the wall face.
-      const res = addSpace(sketchModelId, sid, {
-        Profile: 'polygon', OuterCurve: room.boundary, Height: height,
-        Name: `Space ${newIds.length + 1}`, ObjectType: GENERATED_SPACE_OBJECTTYPE,
-        grossFloorArea: polyArea(room.outline),
-      });
-      if (res && 'expressId' in res) newIds.push(res.expressId);
-      else error ??= (res && 'error' in res ? res.error : 'unknown error');
-    }
-    generatedRef.current.set(sid, newIds);
-    return { emitted: newIds.length, skipped, error };
-  }, [sketchModelId, removeEntity, addSpace, floorToFloor]);
-
-  /**
-   * Confirm: turn EVERY storey's collected draft into IfcSpace at once — the
-   * single create path, run on close. Reads each per-storey session's rooms at
-   * the active boundary mode and dedupes against existing authored spaces.
-   */
-  const createAllSpaces = useCallback((): { emitted: number; floors: number; error: string | null } => {
-    // Report a real error rather than a silent zero: `confirmCreate` treats a
-    // null error as success and closes the tool, which would discard every
-    // draft the user has drawn. `sketchModelId` is genuinely reachable as null
-    // — with several models loaded and none active we deliberately refuse to
-    // guess which one to author into, rather than picking an arbitrary one.
-    if (!sketchModelId) {
-      return { emitted: 0, floors: 0, error: 'No active model — pick one in the model list, then confirm again.' };
-    }
-    if (!ifcDataStore) {
-      return { emitted: 0, floors: 0, error: 'Model data is still loading — confirm again in a moment.' };
-    }
-    const authoredMap = existingSpaceFootprintsByStorey(ifcDataStore);
-    let emitted = 0, floors = 0;
-    let firstError: string | null = null;
-    for (const [sid, session] of sessionsRef.current) {
-      if (!session.alive || session.roomCount === 0) continue;
-      const rooms = session.rooms().map((r) => ({
-        outline: r.outline,
-        boundary: session.boundaryOutline(r.face, boundaryMode),
-      }));
-      const res = createSpacesForStorey(sid, rooms, authoredMap.get(sid) ?? []);
-      emitted += res.emitted;
-      if (res.emitted) floors++;
-      firstError ??= res.error;
-    }
-    if (emitted > 0) revealSpaces();
-    return { emitted, floors, error: firstError };
-  }, [sketchModelId, ifcDataStore, boundaryMode, createSpacesForStorey, revealSpaces]);
+  // Bake/emit: turning every storey's collected draft into real IfcSpace on
+  // confirm (dedup against existing authored spaces, reveal the space type
+  // afterwards). See space-bake.ts for the pure core + useSpaceBake for the
+  // store/ref wiring.
+  const { createAllSpaces } = useSpaceBake({
+    sketchModelId, ifcDataStore, boundaryMode, sessionsRef, generatedRef, floorToFloor,
+  });
 
   /**
    * Derive rooms on EVERY storey into its own draft session, so the whole
@@ -781,18 +659,8 @@ export function SpaceSketchOverlay() {
     };
   }, []);
 
-  const svgPoint = (e: React.MouseEvent): Pt => {
-    const rect = svgRef.current!.getBoundingClientRect();
-    // Clamp to the canvas: during a drag the pointer is captured, so moving it
-    // past the panel (e.g. dragging a vertex down off the bottom) would report
-    // coordinates far outside the SVG → a huge off-screen world position. That
-    // pushed the room off-canvas ("disappears") and made the SVG rasterise a
-    // polygon spanning to extreme coordinates, freezing the browser.
-    return [
-      Math.max(0, Math.min(sizeRef.current.w, e.clientX - rect.left)),
-      Math.max(0, Math.min(sizeRef.current.h, e.clientY - rect.top)),
-    ];
-  };
+  // svgPoint (canvas-local, edge-clamped pointer coordinates) comes from
+  // useSpaceViewport, declared above.
 
   const pickVertex = useCallback((wx: number, wy: number): number | null => {
     return sessionRef.current?.findVertexNear(wx, wy, PICK_PX / fitRef.current.scale) ?? null;
@@ -1021,33 +889,13 @@ export function SpaceSketchOverlay() {
   }, [createAllSpaces, clearGhosts, restoreScene, setActiveTool, sketchModelId, toGlobalId]);
 
   // While the panel is open, Esc belongs to the sketch — NOT the global
-  // shortcut (which closes the tool and would lose the sketch). Capture-phase +
-  // stopImmediatePropagation beats the window-level handler in useKeyboardShortcuts.
-  // Esc: close a popover/confirm → abort the current op → (double-tap) close, with
-  // an unconfirmed-drafts guard. Enter closes a drawn room.
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      const t = e.target as HTMLElement | null;
-      const inField = !!t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable);
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        e.stopImmediatePropagation(); // own Esc; don't let the global handler close us
-        if (helpOpen || optionsOpen) { setHelpOpen(false); setOptionsOpen(false); return; }
-        const now = Date.now();
-        if (abortCurrentOp()) { escTimeRef.current = 0; return; }
-        // Double-tap Esc cancels (close without creating); the Confirm button is
-        // the only create path.
-        if (now - escTimeRef.current <= 400) { escTimeRef.current = 0; closeNow(); }
-        else { escTimeRef.current = now; setStatus(needsConfirm ? 'Esc again to close without creating (use Confirm to create).' : 'Press Esc again to close.'); }
-      } else if (e.key === 'Enter' && drawPts.length > 0 && !inField) {
-        e.preventDefault();
-        e.stopImmediatePropagation();
-        commitDraw();
-      }
-    };
-    window.addEventListener('keydown', onKey, true);
-    return () => window.removeEventListener('keydown', onKey, true);
-  }, [abortCurrentOp, commitDraw, drawPts.length, needsConfirm, closeNow, helpOpen, optionsOpen]);
+  // shortcut. See useSpaceKeyboard's useEscEnterKeys for the capture-phase
+  // rationale. Kept at this position (after closeNow/confirmCreate, as
+  // before extraction) so its listener mounts in the same relative order.
+  useEscEnterKeys({
+    helpOpen, optionsOpen, setHelpOpen, setOptionsOpen, abortCurrentOp, escTimeRef,
+    needsConfirm, closeNow, setStatus, drawPtsLength: drawPts.length, commitDraw,
+  });
 
   // "Clean up" — sweep the whole plate clean in the engine: remove dangling
   // spur walls, isolated nodes, and redundant collinear nodes left by the
@@ -1199,31 +1047,19 @@ export function SpaceSketchOverlay() {
     if (panningRef.current) {
       // Pan by the raw pointer delta (movement*), so it doesn't fight the
       // canvas-edge clamp in svgPoint.
-      fitRef.current = { scale: fitRef.current.scale, offX: fitRef.current.offX + e.movementX, offY: fitRef.current.offY + e.movementY };
-      setFitTick((t) => t + 1);
+      panBy(e.movementX, e.movementY);
       return;
     }
     const [x, y] = svgPoint(e);
     moveRef.current = { x, y, shift: e.shiftKey, del: isRemoveModifier(e) };
     if (rafRef.current == null) rafRef.current = requestAnimationFrame(processMove);
-  }, [processMove]);
+  }, [processMove, panningRef, panBy, svgPoint]);
 
-  // Pressing/releasing a modifier re-evaluates the hover preview at the current
-  // cursor (so the action label + cues flip the instant you hold ⌥/Ctrl/Shift,
-  // without having to move). No-op until the cursor has been over the canvas.
-  useEffect(() => {
-    const onMod = (e: KeyboardEvent) => {
-      if (e.key !== 'Alt' && e.key !== 'Control' && e.key !== 'Meta' && e.key !== 'Shift') return;
-      const m = moveRef.current;
-      if (!m || dragRef.current != null || panningRef.current) return;
-      m.del = isRemoveModifier(e);
-      m.shift = e.shiftKey;
-      if (rafRef.current == null) rafRef.current = requestAnimationFrame(processMove);
-    };
-    window.addEventListener('keydown', onMod);
-    window.addEventListener('keyup', onMod);
-    return () => { window.removeEventListener('keydown', onMod); window.removeEventListener('keyup', onMod); };
-  }, [processMove]);
+  // Pressing/releasing a modifier re-evaluates the hover preview at the
+  // current cursor. `rafRef` is passed in (not owned by the hook) — see
+  // useModifierRepaintKeys for why it must be the SAME ref `onPointerMove`
+  // schedules with.
+  useModifierRepaintKeys(processMove, moveRef, dragRef, panningRef, rafRef);
 
   // The "remove at this point" gesture, shared by modifier+left-click
   // (onPointerDown) and right-click / macOS Ctrl-click (onContextMenu): a node
@@ -1586,7 +1422,7 @@ export function SpaceSketchOverlay() {
             const pts = rooms.length > 0
               ? rooms.flatMap((r) => r.outline)
               : (lastBuildRef.current?.rects ?? []).flatMap((r) => r.corners);
-            applyFit(computeFitFromPoints(pts, sizeRef.current.w, sizeRef.current.h));
+            fitToPoints(pts);
           }}
           disabled={derivedStorey == null} title="Fit plan to canvas (reset zoom & pan)"><Maximize className="h-4 w-4" /></button>
       </div>
@@ -1697,9 +1533,9 @@ export function SpaceSketchOverlay() {
       {/* Resize grip (Issue 4) — drag to grow/shrink the canvas; the plan stays
           put (hit ⤢ to reframe). */}
       <div
-        onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); resizeRef.current = { x: e.clientX, y: e.clientY, w: size.w, h: size.h }; (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId); }}
-        onPointerMove={(e) => { const r = resizeRef.current; if (!r) return; setSize({ w: Math.max(MIN_W, Math.round(r.w + (e.clientX - r.x))), h: Math.max(MIN_H, Math.round(r.h + (e.clientY - r.y))) }); }}
-        onPointerUp={(e) => { resizeRef.current = null; (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId); }}
+        onPointerDown={resizeHandlers.onPointerDown}
+        onPointerMove={resizeHandlers.onPointerMove}
+        onPointerUp={resizeHandlers.onPointerUp}
         title="Drag to resize the panel"
         className="absolute bottom-1 right-1 h-3.5 w-3.5 cursor-nwse-resize text-muted-foreground/50 hover:text-foreground"
         style={{ touchAction: 'none' }}>
