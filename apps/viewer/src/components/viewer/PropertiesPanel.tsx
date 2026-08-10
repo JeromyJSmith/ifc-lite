@@ -36,7 +36,7 @@ import { useIfc } from '@/hooks/useIfc';
 import { configureMutationView } from '@/utils/configureMutationView';
 import { IfcQuery } from '@ifc-lite/query';
 import { MutablePropertyView } from '@ifc-lite/mutations';
-import { extractClassificationsOnDemand, extractAllMaterialsOnDemand, extractMaterialPropertiesOnDemand, extractTypePropertiesOnDemand, extractTypeEntityOwnProperties, extractDocumentsOnDemand, extractRelationshipsOnDemand, extractGroupMembersOnDemand, extractGeoreferencingOnDemand, extractLengthUnitScale, extractProjectUnits, ProjectUnits, getAttributeNames, type IfcDataStore, type MaterialPsetGroup } from '@ifc-lite/parser';
+import { extractClassificationsOnDemand, extractAllMaterialsOnDemand, extractMaterialPropertiesOnDemand, extractTypePropertiesOnDemand, extractTypeEntityOwnProperties, extractDocumentsOnDemand, extractRelationshipsOnDemand, extractGroupMembersOnDemand, extractGeoreferencingOnDemand, extractLengthUnitScale, extractProjectUnits, ProjectUnits, getAttributeNamesAcrossSchemas, type IfcDataStore, type MaterialPsetGroup } from '@ifc-lite/parser';
 import type { NewEntity } from '@ifc-lite/mutations';
 import { EntityFlags, RelationshipType, isSpatialStructureTypeName, isStoreyLikeSpatialTypeName } from '@ifc-lite/data';
 import type { EntityRef, FederatedModel } from '@/store/types';
@@ -85,8 +85,11 @@ type DisplayPropertySet = {
  * the schema's defined slots is dropped (no "Arg 9" rows in the bSDD
  * panel).
  */
-function attributesFromOverlayEntity(entity: NewEntity): Array<{ name: string; value: string }> {
-  const names = getAttributeNames(entity.type) ?? [];
+export function attributesFromOverlayEntity(entity: NewEntity): Array<{ name: string; value: string }> {
+  // Across the bundled schema union: the IFC4 pin answers an empty list for
+  // IFC4.3 classes the SDK can legitimately author (#2003), which rendered
+  // zero attribute rows for an overlay-created IfcCourse/IfcSignal/… .
+  const names = getAttributeNamesAcrossSchemas(entity.type) ?? [];
   if (names.length === 0) return [];
   const out: Array<{ name: string; value: string }> = [];
   // Stop at the smaller of the schema and the actual attributes — IFC
