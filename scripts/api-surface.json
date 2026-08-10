@@ -1386,6 +1386,7 @@
     "ParsedPropertyValue: interface",
     "RandomSource: type",
     "decodeIfcString: function",
+    "decodeStepStringLiteral: function",
     "encodeIfcString: function",
     "generateIfcGuid: function",
     "generateUuid: function",
@@ -3775,7 +3776,8 @@
     "resolveEnvironment: function",
     "selectEvictions: function",
     "simplifyIndicesByClustering: function",
-    "sumResidentGpuBytes: function"
+    "sumResidentGpuBytes: function",
+    "viewBasis: function"
   ],
   "@ifc-lite/sandbox": [
     "DEFAULT_LIMITS: const",
@@ -3890,6 +3892,7 @@
     "EventsNamespace: class",
     "ExportBackendMethods: interface",
     "ExportCsvOptions: interface",
+    "ExportDfjsonOptions: interface",
     "ExportGltfOptions: interface",
     "ExportHbjsonOptions: interface",
     "ExportNamespace: class",

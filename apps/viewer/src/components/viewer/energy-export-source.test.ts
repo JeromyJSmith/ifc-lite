@@ -11,7 +11,7 @@ import { contiguousSourceBytes, EMPTY_SOURCE_BYTES, type IfcSourceBytes } from '
  * `packages/cli/src/headless-backend.hbjson.test.ts`, which shares the same
  * `StepExporter` + `GeometryProcessor` pipeline this dialog calls into — this
  * suite covers only the branching that decides which bytes source to use.
- * The dialog itself is exercised in `HbjsonExportDialog.test.tsx` against the
+ * The dialog itself is exercised in `EnergyModelExportDialog.test.tsx` against the
  * happy-dom harness (`src/test/setup-dom.ts`); keeping the branch logic in a
  * plain module keeps these cases readable without rendering anything.
  */
@@ -19,9 +19,9 @@ import { contiguousSourceBytes, EMPTY_SOURCE_BYTES, type IfcSourceBytes } from '
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { MutablePropertyView, StoreEditor, type MutationStoreShape, type NewEntity } from '@ifc-lite/mutations';
-import { resolveHbjsonMutationSource, type HbjsonSourceStore } from './hbjson-export-source.js';
+import { resolveEnergyExportMutationSource, type EnergyExportSourceStore } from './energy-export-source.js';
 
-function makeStore(): HbjsonSourceStore & { source: IfcSourceBytes } {
+function makeStore(): EnergyExportSourceStore & { source: IfcSourceBytes } {
   return { source: contiguousSourceBytes(new Uint8Array([1, 2, 3])), schemaVersion: 'IFC4' };
 }
 
@@ -34,10 +34,10 @@ function makeMutationStore(maxId: number): MutationStoreShape {
   return { entityIndex: { byId } };
 }
 
-describe('resolveHbjsonMutationSource', () => {
+describe('resolveEnergyExportMutationSource', () => {
   it('returns null (raw-bytes path) when there is no mutation view', () => {
     const store = makeStore();
-    const result = resolveHbjsonMutationSource({ mutationView: null, dataStore: store, schemaVersion: 'IFC4' });
+    const result = resolveEnergyExportMutationSource({ mutationView: null, dataStore: store, schemaVersion: 'IFC4' });
     assert.strictEqual(result, null);
   });
 
@@ -50,7 +50,7 @@ describe('resolveHbjsonMutationSource', () => {
     const store = makeStore();
     const view = new MutablePropertyView(null, 'm1');
     assert.strictEqual(view.hasPendingChanges(), false);
-    const result = resolveHbjsonMutationSource({ mutationView: view, dataStore: store, schemaVersion: 'IFC4' });
+    const result = resolveEnergyExportMutationSource({ mutationView: view, dataStore: store, schemaVersion: 'IFC4' });
     assert.strictEqual(result, null);
   });
 
@@ -61,7 +61,7 @@ describe('resolveHbjsonMutationSource', () => {
     // `hasChanges()` read only the append-only history and would report
     // `false` here even though the overlay genuinely carries a new IfcSpace;
     // it now reads the live overlay (same footprint as `hasPendingChanges()`)
-    // so both agree. `resolveHbjsonMutationSource` itself still gates on
+    // so both agree. `resolveEnergyExportMutationSource` itself still gates on
     // `hasPendingChanges()`, not `hasChanges()` — kept here as a second
     // assertion so a regression in either one is caught.
     const store = makeStore();
@@ -70,7 +70,7 @@ describe('resolveHbjsonMutationSource', () => {
     view.restoreNewEntity(restored);
     assert.strictEqual(view.hasChanges(), true);
     assert.strictEqual(view.hasPendingChanges(), true);
-    const result = resolveHbjsonMutationSource({ mutationView: view, dataStore: store, schemaVersion: 'IFC4' });
+    const result = resolveEnergyExportMutationSource({ mutationView: view, dataStore: store, schemaVersion: 'IFC4' });
     assert.notStrictEqual(result, null);
   });
 
@@ -84,7 +84,7 @@ describe('resolveHbjsonMutationSource', () => {
     const editor = new StoreEditor(makeMutationStore(40), view);
     editor.addEntity('IfcSpace', ['guid', null, 'New Space']);
     assert.strictEqual(view.hasPendingChanges(), true);
-    const result = resolveHbjsonMutationSource({ mutationView: view, dataStore: null, schemaVersion: 'IFC4' });
+    const result = resolveEnergyExportMutationSource({ mutationView: view, dataStore: null, schemaVersion: 'IFC4' });
     assert.strictEqual(result, null);
   });
 
@@ -94,7 +94,7 @@ describe('resolveHbjsonMutationSource', () => {
     const editor = new StoreEditor(makeMutationStore(40), view);
     editor.addEntity('IfcSpace', ['guid', null, 'New Space']);
     assert.strictEqual(view.hasChanges(), true);
-    const result = resolveHbjsonMutationSource({ mutationView: view, dataStore: store, schemaVersion: 'IFC5' });
+    const result = resolveEnergyExportMutationSource({ mutationView: view, dataStore: store, schemaVersion: 'IFC5' });
     assert.strictEqual(result, null);
   });
 
@@ -105,7 +105,7 @@ describe('resolveHbjsonMutationSource', () => {
     const view = new MutablePropertyView(null, 'm1');
     const editor = new StoreEditor(makeMutationStore(40), view);
     editor.addEntity('IfcSpace', ['guid', null, 'New Space']);
-    const result = resolveHbjsonMutationSource({ mutationView: view, dataStore: store, schemaVersion: 'IFC4' });
+    const result = resolveEnergyExportMutationSource({ mutationView: view, dataStore: store, schemaVersion: 'IFC4' });
     assert.strictEqual(result, null);
   });
 
@@ -114,7 +114,7 @@ describe('resolveHbjsonMutationSource', () => {
     const view = new MutablePropertyView(null, 'm1');
     const editor = new StoreEditor(makeMutationStore(40), view);
     editor.addEntity('IfcSpace', ['guid', null, 'New Space']);
-    const result = resolveHbjsonMutationSource({ mutationView: view, dataStore: store, schemaVersion: 'IFC4' });
+    const result = resolveEnergyExportMutationSource({ mutationView: view, dataStore: store, schemaVersion: 'IFC4' });
     assert.notStrictEqual(result, null);
     assert.strictEqual(result?.dataStore, store);
     assert.strictEqual(result?.mutationView, view);

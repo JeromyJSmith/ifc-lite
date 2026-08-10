@@ -5,7 +5,7 @@
 import type { IfcSourceBytes } from '@ifc-lite/parser';
 
 /**
- * Pure decision logic for `HbjsonExportDialog` (issue #1908), split out so it
+ * Pure decision logic for the energy-model export dialog and CLI (issues #1908, #1344), split out so it
  * is unit-testable without mounting a React component (this codebase has no
  * `.test.tsx` component tests — see AGENTS.md "Writing tests").
  *
@@ -20,19 +20,19 @@ import type { MutablePropertyView } from '@ifc-lite/mutations';
 import type { SchemaVersion } from '@/store/types';
 
 /** The subset of `IfcDataStore` these functions read. */
-export interface HbjsonSourceStore {
+export interface EnergyExportSourceStore {
   source?: IfcSourceBytes;
   schemaVersion: SchemaVersion;
 }
 
-/** Non-null pair resolved by {@link resolveHbjsonMutationSource}. */
-export interface HbjsonMutationSource<T extends HbjsonSourceStore> {
+/** Non-null pair resolved by {@link resolveEnergyExportMutationSource}. */
+export interface EnergyExportMutationSource<T extends EnergyExportSourceStore> {
   dataStore: T;
   mutationView: MutablePropertyView;
 }
 
 /**
- * Resolve whether HBJSON export should regenerate STEP bytes through
+ * Resolve whether an energy-model export (HBJSON or DFJSON) should regenerate STEP bytes through
  * `StepExporter` (applying the mutation view) instead of reading the model's
  * original `sourceFile` bytes verbatim. Returns the pair to pass to
  * `StepExporter` when it should, or `null` when the raw-bytes path applies.
@@ -54,11 +54,11 @@ export interface HbjsonMutationSource<T extends HbjsonSourceStore> {
  * overlay footprint instead — the same set the exporter actually reads — so
  * a restored overlay-created space is not silently missed.
  */
-export function resolveHbjsonMutationSource<T extends HbjsonSourceStore>(params: {
+export function resolveEnergyExportMutationSource<T extends EnergyExportSourceStore>(params: {
   mutationView: MutablePropertyView | null;
   dataStore: T | null | undefined;
   schemaVersion: SchemaVersion;
-}): HbjsonMutationSource<T> | null {
+}): EnergyExportMutationSource<T> | null {
   const { mutationView, dataStore, schemaVersion } = params;
   if (
     !mutationView ||
