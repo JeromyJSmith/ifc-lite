@@ -344,8 +344,11 @@ export function useClash() {
       state.setClashSelectedId(null);
       // duplicate_count counts SETS — what the panel now reports as findings —
       // not pairwise rows, which overstate N copies by N(N−1)/2 (#2530 review).
+      // Re-read from the store rather than the local `res`: `clashGroups` is
+      // what `setClashResult` just derived (coincident sets, post-exclusions),
+      // the same number the panel renders.
       posthog.capture('clash_duplicate_scan', {
-        duplicate_count: sets.length,
+        duplicate_count: useViewerStore.getState().clashGroups?.length ?? 0,
         pair_count: res.clashes.length,
       });
     } catch (err) {

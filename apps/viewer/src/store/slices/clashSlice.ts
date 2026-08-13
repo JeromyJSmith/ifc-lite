@@ -21,7 +21,12 @@ import type {
   ClashReviewStatus,
   ClashSortBy,
 } from '@ifc-lite/clash';
-import { CLASH_REVIEW_STATUSES, DEFAULT_CLASH_REVIEW_STATUS, groupClashes } from '@ifc-lite/clash';
+import {
+  CLASH_REVIEW_STATUSES,
+  DEFAULT_CLASH_REVIEW_STATUS,
+  groupClashes,
+  groupDuplicateSets,
+} from '@ifc-lite/clash';
 import {
   applyClashExclusions,
   exclusionRuleKey,
@@ -67,6 +72,23 @@ export type NewClashPreset = {
   selectorB: string;
 };
 
+/**
+ * Which grouping algorithm `deriveFromExclusions` applies to a result:
+ * - `clashes`    — spatial clusters (`groupClashes({ by: 'cluster' })`), the
+ *                  general-purpose BCF unit for a detection/matrix/preset run.
+ * - `duplicates` — coincident sets (`groupDuplicateSets`), connected components
+ *                  of the pair graph with no epsilon. A duplicate scan's N
+ *                  copies of one object are ONE finding under this grouping and
+ *                  N(N−1)/2 separate (epsilon-fused, possibly wrongly) clusters
+ *                  under the other, so the two are not interchangeable.
+ *
+ * Stored alongside `clashRawResult` (not inferred from `clashResult.clashes[0]
+ * .rule`, which the duplicates rule id would make possible but fragile — an
+ * empty result has no rule to read) so a later exclusion toggle re-derives
+ * with the SAME algorithm the run that produced `clashRawResult` used.
+ */
+export type ClashResultKind = 'clashes' | 'duplicates';
+
 export interface ClashSlice {
   clashPanelVisible: boolean;
   /**
@@ -80,6 +102,9 @@ export interface ClashSlice {
    * which is what makes an exclusion genuinely undoable.
    */
   clashRawResult: ClashResult | null;
+  /** Which grouping algorithm produced `clashGroups` from `clashRawResult`,
+   *  and which one a later exclusion-toggle re-derivation must keep using. */
+  clashResultKind: ClashResultKind;
   clashGroups: ClashGroup[] | null;
   clashRunning: boolean;
   clashError: string | null;
@@ -168,7 +193,13 @@ export interface ClashSlice {
 
   setClashPanelVisible: (visible: boolean) => void;
   toggleClashPanel: () => void;
-  setClashResult: (result: ClashResult | null) => void;
+  /**
+   * `kind` selects the grouping algorithm `deriveFromExclusions` applies now
+   * AND on every later re-derivation of this run (an exclusion toggle, a
+   * cluster-epsilon change). Omit for a normal detection/matrix/preset run
+   * (defaults to `'clashes'`); pass `'duplicates'` from a duplicate scan.
+   */
+  setClashResult: (result: ClashResult | null, kind?: ClashResultKind) => void;
   bumpClashRunSeq: () => void;
   setClashRunning: (running: boolean) => void;
   setClashError: (error: string | null) => void;
@@ -237,19 +268,31 @@ function snapshotSettings(s: ClashSlice): ClashGlobalSettings {
 
 /**
  * Everything derived from (raw result × exclusion rules): the filtered result,
- * its clusters, each rule's reach and the suppressed total. One function so the
+ * its groups, each rule's reach and the suppressed total. One function so the
  * four can never disagree — a stale `clashGroups` would still hold the very
  * clashes the user just excluded.
+ *
+ * `kind` picks the grouping algorithm: `'duplicates'` groups the filtered
+ * result into coincident SETS (`groupDuplicateSets` — connected components of
+ * the pair graph, no epsilon); anything else groups into spatial CLUSTERS
+ * (`groupClashes({ by: 'cluster' })`). This runs on every re-derivation, not
+ * just the initial one, so toggling an exclusion mid-duplicates-run keeps
+ * producing coincident sets instead of silently falling back to clusters.
  */
 function deriveFromExclusions(
   raw: ClashResult | null,
   rules: readonly ClashExclusionRule[],
   clusterEpsilon: number,
+  kind: ClashResultKind,
 ): Pick<ClashSlice, 'clashResult' | 'clashGroups' | 'clashExclusionCounts' | 'clashSuppressedCount'> {
   const { result, counts, suppressed } = applyClashExclusions(raw, rules);
   return {
     clashResult: result,
-    clashGroups: result ? groupClashes(result, { by: 'cluster', epsilon: clusterEpsilon }) : null,
+    clashGroups: !result
+      ? null
+      : kind === 'duplicates'
+        ? groupDuplicateSets(result)
+        : groupClashes(result, { by: 'cluster', epsilon: clusterEpsilon }),
     clashExclusionCounts: counts,
     clashSuppressedCount: suppressed,
   };
@@ -292,7 +335,10 @@ export const createClashSlice: StateCreator<ClashSlice, [], [], ClashSlice> = (s
     const result = saveExclusions(next);
     if (!result.ok) return result;
     const state = get();
-    set({ clashExclusions: next, ...deriveFromExclusions(state.clashRawResult, next, state.clashClusterEpsilon) });
+    set({
+      clashExclusions: next,
+      ...deriveFromExclusions(state.clashRawResult, next, state.clashClusterEpsilon, state.clashResultKind),
+    });
     return result;
   };
 
@@ -300,6 +346,7 @@ export const createClashSlice: StateCreator<ClashSlice, [], [], ClashSlice> = (s
     clashPanelVisible: false,
     clashResult: null,
     clashRawResult: null,
+    clashResultKind: 'clashes',
     clashGroups: null,
     clashRunning: false,
     clashError: null,
@@ -334,11 +381,17 @@ export const createClashSlice: StateCreator<ClashSlice, [], [], ClashSlice> = (s
     setClashPanelVisible: (clashPanelVisible) => set({ clashPanelVisible }),
     toggleClashPanel: () => set((s) => ({ clashPanelVisible: !s.clashPanelVisible })),
     // Stores the RAW run and publishes the exclusion-filtered view (plus its
-    // clusters) in the same commit, so no consumer can observe a result that
-    // still contains clashes the user excluded.
-    setClashResult: (raw) => {
+    // groups) in the same commit, so no consumer can observe a result that
+    // still contains clashes the user excluded. `kind` is remembered so a
+    // later re-derivation (exclusion toggle, epsilon change) keeps grouping
+    // this run the same way it was grouped the first time.
+    setClashResult: (raw, kind = 'clashes') => {
       const state = get();
-      set({ clashRawResult: raw, ...deriveFromExclusions(raw, state.clashExclusions, state.clashClusterEpsilon) });
+      set({
+        clashRawResult: raw,
+        clashResultKind: kind,
+        ...deriveFromExclusions(raw, state.clashExclusions, state.clashClusterEpsilon, kind),
+      });
     },
     bumpClashRunSeq: () => set((s) => ({ clashRunSeq: s.clashRunSeq + 1 })),
     setClashRunning: (clashRunning) => set({ clashRunning }),
@@ -529,6 +582,7 @@ export const createClashSlice: StateCreator<ClashSlice, [], [], ClashSlice> = (s
       set({
         clashResult: null,
         clashRawResult: null,
+        clashResultKind: 'clashes',
         clashExclusionCounts: new Map<string, number>(),
         clashSuppressedCount: 0,
         clashGroups: null,
