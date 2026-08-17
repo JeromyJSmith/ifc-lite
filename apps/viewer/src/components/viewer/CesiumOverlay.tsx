@@ -101,6 +101,9 @@ export function CesiumOverlay({
     if (!cesiumEnabled || !containerRef.current) return;
 
     let cancelled = false;
+    // Cesium's `addEventListener` returns its own remover; hold it so the
+    // cleanup can detach the basemap error listener with the effect.
+    let removeBasemapErrorListener: (() => void) | null = null;
     setStatus('loading');
     setError(null);
     setBasemapWarning(null);
@@ -220,14 +223,28 @@ export function CesiumOverlay({
               // no `statusCode` and the globe just stays empty. Cesium retries
               // and re-raises per tile, so the listener fires repeatedly —
               // setting the same string is a no-op for React.
-              provider.errorEvent.addEventListener((event: unknown) => {
-                const message = classifyTileProviderError(event);
-                if (message) setBasemapWarning(message);
-              });
+              // `!cancelled` here for the same reason the line below it has it,
+              // and it was the one async continuation in this effect without it.
+              // Cesium frees a tile's texture on teardown but never cancels the
+              // in-flight request, and `viewer.destroy()` does not clear this
+              // listener array — so a provider belonging to a viewer that is
+              // already destroyed can still raise, and warn about a basemap the
+              // user has since switched away from. Reproduced: pick Custom with
+              // a slow host, switch to OSM Map inside the connect timeout, and
+              // BROWSER_ACCESS_BLOCKED lands on top of a working OSM globe.
+              //
+              // The unsubscribe is kept rather than discarded so the listener
+              // goes with the effect, instead of living as long as the provider.
+              removeBasemapErrorListener = provider.errorEvent.addEventListener(
+                (event: unknown) => {
+                  const message = classifyTileProviderError(event);
+                  if (message && !cancelled) setBasemapWarning(message);
+                },
+              );
               if (!cancelled) viewer.imageryLayers.addImageryProvider(provider);
             } catch (e) {
               console.warn('[CesiumOverlay] Custom basemap unavailable:', e);
-              setBasemapWarning('That tile URL could not be used as a basemap.');
+              if (!cancelled) setBasemapWarning('That tile URL could not be used as a basemap.');
             }
           }
         } else if (dataSource === 'osm-buildings') {
@@ -289,6 +306,8 @@ export function CesiumOverlay({
       // The destroyed viewer also took the tileset + sun-path entities.
       tilesetRef.current = null;
       invalidateSolarRef.current();
+      removeBasemapErrorListener?.();
+      removeBasemapErrorListener = null;
       setStatus('idle');
       setBasemapWarning(null);
     };
