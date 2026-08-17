@@ -77,7 +77,12 @@ export function validateCustomBasemap(draft: CustomBasemapDraft): ValidationResu
     return fail('protocol', `Unsupported basemap protocol "${draft.protocol}". This build serves XYZ/TMS tile templates only.`);
   }
 
-  const url = (draft.url ?? '').trim();
+  // `typeof` rather than `?? ''`: a hand-edited or extension-written
+  // localStorage entry can hold a number, object or boolean here, and
+  // `(123).trim` is a TypeError that escapes `decodeCustomBasemap`'s try —
+  // which wraps only `JSON.parse` — and out of store construction, so the
+  // viewer never mounts. Every sibling slice coerces instead of trusting.
+  const url = typeof draft.url === 'string' ? draft.url.trim() : '';
   if (!url) return fail('url', 'Enter a tile URL template, e.g. https://example.org/tiles/{z}/{x}/{y}.png');
 
   // Parse with the placeholders replaced: `{z}` is legal in a template but not
@@ -112,7 +117,7 @@ export function validateCustomBasemap(draft: CustomBasemapDraft): ValidationResu
     return fail('url', `An XYZ template needs ${missing.join(', ')} — without it every request is the same tile.`);
   }
 
-  const credit = (draft.credit ?? '').trim();
+  const credit = typeof draft.credit === 'string' ? draft.credit.trim() : '';
   if (!credit) {
     // Required, not optional: an XYZ template carries no capabilities document,
     // so there is nowhere but this field for the attribution to come from, and
@@ -120,7 +125,7 @@ export function validateCustomBasemap(draft: CustomBasemapDraft): ValidationResu
     return fail('credit', 'Attribution is required. Most public imagery is licensed on condition of visible credit, and an XYZ URL carries none — copy the wording the provider asks for.');
   }
 
-  const creditUrl = (draft.creditUrl ?? '').trim();
+  const creditUrl = typeof draft.creditUrl === 'string' ? draft.creditUrl.trim() : '';
   if (creditUrl) {
     let parsedCredit: URL;
     try {
@@ -232,7 +237,16 @@ export function decodeCustomBasemap(raw: string | null): CustomBasemap | null {
 // ─── Browser access (CORS) ──────────────────────────────────────────────────
 
 export interface TileAccessResult {
-  status: 'ok' | 'blocked';
+  /**
+   * `ok` — a browser may read this server's tiles and the zoom-0 tile exists
+   *   (or is a benign 404 at the edge of the pyramid).
+   * `rejected` — CORS passed, but the server refused the request (auth, quota,
+   *   or a server fault). The layer will render nothing, so this is a warning
+   *   and not an informational note.
+   * `blocked` — no response reached JavaScript at all: no CORS headers, or
+   *   unreachable.
+   */
+  status: 'ok' | 'rejected' | 'blocked';
   message?: string;
   httpStatus?: number;
 }
@@ -265,10 +279,25 @@ export async function probeTileAccess(
   try {
     const response = await fetchImpl(url, { method: 'GET', mode: 'cors', cache: 'no-store' });
     if (response.ok) return { status: 'ok', httpStatus: response.status };
+    // `status: 'ok'` either way — the CORS conclusion is sound, because a
+    // cross-origin response that reached JavaScript has already passed the
+    // check. But the EXPLANATION must not be. A single "that is normal for a
+    // deeper pyramid" sentence attached to 401/403/429 tells a user whose API
+    // key is wrong that nothing is wrong: save succeeds, the globe stays
+    // empty, and the only text on screen points away from the fault. Measured
+    // on the service in #2685 — a malformed key answers HTTP 400 WITH
+    // `access-control-allow-origin`, so it lands here and not in the catch.
+    if (response.status === 404) {
+      return {
+        status: 'ok',
+        httpStatus: response.status,
+        message: `The server allows browser access but has no zoom-0 tile (404). That is normal for a service whose tiles start at a deeper zoom; check the imagery once the globe is over your site.`,
+      };
+    }
     return {
-      status: 'ok',
+      status: 'rejected',
       httpStatus: response.status,
-      message: `The server allows browser access but answered ${response.status} for the zoom-0 tile. That is normal for a service whose tiles start at a deeper zoom; check the imagery once the globe is over your site.`,
+      message: `The server allows browser access but REJECTED the request with ${response.status}. For ${response.status === 429 ? 'this status the usual cause is a rate or quota limit' : 'this status the usual cause is a missing, expired or mistyped API key'} — check any key in the URL. The layer will stay empty until the server answers.`,
     };
   } catch {
     return { status: 'blocked', message: BROWSER_ACCESS_BLOCKED };
@@ -293,5 +322,22 @@ export function classifyTileProviderError(event: unknown): string | null {
   if (!('statusCode' in inner)) return null;
   const statusCode = (inner as { statusCode?: unknown }).statusCode;
   if (statusCode === undefined) return BROWSER_ACCESS_BLOCKED;
+  // A defined status means the browser WAS allowed through, so this is not a
+  // CORS refusal. 404 at the edge of a pyramid is ordinary noise and stays
+  // silent. An auth, quota or server failure is not noise: without this the
+  // save-time probe is the only place a wrong key is ever mentioned, and if
+  // the key expires after saving nothing tells the user at all.
+  // `statusCode` is `unknown` off the wire, so narrow before comparing —
+  // otherwise a non-numeric value would fall through the `>=` silently.
+  if (typeof statusCode !== 'number') return null;
+  if (statusCode === 401 || statusCode === 403) {
+    return `The tile server rejected the request (${statusCode}). Check the API key in the basemap URL — it may be missing, expired or mistyped.`;
+  }
+  if (statusCode === 429) {
+    return 'The tile server is rate-limiting these requests (429). The imagery will be incomplete until the limit resets.';
+  }
+  if (statusCode >= 500) {
+    return `The tile server failed on this request (${statusCode}). The imagery will be incomplete until it recovers.`;
+  }
   return null;
 }

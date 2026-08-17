@@ -151,7 +151,10 @@ export function CustomBasemapEditor() {
       {problem && (
         <p role="alert" className="text-[9px] leading-tight text-red-400">{problem.message}</p>
       )}
-      {probe?.status === 'blocked' && (
+      {(probe?.status === 'blocked' || probe?.status === 'rejected') && (
+        // `role="alert"` for both: a server that refuses the request leaves the
+        // layer as empty as one that refuses the browser, so it must not be
+        // rendered as the neutral note that `ok` gets.
         <p role="alert" className="text-[9px] leading-tight text-red-400">{probe.message}</p>
       )}
       {probe?.status === 'ok' && (
