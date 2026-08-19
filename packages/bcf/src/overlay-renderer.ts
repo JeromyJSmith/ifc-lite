@@ -28,15 +28,23 @@ const CONNECTOR_CLASS = 'bcf-overlay-connector';
 const ACTIVE_CLASS = 'bcf-overlay-active';
 const TOOLTIP_CLASS = 'bcf-overlay-tooltip';
 
-/** Pin and connector colors keyed by BCF topic status */
-const STATUS_COLORS: Record<string, string> = {
+/**
+ * Pin and connector colors keyed by BCF topic status.
+ *
+ * Exported (not just for internal use) so tests can assert this stays in
+ * sync with STATUS_ICONS below — both are keyed by the same status domain,
+ * and a status present in one but missing from the other silently falls
+ * back to a default via `??` at the call site instead of failing loudly.
+ */
+export const STATUS_COLORS: Record<string, string> = {
   open: '#f7768e',
   'in progress': '#e0af68',
   resolved: '#9ece6a',
   closed: '#565f89',
 };
 
-const STATUS_ICONS: Record<string, string> = {
+/** Pin/tooltip icons keyed by BCF topic status. Must match STATUS_COLORS' key set. */
+export const STATUS_ICONS: Record<string, string> = {
   open: '●',
   'in progress': '◐',
   resolved: '✓',
