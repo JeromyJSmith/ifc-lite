@@ -30,7 +30,7 @@ import { asSourceBytes, type IfcSourceBytes } from '@ifc-lite/parser';
  * as `splitTopLevelArgs` in `@ifc-lite/export` (kept inline here to
  * avoid leaking a private util across the package boundary).
  */
-function splitTopLevelArgs(text: string): string[] {
+export function splitTopLevelArgs(text: string): string[] {
   const parts: string[] = [];
   let current = '';
   let depth = 0;
