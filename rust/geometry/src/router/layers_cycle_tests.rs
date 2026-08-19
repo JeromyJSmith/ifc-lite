@@ -76,3 +76,23 @@ fn boolean_over_translated_extrusion_reports_non_identity() {
         10
     ));
 }
+
+/// A long ACYCLIC FirstOperand chain, every id distinct, so every
+/// `visited.insert` succeeds and the set never fires. Before the depth cap
+/// this aborted the process the same way the cyclic case did, on a file with
+/// no cycle in it (Codex, #2872 review).
+#[test]
+fn a_long_acyclic_operand_chain_terminates() {
+    let n: u32 = 5_000;
+    let mut data = String::new();
+    for i in 1..n {
+        data.push_str(&format!(
+            "#{}=IFCBOOLEANRESULT(.DIFFERENCE.,#{},#90000);\n",
+            i,
+            i + 1
+        ));
+    }
+    data.push_str(&format!("#{n}=IFCBLOCK($,1.,1.,1.);\n"));
+    data.push_str("#90000=IFCBLOCK($,1.,1.,1.);\n");
+    assert!(!identity_of(&data, 1));
+}

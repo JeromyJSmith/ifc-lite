@@ -435,8 +435,22 @@ fn element_is_single_unshifted_item(
 /// exotic returns false so we bail safely.
 fn item_has_identity_position(item: &DecodedEntity, decoder: &mut EntityDecoder) -> bool {
     let mut visited = std::collections::HashSet::new();
-    item_has_identity_position_guarded(item, decoder, &mut visited)
+    item_has_identity_position_guarded(item, decoder, 0, &mut visited)
 }
+
+/// Longest `IfcBooleanResult.FirstOperand` chain this will follow.
+///
+/// The visited set stops CYCLES; this stops LENGTH. They are not
+/// interchangeable: a chain of distinct booleans makes every `visited.insert`
+/// succeed, so the set never fires and the recursion consumes one stack frame
+/// per file-supplied entity until the process aborts -- the same crash, on a
+/// file with no cycle in it (Codex, #2872 review).
+///
+/// This is only the layer-slicing eligibility probe, not the geometry walk, so
+/// a shallow bound is safe: past it the answer is `false` and the element
+/// simply renders without layer slicing. `BooleanClippingProcessor` walks the
+/// same spine iteratively and is unaffected.
+const MAX_OPERAND_CHAIN_DEPTH: u32 = 32;
 
 /// The `IfcBooleanResult` arm below chases `FirstOperand`, a file-supplied
 /// reference, so `#10=IFCBOOLEANRESULT(.DIFFERENCE.,#10,#20)` -- one
@@ -452,9 +466,10 @@ fn item_has_identity_position(item: &DecodedEntity, decoder: &mut EntityDecoder)
 fn item_has_identity_position_guarded(
     item: &DecodedEntity,
     decoder: &mut EntityDecoder,
+    depth: u32,
     visited: &mut std::collections::HashSet<u32>,
 ) -> bool {
-    if !visited.insert(item.id) {
+    if depth >= MAX_OPERAND_CHAIN_DEPTH || !visited.insert(item.id) {
         return false;
     }
     match item.ifc_type {
@@ -473,7 +488,9 @@ fn item_has_identity_position_guarded(
                 None => return false,
             };
             match decoder.decode_by_id(first_operand_id) {
-                Ok(inner) => item_has_identity_position_guarded(&inner, decoder, visited),
+                Ok(inner) => {
+                    item_has_identity_position_guarded(&inner, decoder, depth + 1, visited)
+                }
                 Err(_) => false,
             }
         }
