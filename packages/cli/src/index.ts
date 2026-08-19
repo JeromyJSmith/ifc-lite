@@ -21,6 +21,7 @@ import { bcfCommand } from './commands/bcf.js';
 import { clashCommand } from './commands/clash.js';
 import { createCommand } from './commands/create.js';
 import { evalCommand } from './commands/eval.js';
+import { workbenchGraphCommand } from './commands/workbench-graph.js';
 import { runCommand } from './commands/run.js';
 import { schemaCommand } from './commands/schema.js';
 import { mergeCommand } from './commands/merge.js';
@@ -82,6 +83,7 @@ const HELP = `
     validate  <file.ifc>                          Structural validation checks
     bsdd      <class|search|psets|qsets> <arg>     buildingSMART Data Dictionary lookup
     stats     <file.ifc>                          Auto-calculated model KPIs and health check
+    workbench-graph <file.ifc> [--json]           Marpa workbench graph (RelationshipGraph JSON)
     mutate    <file.ifc> --id N --set P=V --out F  Modify properties/attributes and save
     generate-spaces <file.ifc> --out F           Derive IfcSpace from walls (slab/roof-aware height)
     ask       <file.ifc> "<question>"            Natural language BIM queries
@@ -257,6 +259,9 @@ async function main(): Promise<void> {
       break;
     case 'stats':
       await statsCommand(commandArgs);
+      break;
+    case 'workbench-graph':
+      await workbenchGraphCommand(commandArgs);
       break;
     case 'mutate':
       await mutateCommand(commandArgs);
