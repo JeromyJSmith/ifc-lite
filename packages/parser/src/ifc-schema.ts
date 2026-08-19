@@ -33,19 +33,29 @@ const ENTITY_INFO_BY_UPPER: Map<string, IfcEntityInfo> = (() => {
 // authoring tools emit the leaf. Resolving the alias to its closest
 // schema-known supertype lets the inheritance walk reach IfcProduct.
 //
-// Mirrors `rust/core/src/legacy_entities.rs` so the two sides stay in
-// lockstep — if you add a row here, add the matching Rust entry too.
-const ENTITY_NAME_ALIASES: Record<string, string> = {
+// `rust/core/src/legacy_entities.rs` maps a broader set of legacy names
+// (StandardCase/ElementedCase/Style variants, …) that ENTITY_INFO_BY_UPPER
+// already resolves directly because they ARE present in one of the bundled
+// ENTITIES_IFC2X3/IFC4/IFC4X3 tables — those don't need an entry here. This
+// table only needs to carry the subset of Rust's rows whose source name is
+// absent from all three bundled tables; for that subset the two sides must
+// stay in lockstep — if you add a row here, add/verify the matching Rust
+// entry, and vice versa. `entity-name-aliases.parity.test.ts` parses
+// `legacy_entities.rs` and enforces this mechanically.
+export const ENTITY_NAME_ALIASES: Record<string, string> = {
     // IFC4.3 stratum subtypes (issue #860) — schema only has the abstract
     // `IfcGeotechnicalStratum`, real models emit one of these three leaves
     // with a PredefinedType pinned (SOLID / VOID / WATER).
     IFCSOLIDSTRATUM: 'IfcGeotechnicalStratum',
     IFCVOIDSTRATUM: 'IfcGeotechnicalStratum',
     IFCWATERSTRATUM: 'IfcGeotechnicalStratum',
-    // IFC2x3 names with no IFC4x3 enum variant in any bundled schema table
-    // (ENTITIES_IFC2X3/IFC4/IFC4X3 all lack them) — mirrors
-    // `rust/core/src/legacy_entities.rs`'s "IFC2x3 names that have no IFC4x3
-    // enum variant" arm, which maps both to `IfcDistributionElement`.
+    // Rust's "IFC2x3 names that have no IFC4x3 enum variant" arm maps BOTH
+    // IFCEQUIPMENTELEMENT and IFCELECTRICALDISTRIBUTIONPOINT to
+    // `IfcDistributionElement`. Only the latter needs an entry here:
+    // IFCEQUIPMENTELEMENT already exists as a real entity in
+    // ENTITIES_IFC2X3 (parent IfcElement) so ENTITY_INFO_BY_UPPER resolves
+    // it directly, with its own — more specific — inheritance chain.
+    // IFCELECTRICALDISTRIBUTIONPOINT is absent from every bundled table.
     IFCELECTRICALDISTRIBUTIONPOINT: 'IfcDistributionElement',
 };
 
