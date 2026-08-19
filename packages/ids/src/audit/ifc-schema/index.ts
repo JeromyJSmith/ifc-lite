@@ -60,7 +60,14 @@ export async function runIfcSchemaAudit(
       const perVersion: IDSAuditIssue[] = [];
       await auditSpec(spec, version, `specifications[${i}]`, perVersion);
       for (const iss of perVersion) {
-        const key = `${iss.code}|${iss.path}|${iss.message}`;
+        // Dedupe key is code+path only, per the contract above — not the
+        // message. Nearly every message here interpolates `${version}`
+        // (e.g. `"...for IFC2X3"` vs `"...for IFC4"`), so including the
+        // message in the key made cross-version dedup silently inert for
+        // most issue codes: a spec with two `@ifcVersion` tokens and one
+        // real defect (say, an unknown entity name) would surface as two
+        // near-duplicate issues instead of one.
+        const key = `${iss.code}|${iss.path}`;
         if (seen.has(key)) continue;
         seen.add(key);
         issues.push(iss);
