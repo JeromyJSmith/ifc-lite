@@ -17,7 +17,12 @@
 //! # Why this is gated, and what the gate is
 //!
 //! The exact CSG kernel snaps every input coordinate to
-//! [`SNAP_GRID`](crate::kernel::mesh_bridge) = `2^-16 m ≈ 15.26 µm` and treats
+//! [`SNAP_GRID`](crate::kernel::mesh_bridge) = `2^-16` in the CALLER's unit —
+//! not metres as a property of the constant itself (#2684) — which reads as
+//! `≈ 15.26 µm` HERE only because `intersection_solid`'s operands are
+//! required to already be in the common world frame, post-scale (see its doc
+//! below); a caller passing file-unit coordinates would get a different
+//! figure. In this module's frame it treats
 //! faces within [`near_band_from_extent`] of each other as coplanar. Inside that
 //! band a thin overlap is not a thin solid — it is a *coplanar contact*, and the
 //! arrangement returns a wedge rather than the slab. Measured on the analytic

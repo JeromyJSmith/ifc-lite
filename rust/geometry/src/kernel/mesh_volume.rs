@@ -16,11 +16,14 @@ use crate::mesh::Mesh;
 /// to read regardless of where it sits. That reading is translation-stable
 /// only up to a bounded QUANTIZATION noise floor, not exactly
 /// translation-invariant: [`mesh_to_tris`] rounds every coordinate to
-/// `kernel::mesh_bridge::SNAP_GRID` (1/65536 m, ~15.26 µm) before this
-/// function ever sees it, and a non-grid-aligned translation moves each
-/// vertex's rounding independently, so the sum drifts by roughly
-/// `surface_area * SNAP_GRID` (plus, at far-from-origin offsets, the
-/// coarser f32-ulp term the `Mesh` positions already carried on the way in).
+/// `kernel::mesh_bridge::SNAP_GRID` (1/65536 in the CALLER's unit — NOT
+/// metres (#2684): 15 µm on a metre-denominated caller, 15 nm on the
+/// FILE-UNIT `IfcBooleanResult` path this function's callers actually use)
+/// before this function ever sees it, and a non-grid-aligned translation
+/// moves each vertex's rounding independently, so the sum drifts by roughly
+/// `surface_area * SNAP_GRID` in that same caller-relative unit (plus, at
+/// far-from-origin offsets, the coarser f32-ulp term the `Mesh` positions
+/// already carried on the way in).
 /// Because it delegates to `signed_volume6`, which sums about the
 /// operand's own AABB centre rather than a fixed point, that drift is the
 /// ONLY thing that moves the reading — a world-origin implementation would
@@ -108,7 +111,8 @@ mod tests {
     ///
     /// Deliberately NOT grid-aligned: an earlier version of this test used
     /// integer cube corners and an offset that was an exact multiple of
-    /// `SNAP_GRID` (1/65536 m), which makes BOTH the f32 store and the
+    /// `SNAP_GRID` (1/65536 in the CALLER's unit, not metres (#2684)), which
+    /// makes BOTH the f32 store and the
     /// reconciliation snap in [`mesh_to_tris`] exact no-ops — so it could
     /// only ever discriminate the AABB-centred-vs-world-origin reference
     /// choice, never the quantization noise those two steps genuinely
