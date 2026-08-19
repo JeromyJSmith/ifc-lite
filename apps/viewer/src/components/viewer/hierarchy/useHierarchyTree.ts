@@ -52,7 +52,7 @@ interface UseHierarchyTreeParams {
  * Build a stable Set of global IDs that have geometry.
  * Only rebuilds when the actual set of IDs changes, NOT when mesh colors change.
  */
-function buildGeometricIdSet(
+export function buildGeometricIdSet(
   models: Map<string, FederatedModel>,
   legacyGeometry: GeometryResult | null | undefined,
 ): Set<number> {
@@ -83,7 +83,7 @@ function buildGeometricIdSet(
  * `useSymbolicAnnotations`). Text annotations that carry a real brep mesh are
  * already in the geometric set, so the union is idempotent for them.
  */
-function collectAnnotationEntityIds(
+export function collectAnnotationEntityIds(
   models: Map<string, FederatedModel>,
   legacyStore: IfcDataStore | null | undefined,
 ): Set<number> {
