@@ -177,3 +177,46 @@ fn quantity_sets_follow_the_same_rule() {
         "the occurrence's own Length must win"
     );
 }
+
+/// Pins [`merge_inherited`] to the cross-language vectors shared with
+/// `mergeInheritedPropertySets` in
+/// `packages/parser/src/property-set-merge.parity.test.ts`, so the two
+/// implementations cannot silently drift (see the doc comment on
+/// `merge_inherited` in `model_inherit.rs`).
+#[test]
+fn rust_merge_matches_shared_parity_vectors() {
+    let raw = include_str!("../tests/fixtures/pset_merge_vectors.json");
+    let doc: serde_json::Value = serde_json::from_str(raw).expect("fixture is valid JSON");
+    let cases = doc["cases"].as_array().expect("cases is an array");
+    assert!(!cases.is_empty(), "fixture has at least one case");
+
+    fn sets_from(json: &serde_json::Value) -> Vec<PropertySet> {
+        json.as_array()
+            .expect("sets is an array")
+            .iter()
+            .map(|s| PropertySet {
+                name: s["name"].as_str().expect("name is a string").to_string(),
+                properties: s["properties"]
+                    .as_array()
+                    .expect("properties is an array")
+                    .iter()
+                    .map(|p| PropValue {
+                        name: p["name"].as_str().expect("prop name is a string").to_string(),
+                        value: p["value"].as_str().expect("prop value is a string").to_string(),
+                        value_type: "IFCLABEL".to_string(),
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
+    for case in cases {
+        let name = case["name"].as_str().unwrap_or("<unnamed>");
+        let own = sets_from(&case["own"]);
+        let inherited = sets_from(&case["inherited"]);
+        let expected = shape(&sets_from(&case["expected"]));
+
+        let merged = merge_inherited(own, inherited);
+        assert_eq!(shape(&merged), expected, "case `{name}` mismatch");
+    }
+}

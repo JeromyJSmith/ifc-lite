@@ -1,0 +1,104 @@
+{
+  "_comment": "Shared property/quantity-set inheritance-merge test vectors for the Rust merger (rust/export/src/model_inherit.rs::merge_inherited) and the TS merger (packages/parser/src/property-set-merge.ts::mergeInheritedPropertySets). Both must agree on every case: `own` merged with `inherited`, occurrence wins on a per-property collision, expected output lists sets and their properties IN ORDER. All fixtures are synthetic.",
+  "cases": [
+    {
+      "name": "collision_type_only_props_survive_occurrence_value_wins",
+      "own": [
+        { "name": "Pset_CoveringCommon", "properties": [{ "name": "Reference", "value": "occurrence" }] }
+      ],
+      "inherited": [
+        { "name": "Pset_CoveringCommon", "properties": [{ "name": "Reference", "value": "type" }, { "name": "Combustible", "value": "F" }] }
+      ],
+      "expected": [
+        { "name": "Pset_CoveringCommon", "properties": [{ "name": "Reference", "value": "occurrence" }, { "name": "Combustible", "value": "F" }] }
+      ]
+    },
+    {
+      "name": "every_same_named_own_set_is_augmented_not_just_the_first",
+      "own": [
+        { "name": "Pset_WallCommon", "properties": [{ "name": "IsExternal", "value": "T" }] },
+        { "name": "Pset_WallCommon", "properties": [{ "name": "IsExternal", "value": "F" }] }
+      ],
+      "inherited": [
+        { "name": "Pset_WallCommon", "properties": [{ "name": "FireRating", "value": "60" }] }
+      ],
+      "expected": [
+        { "name": "Pset_WallCommon", "properties": [{ "name": "IsExternal", "value": "T" }, { "name": "FireRating", "value": "60" }] },
+        { "name": "Pset_WallCommon", "properties": [{ "name": "IsExternal", "value": "F" }, { "name": "FireRating", "value": "60" }] }
+      ]
+    },
+    {
+      "name": "inherited_only_set_is_appended_after_own_sets",
+      "own": [
+        { "name": "Pset_WallCommon", "properties": [{ "name": "IsExternal", "value": "T" }] }
+      ],
+      "inherited": [
+        { "name": "Pset_ManufacturerTypeInformation", "properties": [{ "name": "Manufacturer", "value": "Acme" }] }
+      ],
+      "expected": [
+        { "name": "Pset_WallCommon", "properties": [{ "name": "IsExternal", "value": "T" }] },
+        { "name": "Pset_ManufacturerTypeInformation", "properties": [{ "name": "Manufacturer", "value": "Acme" }] }
+      ]
+    },
+    {
+      "name": "two_inherited_sets_of_one_name_stay_separate_appended_set_not_reregistered",
+      "own": [],
+      "inherited": [
+        { "name": "Foo_Bar", "properties": [{ "name": "A", "value": "1" }] },
+        { "name": "Foo_Bar", "properties": [{ "name": "B", "value": "2" }] }
+      ],
+      "expected": [
+        { "name": "Foo_Bar", "properties": [{ "name": "A", "value": "1" }] },
+        { "name": "Foo_Bar", "properties": [{ "name": "B", "value": "2" }] }
+      ]
+    },
+    {
+      "name": "occurrence_with_nothing_of_its_own_inherits_the_whole_set",
+      "own": [],
+      "inherited": [
+        { "name": "Foo_Bar", "properties": [{ "name": "Foo", "value": "Bar" }] }
+      ],
+      "expected": [
+        { "name": "Foo_Bar", "properties": [{ "name": "Foo", "value": "Bar" }] }
+      ]
+    },
+    {
+      "name": "no_inherited_sets_leaves_own_untouched",
+      "own": [
+        { "name": "Pset_WallCommon", "properties": [{ "name": "IsExternal", "value": "T" }] }
+      ],
+      "inherited": [],
+      "expected": [
+        { "name": "Pset_WallCommon", "properties": [{ "name": "IsExternal", "value": "T" }] }
+      ]
+    },
+    {
+      "name": "empty_inherited_set_matching_an_empty_own_set_adds_nothing",
+      "own": [
+        { "name": "Pset_Empty", "properties": [] }
+      ],
+      "inherited": [
+        { "name": "Pset_Empty", "properties": [] }
+      ],
+      "expected": [
+        { "name": "Pset_Empty", "properties": [] }
+      ]
+    },
+    {
+      "name": "multi_set_index_maps_a_name_to_every_own_occurrence_three_twins",
+      "own": [
+        { "name": "Pset_CoveringCommon", "properties": [{ "name": "Reference", "value": "R1" }] },
+        { "name": "Pset_CoveringCommon", "properties": [{ "name": "Reference", "value": "R2" }] },
+        { "name": "Pset_CoveringCommon", "properties": [{ "name": "Reference", "value": "R3" }] }
+      ],
+      "inherited": [
+        { "name": "Pset_CoveringCommon", "properties": [{ "name": "Combustible", "value": "F" }] }
+      ],
+      "expected": [
+        { "name": "Pset_CoveringCommon", "properties": [{ "name": "Reference", "value": "R1" }, { "name": "Combustible", "value": "F" }] },
+        { "name": "Pset_CoveringCommon", "properties": [{ "name": "Reference", "value": "R2" }, { "name": "Combustible", "value": "F" }] },
+        { "name": "Pset_CoveringCommon", "properties": [{ "name": "Reference", "value": "R3" }, { "name": "Combustible", "value": "F" }] }
+      ]
+    }
+  ]
+}
