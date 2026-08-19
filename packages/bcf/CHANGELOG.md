@@ -1,5 +1,56 @@
 # @ifc-lite/bcf
 
+## 1.18.2
+
+### Patch Changes
+
+- [#2758](https://github.com/LTplus-AG/ifc-lite/pull/2758) [`8f89331`](https://github.com/LTplus-AG/ifc-lite/commit/8f893311b170a983e160737bd9479c3caf961911) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `readBCF` silently dropping topics from spec-legal BCF files written by other tools.
+  
+  `reader.ts`'s regexes for `<Topic>`, `<RelatedTopic>`, `<Comment>`, and the
+  comment's `<Viewpoint>` reference required `Guid` to be the attribute
+  immediately after the tag name. XML attribute order is not semantically
+  significant, so a file written with e.g. `<Topic TopicType="Issue"
+  TopicStatus="Open" Guid="topic-1">` failed to match: `readTopic` logged
+  "missing Topic element" and the whole topic -- title, comments, viewpoints --
+  was silently dropped with no throw and no partial result.
+  
+  Our own `writer.ts` always emits `Guid` first, so every self round-trip
+  passed and no existing test caught this; only a file from another tool
+  exposed it.
+  
+  Each affected site now matches the opening tag generically (`<Tag\b([^>]*)>`)
+  and pulls individual attributes out of the captured attribute string with a
+  new shared `extractAttr` helper, so attribute order can no longer matter at
+  any of these call sites.
+
+- [#2760](https://github.com/LTplus-AG/ifc-lite/pull/2760) [`48b204b`](https://github.com/LTplus-AG/ifc-lite/commit/48b204b868016aad29b694b53ac8ace5e76a0542) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `readBCF` failing to resolve a viewpoint's snapshot when `markup.bcf` names
+  it with a non-buildingSMART-convention filename.
+  
+  `parseViewpoints` looked up each viewpoint's declared `<Viewpoint>`/`<Snapshot>`
+  filenames in `markup.bcf` with a regex matching the singular tag
+  `<Viewpoint Guid="...">`. The markup element that actually carries those
+  filenames is plural — `<Viewpoints Guid="...">`, per the BCF 2.1/3.0 schema and
+  this package's own writer (`writer.ts` `writeMarkupFile` emits exactly that tag)
+  — so the regex could never match a spec-correct file, and the lookup map was
+  always empty. Every snapshot resolution silently fell through to a
+  filename-guessing fallback (`Viewpoint_<guid>.bcfv` → `Snapshot_<guid>.png` and
+  similar patterns). That fallback happens to cover buildingSMART's own reference
+  fixtures, which follow the convention, but a third-party file is free to name
+  its entries however it likes; when the filenames don't match a guessed
+  pattern, the snapshot markup.bcf explicitly names was silently dropped even
+  though it exists in the archive.
+  
+  The viewpoint's own GUID was never at risk — it comes from the `.bcfv` file's
+  `<VisualizationInfo Guid="...">` element directly, independent of this lookup
+  — so this was a snapshot-association defect, not a GUID/identity defect.
+  
+  Fixed the regex to match the plural `<Viewpoints>` tag, so the markup-declared
+  filename is used when present and the naming-convention fallback now only
+  runs when markup.bcf genuinely doesn't declare a snapshot. Added a test using
+  a synthetic third-party-shaped archive (custom filenames, spec-legal) that
+  previously lost its snapshot and now resolves it, plus a regression test
+  against the buildingSMART `PerspectiveCamera.bcf` fixture.
+
 ## 1.18.1
 
 ### Patch Changes

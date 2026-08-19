@@ -1,5 +1,63 @@
 # @ifc-lite/collab-server
 
+## 0.6.0
+
+### Minor Changes
+
+- [#2794](https://github.com/LTplus-AG/ifc-lite/pull/2794) [`eadb0e0`](https://github.com/LTplus-AG/ifc-lite/commit/eadb0e09e304701d0774467335dd482fafdb045c) Thanks [@louistrue](https://github.com/louistrue)! - Add garbage collection for content-addressed blobs. Blobs were one file per mesh
+  and were never deleted, so a long-lived server exhausted its volume's INODES
+  rather than its bytes: production hit 305,741 blobs against a 5 GB volume's
+  305,175 inodes with only 2.9 GB of 4.9 GB used, and every geometry upload began
+  failing with ENOSPC. Mean blob size is well under the default 16 KB-per-inode
+  ratio, so a larger volume only delays this.
+  
+  The sweep deletes a blob only when no persisted room log references it, no
+  loaded room references it, and it is older than a 24h grace window covering the
+  upload-then-reference race. References are unioned across every room, since
+  content-addressed blobs are shared between rooms and branch forks. Enabled by
+  default; `COLLAB_BLOB_GC=0` disables it.
+
+### Patch Changes
+
+- [#2806](https://github.com/LTplus-AG/ifc-lite/pull/2806) [`7544c9d`](https://github.com/LTplus-AG/ifc-lite/commit/7544c9d36f735cf52a7c0494a4e7ff9c3c3a3954) Thanks [@louistrue](https://github.com/louistrue)! - The blob sweep now runs once at startup IN ADDITION to the configured interval,
+  and the configurable grace window has a floor. The periodic sweeps are unchanged;
+  what was missing was the first one.
+  
+  `setInterval` does not fire immediately, so with the default six-hour period a
+  server that restarts more often than that never completed a sweep at all: the GC
+  was present in the code and absent in effect. Hosted deploys restart on
+  redeploy, OOM and platform events, so that was the normal case rather than an
+  edge one.
+  
+  `COLLAB_BLOB_GC_GRACE_MS` also accepted `0`, which is the destructive value: it
+  makes the cutoff equal to now, condemning every unreferenced blob regardless of
+  age, including one uploaded moments earlier by an in-flight share whose document
+  reference has not landed yet. The minimum is now one minute.
+
+- [#2793](https://github.com/LTplus-AG/ifc-lite/pull/2793) [`f4a6cdc`](https://github.com/LTplus-AG/ifc-lite/commit/f4a6cdc1d2179bc406cf41da79580ce4f03ffeb5) Thanks [@louistrue](https://github.com/louistrue)! - Stop the collab server counting itself as a room participant, and give it a real
+  keepalive. y-protocols' `Awareness` constructor self-registers a local state of
+  `{}` and renews it every 15 seconds, so every room's peer badge read one too
+  high: it showed "(2)" directly above a roster saying "You're the only one here",
+  because the roster filters on a `user` field and the badge did not.
+  
+  That renewal was also the only server-to-client traffic in a single-occupant
+  room, and so was accidentally feeding y-websocket's 30-second reconnect
+  watchdog. Clearing the ghost alone put every lone client into a permanent ~30
+  second disconnect/reconnect loop, so the server now sends an explicit
+  application-level keepalive instead of relying on that side effect.
+
+- [#2848](https://github.com/LTplus-AG/ifc-lite/pull/2848) [`35594ee`](https://github.com/LTplus-AG/ifc-lite/commit/35594eeb99bd01757c945b4fe841870c7487fb9b) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Pin the path-lock accept path end to end: a write to an *unlocked* prefix, verified by `verifyAgainstPathLocks`, actually reaches a second peer through a real `startCollabServer` instance.
+  
+  `path-locks.test.ts` already had a real reject-path test (`rejects writes to locked prefixes via verifyAgainstPathLocks`) but no accept-path equivalent — the remaining coverage was pure-function tests of `harvestUpdatePaths` / `registry.matches`. That asymmetry is exactly the shape that let the anti-replay protector's accept path go silently broken (fixed in [#2846](https://github.com/LTplus-AG/ifc-lite/issues/2846)): `handleMessage` ignored the transformed `payload` the verifier returned, so every accepted edit vanished while the reject-path test stayed green.
+  
+  `verifyAgainstPathLocks` doesn't transform its input (pure allow/deny), so it isn't exposed to that exact bug shape, but the accept path through `Room.dispatchMessage` was still unverified end to end. Confirmed the new test pins something: mutating `dispatchMessage`'s `MESSAGE_SYNC` branch to swallow accepted `messageYjsUpdate` frames without applying them fails only the new test (the reject-path test and the pure-function tests stay green); reverting restores 5/5.
+  
+  No production code changed; this is coverage only.
+- Updated dependencies [[`b14e710`](https://github.com/LTplus-AG/ifc-lite/commit/b14e710ae8d56f518f84abb4d4ec8d1f98aacad8), [`4ce3879`](https://github.com/LTplus-AG/ifc-lite/commit/4ce38798211b6b5f84e5b21ed335aa80fe1514c4), [`36e4eca`](https://github.com/LTplus-AG/ifc-lite/commit/36e4eca3b19a2fe02f1679acc9a2a43cd90aa163), [`a7b8a20`](https://github.com/LTplus-AG/ifc-lite/commit/a7b8a201eaecd411a4246421893e887bf55aafd3), [`4d1c611`](https://github.com/LTplus-AG/ifc-lite/commit/4d1c611b822e80a6123b040887a31cdb43c460da)]:
+  - @ifc-lite/collab@0.5.0
+  - @ifc-lite/ifcx@2.3.7
+  - @ifc-lite/merge@0.4.3
+
 ## 0.5.3
 
 ### Patch Changes

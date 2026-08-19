@@ -1,5 +1,61 @@
 # @ifc-lite/mcp
 
+## 0.11.3
+
+### Patch Changes
+
+- [#2845](https://github.com/LTplus-AG/ifc-lite/pull/2845) [`8226c0a`](https://github.com/LTplus-AG/ifc-lite/commit/8226c0aae9c4ca641b970873c0a0adf648429205) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix two declared-but-ignored MCP tool inputs.
+  
+  `ids_validate`'s `locale` field (`en`/`de`/`fr`) was read into a variable and immediately discarded (`void input.locale`); no translator was ever built, so every call produced English `failureReason` / requirement-description text regardless of the requested locale. It now builds a `@ifc-lite/ids` translation service from `locale` and passes it into `validateIDS`, so `de`/`fr` actually translate the report.
+  
+  `geometry_bbox` / `geometry_volume` / `geometry_area`'s `global_id` / `global_ids` selectors resolved by scanning the parsed store directly, never consulting the session's pending-mutation overlay. That put them out of step with every other GlobalId-keyed tool (`get_entity`, `query_entities`, `bsdd_match`, `entity_delete`, ...), which all fold the overlay per the [#2014](https://github.com/LTplus-AG/ifc-lite/issues/2014)/[#2015](https://github.com/LTplus-AG/ifc-lite/issues/2015) one-resolution-rule: an entity created this session (`entity_create`) was invisible to the geometry tools by GlobalId even though `get_entity` found it immediately, and an entity queued for deletion (`entity_delete`) stayed resolvable there after `get_entity` already reported it gone. `resolveExpressIds` now resolves `global_id`/`global_ids` through the same overlay-aware `resolveGlobalIds` helper `get_entity` and `entity_delete` use.
+
+- [#2734](https://github.com/LTplus-AG/ifc-lite/pull/2734) [`2edf1c6`](https://github.com/LTplus-AG/ifc-lite/commit/2edf1c60023832a7a9a3629e9d5aaa40e4be1e35) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `ServerConfig.autoOpenViewer` / `.viewerPort` being declared on the public
+  `MCPServer` config type but never read by the server (issue [#2731](https://github.com/LTplus-AG/ifc-lite/issues/2731), finding 4).
+  
+  `MCPServer` takes `config: Partial<ServerConfig>` in its constructor, and the
+  sibling fields `readOnly`, `bsddEndpoint`, `samplingEnabled` and
+  `allowedPaths` are honoured via `ctx.config.*` — but `autoOpenViewer` and
+  `viewerPort` were not. The CLI's own `--viewer` / `--viewer-port` auto-open
+  behaviour came entirely from separate local variables (`opts.autoViewer`,
+  `opts.viewerPort`) that happened to be written into `config` but never read
+  back out of it. An embedder constructing `MCPServer` directly with
+  `config: { autoOpenViewer: true }` got nothing, silently.
+  
+  Adds `MCPServer.maybeAutoOpenViewer(overrides?)`, which opens the in-process
+  viewer for the first loaded model when configured to do so and no-ops
+  otherwise. Precedence: an explicit `overrides` argument (what a CLI flag
+  represents) beats `this.config` (set at construction, e.g. by an embedder)
+  beats the built-in default (no auto-open, port 0). The CLI now calls this
+  method with `{ autoOpen: opts.autoViewer, port: opts.viewerPort }` instead of
+  calling `server.viewer.open()` directly, so its `--viewer` / `--viewer-port`
+  behaviour is unchanged but now goes through the same config-aware path any
+  other caller gets.
+
+- [#2850](https://github.com/LTplus-AG/ifc-lite/pull/2850) [`5660d53`](https://github.com/LTplus-AG/ifc-lite/commit/5660d53f5326188c474bb0c31d3e1ff6b104426c) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `mutation_batch` dispatching each sub-op with its raw, pre-validation `args` instead of `validateInput`'s validated result.
+  
+  Same shape as the collab-server bug in [#2846](https://github.com/LTplus-AG/ifc-lite/issues/2846): `mutation_batch`'s per-op loop already calls `validateInput(tool.inputSchema, subArgs)` and checks `validation.valid`, but then handed `subArgs` — the original, unvalidated object — to `tool.handler`, discarding `validation.value`. A single, non-batched call to the same tool goes through `MCPServer.handleToolCall`, which correctly dispatches with `validation.value` (the schema-default-filled result).
+  
+  No sub-tool on the batch whitelist (`entity_set_property`, `entity_delete_property`, `entity_set_attribute`, `entity_create`, `entity_delete`) currently declares a schema `default`, so this had no observable effect today — but the moment one does, a batched call and a single call would silently disagree about what an omitted field means, exactly like the `handleMessage`/`verifyWithReplayProtector` divergence, and the mismatch would be invisible to any test that only exercises `validateInput` in isolation or only exercises the reject path through `mutation_batch`.
+  
+  `mutation_batch` now dispatches with `validation.value`, matching the single-call path.
+- Updated dependencies [[`8f89331`](https://github.com/LTplus-AG/ifc-lite/commit/8f893311b170a983e160737bd9479c3caf961911), [`48b204b`](https://github.com/LTplus-AG/ifc-lite/commit/48b204b868016aad29b694b53ac8ace5e76a0542), [`b14e710`](https://github.com/LTplus-AG/ifc-lite/commit/b14e710ae8d56f518f84abb4d4ec8d1f98aacad8), [`05592f8`](https://github.com/LTplus-AG/ifc-lite/commit/05592f8c1ef5b34a00c2ea077542dc68107a7ae5), [`6a43522`](https://github.com/LTplus-AG/ifc-lite/commit/6a43522cdf3b0a9b0f7ce303b59f479dca2a2aca), [`0a10389`](https://github.com/LTplus-AG/ifc-lite/commit/0a1038972a72b27bda99c8793055efe39d623f10), [`5334bd1`](https://github.com/LTplus-AG/ifc-lite/commit/5334bd1589acb1c4b81a1f255d1a9171530b1467), [`b1ac6be`](https://github.com/LTplus-AG/ifc-lite/commit/b1ac6be425cd89ff90eaab02636211f0d928b3e6), [`4ce3879`](https://github.com/LTplus-AG/ifc-lite/commit/4ce38798211b6b5f84e5b21ed335aa80fe1514c4), [`2156528`](https://github.com/LTplus-AG/ifc-lite/commit/2156528c926114233c79ba74925c0c8656f1ea65), [`7869a90`](https://github.com/LTplus-AG/ifc-lite/commit/7869a90f35384ceba40b7ce4f3e9fadbe6990fa8), [`1cda2d0`](https://github.com/LTplus-AG/ifc-lite/commit/1cda2d04dc66542892dd0181768c027b3d1b4e6f), [`b4740a1`](https://github.com/LTplus-AG/ifc-lite/commit/b4740a1fb18050c065e8fbd58714626bdf852f00), [`9fb50eb`](https://github.com/LTplus-AG/ifc-lite/commit/9fb50ebcfaaf2926b2badd4d4d8dfc6ca55b762f), [`36e4eca`](https://github.com/LTplus-AG/ifc-lite/commit/36e4eca3b19a2fe02f1679acc9a2a43cd90aa163), [`a7b8a20`](https://github.com/LTplus-AG/ifc-lite/commit/a7b8a201eaecd411a4246421893e887bf55aafd3), [`ad50aa9`](https://github.com/LTplus-AG/ifc-lite/commit/ad50aa9751c31f6895944e26ce19fe8cbbf3018e), [`ccc38b0`](https://github.com/LTplus-AG/ifc-lite/commit/ccc38b0de9925a3de1106893a5785117e0e7551d), [`ae14cd3`](https://github.com/LTplus-AG/ifc-lite/commit/ae14cd3036f11c039d9b7cd786acf51a68b884dc), [`4d1c611`](https://github.com/LTplus-AG/ifc-lite/commit/4d1c611b822e80a6123b040887a31cdb43c460da), [`c233d48`](https://github.com/LTplus-AG/ifc-lite/commit/c233d48a935a70851271b61a305f43dd9261dcca), [`b28a629`](https://github.com/LTplus-AG/ifc-lite/commit/b28a629d49f279ce01537cb06ae4c28f32beb2bb), [`6ce17fa`](https://github.com/LTplus-AG/ifc-lite/commit/6ce17fa903d38ab8ee3e6ebaf6da8453726d3ce2), [`c849b13`](https://github.com/LTplus-AG/ifc-lite/commit/c849b1395511e48ed6c8b6bd01bc0b1a66d60bfa), [`adc37ca`](https://github.com/LTplus-AG/ifc-lite/commit/adc37cac288e53be88796fddf06b0a7ae179f451), [`2affb53`](https://github.com/LTplus-AG/ifc-lite/commit/2affb534e8ed7b339dc52984789638d4ea4774bc), [`adc37ca`](https://github.com/LTplus-AG/ifc-lite/commit/adc37cac288e53be88796fddf06b0a7ae179f451), [`f19206b`](https://github.com/LTplus-AG/ifc-lite/commit/f19206b8912ba418627373e147c1699019450ebf), [`c49c7f6`](https://github.com/LTplus-AG/ifc-lite/commit/c49c7f644cd7930bd3937ed850f3864aa516934b)]:
+  - @ifc-lite/bcf@1.18.2
+  - @ifc-lite/collab@0.5.0
+  - @ifc-lite/mutations@1.26.1
+  - @ifc-lite/clash@1.9.0
+  - @ifc-lite/query@1.14.17
+  - @ifc-lite/parser@4.2.0
+  - @ifc-lite/geometry@3.8.4
+  - @ifc-lite/ids@1.15.48
+  - @ifc-lite/create@2.1.2
+  - @ifc-lite/ifcx@2.3.7
+  - @ifc-lite/export@2.9.4
+  - @ifc-lite/merge@0.4.3
+  - @ifc-lite/data@3.4.0
+  - @ifc-lite/sdk@2.1.3
+  - @ifc-lite/viewer-core@0.2.13
+
 ## 0.11.2
 
 ### Patch Changes

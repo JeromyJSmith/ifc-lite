@@ -1,5 +1,46 @@
 # @ifc-lite/parser
 
+## 4.2.0
+
+### Minor Changes
+
+- [#2753](https://github.com/LTplus-AG/ifc-lite/pull/2753) [`6ce17fa`](https://github.com/LTplus-AG/ifc-lite/commit/6ce17fa903d38ab8ee3e6ebaf6da8453726d3ce2) Thanks [@mpancera](https://github.com/mpancera)! - Index `IfcRelConnectsPortToElement` and `IfcRelConnectsPorts`, so plant topology is traversable.
+  
+  The ports themselves were always parsed — they are `IfcProduct` subtypes and land in the `EntityTable` like any other product — but neither relationship was in the index, so nothing recorded which element a port belonged to or which port it was joined to. A distribution system therefore read as a set of unrelated parts, and there was no way to answer "what is this pump connected to" from the store.
+  
+  - `RelationshipType` gains `ConnectsPortToElement = 44` and `ConnectsPorts = 45`, keeping the existing 40-range grouping for connection relationships.
+  - Both need their own branch in `extractRelFast`: their two ends are single references at attributes 4 and 5, which neither existing branch reads. The default branch takes attribute 5 as a list, and the `IfcRelConnectsElements` branch skips one attribute first because that entity carries an optional `ConnectionGeometry` ahead of its ends.
+  - `IfcRelConnectsPorts.RealizingElement` (the optional element that realises a connection, e.g. a length of duct) is deliberately not read. It is a third party to the connection rather than one of its two ends, and treating it as one would invent an edge between a port and that element.
+  
+  A plant is walked as element → `ConnectsPortToElement` inverse → its ports → `ConnectsPorts` → the opposite ports → `ConnectsPortToElement` forward → their elements.
+
+### Patch Changes
+
+- [#2740](https://github.com/LTplus-AG/ifc-lite/pull/2740) [`7869a90`](https://github.com/LTplus-AG/ifc-lite/commit/7869a90f35384ceba40b7ce4f3e9fadbe6990fa8) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `buildEntityRefsFromIndex` dropping the entity type when a line break
+  follows `#id=` directly (`[#1](https://github.com/LTplus-AG/ifc-lite/issues/1)=\nIFCWALL($);`).
+  
+  This is legal STEP — a newline directly after `#id=` appears in real
+  fixtures — and the tokenizer's own `scanEntitiesFast` / `scanEntities`
+  already handle it. `buildEntityRefsFromIndex` is the fast path taken when
+  the streaming geometry pre-pass has already built the entity index; its
+  whitespace skip after `=` only recognised space and tab, so a record
+  starting with a newline resolved to `type: ''` and the entity was silently
+  misclassified. The skip now also recognises `LF` and `CR`, matching the
+  type-end scan a few lines below it in the same function.
+
+- [#2813](https://github.com/LTplus-AG/ifc-lite/pull/2813) [`ad50aa9`](https://github.com/LTplus-AG/ifc-lite/commit/ad50aa9751c31f6895944e26ce19fe8cbbf3018e) Thanks [@louistrue](https://github.com/louistrue)! - An `.ifczip` compressed on macOS is no longer rejected. Finder writes an
+  AppleDouble sidecar (`__MACOSX/._<name>`) beside each entry, and it keeps the
+  original extension, so `__MACOSX/._model.ifc` was counted as a second model and
+  the archive failed with "contains 2 model files — expected exactly one".
+  
+  Entries whose BASENAME begins with `._` are now excluded from the model-entry
+  scan on both the browser and server paths. A genuine second model still fails as
+  before, and a real model inside a folder named `__MACOSX` is still found.
+- Updated dependencies [[`0ed2582`](https://github.com/LTplus-AG/ifc-lite/commit/0ed2582b71973fa6d16307999ed2ea59f7a2db3f), [`36e4eca`](https://github.com/LTplus-AG/ifc-lite/commit/36e4eca3b19a2fe02f1679acc9a2a43cd90aa163), [`a7b8a20`](https://github.com/LTplus-AG/ifc-lite/commit/a7b8a201eaecd411a4246421893e887bf55aafd3), [`6ce17fa`](https://github.com/LTplus-AG/ifc-lite/commit/6ce17fa903d38ab8ee3e6ebaf6da8453726d3ce2)]:
+  - @ifc-lite/wasm@5.0.0
+  - @ifc-lite/ifcx@2.3.7
+  - @ifc-lite/data@3.4.0
+
 ## 4.1.0
 
 ### Minor Changes

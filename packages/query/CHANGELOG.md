@@ -1,5 +1,20 @@
 # @ifc-lite/query
 
+## 1.14.17
+
+### Patch Changes
+
+- [#2861](https://github.com/LTplus-AG/ifc-lite/pull/2861) [`2156528`](https://github.com/LTplus-AG/ifc-lite/commit/2156528c926114233c79ba74925c0c8656f1ea65) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `ifc-lite query`'s DuckDB SQL integration reading a NULL string-typed property as an empty string instead of SQL `NULL`.
+  
+  `createPropertiesTable` (duckdb-integration.ts) resolved `PropertyTable.valueString` with `valueStringIdx >= 0 ? ... : ''`. `valueString` is a `Uint32Array`, so the NULL sentinel written by `StringTable.intern(null)` (-1) wraps to 4294967295 rather than going negative — the `>= 0` check was always true and never caught it, and the row was inserted with `value_string = ''`, indistinguishable from a genuine empty-string property. `WHERE value_string IS NULL` silently matched nothing.
+  
+  Two siblings on the same column family already guard this correctly: `getPropertyValue`'s String branch in `@ifc-lite/data`'s `property-table.ts` and its cache-restored twin in `@ifc-lite/cache`'s `properties.ts`, both checking `idx < strings.count`. This DuckDB path is named as a sibling in `property-table.ts`'s own doc comment ("the on-demand fallback in `@ifc-lite/query`") but used an independent, unguarded decode. The fix extracts the shared logic into `resolveDuckDBStringLiteral` and applies the same in-range check, emitting the bare `NULL` keyword — matching how this same file already handles the `containedInStorey`/`definedByType` sentinels a few lines above.
+- Updated dependencies [[`7869a90`](https://github.com/LTplus-AG/ifc-lite/commit/7869a90f35384ceba40b7ce4f3e9fadbe6990fa8), [`1cda2d0`](https://github.com/LTplus-AG/ifc-lite/commit/1cda2d04dc66542892dd0181768c027b3d1b4e6f), [`ad50aa9`](https://github.com/LTplus-AG/ifc-lite/commit/ad50aa9751c31f6895944e26ce19fe8cbbf3018e), [`6ce17fa`](https://github.com/LTplus-AG/ifc-lite/commit/6ce17fa903d38ab8ee3e6ebaf6da8453726d3ce2), [`ae5a5ca`](https://github.com/LTplus-AG/ifc-lite/commit/ae5a5caa3e20304085ba14c0708cd026c1d4bf16)]:
+  - @ifc-lite/parser@4.2.0
+  - @ifc-lite/geometry@3.8.4
+  - @ifc-lite/data@3.4.0
+  - @ifc-lite/spatial@1.14.14
+
 ## 1.14.16
 
 ### Patch Changes

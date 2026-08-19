@@ -1,5 +1,44 @@
 # @ifc-lite/geometry
 
+## 3.8.4
+
+### Patch Changes
+
+- [#2720](https://github.com/LTplus-AG/ifc-lite/pull/2720) [`1cda2d0`](https://github.com/LTplus-AG/ifc-lite/commit/1cda2d04dc66542892dd0181768c027b3d1b4e6f) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Harden three Rust fixtures that could not observe the property they asserted.
+  
+  Test-only; no production code changed. Each of the three was verified by
+  mutating production, confirming the old fixture still passed, and confirming
+  the new one fails.
+  
+  - `rust/processing/src/simplify_session_tests.rs` — the only `y_up: true` test
+    passed `origin: [0.0; 3]`, and `yup_to_zup` of zero is zero, so
+    `simplify_element`'s `yup_to_zup(rec.origin)` branch was unobservable:
+    replacing it with `let origin = rec.origin;` kept the crate green. The
+    record now carries a Z-up origin of (1, 2, 3), fed in as the boundary's Y-up
+    swap, and both the local and render extents are pinned at min and max.
+  
+  - `rust/ffi/src/tests.rs` — `normalize_to_site_local`'s guard skips the shift
+    only when all three site-translation components are inside
+    `LARGE_COORD_THRESHOLD`, but the only fixture exercising it put all three
+    past 1 km, so rewriting `&&` as `||` still shifted. The fixture now uses a
+    realistic georeferenced placement (large easting and northing, a 2 m
+    elevation), and a second test brackets the constant itself, which the
+    previous 1.0-vs-123456.0 pair left free anywhere in between.
+  
+  - `rust/geometry/src/router/voids/bool2d_path_tests.rs` — `hm_inv()` returned
+    the identity and was the argument to every `opening_solid_footprint` call in
+    the crate, so production's `let to_host = hm_inv * op.m;` was
+    indistinguishable from `let to_host = op.m;`. The host is now placed at
+    (3, -2, 5) rotated about Z, `hm_inv()` is its real inverse, and opening
+    placements are given in world space as `host_m() * (host-local placement)`.
+  
+  Scope: these three fixtures only. The sweep that found them did not cover most
+  of `rust/export`, about 40 files under `rust/processing/tests/`, or the 90-plus
+  files under `rust/geometry/tests/`; nothing is claimed about those.
+- Updated dependencies [[`0ed2582`](https://github.com/LTplus-AG/ifc-lite/commit/0ed2582b71973fa6d16307999ed2ea59f7a2db3f), [`6ce17fa`](https://github.com/LTplus-AG/ifc-lite/commit/6ce17fa903d38ab8ee3e6ebaf6da8453726d3ce2)]:
+  - @ifc-lite/wasm@5.0.0
+  - @ifc-lite/data@3.4.0
+
 ## 3.8.3
 
 ### Patch Changes
