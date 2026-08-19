@@ -111,7 +111,13 @@
 # +26: cap the fast-path opening count (O(N^3) DoS guard) + regression test.
      807 rust/geometry/src/rect_fast.rs
      586 rust/geometry/src/router/diagnostics.rs
-     659 rust/geometry/src/router/layers.rs
+# +14: #2866 — item_has_identity_position chases IfcBooleanResult.FirstOperand,
+# a file-supplied reference, so one self-referential entity aborted the process
+# (stack overflow = abort in Rust, not a catchable panic). A visited set
+# threaded through the recursion; a repeat returns false, which is this
+# function's existing "anything exotic bails safely" contract rather than a new
+# special case. Tests are in a sibling layers_cycle_tests.rs.
+     673 rust/geometry/src/router/layers.rs
 # +1: unify body-rep predicate — added is_direct_body_representation + docs; net removes ~60 lines from processing.rs and ~12 from layers.rs (crate trends down).
 # +65: promote the per-router IfcMappedItem source cache to a model-wide SharedMappedItemCache (type alias + field + new_/enable_ setters + unique-count diagnostic), meshing each source once model-wide (#1623).
 # +38: #1623 Phase 2 don't-bake — MappedInstancePlan type alias + output_instancing_plan field + enable_/getter + `mod instancing` decl.

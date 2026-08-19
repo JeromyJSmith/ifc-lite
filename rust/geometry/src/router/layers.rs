@@ -434,6 +434,29 @@ fn element_is_single_unshifted_item(
 /// advanced swept solids, boolean clipping on top of those). Anything
 /// exotic returns false so we bail safely.
 fn item_has_identity_position(item: &DecodedEntity, decoder: &mut EntityDecoder) -> bool {
+    let mut visited = std::collections::HashSet::new();
+    item_has_identity_position_guarded(item, decoder, &mut visited)
+}
+
+/// The `IfcBooleanResult` arm below chases `FirstOperand`, a file-supplied
+/// reference, so `#10=IFCBOOLEANRESULT(.DIFFERENCE.,#10,#20)` -- one
+/// self-referential entity -- recursed forever. A Rust stack overflow ABORTS
+/// rather than raising a catchable panic, so nothing could turn it into a load
+/// error (#2866).
+///
+/// A repeat returns `false`, which is not a special case but this function's
+/// existing contract: "anything exotic returns false so we bail safely". A
+/// cyclic operand chain is exactly that, and bailing means the layer-slicing
+/// optimisation is skipped for the element rather than applied on a shape
+/// nobody can resolve.
+fn item_has_identity_position_guarded(
+    item: &DecodedEntity,
+    decoder: &mut EntityDecoder,
+    visited: &mut std::collections::HashSet<u32>,
+) -> bool {
+    if !visited.insert(item.id) {
+        return false;
+    }
     match item.ifc_type {
         // Solid primitives with a Position at attribute 1.
         IfcType::IfcExtrudedAreaSolid
@@ -450,7 +473,7 @@ fn item_has_identity_position(item: &DecodedEntity, decoder: &mut EntityDecoder)
                 None => return false,
             };
             match decoder.decode_by_id(first_operand_id) {
-                Ok(inner) => item_has_identity_position(&inner, decoder),
+                Ok(inner) => item_has_identity_position_guarded(&inner, decoder, visited),
                 Err(_) => false,
             }
         }
@@ -644,3 +667,7 @@ mod tests {
         assert_eq!(merged[1].material_id, 3);
     }
 }
+
+#[cfg(test)]
+#[path = "layers_cycle_tests.rs"]
+mod layers_cycle_tests;
