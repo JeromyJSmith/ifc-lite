@@ -249,3 +249,183 @@ describe('DeviationComputer.compute(): releaseTransientParams on the rejection p
     assert.strictEqual(paramsBuffer.destroyed, 1, 'the transient params buffer must be released on the happy path too');
   });
 });
+
+// ---------------------------------------------------------------------
+// Coverage for the pure-maths parts of `compute()`: the BVH-reuse
+// fingerprint gate, the mesh-collection filter, and the
+// `suggestedHalfRange` formula. These run the REAL `buildTriangleBVH`
+// and `DeviationPipeline` (only the GPUDevice is faked), so the bounds
+// and triangle counts below are genuine, not stubbed.
+// ---------------------------------------------------------------------
+
+/** A mesh with a distinct, non-zero extent on every axis (X, Y, and Z),
+ * so a bounds/extent computation that drops or swaps an axis is
+ * observable rather than accidentally correct. */
+function extentMesh(expressId: number, dx: number, dy: number, dz: number, origin: [number, number, number] = [0, 0, 0]) {
+  return {
+    expressId,
+    modelIndex: 0,
+    origin,
+    positions: new Float32Array([
+      0, 0, 0,
+      dx, 0, 0,
+      0, dy, 0,
+      0, 0, dz,
+    ]),
+    indices: new Uint32Array([0, 1, 2, 0, 2, 3]),
+  };
+}
+
+function makeCtxWithMeshes(
+  device: GPUDevice,
+  meshes: unknown[],
+  opts: { chunks?: number } = {},
+): DeviationComputeContext {
+  const chunkCount = opts.chunks ?? 1;
+  const chunks = Array.from({ length: chunkCount }, () => ({
+    vertexBuffer: fakeBuffer() as unknown as GPUBuffer,
+    deviationBuffer: fakeBuffer() as unknown as GPUBuffer,
+    pointCount: 4,
+  }));
+  return {
+    device: { getDevice: () => device } as unknown as DeviationComputeContext['device'],
+    scene: {
+      forEachMeshData: (visit: (md: unknown) => void) => {
+        for (const m of meshes) visit(m);
+      },
+    } as unknown as DeviationComputeContext['scene'],
+    pointCloudRenderer: {
+      getInternalNodes: () => [{ chunks, model: undefined }],
+    } as unknown as DeviationComputeContext['pointCloudRenderer'],
+    requestRender: () => {},
+  };
+}
+
+describe('DeviationComputer.compute(): suggestedHalfRange + bounds (real BVH, no GPU maths)', () => {
+  it('suggestedHalfRange = max(0.01, maxExtent / 1000) when the extent dominates the floor', async () => {
+    const device = makeFakeGpuDevice();
+    const computer = new DeviationComputer();
+    computer.init(device);
+    // Distinct extents per axis; X is by far the largest (100), so the
+    // suggested half-range must derive from X, not Y or Z.
+    const ctx = makeCtxWithMeshes(device, [extentMesh(1, 100, 4, 7)]);
+    const result = await computer.compute({}, ctx);
+    assert.deepStrictEqual(result.bounds, { min: [0, 0, 0], max: [100, 4, 7] });
+    assert.ok(
+      Math.abs(result.suggestedHalfRange - 0.1) < 1e-9,
+      `expected suggestedHalfRange = 100/1000 = 0.1, got ${result.suggestedHalfRange}`,
+    );
+  });
+
+  it('suggestedHalfRange floors at 0.01 for a small mesh (extent/1000 would be smaller)', async () => {
+    const device = makeFakeGpuDevice();
+    const computer = new DeviationComputer();
+    computer.init(device);
+    // Max extent is 1 -> 1/1000 = 0.001, below the 0.01 floor.
+    const ctx = makeCtxWithMeshes(device, [extentMesh(1, 1, 0.5, 0.25)]);
+    const result = await computer.compute({}, ctx);
+    assert.strictEqual(result.suggestedHalfRange, 0.01, 'the 0.01 floor must win over extent/1000');
+  });
+
+  it('bounds fold in mesh.origin and are NOT axis-swapped across two meshes with asymmetric extents', async () => {
+    const device = makeFakeGpuDevice();
+    const computer = new DeviationComputer();
+    computer.init(device);
+    const meshes = [
+      extentMesh(1, 10, 20, 30, [0, 0, 0]),
+      extentMesh(2, 1, 1, 1, [-50, 200, -5]),
+    ];
+    const ctx = makeCtxWithMeshes(device, meshes);
+    const result = await computer.compute({}, ctx);
+    // mesh 1 spans x:[0,10] y:[0,20] z:[0,30]; mesh 2, offset by its
+    // origin, spans x:[-50,-49] y:[200,201] z:[-5,-4]. Union per axis,
+    // computed independently, must not be swapped.
+    assert.deepStrictEqual(result.bounds, { min: [-50, 0, -5], max: [10, 201, 30] });
+  });
+
+  it('meshes with zero-length positions are excluded from the BVH triangle/point set', async () => {
+    const device = makeFakeGpuDevice();
+    const computer = new DeviationComputer();
+    computer.init(device);
+    const real = extentMesh(1, 5, 6, 7);
+    const empty = { expressId: 2, modelIndex: 0, positions: new Float32Array(0), indices: new Uint32Array(0) };
+    const ctx = makeCtxWithMeshes(device, [real, empty]);
+    const result = await computer.compute({}, ctx);
+    assert.strictEqual(result.bvhTriangles, 2, 'only the real mesh (2 triangles) should reach the BVH, the empty one must be filtered out');
+  });
+});
+
+describe('DeviationComputer.compute(): BVH rebuild is gated by the mesh-set fingerprint', () => {
+  it('a second compute() against the SAME mesh set reuses the BVH (no new BVH buffers created)', async () => {
+    const created: Array<GPUBuffer & { destroyed: number }> = [];
+    const device = makeFakeGpuDevice();
+    (device as unknown as { createBuffer: () => GPUBuffer }).createBuffer = () => {
+      const buf = fakeBuffer();
+      created.push(buf);
+      return buf as unknown as GPUBuffer;
+    };
+    const computer = new DeviationComputer();
+    computer.init(device);
+
+    const meshes = [extentMesh(1, 3, 9, 12)];
+    await computer.compute({}, makeCtxWithMeshes(device, meshes));
+    // uploadBvh() creates 2 buffers (nodes + triangles); dispatch() creates
+    // 1 transient params buffer per chunk (1 chunk) = 3 total so far.
+    assert.strictEqual(created.length, 3, 'sanity: first compute created BVH (2) + params (1) buffers');
+
+    await computer.compute({}, makeCtxWithMeshes(device, meshes));
+    // Same fingerprint (identical mesh set) -> uploadBvh must be skipped,
+    // so only 1 more buffer (the second call's transient params) is created.
+    assert.strictEqual(
+      created.length, 4,
+      'second compute() with an unchanged mesh set must NOT re-create the BVH buffers (only +1 transient params buffer)',
+    );
+  });
+
+  it('forceRebuild: true re-creates the BVH buffers even though the mesh set is unchanged', async () => {
+    const created: Array<GPUBuffer & { destroyed: number }> = [];
+    const device = makeFakeGpuDevice();
+    (device as unknown as { createBuffer: () => GPUBuffer }).createBuffer = () => {
+      const buf = fakeBuffer();
+      created.push(buf);
+      return buf as unknown as GPUBuffer;
+    };
+    const computer = new DeviationComputer();
+    computer.init(device);
+
+    const meshes = [extentMesh(1, 3, 9, 12)];
+    await computer.compute({}, makeCtxWithMeshes(device, meshes));
+    assert.strictEqual(created.length, 3);
+
+    await computer.compute({ forceRebuild: true }, makeCtxWithMeshes(device, meshes));
+    // forceRebuild bypasses the fingerprint match -> BVH (2) + params (1) again.
+    assert.strictEqual(
+      created.length, 6,
+      'forceRebuild: true must re-create the BVH buffers (+2) plus a new transient params buffer (+1)',
+    );
+  });
+
+  it('a DIFFERENT mesh set (changed geometry, same triangle count) rebuilds the BVH', async () => {
+    const created: Array<GPUBuffer & { destroyed: number }> = [];
+    const device = makeFakeGpuDevice();
+    (device as unknown as { createBuffer: () => GPUBuffer }).createBuffer = () => {
+      const buf = fakeBuffer();
+      created.push(buf);
+      return buf as unknown as GPUBuffer;
+    };
+    const computer = new DeviationComputer();
+    computer.init(device);
+
+    await computer.compute({}, makeCtxWithMeshes(device, [extentMesh(1, 3, 9, 12)]));
+    assert.strictEqual(created.length, 3);
+
+    // Same expressId/modelIndex/positions-length/indices-length shape as
+    // the mesh above (fingerprint folds in lengths, not values) but a
+    // DIFFERENT expressId, so the fingerprint must still miss.
+    await computer.compute({}, makeCtxWithMeshes(device, [extentMesh(2, 3, 9, 12)]));
+    assert.strictEqual(
+      created.length, 6,
+      'a mesh set with a different expressId must be treated as a different fingerprint and rebuild the BVH',
+    );
+  });
+});
