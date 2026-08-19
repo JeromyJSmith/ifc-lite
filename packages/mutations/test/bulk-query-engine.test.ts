@@ -266,5 +266,203 @@ describe('BulkQueryEngine property filter operators', () => {
         })
       ).toEqual([2]);
     });
+
+    it('= with filter value "true" (string) coerces to boolean true, not just falls through to false', () => {
+      // The 'false' case above passes even without the `filterValue === 'true'`
+      // coercion arm, because a non-coerced comparison also lands on
+      // boolFilterValue=false for the literal string 'false'. Only the
+      // 'true' string actually exercises the coercion: without it,
+      // boolFilterValue would incorrectly stay false and this would select
+      // entity 2 (the false entity) instead of 1 and 3.
+      expect(
+        engine.select({
+          propertyFilters: [{ psetName: 'Pset_Test', propName: 'Prop', operator: '=', value: 'true' as any }],
+        })
+      ).toEqual([1, 3]);
+    });
+  });
+
+  /**
+   * The three switches in matchesFilter() are keyed on typeof(value) &&
+   * typeof(filterValue) (string/string, number/number) or typeof(value)
+   * alone (boolean). A mismatch between the stored property's type and the
+   * filter's value type must fall through to the final `return false` —
+   * never throw, never coerce. The boolean branch is the one exception: it
+   * deliberately coerces a string filter value ('true'/'false') to match a
+   * boolean property, tested above. Numeric and string operators must NOT
+   * do the equivalent coercion.
+   */
+  describe('operator/value-type mismatches', () => {
+    it('numeric operator (>) given a string property value never matches, even when numerically true', () => {
+      // '30' > '20' would be true under numeric coercion; matchesFilter must
+      // not enter the numeric switch because typeof value is 'string'.
+      const engine = makeEngineWithProperty(['30']);
+      const ids = engine.select({
+        propertyFilters: [{ psetName: 'Pset_Test', propName: 'Prop', operator: '>', value: 20 }],
+      });
+      expect(ids).toEqual([]);
+    });
+
+    it('a numeric property value against a string filter value does not coerce for >', () => {
+      // 20 > '15' would be true under JS's relational coercion (numeric
+      // switch's own case bodies don't re-check types); matchesFilter must
+      // never enter the numeric switch at all when typeof filterValue is
+      // 'string' rather than 'number', so this must not match.
+      const engine = makeEngineWithProperty([20]);
+      const ids = engine.select({
+        propertyFilters: [{ psetName: 'Pset_Test', propName: 'Prop', operator: '>', value: '15' as any }],
+      });
+      expect(ids).toEqual([]);
+    });
+
+    it('string operator (CONTAINS) given a numeric filter value never matches', () => {
+      const engine = makeEngineWithProperty(['Beta']);
+      const ids = engine.select({
+        propertyFilters: [{ psetName: 'Pset_Test', propName: 'Prop', operator: 'CONTAINS', value: 5 as any }],
+      });
+      expect(ids).toEqual([]);
+    });
+
+    it('boolean property value against a non-string, non-boolean filter value (a number) never matches =', () => {
+      const engine = makeEngineWithProperty([true]);
+      const ids = engine.select({
+        propertyFilters: [{ psetName: 'Pset_Test', propName: 'Prop', operator: '=', value: 1 as any }],
+      });
+      // boolFilterValue = (1 === true || 1 === 'true') = false, so true !== false -> no match.
+      expect(ids).toEqual([]);
+    });
+
+    it('a boolean-typed operator (=) given a missing/null property value never matches (not IS_NULL)', () => {
+      // Entity has no property at all -> value resolves to null. matchesFilter
+      // short-circuits null handling to IS_NULL/IS_NOT_NULL only; '=' against
+      // a null value must fail closed rather than throw or coerce.
+      const engine = makeEngineWithProperty([null]);
+      const ids = engine.select({
+        propertyFilters: [{ psetName: 'Pset_Test', propName: 'Prop', operator: '=', value: true }],
+      });
+      expect(ids).toEqual([]);
+    });
+
+    it('a numeric-only operator (>) applied to a boolean value never matches (cross-switch leak check)', () => {
+      const engine = makeEngineWithProperty([true]);
+      const ids = engine.select({
+        propertyFilters: [{ psetName: 'Pset_Test', propName: 'Prop', operator: '>', value: true as any }],
+      });
+      expect(ids).toEqual([]);
+    });
+
+    it('a string-only operator (STARTS_WITH) applied to a numeric value never matches (cross-switch leak check)', () => {
+      const engine = makeEngineWithProperty([42]);
+      const ids = engine.select({
+        propertyFilters: [
+          { psetName: 'Pset_Test', propName: 'Prop', operator: 'STARTS_WITH', value: '4' as any },
+        ],
+      });
+      expect(ids).toEqual([]);
+    });
+
+    it("the string switch's own default arm rejects a numeric-only operator (>) given two string operands", () => {
+      // Both operands are strings, so this enters the string switch (not a
+      // cross-switch case) — '>' isn't one of its cases, so it must hit that
+      // switch's own `default: return false`, not silently match everything.
+      const engine = makeEngineWithProperty(['30']);
+      const ids = engine.select({
+        propertyFilters: [{ psetName: 'Pset_Test', propName: 'Prop', operator: '>', value: '20' as any }],
+      });
+      expect(ids).toEqual([]);
+    });
+
+    it("the numeric switch's own default arm rejects a string-only operator (CONTAINS) given two number operands", () => {
+      // Both operands are numbers, so this enters the numeric switch —
+      // CONTAINS isn't one of its cases, so it must hit that switch's own
+      // `default: return false`, not silently match everything.
+      const engine = makeEngineWithProperty([30]);
+      const ids = engine.select({
+        propertyFilters: [{ psetName: 'Pset_Test', propName: 'Prop', operator: 'CONTAINS', value: 3 as any }],
+      });
+      expect(ids).toEqual([]);
+    });
+  });
+});
+
+describe('BulkQueryEngine.applyAction / action.type switch', () => {
+  function makeEngine() {
+    const entities = makeEntities(1);
+    const view = new MutablePropertyView(null, 'model-1');
+    view.setOnDemandExtractor(() => []);
+    const engine = new BulkQueryEngine(entities, view, null, null, null);
+    return { engine, view };
+  }
+
+  it('SET_PROPERTY creates a property mutation for entity 1', () => {
+    const { engine } = makeEngine();
+    const mutation = engine.applyAction(1, {
+      type: 'SET_PROPERTY',
+      psetName: 'Pset_Test',
+      propName: 'Prop',
+      value: 'hello',
+      valueType: PropertyValueType.Label,
+    });
+    expect(mutation).not.toBeNull();
+    expect(mutation!.entityId).toBe(1);
+    expect(mutation!.newValue).toBe('hello');
+  });
+
+  it('DELETE_PROPERTY on a property that was never set returns null (nothing to delete)', () => {
+    const { engine } = makeEngine();
+    const mutation = engine.applyAction(1, {
+      type: 'DELETE_PROPERTY',
+      psetName: 'Pset_Test',
+      propName: 'Prop',
+    });
+    expect(mutation).toBeNull();
+  });
+
+  it('DELETE_PROPERTY on a property that was set produces a mutation', () => {
+    const { engine } = makeEngine();
+    engine.applyAction(1, {
+      type: 'SET_PROPERTY',
+      psetName: 'Pset_Test',
+      propName: 'Prop',
+      value: 'hello',
+      valueType: PropertyValueType.Label,
+    });
+    const mutation = engine.applyAction(1, {
+      type: 'DELETE_PROPERTY',
+      psetName: 'Pset_Test',
+      propName: 'Prop',
+    });
+    expect(mutation).not.toBeNull();
+  });
+
+  it('SET_ATTRIBUTE is unimplemented and always returns null, silently no-oping the selected entity', () => {
+    // Documents current behavior (see the "not implemented" comment on this
+    // arm in bulk-query-engine.ts): a bulk action targeting name/description/
+    // objectType selects entities but produces zero mutations for them.
+    const { engine } = makeEngine();
+    const mutation = engine.applyAction(1, {
+      type: 'SET_ATTRIBUTE',
+      attribute: 'name',
+      value: 'New Name',
+    });
+    expect(mutation).toBeNull();
+  });
+
+  it('SET_ENTITY_TYPE produces an entity-type mutation', () => {
+    const { engine } = makeEngine();
+    const mutation = engine.applyAction(1, {
+      type: 'SET_ENTITY_TYPE',
+      entityType: 'IfcColumn',
+      predefinedType: null,
+    });
+    expect(mutation).not.toBeNull();
+    expect(mutation!.entityId).toBe(1);
+    expect(mutation!.entityType).toBe('IfcColumn');
+  });
+
+  it('an unknown action.type falls to the default arm and returns null rather than throwing or matching a known type', () => {
+    const { engine } = makeEngine();
+    const mutation = engine.applyAction(1, { type: 'NOT_A_REAL_ACTION' } as any);
+    expect(mutation).toBeNull();
   });
 });
