@@ -4,18 +4,18 @@
   "description": "High-performance browser IFC parser & renderer",
   "private": true,
   "type": "module",
-  "packageManager": "pnpm@10.8.1",
+  "packageManager": "bun@1.3.14",
   "workspaces": [
     "packages/*",
     "apps/*",
     "examples/*"
   ],
   "scripts": {
-    "dev": "pnpm build && pnpm --filter viewer dev",
+    "dev": "bun run build && bun run --filter @ifc-lite/viewer dev",
     "dev:api": "zsh -lc 'set -a; source \"api/.env.local\"; set +a; PORT=3001 tsx scripts/dev-chat-api.ts'",
-    "dev:embed": "pnpm build && pnpm --filter @ifc-lite/viewer-embed dev",
+    "dev:embed": "bun run build && bun run --filter @ifc-lite/viewer-embed dev",
     "build": "turbo build",
-    "build:embed": "pnpm --filter @ifc-lite/viewer-embed build",
+    "build:embed": "bun run --filter @ifc-lite/viewer-embed build",
     "build:wasm": "node scripts/run-build-wasm.mjs",
     "build:wasm:fetch": "node scripts/fetch-prebuilt-wasm.mjs",
     "fixtures": "node scripts/fixtures/fetch-fixtures.mjs",
@@ -24,7 +24,7 @@
     "fixtures:manifest": "node scripts/fixtures/build-manifest.mjs",
     "fixtures:upload": "node scripts/fixtures/upload-fixtures.mjs",
     "test": "turbo test",
-    "test:collab": "pnpm --filter @ifc-lite/collab --filter @ifc-lite/collab-server test",
+    "test:collab": "bun run --filter @ifc-lite/collab test && bun run --filter @ifc-lite/collab-server test",
     "test:e2e": "playwright test --project=viewer-e2e",
     "test:e2e:ci": "playwright test --project=viewer-e2e-ci",
     "test:api": "tsx --tsconfig tests/tsconfig.json --test \"tests/api/**/*.test.ts\"",
@@ -36,29 +36,29 @@
     "test:regression": "node scripts/test-geometry-regression.mjs",
     "test:esm": "node scripts/verify-esm-entrypoints.mjs",
     "test:ids-corpus": "node scripts/test-ids-corpus.mjs",
-    "collab:server": "pnpm turbo build --filter=@ifc-lite/collab-server && node packages/collab-server/dist/bin.js",
-    "collab:demo": "pnpm turbo build --filter=@ifc-lite/collab --filter=@ifc-lite/collab-server && node scripts/collab-demo.mjs",
-    "collab:demo:3d": "pnpm turbo build --filter=@ifc-lite/collab --filter=@ifc-lite/collab-server && node scripts/collab-demo-3d.mjs",
+    "collab:server": "bun run turbo build --filter=@ifc-lite/collab-server && node packages/collab-server/dist/bin.js",
+    "collab:demo": "bun run turbo build --filter=@ifc-lite/collab --filter=@ifc-lite/collab-server && node scripts/collab-demo.mjs",
+    "collab:demo:3d": "bun run turbo build --filter=@ifc-lite/collab --filter=@ifc-lite/collab-server && node scripts/collab-demo-3d.mjs",
     "typecheck": "turbo typecheck",
-    "lint": "pnpm -r lint",
+    "lint": "bun run --workspaces --if-present lint",
     "knip": "knip",
     "docs:serve": "python3 -m mkdocs serve",
     "docs:build": "python3 -m mkdocs build",
     "changeset": "changeset",
     "version": "changeset version && node scripts/sync-versions.js",
-    "release": "pnpm build && pnpm test:esm && pnpm release:npm && pnpm release:crates",
+    "release": "bun run build && bun run test:esm && bun run release:npm && bun run release:crates",
     "release:npm": "changeset publish",
     "release:crates": "node scripts/release-crates.mjs",
-    "publish:npm": "pnpm -r publish --access public",
-    "publish:dry": "pnpm -r publish --access public --dry-run",
+    "publish:npm": "bun publish --access public",
+    "publish:dry": "bun publish --access public --dry-run",
     "test:benchmark:viewer": "playwright test tests/benchmark/viewer-benchmark.spec.ts --project=viewer-benchmark",
     "test:benchmark:viewer:ci": "playwright test tests/benchmark/viewer-benchmark.spec.ts --project=viewer-benchmark-ci --reporter=json",
     "benchmark:check": "node scripts/check-benchmark-regression.js",
-    "benchmark:baseline": "pnpm --filter viewer build && pnpm test:benchmark:viewer",
+    "benchmark:baseline": "bun run --filter @ifc-lite/viewer build && bun run test:benchmark:viewer",
     "generate:bim-globals": "tsx scripts/generate-bim-globals.ts",
-    "verify:epsg": "pnpm --filter @ifc-lite/data verify:epsg",
+    "verify:epsg": "bun run --filter @ifc-lite/data verify:epsg",
     "generate:epsg-index": "tsx scripts/generate-epsg-index.ts",
-    "check:templates": "pnpm --filter viewer check:templates"
+    "check:templates": "bun run --filter @ifc-lite/viewer check:templates"
   },
   "devDependencies": {
     "@changesets/changelog-github": "^0.7.0",
@@ -71,8 +71,7 @@
     "typescript": "^6.0.3"
   },
   "engines": {
-    "node": "22.x",
-    "pnpm": ">=8.0.0"
+    "node": "22.x"
   },
   "dependencies": {
     "@neondatabase/serverless": "^1.1.0"
