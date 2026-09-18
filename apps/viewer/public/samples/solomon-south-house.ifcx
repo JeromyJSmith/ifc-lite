@@ -1,0 +1,231 @@
+{
+  "header": {
+    "id": "solomon-2605-south@v0",
+    "ifcxVersion": "ifcx_alpha",
+    "dataVersion": "1.0.0",
+    "author": "MARPA",
+    "timestamp": "2026-09-17T17:21:26.864251+00:00"
+  },
+  "imports": [
+    {
+      "uri": "file:///Volumes/DoubleAught/clients/marpa/09_delivery/work/data-consolidation/schemas/marpa@v1.ifcx"
+    }
+  ],
+  "schemas": {},
+  "data": [
+    {
+      "path": "46c9170d-cd12-44c3-8646-a41a6b47e316",
+      "attributes": {
+        "bsi::ifc::class": {
+          "code": "IfcProject"
+        }
+      },
+      "children": {
+        "Site": "85fe3666-6f76-480e-a83e-925ca21628f5"
+      }
+    },
+    {
+      "path": "85fe3666-6f76-480e-a83e-925ca21628f5",
+      "attributes": {
+        "bsi::ifc::class": {
+          "code": "IfcSite"
+        },
+        "bsi::ifc::prop::Name": "2500 Linden"
+      },
+      "children": {
+        "HS-S-EW-1": "d49e64ce-4fec-4ec1-80d1-95b3c3608009",
+        "HS-S-EW-2": "0228a0ad-4e61-4727-a52d-6a00e76a4718",
+        "HS-S-EW-3": "4c789987-ba0f-4f2b-8147-33b5fa72b3a1",
+        "HS-S-EW-4": "5330b31f-1522-4847-9ffb-0a60c7054c36",
+        "HS-S-NS-1": "6fa7d716-d983-4eac-b2c3-8751925ba7ff",
+        "HS-S-NS-2": "d701e9f0-ea1f-40bc-9c90-c805fc62cd3c",
+        "TR-1": "6c351638-249a-4d24-a0a9-14bc320eacb3",
+        "TR-2": "b70a0abe-2bcc-48d8-b401-3fd214ba0acd",
+        "TR-3": "f942be9d-def0-40d8-a1a0-ec516106b58e",
+        "TR-4": "be2c3ec2-52d5-4511-b823-817de79871fc",
+        "TR-5": "11c70561-17fe-4912-81f3-f8aa9b38dea1",
+        "TR-6": "7e082858-bd67-4e7a-9531-c4be636ff945"
+      }
+    },
+    {
+      "path": "d49e64ce-4fec-4ec1-80d1-95b3c3608009",
+      "attributes": {
+        "bsi::ifc::class": {
+          "code": "IfcWall"
+        },
+        "bsi::ifc::prop::Name": "HS-S-EW-1",
+        "marpa::namespace": "marpa@v1",
+        "marpa::semantic_role": "existing_context_house_wall",
+        "marpa::quantity_intent": {
+          "basis": "vw_bbox_long_side",
+          "unit": "us_survey_foot",
+          "dimension": "length",
+          "verified": false
+        }
+      },
+      "children": {}
+    },
+    {
+      "path": "0228a0ad-4e61-4727-a52d-6a00e76a4718",
+      "attributes": {
+        "bsi::ifc::class": {
+          "code": "IfcWall"
+        },
+        "bsi::ifc::prop::Name": "HS-S-EW-2",
+        "marpa::namespace": "marpa@v1",
+        "marpa::semantic_role": "existing_context_house_wall",
+        "marpa::quantity_intent": {
+          "basis": "vw_bbox_long_side",
+          "unit": "us_survey_foot",
+          "dimension": "length",
+          "verified": false
+        }
+      },
+      "children": {}
+    },
+    {
+      "path": "4c789987-ba0f-4f2b-8147-33b5fa72b3a1",
+      "attributes": {
+        "bsi::ifc::class": {
+          "code": "IfcWall"
+        },
+        "bsi::ifc::prop::Name": "HS-S-EW-3",
+        "marpa::namespace": "marpa@v1",
+        "marpa::semantic_role": "existing_context_house_wall",
+        "marpa::quantity_intent": {
+          "basis": "vw_bbox_long_side",
+          "unit": "us_survey_foot",
+          "dimension": "length",
+          "verified": false
+        }
+      },
+      "children": {}
+    },
+    {
+      "path": "5330b31f-1522-4847-9ffb-0a60c7054c36",
+      "attributes": {
+        "bsi::ifc::class": {
+          "code": "IfcWall"
+        },
+        "bsi::ifc::prop::Name": "HS-S-EW-4",
+        "marpa::namespace": "marpa@v1",
+        "marpa::semantic_role": "existing_context_house_wall",
+        "marpa::quantity_intent": {
+          "basis": "vw_bbox_long_side",
+          "unit": "us_survey_foot",
+          "dimension": "length",
+          "verified": false
+        }
+      },
+      "children": {}
+    },
+    {
+      "path": "6fa7d716-d983-4eac-b2c3-8751925ba7ff",
+      "attributes": {
+        "bsi::ifc::class": {
+          "code": "IfcWall"
+        },
+        "bsi::ifc::prop::Name": "HS-S-NS-1",
+        "marpa::namespace": "marpa@v1",
+        "marpa::semantic_role": "existing_context_house_wall",
+        "marpa::quantity_intent": {
+          "basis": "vw_bbox_long_side",
+          "unit": "us_survey_foot",
+          "dimension": "length",
+          "verified": false
+        }
+      },
+      "children": {}
+    },
+    {
+      "path": "d701e9f0-ea1f-40bc-9c90-c805fc62cd3c",
+      "attributes": {
+        "bsi::ifc::class": {
+          "code": "IfcWall"
+        },
+        "bsi::ifc::prop::Name": "HS-S-NS-2",
+        "marpa::namespace": "marpa@v1",
+        "marpa::semantic_role": "existing_context_house_wall",
+        "marpa::quantity_intent": {
+          "basis": "vw_bbox_long_side",
+          "unit": "us_survey_foot",
+          "dimension": "length",
+          "verified": false
+        }
+      },
+      "children": {}
+    },
+    {
+      "path": "6c351638-249a-4d24-a0a9-14bc320eacb3",
+      "attributes": {
+        "bsi::ifc::class": {
+          "code": "IfcPlant"
+        },
+        "bsi::ifc::prop::Name": "TR-1 Pin Oak",
+        "marpa::namespace": "marpa@v1",
+        "marpa::semantic_role": "existing_tree"
+      },
+      "children": {}
+    },
+    {
+      "path": "b70a0abe-2bcc-48d8-b401-3fd214ba0acd",
+      "attributes": {
+        "bsi::ifc::class": {
+          "code": "IfcPlant"
+        },
+        "bsi::ifc::prop::Name": "TR-2 Blue Spruce",
+        "marpa::namespace": "marpa@v1",
+        "marpa::semantic_role": "existing_tree"
+      },
+      "children": {}
+    },
+    {
+      "path": "f942be9d-def0-40d8-a1a0-ec516106b58e",
+      "attributes": {
+        "bsi::ifc::class": {
+          "code": "IfcPlant"
+        },
+        "bsi::ifc::prop::Name": "TR-3 Blue Spruce",
+        "marpa::namespace": "marpa@v1",
+        "marpa::semantic_role": "existing_tree"
+      },
+      "children": {}
+    },
+    {
+      "path": "be2c3ec2-52d5-4511-b823-817de79871fc",
+      "attributes": {
+        "bsi::ifc::class": {
+          "code": "IfcPlant"
+        },
+        "bsi::ifc::prop::Name": "TR-4 Pin Oak",
+        "marpa::namespace": "marpa@v1",
+        "marpa::semantic_role": "existing_tree"
+      },
+      "children": {}
+    },
+    {
+      "path": "11c70561-17fe-4912-81f3-f8aa9b38dea1",
+      "attributes": {
+        "bsi::ifc::class": {
+          "code": "IfcPlant"
+        },
+        "bsi::ifc::prop::Name": "TR-5 Pin Oak",
+        "marpa::namespace": "marpa@v1",
+        "marpa::semantic_role": "existing_tree"
+      },
+      "children": {}
+    },
+    {
+      "path": "7e082858-bd67-4e7a-9531-c4be636ff945",
+      "attributes": {
+        "bsi::ifc::class": {
+          "code": "IfcPlant"
+        },
+        "bsi::ifc::prop::Name": "TR-6 Pin Oak",
+        "marpa::namespace": "marpa@v1",
+        "marpa::semantic_role": "existing_tree"
+      },
+      "children": {}
+    }
+  ]
+}
