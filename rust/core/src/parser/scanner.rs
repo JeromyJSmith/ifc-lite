@@ -104,10 +104,7 @@ impl<'a> EntityScanner<'a> {
                     while p + 1 < len {
                         // Find next '*'; check if followed by '/'.
                         let from = p;
-                        let star = match memchr::memchr(b'*', &bytes[from..]) {
-                            Some(off) => from + off,
-                            None => return None, // unterminated comment
-                        };
+                        let star = from + memchr::memchr(b'*', &bytes[from..])?;
                         if star + 1 < len && bytes[star + 1] == b'/' {
                             self.position = star + 2;
                             break;
