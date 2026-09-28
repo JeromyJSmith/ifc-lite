@@ -68,6 +68,13 @@ const ERROR_ONLY = PREAMBLE + `#1= IFCPROJECT('${guid('PROJ')}',$,'Proj',$,$,$,$
 #72= IFCWALL('${guid('WALA')}',$,'Wall A',$,$,#40,$,'tagA',$);
 ` + TAIL;
 
+const SITE_ONLY = PREAMBLE + `#1= IFCPROJECT('${guid('PROJ')}',$,'Proj',$,$,$,$,(#20),#30);
+#2= IFCSITE('${guid('SITE')}',$,'Site',$,$,#40,$,$,.ELEMENT.,$,$,$,$,$);
+` + TAIL;
+
+const SITE_WITHOUT_PROJECT = PREAMBLE + `#2= IFCSITE('${guid('SITE')}',$,'Site',$,$,#40,$,$,.ELEMENT.,$,$,$,$,$);
+` + TAIL;
+
 /** Everything present, but one of two walls carries no Name. */
 const UNNAMED = PREAMBLE + `#1= IFCPROJECT('${guid('PROJ')}',$,'Proj',$,$,$,$,(#20),#30);
 #2= IFCSITE('${guid('SITE')}',$,'Site',$,$,#40,$,$,.ELEMENT.,$,$,$,$,$);
@@ -78,6 +85,7 @@ const UNNAMED = PREAMBLE + `#1= IFCPROJECT('${guid('PROJ')}',$,'Proj',$,$,$,$,(#
 ` + TAIL;
 
 interface AuditShape {
+  profile: string;
   overall: number;
   scores: { structure: number; identity: number; dataQuality: number };
   issues: Array<{ severity: string; category: string; rule: string; message: string }>;
@@ -103,8 +111,8 @@ function tool(name: string) {
 
 let tmp: string;
 
-async function auditOf(file: string): Promise<AuditShape> {
-  return (await run(file, 'model_audit', {})).structuredContent as unknown as AuditShape;
+async function auditOf(file: string, profile?: string): Promise<AuditShape> {
+  return (await run(file, 'model_audit', profile ? { profile } : {})).structuredContent as unknown as AuditShape;
 }
 
 async function run(file: string, name: string, input: Record<string, unknown>): Promise<CallToolResult> {
@@ -125,6 +133,8 @@ beforeAll(async () => {
   await writeFile(join(tmp, 'warning-only.ifc'), WARNING_ONLY, 'utf-8');
   await writeFile(join(tmp, 'error-only.ifc'), ERROR_ONLY, 'utf-8');
   await writeFile(join(tmp, 'unnamed.ifc'), UNNAMED, 'utf-8');
+  await writeFile(join(tmp, 'site-only.ifc'), SITE_ONLY, 'utf-8');
+  await writeFile(join(tmp, 'site-without-project.ifc'), SITE_WITHOUT_PROJECT, 'utf-8');
 });
 
 afterAll(async () => {
@@ -132,6 +142,16 @@ afterAll(async () => {
 });
 
 describe('model_audit scoring', () => {
+  it('uses explicit site-v1 roots without weakening project identity', async () => {
+    const building = await auditOf('site-only.ifc');
+    expect(building.profile).toBe('building-v1');
+    expect(building.issues.map(i => i.rule)).toContain('required-entity');
+    const site = await auditOf('site-only.ifc', 'site-v1');
+    expect(site.profile).toBe('site-v1');
+    expect(site.issues.filter(i => i.rule === 'required-entity' || i.rule === 'has-storeys')).toEqual([]);
+    const missing = await auditOf('site-without-project.ifc', 'site-v1');
+    expect(missing.issues.filter(i => i.rule === 'required-entity').map(i => i.message)).toEqual(['Missing required entity IfcProject']);
+  });
   it('docks a structural warning 10 points, distinctly from an error', async () => {
     const warned = await auditOf('warning-only.ifc');
     // Exactly one structural finding, and it is a warning — so the score below

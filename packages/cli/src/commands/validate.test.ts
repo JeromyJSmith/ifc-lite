@@ -113,3 +113,32 @@ describe('computeValidationIssues reference-integrity rule', () => {
     expect(issues.filter(i => i.rule === 'reference-integrity')).toHaveLength(0);
   });
 });
+
+describe('versioned spatial validation profiles', () => {
+  const project = "#1=IFCPROJECT('0Project_GUID_000001',$,'Project',$,$,$,$,$,$);";
+  const site = "#2=IFCSITE('0Site_GUID_00000001',$,'Site',$,$,$,$,$,$,$,$,$,$,$);";
+
+  it('keeps the building-v1 default building and storey requirements', async () => {
+    const issues = computeValidationIssues(await parse(buildIfc([project, site])));
+    expect(issues.filter(i => i.rule === 'required-entity').map(i => i.message)).toEqual(['Missing required entity: IFCBUILDING']);
+    expect(issues.some(i => i.rule === 'has-storeys')).toBe(true);
+    expect(computeValidationIssues(await parse(buildIfc(CLEAN_LINES))).filter(i => i.severity === 'error')).toEqual([]);
+  });
+
+  it('accepts a site-rooted model without inventing a building or storey', async () => {
+    const issues = computeValidationIssues(await parse(buildIfc([project, site])), 'site-v1');
+    expect(issues.filter(i => i.severity === 'error' || i.rule === 'has-storeys')).toEqual([]);
+  });
+
+  it('accepts site-rooted infrastructure and still requires one project', async () => {
+    const infra = buildIfc([project, site, "#3=IFCROAD('0Road_GUID_00000001',$,'Road',$,$,$,$,$,$);"]).replace("FILE_SCHEMA(('IFC4'))", "FILE_SCHEMA(('IFC4X3_ADD2'))");
+    expect(computeValidationIssues(await parse(infra), 'site-v1').filter(i => i.severity === 'error')).toEqual([]);
+    const missing = computeValidationIssues(await parse(buildIfc([site])), 'site-v1');
+    expect(missing.filter(i => i.rule === 'required-entity').map(i => i.message)).toEqual(['Missing required entity: IFCPROJECT']);
+  });
+
+  it('keeps reference integrity in site-v1', async () => {
+    const dangling = buildIfc([project, site, "#3=IFCRELAGGREGATES('0RelAgg_GUID_000001',$,$,$,#1,(#9999));"]);
+    expect(computeValidationIssues(await parse(dangling), 'site-v1').some(i => i.rule === 'reference-integrity' && i.severity === 'error')).toBe(true);
+  });
+});

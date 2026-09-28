@@ -807,24 +807,27 @@ Check an IFC file for structural issues.
 ```bash
 ifc-lite validate model.ifc
 ifc-lite validate model.ifc --json
+ifc-lite validate landscape.ifc --profile site-v1 --json
 ```
 
 Checks:
 
-- Required entities (IfcProject, IfcSite, IfcBuilding)
+- Profile-specific required entities: `building-v1` (default) requires IfcProject, IfcSite, and IfcBuilding; `site-v1` requires IfcProject and IfcSite. IFC4.3 permits site-rooted spatial structures without a building ([IfcProject](https://standards.buildingsmart.org/IFC/RELEASE/IFC4_3/HTML/lexical/IfcProject.htm), [IfcSpatialStructureElement](https://standards.buildingsmart.org/IFC/RELEASE/IFC4_3/HTML/lexical/IfcSpatialStructureElement.htm)).
 - Single IfcProject presence
-- Building storeys existence
+- Building storeys existence (`building-v1` only)
 - GlobalId uniqueness — across every `IfcRoot` subtype the file holds, read from the inheritance chain of every schema ifc-lite bundles (IFC2X3, IFC4 and IFC4X3). Classes only one schema declares (`IfcScheduleTimeControl`, `IfcSpaceProgram`, `IfcServiceLife` in IFC2X3; `IfcCourse`, `IfcBorehole` in IFC4X3) are checked like any other. Entities that are not `IfcRoot` subtypes — materials, surface styles, classifications — are deliberately left out, because they carry a name where an `IfcRoot` carries a GlobalId and two same-named materials are not a duplicate
 - Named elements
 - Reference integrity (every `#N` attribute reference must point at an entity that exists in the file; each dangling reference is reported with the referencing entity, attribute slot, and missing target — detailed up to the first 50, after which a single rollup issue reports the count of remaining dangling references)
 
 Returns exit code 0 (valid) or 1 (errors found).
+JSON output echoes `profile`; all profiles retain GlobalId, reference-integrity, schema, naming, and quantity checks.
 
 **Flags:**
 
 | Flag | Description |
 |------|-------------|
 | `--json` | Full report as JSON |
+| `--profile building-v1\|site-v1` | Spatial structure contract; defaults to `building-v1` |
 
 ---
 

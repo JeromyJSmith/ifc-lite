@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 /**
- * ifc-lite validate <file.ifc> [--json]
+ * ifc-lite validate <file.ifc> [--profile building-v1|site-v1] [--json]
  *
  * Perform structural validation checks on an IFC file:
  * - Schema version detection
@@ -15,7 +15,7 @@
  */
 
 import { loadIfcFile } from '../loader.js';
-import { hasFlag, fatal, printJson } from '../output.js';
+import { getFlag, hasFlag, fatal, printJson } from '../output.js';
 import { EntityNode } from '@ifc-lite/query';
 import { getInheritanceChainAcrossSchemas, asSourceBytes, type IfcDataStore, type EntityRef, type IfcSourceBytes } from '@ifc-lite/parser';
 
@@ -30,6 +30,8 @@ export interface ValidationIssue {
   /** The referenced expressId that does not exist in the file. */
   target?: number;
 }
+
+export type ValidationProfile = 'building-v1' | 'site-v1';
 
 /** One `#N` reference whose target expressId does not exist in the file. */
 interface DanglingReference {
@@ -176,11 +178,11 @@ export function collectDanglingReferences(store: IfcDataStore): DanglingReferenc
  * {@link validateCommand} so other consumers (tests, harnesses) reuse the
  * exact same rules instead of re-implementing them.
  */
-export function computeValidationIssues(store: IfcDataStore): ValidationIssue[] {
+export function computeValidationIssues(store: IfcDataStore, profile: ValidationProfile = 'building-v1'): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
 
   // 1. Check required spatial entities
-  const requiredTypes = ['IFCPROJECT', 'IFCSITE', 'IFCBUILDING'];
+  const requiredTypes = profile === 'site-v1' ? ['IFCPROJECT', 'IFCSITE'] : ['IFCPROJECT', 'IFCSITE', 'IFCBUILDING'];
   for (const reqType of requiredTypes) {
     const ids = store.entityIndex.byType.get(reqType) ?? [];
     if (ids.length === 0) {
@@ -192,7 +194,7 @@ export function computeValidationIssues(store: IfcDataStore): ValidationIssue[] 
 
   // 2. Check storeys
   const storeyIds = store.entityIndex.byType.get('IFCBUILDINGSTOREY') ?? [];
-  if (storeyIds.length === 0) {
+  if (profile === 'building-v1' && storeyIds.length === 0) {
     issues.push({ severity: 'warning', rule: 'has-storeys', message: 'No IfcBuildingStorey entities found' });
   }
 
@@ -326,16 +328,19 @@ export function computeValidationIssues(store: IfcDataStore): ValidationIssue[] 
 }
 
 export async function validateCommand(args: string[]): Promise<void> {
-  const filePath = args.find(a => !a.startsWith('-'));
-  if (!filePath) fatal('Usage: ifc-lite validate <file.ifc> [--json]');
+  const filePath = args.find((a, i) => !a.startsWith('-') && args[i - 1] !== '--profile');
+  if (!filePath) fatal('Usage: ifc-lite validate <file.ifc> [--profile building-v1|site-v1] [--json]');
+  const profile = getFlag(args, '--profile') ?? 'building-v1';
+  if (profile !== 'building-v1' && profile !== 'site-v1') fatal(`Unknown validation profile: ${profile}`);
 
   const jsonOutput = hasFlag(args, '--json');
 
   const store = await loadIfcFile(filePath);
-  const issues = computeValidationIssues(store);
+  const issues = computeValidationIssues(store, profile);
 
   const summary = {
     file: filePath,
+    profile,
     schema: store.schemaVersion,
     entityCount: store.entityCount,
     valid: issues.filter(i => i.severity === 'error').length === 0,
@@ -351,6 +356,7 @@ export async function validateCommand(args: string[]): Promise<void> {
     const status = summary.valid ? 'VALID' : 'INVALID';
     process.stdout.write(`\n  ${status}: ${filePath}\n`);
     process.stdout.write(`  Schema: ${store.schemaVersion ?? 'unknown'}\n`);
+    process.stdout.write(`  Profile: ${profile}\n`);
     process.stdout.write(`  Entities: ${store.entityCount}\n\n`);
     for (const issue of issues) {
       const icon = issue.severity === 'error' ? 'ERR' : issue.severity === 'warning' ? 'WRN' : 'INF';

@@ -103,6 +103,8 @@ Tools are grouped by capability. Everything below is registered in the default t
 | Export | `export_ifc`, `export_csv`, `export_json`, `export_glb`, `export_obj`, `export_ifcx`, `export_usd`, `export_pdf_report` *(planned)* |
 | Viewer | `viewer_ask`, `viewer_open`, `viewer_close`, `viewer_status`, `viewer_colorize`, `viewer_isolate`, `viewer_hide`, `viewer_show`, `viewer_reset`, `viewer_fly_to`, `viewer_set_section`, `viewer_clear_section`, `viewer_color_by_storey`, `viewer_color_by_property`, `viewer_get_selection`, `viewer_wait_for_selection`, `viewer_describe_selection` |
 
+`model_audit` accepts `profile: "building-v1" | "site-v1"` (default `building-v1`) and echoes the selected profile. `site-v1` requires IfcProject and IfcSite without inventing an IfcBuilding or storey; identity and other audit checks still run. IFC4.3 permits this spatial structure ([IfcProject](https://standards.buildingsmart.org/IFC/RELEASE/IFC4_3/HTML/lexical/IfcProject.htm), [IfcSpatialStructureElement](https://standards.buildingsmart.org/IFC/RELEASE/IFC4_3/HTML/lexical/IfcSpatialStructureElement.htm)).
+
 !!! tip "`model_diff` and re-exported models"
     `model_diff` compares by GlobalId, so two files that describe the same
     building read as *the whole model deleted and re-added* when the second was
