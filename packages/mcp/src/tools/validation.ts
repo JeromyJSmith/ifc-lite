@@ -158,14 +158,18 @@ const idsExplain: Tool = {
 
 const modelAudit: Tool = {
   name: 'model_audit',
-  description: 'Comprehensive model health check: required entities, GlobalId uniqueness, orphan detection, naming conventions, broken relationships. Returns Lighthouse-style scores per category.',
+  description: 'Comprehensive model health check: profile-specific spatial roots, GlobalId uniqueness, orphan detection, naming conventions, broken relationships. Returns Lighthouse-style scores per category.',
   scope: 'validate',
   inputSchema: {
     type: 'object',
-    properties: { model_id: { type: 'string' } },
+    properties: { model_id: { type: 'string' }, profile: { type: 'string', enum: ['building-v1', 'site-v1'], default: 'building-v1' } },
     additionalProperties: false,
   },
   handler(input, ctx) {
+    const profile = input.profile ?? 'building-v1';
+    if (profile !== 'building-v1' && profile !== 'site-v1') {
+      throw new ToolExecutionError({ code: ToolErrorCode.INVALID_INPUT, message: `Unknown validation profile: ${String(profile)}` });
+    }
     const m = resolveModel(ctx, input.model_id as string | undefined);
     const issues: Array<{ severity: 'error' | 'warning' | 'info'; category: string; rule: string; message: string; entityCount?: number }> = [];
     // The audit answers about the session, not about the file as parsed (#2014).
@@ -177,7 +181,7 @@ const modelAudit: Tool = {
     const typeCounts = foldedTypeCounts(m.store, overlay);
 
     // 1. Required spatial entities
-    for (const t of ['IFCPROJECT', 'IFCSITE', 'IFCBUILDING']) {
+    for (const t of profile === 'site-v1' ? ['IFCPROJECT', 'IFCSITE'] : ['IFCPROJECT', 'IFCSITE', 'IFCBUILDING']) {
       const count = typeCounts.get(t) ?? 0;
       // STEP type names are stored UPPERCASE; a message an agent reads renders
       // them in IfcPascalCase. `Missing required entity IFCSITE` sat next to
@@ -189,7 +193,7 @@ const modelAudit: Tool = {
         issues.push({ severity: 'error', category: 'structure', rule: 'single-project', message: `Multiple ${name} entities (${count})` });
       }
     }
-    if ((typeCounts.get('IFCBUILDINGSTOREY') ?? 0) === 0) {
+    if (profile === 'building-v1' && (typeCounts.get('IFCBUILDINGSTOREY') ?? 0) === 0) {
       issues.push({ severity: 'warning', category: 'structure', rule: 'has-storeys', message: 'No IfcBuildingStorey entities' });
     }
 
@@ -279,6 +283,7 @@ const modelAudit: Tool = {
     return okResult(
       `Audit score: ${overall}/100 (${issues.length} issue${issues.length === 1 ? '' : 's'}).`,
       {
+        profile,
         overall,
         scores,
         issues,

@@ -77,7 +77,7 @@ const HELP = `
     convert   <file.ifc> --schema VER --out F     Convert between IFC schema versions
     diff      <f1.ifc> <f2.ifc>                   Compare two IFC files
               [--by-content] [--identity-out F] [--identity-in F]  Match re-GUIDed elements by content; save/replay the identity map
-    validate  <file.ifc>                          Structural validation checks
+    validate  <file.ifc> [--profile building-v1|site-v1]  Structural validation checks
     bsdd      <class|search|psets|qsets> <arg>     buildingSMART Data Dictionary lookup
     stats     <file.ifc>                          Auto-calculated model KPIs and health check
     mutate    <file.ifc> --id N --set P=V --out F  Modify properties/attributes and save
