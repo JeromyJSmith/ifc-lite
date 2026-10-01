@@ -2,6 +2,14 @@
 
 Project-specific gotchas and guardrails: the things that bite you *here* and that you can't infer from the code. Generic good practice is assumed, not repeated. This file is the single source of truth; `CLAUDE.md` and `.cursorrules` just point here.
 
+## Before you build (Jero's standing rules, 2026-09-30)
+
+These apply in every MARPA repo, submodules and companion repos included. The home copy is `AGENTS.md` in marpa-desk.
+
+- **Read the database first.** The Pixeltable store is the runtime: walk the catalog and see what already exists before you build, and delete what does not need to be there.
+- **Adopt before build.** Before building any system-level tool, research existing open-source solutions and say what you found. Custom code is only the glue between adopted parts. Adopt maximally: take the full functionality of the tools you choose, every capability we could need, because unused capability costs little. Never a "minimal v1".
+- **Latest versions.** Use the newest releases of dependencies, pre-releases included. When a bump breaks something, fix our code instead of pinning back.
+
 ## What this is
 Browser-first IFC toolkit: a WebGPU web viewer plus a headless CLI/MCP/server. No first-party desktop app. Domain logic (decode, geometry, styling, export) lives in Rust crates under `rust/*` and is the source of truth for the server, CLI, SDK, and wasm; TypeScript packages under `packages/*` and apps under `apps/*` consume it (TS mostly does GPU upload and UI). Architecture docs: `docs/architecture/overview.md`.
 
