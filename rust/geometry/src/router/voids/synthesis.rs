@@ -140,7 +140,7 @@ impl GeometryRouter {
                     if item_meshes.len() == item_bounds_with_dir.len() {
                         for ((min_pt, max_pt, extrusion_dir), item_mesh) in item_bounds_with_dir
                             .into_iter()
-                            .zip(item_meshes.into_iter())
+                            .zip(item_meshes)
                         {
                             let frame = infer_opening_frame(&item_mesh, extrusion_dir.as_ref());
                             let direction_is_diagonal = extrusion_dir

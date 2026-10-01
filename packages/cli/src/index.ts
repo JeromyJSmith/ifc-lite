@@ -11,33 +11,6 @@
  */
 
 import { logger, parseVerbosity } from './logger.js';
-import { infoCommand } from './commands/info.js';
-import { queryCommand } from './commands/query.js';
-import { propsCommand } from './commands/props.js';
-import { exportCommand } from './commands/export.js';
-import { diagnoseGeometryCommand } from './commands/diagnose-geometry.js';
-import { idsCommand } from './commands/ids.js';
-import { bcfCommand } from './commands/bcf.js';
-import { clashCommand } from './commands/clash.js';
-import { createCommand } from './commands/create.js';
-import { evalCommand } from './commands/eval.js';
-import { workbenchGraphCommand } from './commands/workbench-graph.js';
-import { runCommand } from './commands/run.js';
-import { schemaCommand } from './commands/schema.js';
-import { mergeCommand } from './commands/merge.js';
-import { convertCommand } from './commands/convert.js';
-import { diffCommand } from './commands/diff.js';
-import { validateCommand } from './commands/validate.js';
-import { bsddCommand } from './commands/bsdd.js';
-import { statsCommand } from './commands/stats.js';
-import { mutateCommand } from './commands/mutate.js';
-import { generateSpacesCommand } from './commands/generate-spaces.js';
-import { askCommand } from './commands/ask.js';
-import { viewCommand } from './commands/view.js';
-import { analyzeCommand } from './commands/analyze.js';
-import { lodCommand } from './commands/lod.js';
-import { mcpCommand } from './commands/mcp.js';
-import { extCommand } from './commands/ext.js';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -207,85 +180,85 @@ async function main(): Promise<void> {
 
   switch (command) {
     case 'info':
-      await infoCommand(commandArgs);
+      await (await import('./commands/info.js')).infoCommand(commandArgs);
       break;
     case 'query':
-      await queryCommand(commandArgs);
+      await (await import('./commands/query.js')).queryCommand(commandArgs);
       break;
     case 'props':
-      await propsCommand(commandArgs);
+      await (await import('./commands/props.js')).propsCommand(commandArgs);
       break;
     case 'export':
-      await exportCommand(commandArgs);
+      await (await import('./commands/export.js')).exportCommand(commandArgs);
       break;
     case 'diagnose-geometry':
-      await diagnoseGeometryCommand(commandArgs);
+      await (await import('./commands/diagnose-geometry.js')).diagnoseGeometryCommand(commandArgs);
       break;
     case 'ids':
-      await idsCommand(commandArgs);
+      await (await import('./commands/ids.js')).idsCommand(commandArgs);
       break;
     case 'bcf':
-      await bcfCommand(commandArgs);
+      await (await import('./commands/bcf.js')).bcfCommand(commandArgs);
       break;
     case 'clash':
-      await clashCommand(commandArgs);
+      await (await import('./commands/clash.js')).clashCommand(commandArgs);
       break;
     case 'create':
-      await createCommand(commandArgs);
+      await (await import('./commands/create.js')).createCommand(commandArgs);
       break;
     case 'eval':
-      await evalCommand(commandArgs);
+      await (await import('./commands/eval.js')).evalCommand(commandArgs);
       break;
     case 'run':
-      await runCommand(commandArgs);
+      await (await import('./commands/run.js')).runCommand(commandArgs);
       break;
     case 'schema':
-      await schemaCommand(commandArgs);
+      await (await import('./commands/schema.js')).schemaCommand(commandArgs);
       break;
     case 'merge':
-      await mergeCommand(commandArgs);
+      await (await import('./commands/merge.js')).mergeCommand(commandArgs);
       break;
     case 'convert':
-      await convertCommand(commandArgs);
+      await (await import('./commands/convert.js')).convertCommand(commandArgs);
       break;
     case 'diff':
-      await diffCommand(commandArgs);
+      await (await import('./commands/diff.js')).diffCommand(commandArgs);
       break;
     case 'validate':
-      await validateCommand(commandArgs);
+      await (await import('./commands/validate.js')).validateCommand(commandArgs);
       break;
     case 'bsdd':
-      await bsddCommand(commandArgs);
+      await (await import('./commands/bsdd.js')).bsddCommand(commandArgs);
       break;
     case 'stats':
-      await statsCommand(commandArgs);
+      await (await import('./commands/stats.js')).statsCommand(commandArgs);
       break;
     case 'workbench-graph':
-      await workbenchGraphCommand(commandArgs);
+      await (await import('./commands/workbench-graph.js')).workbenchGraphCommand(commandArgs);
       break;
     case 'mutate':
-      await mutateCommand(commandArgs);
+      await (await import('./commands/mutate.js')).mutateCommand(commandArgs);
       break;
     case 'generate-spaces':
-      await generateSpacesCommand(commandArgs);
+      await (await import('./commands/generate-spaces.js')).generateSpacesCommand(commandArgs);
       break;
     case 'ask':
-      await askCommand(commandArgs);
+      await (await import('./commands/ask.js')).askCommand(commandArgs);
       break;
     case 'view':
-      await viewCommand(commandArgs);
+      await (await import('./commands/view.js')).viewCommand(commandArgs);
       break;
     case 'analyze':
-      await analyzeCommand(commandArgs);
+      await (await import('./commands/analyze.js')).analyzeCommand(commandArgs);
       break;
     case 'lod':
-      await lodCommand(commandArgs);
+      await (await import('./commands/lod.js')).lodCommand(commandArgs);
       break;
     case 'mcp':
-      await mcpCommand(commandArgs);
+      await (await import('./commands/mcp.js')).mcpCommand(commandArgs);
       break;
     case 'ext':
-      await extCommand(commandArgs);
+      await (await import('./commands/ext.js')).extCommand(commandArgs);
       break;
     default:
       process.stderr.write(`Unknown command: ${command}\n`);

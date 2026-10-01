@@ -258,7 +258,7 @@ fn extract_mapped_item_profiles(
     // Attr 0: MappingSource → IfcRepresentationMap
     let source = match mapped_item
         .get(0)
-        .and_then(|a| if a.is_null() { None } else { Some(a) })
+        .filter(|a| !a.is_null())
         .and_then(|a| decoder.resolve_ref(a).ok().flatten())
     {
         Some(s) => s,
@@ -268,7 +268,7 @@ fn extract_mapped_item_profiles(
     // Attr 1: MappingTarget → IfcCartesianTransformationOperator3D
     let target_tf = mapped_item
         .get(1)
-        .and_then(|a| if a.is_null() { None } else { Some(a) })
+        .filter(|a| !a.is_null())
         .and_then(|a| decoder.resolve_ref(a).ok().flatten())
         .and_then(|e| parse_cartesian_transformation_operator(&e, decoder).ok())
         .unwrap_or_else(Matrix4::identity);
@@ -280,7 +280,7 @@ fn extract_mapped_item_profiles(
     // MappedRepresentation (attr 1 of RepresentationMap) → items
     let mapped_rep = match source
         .get(1)
-        .and_then(|a| if a.is_null() { None } else { Some(a) })
+        .filter(|a| !a.is_null())
         .and_then(|a| decoder.resolve_ref(a).ok().flatten())
     {
         Some(r) => r,

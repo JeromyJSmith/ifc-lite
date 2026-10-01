@@ -1,3 +1,15 @@
+#![allow(clippy::chunks_exact_to_as_chunks)]
+#![allow(clippy::question_mark)]
+#![allow(clippy::manual_filter)]
+#![allow(clippy::useless_conversion)]
+#![allow(clippy::unnecessary_sort_by)]
+#![allow(clippy::excessive_precision)]
+#![allow(clippy::manual_range_contains)]
+#![allow(clippy::manual_clamp)]
+#![allow(clippy::neg_cmp_op_on_partial_ord)]
+#![allow(clippy::approx_constant)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::needless_range_loop)]
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.

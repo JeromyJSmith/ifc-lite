@@ -278,15 +278,11 @@ impl GeoRefExtractor {
 
         for (id, ifc_type) in entity_types {
             match ifc_type {
-                IfcType::IfcMapConversion => {
-                    if map_conversion_id.is_none() {
-                        map_conversion_id = Some(*id);
-                    }
+                IfcType::IfcMapConversion if map_conversion_id.is_none() => {
+                    map_conversion_id = Some(*id);
                 }
-                IfcType::IfcProjectedCRS => {
-                    if projected_crs_id.is_none() {
-                        projected_crs_id = Some(*id);
-                    }
+                IfcType::IfcProjectedCRS if projected_crs_id.is_none() => {
+                    projected_crs_id = Some(*id);
                 }
                 _ => {}
             }
@@ -674,19 +670,22 @@ impl RtcOffset {
             return Self::default();
         }
 
-        let count = positions.len() / 3;
-        let mut sum = (0.0f64, 0.0f64, 0.0f64);
+        let (chunks, _) = positions.as_chunks::<3>();
+        if chunks.is_empty() {
+            return Self::default();
+        }
 
-        for chunk in positions.chunks_exact(3) {
+        let mut sum = (0.0f64, 0.0f64, 0.0f64);
+        for chunk in chunks {
             sum.0 += chunk[0] as f64;
             sum.1 += chunk[1] as f64;
             sum.2 += chunk[2] as f64;
         }
 
         Self {
-            x: sum.0 / count as f64,
-            y: sum.1 / count as f64,
-            z: sum.2 / count as f64,
+            x: sum.0 / chunks.len() as f64,
+            y: sum.1 / chunks.len() as f64,
+            z: sum.2 / chunks.len() as f64,
         }
     }
 
@@ -700,7 +699,8 @@ impl RtcOffset {
     /// Apply offset to positions in-place
     #[inline]
     pub fn apply(&self, positions: &mut [f32]) {
-        for chunk in positions.chunks_exact_mut(3) {
+        let (chunks, _) = positions.as_chunks_mut::<3>();
+        for chunk in chunks {
             chunk[0] = (chunk[0] as f64 - self.x) as f32;
             chunk[1] = (chunk[1] as f64 - self.y) as f32;
             chunk[2] = (chunk[2] as f64 - self.z) as f32;
