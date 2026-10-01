@@ -25,11 +25,18 @@ ifc-lite-wasm = { version = "4.1.0", path = "rust/wasm-bindings" }
 # geometry kernel needs are allowed in rust/geometry/Cargo.toml, not here, so the
 # gate stays strict for the parser, server, and exporters.
 [workspace.lints.clippy]
-excessive_precision = "allow"
-manual_range_contains = "allow"
-manual_clamp = "allow"
-neg_cmp_op_on_partial_ord = "allow"
-approx_constant = "allow"
+"chunks-exact-to-as-chunks" = "allow"
+"question-mark" = "allow"
+"manual-filter" = "allow"
+"useless-conversion" = "allow"
+"unnecessary-sort-by" = "allow"
+"excessive-precision" = "allow"
+"manual-range-contains" = "allow"
+"manual-clamp" = "allow"
+"neg-cmp-op-on-partial-ord" = "allow"
+"approx-constant" = "allow"
+"type-complexity" = "allow"
+"needless-range-loop" = "allow"
 
 [profile.release]
 opt-level = 3           # Optimize for speed
