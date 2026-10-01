@@ -39,19 +39,19 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@automerge/automerge": "^3.4.1",
+    "@automerge/automerge": "^3.5.0",
     "@ifc-lite/data": "workspace:^",
     "@ifc-lite/ifcx": "workspace:^",
     "@ifc-lite/mutations": "workspace:^",
-    "lib0": "^0.2.99",
+    "lib0": "^1.0.0-rc.36",
     "y-indexeddb": "^9.0.12",
-    "y-protocols": "^1.0.6",
+    "y-protocols": "^1.0.7",
     "y-websocket": "^3.1.0",
-    "yjs": "^13.6.32"
+    "yjs": "^14.0.0-16"
   },
   "devDependencies": {
-    "typescript": "^6.0.3",
-    "vitest": "^4.1.10"
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.3"
   },
   "license": "MPL-2.0",
   "author": "Louis True",

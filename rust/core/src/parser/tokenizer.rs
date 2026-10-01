@@ -12,8 +12,8 @@ use nom::{
     character::complete::{char, digit1, one_of},
     combinator::{map, map_res, opt, recognize},
     multi::separated_list0,
-    sequence::{delimited, pair, preceded, tuple},
-    IResult,
+    sequence::{delimited, pair, preceded},
+    IResult, Parser,
 };
 
 use crate::error::{Error, Result};
@@ -51,7 +51,7 @@ fn entity_ref(input: &[u8]) -> IResult<&[u8], Token<'_>> {
     map(
         preceded(char('#'), map_res(digit1, lexical_core::parse::<u32>)),
         Token::EntityRef,
-    )(input)
+    ).parse(input)
 }
 
 /// Parse string literal: 'text' or "text"
@@ -92,18 +92,18 @@ fn string_literal(input: &[u8]) -> IResult<&[u8], Token<'_>> {
             delimited(char('"'), |i| parse_string_content(i, b'"'), char('"')),
             Token::String,
         ),
-    ))(input)
+    )).parse(input)
 }
 
 /// Parse integer: 42, -42
 /// Uses lexical-core for 10x faster parsing
 #[inline]
 fn integer(input: &[u8]) -> IResult<&[u8], Token<'_>> {
-    map_res(recognize(tuple((opt(char('-')), digit1))), |s: &[u8]| {
+    map_res(recognize((opt(char('-')), digit1)), |s: &[u8]| {
         lexical_core::parse::<i64>(s)
             .map(Token::Integer)
             .map_err(|_| "parse error")
-    })(input)
+    }).parse(input)
 }
 
 /// Parse float: 3.14, -3.14, 1.5E-10, 0., 1.
@@ -112,19 +112,19 @@ fn integer(input: &[u8]) -> IResult<&[u8], Token<'_>> {
 #[inline]
 fn float(input: &[u8]) -> IResult<&[u8], Token<'_>> {
     map_res(
-        recognize(tuple((
+        recognize((
             opt(char('-')),
             digit1,
             char('.'),
             opt(digit1), // Made optional to support "0." format
-            opt(tuple((one_of("eE"), opt(one_of("+-")), digit1))),
-        ))),
+            opt((one_of("eE"), opt(one_of("+-")), digit1)),
+        )),
         |s: &[u8]| {
             lexical_core::parse::<f64>(s)
                 .map(Token::Float)
                 .map_err(|_| "parse error")
         },
-    )(input)
+    ).parse(input)
 }
 
 /// Parse enum: .TRUE., .FALSE., .UNKNOWN., .ELEMENT.
@@ -136,17 +136,17 @@ fn enum_value(input: &[u8]) -> IResult<&[u8], Token<'_>> {
             char('.'),
         ),
         Token::Enum,
-    )(input)
+    ).parse(input)
 }
 
 /// Parse null: $
 fn null(input: &[u8]) -> IResult<&[u8], Token<'_>> {
-    map(char('$'), |_| Token::Null)(input)
+    map(char('$'), |_| Token::Null).parse(input)
 }
 
 /// Parse derived: *
 fn derived(input: &[u8]) -> IResult<&[u8], Token<'_>> {
-    map(char('*'), |_| Token::Derived)(input)
+    map(char('*'), |_| Token::Derived).parse(input)
 }
 
 /// Maximum nesting depth for token recursion (list and typed-value bodies).
@@ -172,12 +172,12 @@ fn typed_value_at_depth(input: &[u8], depth: u32) -> IResult<&[u8], Token<'_>> {
             ),
         ),
         |(type_name, args)| Token::TypedValue(type_name, args),
-    )(input)
+    ).parse(input)
 }
 
 /// Skip whitespace
 fn ws(input: &[u8]) -> IResult<&[u8], ()> {
-    map(take_while(|c: u8| c.is_ascii_whitespace()), |_| ())(input)
+    map(take_while(|c: u8| c.is_ascii_whitespace()), |_| ()).parse(input)
 }
 
 /// Parse a token with optional surrounding whitespace
@@ -211,7 +211,7 @@ fn token_at_depth(input: &[u8], depth: u32) -> IResult<&[u8], Token<'_>> {
             move |i| typed_value_at_depth(i, depth + 1),
         )),
         ws,
-    )(input)
+    ).parse(input)
 }
 
 /// Parse list: (1, 2, 3) or nested lists
@@ -231,7 +231,7 @@ fn list_at_depth(input: &[u8], depth: u32) -> IResult<&[u8], Token<'_>> {
             char(')'),
         ),
         Token::List,
-    )(input)
+    ).parse(input)
 }
 
 /// Parse a complete entity line from raw IFC bytes.
@@ -244,7 +244,7 @@ where
     T: AsRef<[u8]> + ?Sized,
 {
     let input = input.as_ref();
-    let result: IResult<&[u8], (u32, &[u8], Vec<Token>)> = tuple((
+    let result: IResult<&[u8], (u32, &[u8], Vec<Token>)> = (
         // Entity ID: #123
         delimited(
             ws,
@@ -265,9 +265,9 @@ where
         delimited(
             char('('),
             separated_list0(delimited(ws, char(','), ws), token),
-            tuple((char(')'), ws, char(';'))),
+            (char(')'), ws, char(';')),
         ),
-    ))(input);
+    ).parse(input);
 
     match result {
         Ok((_, (id, type_str, args))) => {

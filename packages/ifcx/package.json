@@ -22,11 +22,11 @@
     "@ifc-lite/data": "workspace:^",
     "@ifc-lite/mutations": "workspace:^",
     "@ifc-lite/pointcloud": "workspace:^",
-    "@noble/hashes": "^2.3.0"
+    "@noble/hashes": "^2.4.0"
   },
   "devDependencies": {
-    "tsx": "^4.23.12",
-    "typescript": "^6.0.3"
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
   },
   "license": "MPL-2.0",
   "author": "Louis True",

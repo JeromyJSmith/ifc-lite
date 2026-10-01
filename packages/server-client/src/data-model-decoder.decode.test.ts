@@ -39,10 +39,10 @@ beforeAll(async () => {
   // so `ensureParquetInit()`'s later `parquet.default(url)` call short-
   // circuits on the existing instance instead of re-fetching.
   const require = createRequire(import.meta.url);
-  const jsPath = require.resolve('parquet-wasm/esm/arrow2.js');
-  const wasmPath = jsPath.replace(/arrow2\.js$/, 'arrow2_bg.wasm');
+  const jsPath = require.resolve('parquet-wasm/esm/parquet_wasm.js');
+  const wasmPath = jsPath.replace(/parquet_wasm\.js$/, 'parquet_wasm_bg.wasm');
   const wasmBytes = readFileSync(wasmPath);
-  parquet = await import('parquet-wasm/esm/arrow2.js');
+  parquet = await import('parquet-wasm/esm/parquet_wasm.js');
   parquet.initSync(wasmBytes);
 
   arrow = await import('apache-arrow');

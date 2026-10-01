@@ -16,7 +16,7 @@ import { buildMeshesFromTables, buildMeshesFromOptimizedTables } from './parquet
 
 // WASM initialization state
 let parquetInitialized = false;
-let parquetModule: typeof import('parquet-wasm/esm/arrow2.js') | null = null;
+let parquetModule: typeof import('parquet-wasm/esm/parquet_wasm.js') | null = null;
 
 /**
  * Ensure parquet-wasm WASM module is initialized.
@@ -31,11 +31,11 @@ export async function ensureParquetInit() {
 
   console.log('[parquet-decoder] Starting WASM initialization...');
 
-  let parquet: typeof import('parquet-wasm/esm/arrow2.js') | undefined;
+  let parquet: typeof import('parquet-wasm/esm/parquet_wasm.js') | undefined;
 
   // Strategy 1: Try ESM build with explicit WASM URL (works with Vite)
   try {
-    parquet = await import('parquet-wasm/esm/arrow2.js');
+    parquet = await import('parquet-wasm/esm/parquet_wasm.js');
     console.log('[parquet-decoder] Imported ESM build');
 
     // ESM build requires calling init (default export) to load WASM
@@ -43,7 +43,7 @@ export async function ensureParquetInit() {
       console.log('[parquet-decoder] Calling ESM init to load WASM...');
 
       // Get the WASM file URL - Vite handles this with ?url suffix
-      const wasmModule = await import('parquet-wasm/esm/arrow2_bg.wasm?url');
+      const wasmModule = await import('parquet-wasm/esm/parquet_wasm_bg.wasm?url');
       const wasmUrl = wasmModule.default;
       console.log('[parquet-decoder] Loading WASM from:', wasmUrl);
 
@@ -66,15 +66,15 @@ export async function ensureParquetInit() {
 
   // Strategy 2: Try web build with fetch (alternative for browsers)
   try {
-    parquet = await import('parquet-wasm/esm/arrow2.js');
+    parquet = await import('parquet-wasm/esm/parquet_wasm.js');
 
     if (typeof parquet.default === 'function') {
       console.log('[parquet-decoder] Trying web init with node_modules path...');
 
       // Try common paths where WASM might be served
       const wasmPaths = [
-        '/node_modules/parquet-wasm/esm/arrow2_bg.wasm',
-        './node_modules/parquet-wasm/esm/arrow2_bg.wasm',
+        '/node_modules/parquet-wasm/esm/parquet_wasm_bg.wasm',
+        './node_modules/parquet-wasm/esm/parquet_wasm_bg.wasm',
       ];
 
       for (const wasmPath of wasmPaths) {

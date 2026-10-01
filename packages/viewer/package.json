@@ -28,8 +28,8 @@
     "@ifc-lite/wasm": "workspace:^"
   },
   "devDependencies": {
-    "@types/node": "^26.2.0",
-    "typescript": "^6.0.3"
+    "@types/node": "^26.6.3",
+    "typescript": "^7.0.2"
   },
   "engines": {
     "node": ">=18.0.0"

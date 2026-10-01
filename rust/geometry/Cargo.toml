@@ -44,7 +44,7 @@ earcutr = "0.5"
 earcut = { version = "0.4", optional = true }
 
 # 2D polygon boolean operations for profile-level void subtraction
-i_overlay = "8.0"
+i_overlay = "9.0"
 
 # Core IFC parsing
 ifc-lite-core.workspace = true
@@ -53,7 +53,7 @@ ifc-lite-core.workspace = true
 nalgebra = { version = "0.35", default-features = false, features = ["std"] }
 
 # Parallel processing
-rayon = "1.10"
+rayon = "1.12"
 
 # Fast hashing
 rustc-hash = "2.1"
@@ -74,7 +74,7 @@ png = "0.18"
 jpeg-decoder = { version = "0.3", default-features = false }
 
 # Small vector optimization for frequently allocated small collections
-smallvec = "1.13"
+smallvec = "2.0.0-beta.1"
 
 # Error handling
 thiserror = "2.0"
@@ -98,7 +98,7 @@ num-traits = { version = "0.2", default-features = false }
 bnum = { version = "0.14.4", features = ["numtraits"] }
 
 [dev-dependencies]
-approx = "0.5"
+approx = "0.6.0-rc2"
 # The real clash engine, used ONLY by tests/clash_intersection_real_model.rs to
 # produce the same candidate pairs the product reports, so the intersection-solid
 # measurements are taken on genuine clash pairs rather than a test-local
@@ -113,12 +113,12 @@ serde_json = "1.0"
 # (tests/csg_property_test.rs): volume bounds, NaN-freedom, watertightness
 # over bounded randomized inputs. Case counts are set explicitly per
 # property to keep the suite fast.
-proptest = "1.6"
+proptest = "1.11"
 # Snapshot testing for the geometry correctness harness
 # (tests/geometry_correctness_harness.rs). Plain string snapshots only, so
 # no serde-format features are needed. Accept intentional geometry changes
 # with `cargo insta review`.
-insta = { version = "1.43", default-features = false }
+insta = { version = "1.48", default-features = false }
 # Shewchuk adaptive exact geometric predicates (sign-exact, no_std, no C deps).
 # Used by the cross-platform determinism floor test that underpins the
 # pure-Rust CSG kernel. Dev-only: not linked into the shipping crate.

@@ -26,7 +26,7 @@ import * as Y from 'yjs';
  * room reload (up to `compactEvery` updates between compactions).
  */
 export function mergeUpdateFrames(frames: Uint8Array[]): Uint8Array {
-  return frames.length === 1 ? frames[0] : Y.mergeUpdates(frames);
+  return frames.length === 1 ? frames[0] : Y.mergeUpdates(frames as Uint8Array<ArrayBuffer>[]);
 }
 
 export interface Persistence {

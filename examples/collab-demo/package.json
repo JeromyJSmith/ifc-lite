@@ -11,11 +11,11 @@
   },
   "dependencies": {
     "@ifc-lite/collab": "workspace:*",
-    "yjs": "^13.6.32"
+    "yjs": "^14.0.0-16"
   },
   "devDependencies": {
-    "typescript": "^6.0.3",
-    "vite": "^8.2.1",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.1",
     "vite-plugin-top-level-await": "^1.6.0",
     "vite-plugin-wasm": "^3.6.0"
   }

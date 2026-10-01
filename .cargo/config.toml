@@ -20,3 +20,8 @@ rustflags = [
 # threaded bundle — see `scripts/build-wasm.sh`). It gets it by setting the
 # `CARGO_UNSTABLE_BUILD_STD` env var for that invocation only, so only the
 # wasm build pays for it. See `scripts/build-wasm.sh`.
+
+# nom 8 combinators are by-value closures: a debug-build frame per nesting level is large enough that the 256-level
+# tokenizer boundary tests overflow the default 2 MiB test-thread stack (release builds are fine).
+[env]
+RUST_MIN_STACK = "67108864"

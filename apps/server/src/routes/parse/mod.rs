@@ -186,9 +186,11 @@ fn unwrap_ifczip(
         if entry.is_dir() {
             continue;
         }
-        let name = entry.name();
+        let name = entry
+            .name()
+            .map_err(|e| ApiError::BadRequest(format!("Invalid .ifcZIP entry name: {e}")))?;
         let lower = name.to_ascii_lowercase();
-        if (lower.ends_with(".ifc") || lower.ends_with(".ifcxml")) && !is_apple_double(name) {
+        if (lower.ends_with(".ifc") || lower.ends_with(".ifcxml")) && !is_apple_double(&name) {
             candidates.push((i, name.to_string()));
         }
     }

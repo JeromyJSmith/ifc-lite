@@ -101,7 +101,7 @@ export function harvestUpdatePaths(update: Uint8Array): string[] {
   const touched = new Set<string>();
   const onAfter = (tr: Y.Transaction) => {
     for (const [type, keys] of tr.changed.entries()) {
-      let node: Y.AbstractType<unknown> | null = type as Y.AbstractType<unknown>;
+      let node: Y.AbstractType<any> | null = type as Y.AbstractType<any>;
       const basePath: string[] = [];
       while (node) {
         const item = (node as unknown as { _item?: { parent?: unknown; parentSub?: string | null } })._item;
@@ -112,7 +112,7 @@ export function harvestUpdatePaths(update: Uint8Array): string[] {
           break;
         }
         if (typeof item.parentSub === 'string') basePath.unshift(item.parentSub);
-        node = item.parent as Y.AbstractType<unknown> | null;
+        node = item.parent as Y.AbstractType<any> | null;
       }
       if (basePath.length === 0) continue;
       // Always emit the base path itself …
@@ -133,7 +133,7 @@ export function harvestUpdatePaths(update: Uint8Array): string[] {
   return [...touched];
 }
 
-function topLevelKeyOf(type: Y.AbstractType<unknown>, doc: Y.Doc): string | null {
+function topLevelKeyOf(type: Y.AbstractType<any>, doc: Y.Doc): string | null {
   for (const [name, shared] of doc.share) {
     if (shared === type) return name;
   }

@@ -276,6 +276,19 @@ export interface RemoteApplyHandlers {
  * from the `entities` map root: `[entityPath, 'attributes']` for attributes and
  * `[entityPath, 'psets', psetName]` for property sets.
  */
+
+/**
+ * The keys a Y.Map event touched, with whether each was deleted. Yjs 14 dropped `YEvent.changes`; the event now
+ * carries `keysChanged`, and a key that is no longer on the map was deleted by this transaction.
+ */
+function changedKeys(ev: { target: unknown; keysChanged: Set<unknown> }): Array<[string, { action: 'add' | 'delete' }]> {
+  const map = ev.target as unknown as { has(key: string): boolean };
+  return Array.from(ev.keysChanged, (raw): [string, { action: 'add' | 'delete' }] => {
+    const key = String(raw);
+    return [key, { action: map.has(key) ? 'add' : 'delete' }];
+  });
+}
+
 export function attachRemoteApply(
   api: CollabDocApi,
   session: CollabSession,
@@ -308,7 +321,7 @@ export function attachRemoteApply(
       // full reconstruct. `entityForPath` resolves the removed path's expressId.
       if (path.length === 0) {
         if (!handlers.onEntityDelete) continue;
-        for (const [entityPath, change] of ev.changes.keys) {
+        for (const [entityPath, change] of changedKeys(ev)) {
           if (change.action !== 'delete') continue;
           const id = entityForPath(store, entityPath);
           if (id !== null) handlers.onEntityDelete(id);
@@ -322,7 +335,7 @@ export function attachRemoteApply(
       const target = ev.target as { get(key: string): unknown };
 
       if (path[1] === 'attributes' && path.length === 2) {
-        for (const [attrName, change] of ev.changes.keys) {
+        for (const [attrName, change] of changedKeys(ev)) {
           if (change.action === 'delete') continue;
           // Placement (`usd::xformop`) is a structured matrix, not a scalar
           // attribute — route it to the dedicated placement handler so the
@@ -336,7 +349,7 @@ export function attachRemoteApply(
         }
       } else if (path[1] === 'psets' && path.length === 3 && typeof path[2] === 'string') {
         const psetName = path[2];
-        for (const [prop, change] of ev.changes.keys) {
+        for (const [prop, change] of changedKeys(ev)) {
           if (change.action === 'delete') {
             handlers.onPropertyDelete(entityId, psetName, prop);
             continue;
@@ -361,7 +374,7 @@ export function attachRemoteApply(
         // `{}` — so the property names are unrecoverable. `onPsetDelete` tells
         // the consumer to drop the whole set for (entityId, pset) rather than
         // trying to replay per-property deletes it has no names for.
-        for (const [psetName, change] of ev.changes.keys) {
+        for (const [psetName, change] of changedKeys(ev)) {
           if (change.action === 'delete') {
             if (handlers.onPsetDelete) handlers.onPsetDelete(entityId, psetName);
             continue;

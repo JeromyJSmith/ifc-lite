@@ -21,7 +21,7 @@ pub use normals::calculate_normals;
 pub(crate) use consolidate::tri_is_needle;
 
 /// Type alias for small triangle collections (typically 1-2 triangles from clipping)
-pub type TriangleVec = SmallVec<[Triangle; 4]>;
+pub type TriangleVec = SmallVec<Triangle, 4>;
 
 /// Plane definition for clipping
 #[derive(Debug, Clone, Copy)]

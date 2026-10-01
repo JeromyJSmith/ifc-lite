@@ -141,3 +141,14 @@ Browser-first IFC toolkit: a WebGPU web viewer plus a headless CLI/MCP/server. N
 
 ## Per-package notes
 This root file is the shared contract; the closest `AGENTS.md` to an edited file also applies. Package-specific gotchas live in code-adjacent files: [`apps/viewer/AGENTS.md`](./apps/viewer/AGENTS.md), [`rust/AGENTS.md`](./rust/AGENTS.md), [`packages/geometry/AGENTS.md`](./packages/geometry/AGENTS.md), [`packages/collab/AGENTS.md`](./packages/collab/AGENTS.md), [`packages/collab-server/AGENTS.md`](./packages/collab-server/AGENTS.md). Add more as a package accumulates its own footguns.
+
+<!-- BEGIN:turborepo-agent-rules -->
+
+# This is NOT the Turborepo you know
+
+Turborepo configuration, task behavior, and CLI commands can vary between installed versions and may differ from your training data. Resolve the `turbo` package from this file's directory or relevant workspace; in monorepos, it may not be visible from the repository root. For example, run `node -p "require.resolve('turbo/package.json')"` from a workspace that depends on `turbo`.
+
+Read `docs/README.md` inside that installed package first, then read the relevant pages from its `docs/` directory before changing Turborepo configuration or commands. Heed deprecation notices. These bundled docs match the installed package version and are available without network access.
+
+This block is written and re-added by `turbo` before repository-scoped commands when an AI agent is detected. In the Turborepo source repository, its template is defined in `crates/turborepo-cli/src/cli/agent_guidance.rs`. Removing the managed block while updates are enabled means a later qualifying invocation will add it again. Set `"agentGuidance": false` in the root `turbo.json` or `turbo.jsonc` to opt out; this does not remove an existing block. Keep the block committed with your work to avoid an uncommitted change on the next agent invocation.
+<!-- END:turborepo-agent-rules -->

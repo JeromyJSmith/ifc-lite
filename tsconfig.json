@@ -23,121 +23,120 @@
     "declaration": true,
     "declarationMap": true,
     "sourceMap": true,
-    "baseUrl": ".",
     "paths": {
       "@ifc-lite/wasm": [
-        "packages/wasm/pkg/ifc-lite.d.ts"
+        "./packages/wasm/pkg/ifc-lite.d.ts"
       ],
       "@ifc-lite/wasm/*": [
-        "packages/wasm/pkg/*"
+        "./packages/wasm/pkg/*"
       ],
       "@ifc-lite/geometry": [
-        "packages/geometry/dist/index.d.ts"
+        "./packages/geometry/dist/index.d.ts"
       ],
       "@ifc-lite/geometry/*": [
-        "packages/geometry/dist/*"
+        "./packages/geometry/dist/*"
       ],
       "@ifc-lite/spatial": [
-        "packages/spatial/dist/index.d.ts"
+        "./packages/spatial/dist/index.d.ts"
       ],
       "@ifc-lite/spatial/*": [
-        "packages/spatial/dist/*"
+        "./packages/spatial/dist/*"
       ],
       "@ifc-lite/ifcx": [
-        "packages/ifcx/dist/index.d.ts"
+        "./packages/ifcx/dist/index.d.ts"
       ],
       "@ifc-lite/ifcx/*": [
-        "packages/ifcx/dist/*"
+        "./packages/ifcx/dist/*"
       ],
       "@ifc-lite/data": [
-        "packages/data/dist/index.d.ts"
+        "./packages/data/dist/index.d.ts"
       ],
       "@ifc-lite/data/*": [
-        "packages/data/dist/*"
+        "./packages/data/dist/*"
       ],
       "@ifc-lite/mutations": [
-        "packages/mutations/dist/index.d.ts"
+        "./packages/mutations/dist/index.d.ts"
       ],
       "@ifc-lite/mutations/*": [
-        "packages/mutations/dist/*"
+        "./packages/mutations/dist/*"
       ],
       "@ifc-lite/drawing-2d": [
-        "packages/drawing-2d/dist/index.d.ts"
+        "./packages/drawing-2d/dist/index.d.ts"
       ],
       "@ifc-lite/drawing-2d/*": [
-        "packages/drawing-2d/dist/*"
+        "./packages/drawing-2d/dist/*"
       ],
       "@ifc-lite/encoding": [
-        "packages/encoding/dist/index.d.ts"
+        "./packages/encoding/dist/index.d.ts"
       ],
       "@ifc-lite/encoding/*": [
-        "packages/encoding/dist/*"
+        "./packages/encoding/dist/*"
       ],
       "@ifc-lite/ids": [
-        "packages/ids/dist/index.d.ts"
+        "./packages/ids/dist/index.d.ts"
       ],
       "@ifc-lite/ids/*": [
-        "packages/ids/dist/*"
+        "./packages/ids/dist/*"
       ],
       "@ifc-lite/lists": [
-        "packages/lists/dist/index.d.ts"
+        "./packages/lists/dist/index.d.ts"
       ],
       "@ifc-lite/lists/*": [
-        "packages/lists/dist/*"
+        "./packages/lists/dist/*"
       ],
       "@ifc-lite/sdk": [
-        "packages/sdk/dist/index.d.ts"
+        "./packages/sdk/dist/index.d.ts"
       ],
       "@ifc-lite/sdk/*": [
-        "packages/sdk/dist/*"
+        "./packages/sdk/dist/*"
       ],
       "@ifc-lite/sandbox": [
-        "packages/sandbox/dist/index.d.ts"
+        "./packages/sandbox/dist/index.d.ts"
       ],
       "@ifc-lite/sandbox/*": [
-        "packages/sandbox/dist/*"
+        "./packages/sandbox/dist/*"
       ],
       "@ifc-lite/node-registry": [
-        "packages/node-registry/dist/index.d.ts"
+        "./packages/node-registry/dist/index.d.ts"
       ],
       "@ifc-lite/node-registry/*": [
-        "packages/node-registry/dist/*"
+        "./packages/node-registry/dist/*"
       ],
       "@ifc-lite/viewer": [
-        "packages/viewer/dist/index.d.ts"
+        "./packages/viewer/dist/index.d.ts"
       ],
       "@ifc-lite/viewer/*": [
-        "packages/viewer/dist/*"
+        "./packages/viewer/dist/*"
       ],
       "@ifc-lite/plugin-api": [
-        "packages/plugin-api/dist/index.d.ts"
+        "./packages/plugin-api/dist/index.d.ts"
       ],
       "@ifc-lite/source-dalux": [
-        "packages/source-dalux/dist/index.d.ts"
+        "./packages/source-dalux/dist/index.d.ts"
       ],
       "@ifc-lite/source-dalux/*": [
-        "packages/source-dalux/dist/*"
+        "./packages/source-dalux/dist/*"
       ],
       "@ifc-lite/oauth-pkce": [
-        "packages/oauth-pkce/dist/index.d.ts"
+        "./packages/oauth-pkce/dist/index.d.ts"
       ],
       "@ifc-lite/oauth-pkce/*": [
-        "packages/oauth-pkce/dist/*"
+        "./packages/oauth-pkce/dist/*"
       ],
       "@ifc-lite/source-dropbox": [
-        "packages/source-dropbox/dist/index.d.ts"
+        "./packages/source-dropbox/dist/index.d.ts"
       ],
       "@ifc-lite/source-dropbox/*": [
-        "packages/source-dropbox/dist/*"
+        "./packages/source-dropbox/dist/*"
       ],
       "@ifc-lite/source-msgraph": [
-        "packages/source-msgraph/dist/index.d.ts"
+        "./packages/source-msgraph/dist/index.d.ts"
       ],
       "@ifc-lite/source-msgraph/*": [
-        "packages/source-msgraph/dist/*"
+        "./packages/source-msgraph/dist/*"
       ],
       "@ifc-lite/plugin-api/*": [
-        "packages/plugin-api/dist/*"
+        "./packages/plugin-api/dist/*"
       ]
     }
   },

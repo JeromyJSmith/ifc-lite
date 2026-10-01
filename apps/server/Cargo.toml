@@ -47,7 +47,7 @@ ifc-lite-geometry = { path = "../../rust/geometry", default-features = false }
 ifc-lite-processing = { path = "../../rust/processing", features = ["observability"] }
 
 # Parallelism
-rayon = "1.10"
+rayon = "1.12"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -77,18 +77,18 @@ anyhow = "1.0"
 rustc-hash = "2.1"
 
 # CPU count
-num_cpus = "1.16"
+num_cpus = "1.17"
 
 # Parquet/Arrow for efficient binary serialization
-arrow = { version = "59", default-features = false, features = ["ipc"] }
-parquet = { version = "59", default-features = false, features = ["arrow", "snap", "zstd", "lz4"] }
-bytes = "1.5"
+arrow = { version = "60", default-features = false, features = ["ipc"] }
+parquet = { version = "60", default-features = false, features = ["arrow", "snap", "zstd", "lz4"] }
+bytes = "1.12"
 
 # Compression/decompression
-flate2 = "1.0"
+flate2 = "1.1"
 # .ifcZIP container unwrapping (issue #1494). Same crate/features as
 # rust/export; DEFLATE + store cover every real buildingSMART container.
-zip = { version = "8", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.0-pre3", default-features = false, features = ["deflate"] }
 
 # Base64 encoding for SSE payloads
 base64 = "0.23"
