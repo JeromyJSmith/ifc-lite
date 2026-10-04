@@ -127,14 +127,17 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v5
         with:
           python-version: "3.12"
-      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 22
+          node-version: 26
       - name: Fetch fixture corpus
         run: |
-          pnpm install --frozen-lockfile --ignore-scripts
-          pnpm fixtures
+          bun install --frozen-lockfile --ignore-scripts
+          bun run fixtures
       - name: Install pinned reference engine + ifclite wheel
         run: |
           pip install -r tools/ifcopenshell_reference/requirements.lock maturin

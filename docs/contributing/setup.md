@@ -8,8 +8,8 @@ Guide to setting up a development environment for IFClite.
 
 | Tool | Version | Purpose |
 |------|---------|---------|
-| Node.js | 22.x | JavaScript runtime (`engines` in `package.json`) |
-| pnpm | 10.x (8.0+ minimum) | Package manager (pinned via `packageManager: pnpm@10.8.1`) |
+| Node.js | >=26 | JavaScript runtime (`engines` in `package.json`) |
+| Bun | 1.4.2 | Package manager (pinned via `packageManager: bun@1.4.2`) |
 | Rust | pinned nightly | WASM compilation; `rust-toolchain.toml` pins the nightly channel and the `wasm32-unknown-unknown` target, and rustup installs both automatically on first use in the repo |
 | wasm-pack | 0.12+ | WASM toolchain (only needed to rebuild WASM; see `pnpm build:wasm:fetch` below) |
 
@@ -19,10 +19,10 @@ Guide to setting up a development environment for IFClite.
 
     ```bash
     # Install Node.js via Homebrew
-    brew install node@22
+    brew install node@26
 
-    # Install pnpm
-    npm install -g pnpm
+    # Install Bun (package manager, bun@1.4.2)
+    curl -fsSL https://bun.sh/install | bash
 
     # Install Rust (rustup reads rust-toolchain.toml and installs the
     # pinned nightly plus the wasm32-unknown-unknown target automatically)
@@ -36,11 +36,11 @@ Guide to setting up a development environment for IFClite.
 
     ```bash
     # Install Node.js (Ubuntu/Debian)
-    curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+    curl -fsSL https://deb.nodesource.com/setup_26.x | sudo -E bash -
     sudo apt-get install -y nodejs
 
-    # Install pnpm
-    npm install -g pnpm
+    # Install Bun (package manager, bun@1.4.2)
+    curl -fsSL https://bun.sh/install | bash
 
     # Install Rust (rustup reads rust-toolchain.toml and installs the
     # pinned nightly plus the wasm32-unknown-unknown target automatically)
@@ -55,10 +55,10 @@ Guide to setting up a development environment for IFClite.
 
     ```powershell
     # Install Node.js via winget
-    winget install OpenJS.NodeJS.LTS
+    winget install OpenJS.NodeJS
 
-    # Install pnpm
-    npm install -g pnpm
+    # Install Bun (package manager, bun@1.4.2)
+    powershell -c "irm bun.sh/install.ps1 | iex"
 
     # Install Rust via rustup-init.exe (download from https://rustup.rs).
     # rustup reads rust-toolchain.toml and installs the pinned nightly
@@ -90,7 +90,7 @@ even if you have Git LFS on your machine. (If a later push fails with
 ### 2. Install Dependencies
 
 ```bash
-pnpm install
+bun install
 ```
 
 ### 3. Fetch Test Fixtures
@@ -314,7 +314,7 @@ pnpm build:wasm
 ```bash
 # Clean install (keep pnpm-lock.yaml; it is the source of truth)
 rm -rf node_modules
-pnpm install
+bun install
 ```
 
 ### TypeScript Errors

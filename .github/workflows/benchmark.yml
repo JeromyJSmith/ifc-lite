@@ -32,8 +32,7 @@ on:
       - 'scripts/build-wasm.sh'
       - 'scripts/check-benchmark-regression.js'
       - 'scripts/update-benchmark-baseline.mjs'
-      - 'pnpm-lock.yaml'
-      - 'pnpm-workspace.yaml'
+      - 'bun.lock'
       - 'turbo.json'
       - 'package.json'
       - 'playwright.config.ts'
@@ -81,14 +80,15 @@ jobs:
         id: wasm
         run: echo "eligible=$(bash scripts/ci-wasm-prebuilt-eligible.sh)" >> "$GITHUB_OUTPUT"
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
 
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 22
-          cache: pnpm
+          node-version: 26
 
       - name: Setup WASM build toolchain
         if: steps.wasm.outputs.eligible != 'true'
@@ -97,7 +97,7 @@ jobs:
           cache-prefix: benchmark
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: bun install --frozen-lockfile
 
       - name: Fetch prebuilt WASM
         if: steps.wasm.outputs.eligible == 'true'
@@ -130,7 +130,7 @@ jobs:
       # Production build: `vite preview` (the benchmark's webServer) serves
       # apps/viewer/dist. Turbo builds the workspace deps it needs.
       - name: Build viewer app
-        run: pnpm turbo build --filter=@ifc-lite/viewer
+        run: bun x turbo build --filter=@ifc-lite/viewer
 
       # benchmark:check reads every viewer-*.json in the results dir, so make
       # sure only this run's output is present (results are gitignored run
@@ -147,7 +147,7 @@ jobs:
           VIEWER_BENCHMARK_BUILD_MODE: 'production'
           # Divert the json reporter to a file so the step log stays readable.
           PLAYWRIGHT_JSON_OUTPUT_NAME: ${{ runner.temp }}/playwright-benchmark.json
-        run: pnpm test:benchmark:viewer:ci
+        run: bun run test:benchmark:viewer:ci
 
       - name: Check against baseline (advisory)
         run: |

@@ -71,11 +71,10 @@ jobs:
           # Both must be PAT-authored for the pull_request event to fire.
           token: ${{ secrets.RELEASE_PAT }}
 
-      - name: Setup pnpm
-        # v6 reads the version from the `packageManager` field in
-        # package.json (`pnpm@10.8.1`); specifying `with.version` here
-        # would conflict and the action errors with ERR_PNPM_BAD_PM_VERSION.
-        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
 
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -88,7 +87,7 @@ jobs:
           # deps mid-install — `Cannot find module 'promise-retry'` from
           # @npmcli/arborist/lib/arborist/rebuild.js. Node 24 sidesteps
           # the self-upgrade entirely.
-          node-version: 24
+          node-version: 26
           registry-url: 'https://registry.npmjs.org'
 
       # rust-toolchain.toml pins nightly-2025-11-15 + wasm32-unknown-unknown.
@@ -106,7 +105,7 @@ jobs:
           cache-prefix: release
 
       - name: Install Dependencies
-        run: pnpm install --frozen-lockfile
+        run: bun install --frozen-lockfile
 
       # Cache + fetch fixtures so cross-package tests that load
       # tests/models/ifc5/*.ifcx (pointcloud, export, ifcx) can run.
@@ -124,10 +123,10 @@ jobs:
 
       - name: Fetch fixtures
         if: steps.fixtures-cache.outputs.cache-hit != 'true'
-        run: pnpm fixtures
+        run: bun run fixtures
 
       - name: Verify fixtures
-        run: pnpm fixtures:check
+        run: bun run fixtures:check
 
       # Build the publishable artifacts. Typecheck / ESM-resolution /
       # unit tests are NOT re-run here: branch protection requires
@@ -136,7 +135,7 @@ jobs:
       # already passed all of them. Repeating them would add ~8 min
       # per release without changing the verdict.
       - name: Build Packages
-        run: pnpm build
+        run: bun run build
 
       # Exchange the workflow's OIDC ID-token for a short-lived (30-minute)
       # crates.io access token. A Trusted Publisher must be configured on
@@ -151,7 +150,7 @@ jobs:
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
 
       # Read the release state BEFORE `changesets/action` runs. That step invokes
-      # `pnpm run version` when changesets are pending, which CONSUMES
+      # `bun run version` when changesets are pending, which CONSUMES
       # `.changeset/*.md` and bumps `package.json` in this same working tree. A
       # gate reading either of those afterwards sees "no changesets pending" and
       # the NEW, not-yet-released version — and would tag a version whose
@@ -175,8 +174,8 @@ jobs:
           # no publish script, and it would report success having published
           # nothing. A release that goes green and ships nothing is worse
           # than one that fails, so these names are load-bearing.
-          version-script: pnpm run version
-          publish-script: pnpm run release
+          version-script: bun run version
+          publish-script: bun run release
           commit-message: 'chore: version packages'
           pr-title: 'chore: version packages'
           # Also moved: v2 reads the token from this INPUT and no longer from
@@ -386,16 +385,15 @@ jobs:
           lfs: false
           persist-credentials: false
 
-      - name: Setup pnpm
-        # v6 reads the version from the `packageManager` field in
-        # package.json (`pnpm@10.8.1`); specifying `with.version` here
-        # would conflict and the action errors with ERR_PNPM_BAD_PM_VERSION.
-        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
 
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 22
+          node-version: 26
           registry-url: 'https://registry.npmjs.org'
 
       - name: Verify all packages on npm

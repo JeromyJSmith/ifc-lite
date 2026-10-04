@@ -103,7 +103,7 @@ jobs:
               - 'packages/**'
               - 'tests/e2e/**'
               - 'playwright.config.ts'
-              # The relay handlers and their tests. `pnpm test:api` runs in this
+              # The relay handlers and their tests. `bun run test:api` runs in this
               # job, so without these a PR touching ONLY the relay skips the one
               # lane that exercises its allowlists - the guard would exist and
               # never fire, which is the failure this filter block already warns
@@ -120,8 +120,7 @@ jobs:
               # skip the job that checks it (issue #2619).
               - '.github/workflows/server-binaries.yml'
               - 'package.json'
-              - 'pnpm-lock.yaml'
-              - 'pnpm-workspace.yaml'
+              - 'bun.lock'
               - 'turbo.json'
               - 'tsconfig*.json'
               - 'scripts/**'
@@ -187,17 +186,15 @@ jobs:
           lfs: false
           persist-credentials: false
 
-      - name: Setup pnpm
-        # v6 reads the version from the `packageManager` field in
-        # package.json (`pnpm@10.8.1`); specifying `with.version` here
-        # would conflict and the action errors with ERR_PNPM_BAD_PM_VERSION.
-        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
 
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 22
-          cache: pnpm
+          node-version: 26
 
       # Rust + wasm-pack for the wasm32 build (pure-Rust CSG kernel — no
       # C++ toolchain needed since M9). Single-sourced in
@@ -212,7 +209,7 @@ jobs:
           cache-prefix: ci-build
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: bun install --frozen-lockfile
 
       # Fast path: drop the published bundle into packages/wasm/pkg/ so the
       # from-source `Build WASM` step below soft-skips (wasm-pack absent +
@@ -247,10 +244,10 @@ jobs:
 
       - name: Fetch fixtures
         if: steps.fixtures-cache.outputs.cache-hit != 'true'
-        run: pnpm fixtures
+        run: bun run fixtures
 
       - name: Verify fixtures
-        run: pnpm fixtures:check
+        run: bun run fixtures:check
 
       # Rebuild the wasm bindings from rust/wasm-bindings/ on every run. The
       # runtime (ifc-lite_bg.wasm / ifc-lite.js) is gitignored and rebuilt here
@@ -286,14 +283,14 @@ jobs:
       # Build all workspace packages so their dist/ artifacts exist for
       # downstream consumers — turbo handles the dep graph.
       - name: Build packages
-        run: pnpm build
+        run: bun run build
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: build-output
           # `packages/*/pkg` covers `wasm/pkg`, which downstream
-          # `pnpm build` calls require.
+          # `bun run build` calls require.
           path: |
             packages/*/dist
             packages/*/wasm
@@ -313,18 +310,20 @@ jobs:
         with:
           lfs: false
           persist-credentials: false
-      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 22
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
+          node-version: 26
+      - run: bun install --frozen-lockfile
       - name: Download build artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: build-output
           path: packages
-      - run: pnpm typecheck
+      - run: bun run typecheck
 
   lint:
     name: Lint
@@ -343,12 +342,14 @@ jobs:
         with:
           lfs: false
           persist-credentials: false
-      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 22
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
+          node-version: 26
+      - run: bun install --frozen-lockfile
       # The unused-locals ratchet runs `tsc` per package, and a package resolves
       # its workspace siblings through their built `dist` types — without the
       # artifact every dependent package fails to compile, reads as
@@ -359,7 +360,7 @@ jobs:
         with:
           name: build-output
           path: packages
-      - run: pnpm lint
+      - run: bun run lint
 
   node-tests:
     name: Node tests
@@ -376,12 +377,14 @@ jobs:
         with:
           lfs: false
           persist-credentials: false
-      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 22
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
+          node-version: 26
+      - run: bun install --frozen-lockfile
       - name: Download build artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -395,7 +398,7 @@ jobs:
           key: ci-fixtures-${{ runner.os }}-${{ hashFiles('tests/models/manifest.json') }}
       - name: Fetch fixtures
         if: steps.fixtures-cache.outputs.cache-hit != 'true'
-        run: pnpm fixtures
+        run: bun run fixtures
       - name: Check test wiring
         run: node scripts/check-test-wiring.mjs
       # typecheck-tests.mjs writes the `extends` of every generated test
@@ -546,13 +549,10 @@ jobs:
       # schema NAMES resolves — a `tsReturn` of `BimClash.Nope` fails here
       # (#2422). No build needed: the .d.ts is self-contained and the templates
       # import nothing.
-      # Scoped name + `--fail-if-no-match`: an unmatched pnpm filter prints
-      # "No projects matched the filters" and exits 0, so a filter that stops
-      # resolving would turn this gate green without running it. That is the
-      # same "cannot fail" shape as the `skipLibCheck` default this step was
-      # already fixed for, so it is closed here rather than left to luck.
+      # Scoped package: `bun run --filter` exits 1 when nothing matches, so a
+      # filter that stops resolving fails this gate instead of skipping it.
       - name: Check sandbox script templates typecheck
-        run: pnpm --filter=@ifc-lite/viewer --fail-if-no-match check:templates
+        run: bun run --filter=@ifc-lite/viewer check:templates
       # Docs upkeep guards (cheap, no build/fixtures needed — the doc-sample
       # typecheck resolves @ifc-lite/* to each package's src via tsconfig
       # paths). Keep the docs in lockstep with the code they describe.
@@ -562,22 +562,22 @@ jobs:
         run: node scripts/docs/check-doc-samples.mjs
       - name: Check generated doc sections
         run: node scripts/docs/generate-docs-sections.mjs --check
-      - run: pnpm test
+      - run: bun run test
       - name: Integration tests (parse → quantities → export)
         # Step-scoped timeout: a hung harness must fail fast here, not
         # silently consume the whole job budget.
         timeout-minutes: 5
-        run: pnpm test:integration
+        run: bun run test:integration
       - name: API route tests (relay handlers)
-        # `tests/api/**` was reachable only by running `pnpm test:api` by hand,
+        # `tests/api/**` was reachable only by running `bun run test:api` by hand,
         # so the Dalux relay's path allowlist and node allowlist - the guards
         # that stop an unauthenticated public endpoint becoming an open proxy -
         # existed in the repo but never in the pipeline. A guard no lane invokes
         # is not a gate.
         timeout-minutes: 5
-        run: pnpm test:api
+        run: bun run test:api
       - name: WASM contract tests (real processGeometryBatch boundary)
-        run: pnpm test:wasm-contract
+        run: bun run test:wasm-contract
       # The snap cache reconstructs model edges from the mesher's per-triangle
       # segments, so its correctness depends on geometry the unit fixtures can
       # only imitate. This drives the real wasm pipeline over the committed
@@ -585,7 +585,7 @@ jobs:
       # reported length is the whole run, the cache does not move when triangle
       # emission order does -- the #2388 failure class). Issue #2199.
       - name: Snap edge reconstruction (real wasm pipeline)
-        run: pnpm test:snap-edges
+        run: bun run test:snap-edges
 
   # Functional smoke of the real viewer: real WASM pipeline + WebGPU
   # renderer (swiftshader) + pick pass + section plane, asserted through
@@ -606,12 +606,14 @@ jobs:
         with:
           lfs: false
           persist-credentials: false
-      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 22
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
+          node-version: 26
+      - run: bun install --frozen-lockfile
       - name: Download build artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -625,7 +627,7 @@ jobs:
           key: ci-fixtures-${{ runner.os }}-${{ hashFiles('tests/models/manifest.json') }}
       - name: Fetch fixtures
         if: steps.fixtures-cache.outputs.cache-hit != 'true'
-        run: pnpm fixtures
+        run: bun run fixtures
       # Package dists come from the build artifact; the wasm build
       # soft-skips (no wasm-pack on this runner) and reuses the artifact
       # runtime, so this is just the vite build of the app.
@@ -635,7 +637,7 @@ jobs:
       # white screen reached users through Vercel, and a CI-only gate does not
       # run there: vercel-build.sh -> turbo build --filter -> this same script.
       - name: Build viewer app (also runs the __tla chunk-await guard)
-        run: pnpm turbo build --filter=@ifc-lite/viewer
+        run: bun x turbo build --filter=@ifc-lite/viewer
       # No browser download: the CI project uses channel:'chrome' (the
       # runner's preinstalled Chrome) because Playwright's headless
       # shell has a broken WebGPU device under software rendering.
@@ -644,12 +646,12 @@ jobs:
         # unstable under load (drops mid-upload), so GPU-dependent
         # assertions (pick pass, screenshot density, GPU-error
         # strictness) skip here and run in the local headed project
-        # (pnpm test:e2e). The CPU-side pipeline assertions — mesh
+        # (bun run test:e2e). The CPU-side pipeline assertions — mesh
         # count through real WASM, data-store population, model
         # registration, section-plane store contract — still gate.
         env:
           E2E_GPU_STRICT: '0'
-        run: pnpm test:e2e:ci
+        run: bun run test:e2e:ci
 
   rust-tests:
     name: Rust tests
@@ -682,7 +684,7 @@ jobs:
       - name: Fetch fixtures
         if: steps.fixtures-cache.outputs.cache-hit != 'true'
         # The fixtures script is pure Node (no npm deps) so we skip the
-        # pnpm install dance Rust-only jobs don't need.
+        # bun install dance Rust-only jobs don't need.
         run: node scripts/fixtures/fetch-fixtures.mjs
       # Cheap (resolve only, no compile) and it catches a failure mode that
       # otherwise stays invisible for weeks: a release bumps the manifests but
@@ -794,15 +796,17 @@ jobs:
         with:
           lfs: false
           persist-credentials: false
-      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 22
-          cache: pnpm
+          node-version: 26
       # The scalar codemod imports the repo's own pinned typescript package;
       # printer output is only byte-stable against that exact version, so the
       # gate resolves it from the lockfile like every other node job.
-      - run: pnpm install --frozen-lockfile
+      - run: bun install --frozen-lockfile
       - name: Setup .NET 9 SDK
         uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
@@ -840,12 +844,14 @@ jobs:
         with:
           lfs: false
           persist-credentials: false
-      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 22
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
+          node-version: 26
+      - run: bun install --frozen-lockfile
       - name: Check package READMEs
         run: node scripts/docs/check-package-readmes.mjs
       - name: Check doc code samples

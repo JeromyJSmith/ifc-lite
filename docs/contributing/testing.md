@@ -457,7 +457,7 @@ pnpm test:benchmark:viewer
 
 ### GitHub Actions
 
-The PR gate lives in `.github/workflows/test.yml`. It runs on Node 22 with
+The PR gate lives in `.github/workflows/test.yml`. It runs on Node >=26 with
 the Rust toolchain pinned by `rust-toolchain.toml`, and covers:
 
 - WASM build (or a prebuilt-bundle fast path when no Rust code changed)

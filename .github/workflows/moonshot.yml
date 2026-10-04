@@ -162,10 +162,10 @@ jobs:
           lfs: false
           persist-credentials: false
 
-      - name: Setup pnpm
-        # v6 reads the version from package.json's `packageManager` field;
-        # passing `with.version` here would error with ERR_PNPM_BAD_PM_VERSION.
-        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
 
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -178,8 +178,7 @@ jobs:
           # for a reason that is not a kernel regression. The golden was blessed
           # on v22.14.0; re-blessing is a deliberate act (assert-b35-golden.mjs
           # --update), so the runtime that produces it is pinned too.
-          node-version: 22.14.0
-          cache: pnpm
+          node-version: 26
 
       # Rust nightly (pinned by rust-toolchain.toml) + wasm-pack + cargo cache,
       # single-sourced with test.yml / release.yml / sdk-canary.yml /
@@ -190,7 +189,7 @@ jobs:
           cache-prefix: ci-moonshot
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: bun install --frozen-lockfile
 
       # Built from source on purpose -- no prebuilt fast path here. A published
       # bundle would defeat the entire lane: the point is to catch a kernel
@@ -202,11 +201,11 @@ jobs:
       # The demos import sibling packages' built `dist/` by relative path
       # (@ifc-lite/cli, clash, create, data, encoding, geometry, provenance,
       # query and their transitive deps). Filtered rather than a bare
-      # `pnpm build` so the viewer/landing/embed bundles -- which nothing here
+      # `bun run build` so the viewer/landing/embed bundles -- which nothing here
       # imports -- are never built: 28 turbo tasks instead of 40.
       - name: Build workspace packages the exams import
         run: |
-          pnpm turbo build \
+          bun x turbo build \
             --filter=@ifc-lite/cli \
             --filter=@ifc-lite/clash \
             --filter=@ifc-lite/create \
@@ -261,7 +260,7 @@ jobs:
 
       # --- E1: the one thing that already had automated protection ---------
       - name: E1 provenance unit suite (node-hash-v0, certificates, merge battery)
-        run: pnpm --filter @ifc-lite/provenance test
+        run: bun run --filter=@ifc-lite/provenance test
 
       # --- E2: the four gate demos, each asserted on exit code -------------
       # G0 and G1 are the Holter-gated pair; see the FIXTURE GATE note above.
