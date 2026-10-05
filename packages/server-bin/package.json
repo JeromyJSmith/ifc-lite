@@ -16,9 +16,9 @@
     }
   },
   "scripts": {
-    "build": "pnpm exec tsc",
+    "build": "tsc",
     "typecheck": "node ../../scripts/typecheck-tests.mjs",
-    "dev": "pnpm exec tsc --watch",
+    "dev": "tsc --watch",
     "test": "vitest run",
     "start": "node dist/cli.js",
     "postinstall": "node -e \"import('./dist/postinstall.js').catch(() => {})\" || true"

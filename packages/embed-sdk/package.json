@@ -13,9 +13,9 @@
     }
   },
   "scripts": {
-    "build": "pnpm exec tsc",
+    "build": "tsc",
     "typecheck": "node ../../scripts/typecheck-tests.mjs",
-    "dev": "pnpm exec tsc --watch",
+    "dev": "tsc --watch",
     "test": "vitest run"
   },
   "dependencies": {
