@@ -726,3 +726,47 @@ describe('clashCommand GeometryProcessor disposal (#1959 P2 leak)', () => {
     }
   }, 30_000);
 });
+
+
+describe('clash --time-budget', () => {
+  beforeAll(() => {
+    assertBuildArtifactsAvailable(CLI_ENTRY, WASM_RUNTIME);
+  });
+
+  it('stops with one JSON error document and exit 1 when the budget runs out, and never prints a clash list', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'ifc-lite-clash-budget-'));
+    const modelPath = join(dir, 'model.ifc');
+    try {
+      await writeFile(modelPath, buildClashModel());
+      const failure = await execFileAsync(
+        process.execPath,
+        [CLI_ENTRY, 'clash', modelPath, '--json', '--time-budget', '0.000000001'],
+        { timeout: 120_000, maxBuffer: 64 * 1024 * 1024 },
+      ).then(() => null, (e: { code: number; stdout: string }) => e);
+      expect(failure).not.toBeNull();
+      expect(failure!.code).toBe(1);
+      const payload = JSON.parse(failure!.stdout) as { error: { code: string; budgetMs: number; elapsedMs: number; rule: string }; clashes?: unknown };
+      expect(payload.error.code).toBe('TIME_BUDGET_EXCEEDED');
+      expect(payload.error.budgetMs).toBeCloseTo(1e-6, 9);
+      expect(typeof payload.error.rule).toBe('string');
+      expect(payload.clashes).toBeUndefined();
+
+      // a budget the run fits changes nothing
+      const { stdout } = await execFileAsync(
+        process.execPath,
+        [CLI_ENTRY, 'clash', modelPath, '--json', '--time-budget', '100'],
+        { timeout: 120_000, maxBuffer: 64 * 1024 * 1024 },
+      );
+      const ok = JSON.parse(stdout) as { summary: { total: number }; error?: unknown };
+      expect(ok.error).toBeUndefined();
+      expect(ok.summary.total).toBeGreaterThan(0);
+
+      const refused = await execFileAsync(process.execPath, [CLI_ENTRY, 'clash', modelPath, '--time-budget', '0'], { timeout: 60_000 })
+        .then(() => null, (e: { code: number; stderr: string }) => e);
+      expect(refused!.code).toBe(1);
+      expect(refused!.stderr).toContain('--time-budget must be a positive number of seconds');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 180_000);
+});

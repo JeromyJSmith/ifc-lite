@@ -639,6 +639,7 @@ ifc-lite clash model.ifc --matrix --csv clashes.csv
 | `--group <g>` | BCF topic grouping: `cluster` (default), `rule`, `typePair`, `element` |
 | `--bcf-status <s>` | Topic status for exported BCF topics |
 | `--max-topics <N>` | Cap the number of BCF topics |
+| `--time-budget <s>` | Wall-clock budget in seconds. Past it the run stops with an error naming the element pair it was measuring (exit 1; with `--json`, one `{ "error": { "code": "TIME_BUDGET_EXCEEDED", … } }` document). It never prints a partial clash list. |
 | `--csv <file>` | Write every clash as one row of an RFC 4180 CSV table: `ClashId, Rule, Status, Severity, Review, ReviewComment, ReviewUpdatedAt, GlobalIdA, GlobalIdB, KeyA, KeyB, ModelA, ModelB, TypeA, TypeB, NameA, NameB, StoreyA, StoreyB, PointX, PointY, PointZ, Distance, DistanceKind, Group`. Uncapped (the `--json` limit is a display cap); `GlobalId*` is empty for an element without an IfcGUID while `Key*` always carries the run's durable key |
 | `--json` | JSON output (stdout carries exactly one JSON document; progress and geometry diagnostics go to stderr) |
 

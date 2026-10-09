@@ -21,6 +21,7 @@ import { GeometryProcessor, type CoordinateInfo, type MeshData } from '@ifc-lite
 import { renderFrameWorldOffset } from '@ifc-lite/geometry/world-frame';
 import type { IfcDataStore } from '@ifc-lite/parser';
 import {
+  ClashTimeBudgetExceededError,
   createClashEngine,
   groupClashes,
   isClusterGroupingIneffective,
@@ -240,6 +241,9 @@ export async function clashCommand(args: string[]): Promise<void> {
   const mode = parseMode(getFlag(args, '--mode'));
   const tolerance = parseNumberFlag(getFlag(args, '--tolerance'), '--tolerance');
   const clearance = parseNumberFlag(getFlag(args, '--clearance'), '--clearance');
+  // Seconds; the run stops with an error past it (one very dense pair can otherwise hold the process for minutes).
+  const timeBudgetS = parseNumberFlag(getFlag(args, '--time-budget'), '--time-budget');
+  if (timeBudgetS !== undefined && !(timeBudgetS > 0)) fatal('--time-budget must be a positive number of seconds');
   const bcfPath = getFlag(args, '--bcf');
   const csvPath = getFlag(args, '--csv');
   // `ifc-lite clash --csv model.ifc` (input path forgotten) selects `model.ifc`
@@ -275,12 +279,33 @@ export async function clashCommand(args: string[]): Promise<void> {
     const result = await engine.run(elements, rules, {
       exclusions,
       tolerance,
+      ...(timeBudgetS !== undefined ? { timeBudgetMs: timeBudgetS * 1000 } : {}),
       onProgress: (p) => {
         if (!jsonOutput) {
           process.stderr.write(`\r  Clashing: ${p.phase} ${p.rule} (${p.done}/${p.total})`);
         }
       },
+    }).catch((error: unknown) => {
+      if (!(error instanceof ClashTimeBudgetExceededError)) throw error;
+      // No partial result: a short clash list would read as a clean model.
+      if (jsonOutput) {
+        printJson({
+          error: {
+            code: 'TIME_BUDGET_EXCEEDED',
+            message: error.message,
+            budgetMs: error.budgetMs,
+            elapsedMs: Math.round(error.elapsedMs),
+            rule: error.progress.rule ?? null,
+            pair: error.progress.pair ?? null,
+            triangles: error.progress.triangles ?? null,
+          },
+        });
+        process.exitCode = 1;
+        return null;
+      }
+      return fatal(error.message);
     });
+    if (result === null) return;
     if (!jsonOutput) process.stderr.write('\n');
 
     if (bcfPath) {

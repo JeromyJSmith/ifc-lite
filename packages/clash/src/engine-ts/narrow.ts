@@ -9,6 +9,7 @@ import { triTriIntersect } from '../math/triangle-intersect.js';
 import { triTriDistance } from '../math/triangle-distance.js';
 import type { TriMesh } from './tri-mesh.js';
 import { boxPenetration, clearlyInside, containedSolidIsBuried, crossingVertexPenetration, depthClashResult, type VertexPenetration } from './depth.js';
+import type { ClashDeadline } from './kernel.js';
 
 export interface NarrowResult {
   status: ClashStatus;
@@ -53,6 +54,7 @@ export function testPair(
   triB: TriMesh,
   rule: ClashRule,
   tolerance: number,
+  deadline?: ClashDeadline,
 ): NarrowResult | null {
   const margin = Math.max(tolerance, rule.clearance ?? 0);
 
@@ -95,12 +97,23 @@ export function testPair(
   let closestA: Vec3 = elA.bounds.min as Vec3;
   let closestB: Vec3 = elB.bounds.min as Vec3;
 
+  let budgetWork = 0;
   for (let ts = 0; ts < small.count; ts += 1) {
+    // The only place one long pair can be stopped (`ClashSettings.timeBudgetMs`):
+    // a clock read every 256 triangles of the smaller mesh and, because one
+    // triangle can have a whole dense mesh within the margin, every 4096
+    // triangle pairs below.
+    if (deadline !== undefined && (ts & 0xff) === 0) {
+      deadline.check({ pair: [elA.key, elB.key], triangles: [triA.count, triB.count] });
+    }
     const sb = small.triBounds(ts);
     const hits = large.queryTris(inflate(sb, margin));
     if (hits.length === 0) continue;
     const [s0, s1, s2] = small.tri(ts);
     for (const tl of hits) {
+      if (deadline !== undefined && ((budgetWork += 1) & 0xfff) === 0) {
+        deadline.check({ pair: [elA.key, elB.key], triangles: [triA.count, triB.count] });
+      }
       const [l0, l1, l2] = large.tri(tl);
       if (triTriIntersect(s0, s1, s2, l0, l1, l2)) {
         intersects = true;

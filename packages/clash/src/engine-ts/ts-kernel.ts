@@ -6,7 +6,7 @@ import type { ClashElement } from '../types.js';
 import { candidatePairs } from './broad.js';
 import { testPair } from './narrow.js';
 import { TriMesh } from './tri-mesh.js';
-import type { ClashKernel, NarrowRecord, RuleDetection } from './kernel.js';
+import type { ClashDeadline, ClashKernel, NarrowRecord, RuleDetection } from './kernel.js';
 
 /**
  * Pure-TypeScript geometry kernel: spatial BVH broad phase + exact
@@ -47,6 +47,7 @@ export class TsKernel implements ClashKernel {
     maxPairs: number,
     signal?: AbortSignal,
     onProgress?: (done: number, total: number) => void,
+    deadline?: ClashDeadline,
   ): Promise<RuleDetection> {
     const groupA = groupAIdx.map((i) => elements[i]);
     const groupB = groupBIdx ? groupBIdx.map((i) => elements[i]) : null;
@@ -97,6 +98,7 @@ export class TsKernel implements ClashKernel {
       // before ever looking at the signal.
       if ((processed & 0xff) === 0) {
         if (signal?.aborted) throw abortError();
+        deadline?.check();
         // `>=`, not `>`: `yieldMs: 0` means "yield at every checkpoint", and
         // with a strict comparison it would mean the opposite the moment the
         // clock did not advance between two checkpoints — which is the common
@@ -122,7 +124,7 @@ export class TsKernel implements ClashKernel {
       processed += 1;
       const elA = groupA[i];
       const elB = resolveB[j];
-      const res = testPair(elA, this.triFor(elA), elB, this.triFor(elB), rule, tolerance);
+      const res = testPair(elA, this.triFor(elA), elB, this.triFor(elB), rule, tolerance, deadline);
       if (!res) continue;
       records.push({
         a: groupAIdx[i],

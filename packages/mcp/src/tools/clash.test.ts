@@ -21,7 +21,7 @@ import type { ToolContext } from '../context.js';
 import { DEFAULT_CONFIG, InMemoryModelRegistry, NOOP_PROGRESS, SILENT_LOGGER } from '../context.js';
 import { fullScope } from '../auth/scope.js';
 import { loadIfcModel } from '../loader.js';
-import { clashTools, displayClash } from './clash.js';
+import { clashTools, DEFAULT_CLASH_TIME_BUDGET_S, displayClash } from './clash.js';
 
 const SAMPLE = `ISO-10303-21;
 HEADER;
@@ -168,5 +168,56 @@ describe('meshModel WASM disposal (#1959 P1 leak)', () => {
     await expect(clashCheck(context, id)).rejects.toThrow('Clash run cancelled before meshing.');
     expect(processSpy).not.toHaveBeenCalled();
     expect(disposeSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+
+describe('clash_check rule coverage and time budget', () => {
+  const twoWalls: MeshData[] = [oneTriangle, { ...oneTriangle, positions: new Float32Array([0, 0, 0.05, 1, 0, 0.05, 0, 1, 0.05]) }];
+
+  async function check(input: Record<string, unknown>) {
+    vi.spyOn(GeometryProcessor.prototype, 'init').mockResolvedValue(undefined);
+    vi.spyOn(GeometryProcessor.prototype, 'process').mockResolvedValue({ meshes: twoWalls } as unknown as GeometryResult);
+    vi.spyOn(GeometryProcessor.prototype, 'dispose').mockReturnValue(undefined);
+    const { context, id } = await loadedModel();
+    const tool = clashTools.find((t) => t.name === 'clash_check')!;
+    return tool.handler({ model_id: id, ...input }, context);
+  }
+
+  it('says a selector matched nothing instead of reporting a clean model', async () => {
+    const result = await check({ a: 'IfcPavement*', b: 'IfcWall*', mode: 'clearance', clearance: 0.5 });
+    const body = result.structuredContent as { summary: { total: number }; ruleCoverageOutcome: string; ruleCoverage: Array<{ rule: string; matchedA: number; matchedB: number }> };
+    expect(body.summary.total).toBe(0);
+    expect(body.ruleCoverageOutcome).toBe('no-match');
+    expect(body.ruleCoverage).toHaveLength(1);
+    expect(body.ruleCoverage[0]).toMatchObject({ rule: 'clash_check', matchedA: 0 });
+    expect(body.ruleCoverage[0].matchedB).toBeGreaterThan(0);
+    expect(JSON.stringify(result.content)).toContain('NO RULE MATCHED ANY ELEMENT');
+  });
+
+  it('reports the matched counts of a rule that did compare elements', async () => {
+    const result = await check({ a: 'IfcWall*' });
+    const body = result.structuredContent as { ruleCoverageOutcome: string; ruleCoverage: Array<{ matchedA: number }> };
+    expect(body.ruleCoverageOutcome).toBe('clean');
+    expect(body.ruleCoverage[0].matchedA).toBeGreaterThan(0);
+    expect(JSON.stringify(result.content)).not.toContain('NO RULE MATCHED');
+  });
+
+  it('declares time_budget_s with a default and refuses a value that is not a positive number', async () => {
+    for (const name of ['clash_check', 'clash_matrix']) {
+      const schema = clashTools.find((t) => t.name === name)!.inputSchema as { properties: Record<string, { default?: number }> };
+      expect(schema.properties.time_budget_s.default).toBe(DEFAULT_CLASH_TIME_BUDGET_S);
+    }
+    expect(DEFAULT_CLASH_TIME_BUDGET_S).toBe(120);
+    for (const bad of [0, -5, 'soon']) {
+      await expect(check({ time_budget_s: bad })).rejects.toMatchObject({ code: 'INVALID_INPUT' });
+    }
+  });
+
+  it('answers with an error, not a partial list, when the budget runs out', async () => {
+    await expect(check({ a: 'IfcWall*', time_budget_s: 1e-12 })).rejects.toMatchObject({
+      code: 'UNSUPPORTED_OPERATION',
+      message: expect.stringContaining('exceeded its time budget'),
+    });
   });
 });

@@ -132,7 +132,55 @@ export interface ClashSettings {
    * so there it takes effect between rules.)
    */
   signal?: AbortSignal;
+  /**
+   * Wall-clock budget for the whole run, in milliseconds. Past it the run
+   * rejects with a {@link ClashTimeBudgetExceededError} naming the rule and,
+   * when one pair was being measured, that pair.
+   *
+   * This is the bound `signal` cannot give: an abort raised from a timer is
+   * only observed between candidate pairs, and one pair of two very dense
+   * meshes (two 213,253-triangle objects in a real planting model) holds the
+   * thread for minutes without returning to the event loop. The TS backend
+   * reads the clock INSIDE a pair, every 256 triangles of the smaller mesh, so
+   * such a pair stops within a fraction of a second of the deadline. A run
+   * that exceeds its budget never returns a partial result: a short clash list
+   * would read as a clean model.
+   *
+   * (The WASM backend runs a whole rule inside one Rust call; there the budget
+   * is checked between rules.) Unset, zero or negative: no budget.
+   */
+  timeBudgetMs?: number;
   onProgress?: (p: ClashProgress) => void;
+}
+
+/** Where a run was when its {@link ClashSettings.timeBudgetMs} ran out. */
+export interface ClashTimeBudgetProgress {
+  /** Id of the rule being evaluated. */
+  rule?: string;
+  /** Durable keys of the element pair being measured, when inside one. */
+  pair?: [string, string];
+  /** Triangle counts of that pair's meshes. */
+  triangles?: [number, number];
+}
+
+/** Rejection of a run that exceeded {@link ClashSettings.timeBudgetMs}. */
+export class ClashTimeBudgetExceededError extends Error {
+  constructor(
+    public readonly budgetMs: number,
+    public readonly elapsedMs: number,
+    public readonly progress: ClashTimeBudgetProgress = {},
+  ) {
+    const where = progress.pair
+      ? ` while measuring ${progress.pair[0]} against ${progress.pair[1]}` +
+        (progress.triangles ? ` (${progress.triangles[0]} x ${progress.triangles[1]} triangles)` : '')
+      : '';
+    super(
+      `Clash run exceeded its time budget of ${budgetMs} ms after ${Math.round(elapsedMs)} ms` +
+        (progress.rule ? ` in rule "${progress.rule}"` : '') + where +
+        '. No result is returned: narrow the selectors or raise the budget.',
+    );
+    this.name = 'ClashTimeBudgetExceededError';
+  }
 }
 
 /**

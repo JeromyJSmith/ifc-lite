@@ -22,6 +22,8 @@
 import { readFile } from 'node:fs/promises';
 import { GeometryProcessor, type MeshData } from '@ifc-lite/geometry';
 import {
+  ClashTimeBudgetExceededError,
+  classifyRuleCoverage,
   createClashEngine,
   disciplineMatrixRules,
   sortClashes,
@@ -98,18 +100,64 @@ async function withIfcBytes<T>(m: LoadedModel, fn: (bytes: Uint8Array) => Promis
   });
 }
 
+/** Seconds a clash tool may run before it answers with an error instead of holding the session. */
+export const DEFAULT_CLASH_TIME_BUDGET_S = 120;
+
+const TIME_BUDGET_SCHEMA = {
+  type: 'number',
+  exclusiveMinimum: 0,
+  default: DEFAULT_CLASH_TIME_BUDGET_S,
+  description: `Wall-clock budget for the clash run in seconds (default ${DEFAULT_CLASH_TIME_BUDGET_S}). Past it the tool returns an error naming the element pair it was measuring; it never returns a partial clash list.`,
+} as const;
+
+/** The caller's `time_budget_s`, validated. */
+function timeBudgetMs(input: Record<string, unknown>): number {
+  const seconds = input.time_budget_s ?? DEFAULT_CLASH_TIME_BUDGET_S;
+  if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds <= 0) {
+    throw new ToolExecutionError({ code: ToolErrorCode.INVALID_INPUT, message: `time_budget_s must be a positive number of seconds, got ${String(seconds)}` });
+  }
+  return seconds * 1000;
+}
+
+/**
+ * How many elements each side of each rule matched, and what that makes of a
+ * zero: `'no-match'` means no rule compared anything, so `summary.total === 0`
+ * says nothing about the model. The CLI's `--json` has carried the same two
+ * fields; without them an agent read a selector that matched nothing as a
+ * clean model.
+ */
+function coverageOf(result: ClashResult): { ruleCoverageOutcome: string; ruleCoverage: ClashResult['ruleCoverage'] | null; note: string } {
+  const outcome = classifyRuleCoverage(result);
+  const note = outcome === 'no-match'
+    ? ' NO RULE MATCHED ANY ELEMENT: nothing was compared, so this is not a clean result (see ruleCoverage).'
+    : outcome === 'partial'
+      ? ' Some rules matched no elements and compared nothing (see ruleCoverage).'
+      : '';
+  return { ruleCoverageOutcome: outcome, ruleCoverage: result.ruleCoverage ?? null, note };
+}
+
 /** Run a rule set against a model, returning the engine result. */
-async function runRules(m: LoadedModel, rules: ClashRule[], ctx: ToolContext): Promise<ClashResult> {
+async function runRules(m: LoadedModel, rules: ClashRule[], ctx: ToolContext, budgetMs: number): Promise<ClashResult> {
   const meshes = await meshModel(m, ctx);
   const { elements, exclusions } = elementsFromStep({ store: m.store, meshes, modelId: m.id });
   const engine = createClashEngine({ backend: 'ts' });
   return engine.run(elements, rules, {
     exclusions,
     signal: ctx.signal,
+    timeBudgetMs: budgetMs,
     onProgress: (p) => {
       const ratio = p.total > 0 ? p.done / p.total : 0;
       ctx.progress.report(0.2 + ratio * 0.8, `Clash ${p.phase}: ${p.rule} (${p.done}/${p.total})`, 1);
     },
+  }).catch((error: unknown) => {
+    if (error instanceof ClashTimeBudgetExceededError) {
+      throw new ToolExecutionError({
+        code: ToolErrorCode.UNSUPPORTED_OPERATION,
+        message: error.message,
+        hint: 'Narrow selector a / b so the dense pair is not compared, or pass a larger time_budget_s.',
+      });
+    }
+    throw error;
   });
 }
 
@@ -179,6 +227,7 @@ const clashCheck: Tool = {
       mode: { type: 'string', enum: ['hard', 'clearance'], default: 'hard' },
       tolerance: { type: 'number', description: 'Touching band (m). Defaults to the engine tolerance.' },
       clearance: { type: 'number', description: 'Required gap (m) for mode="clearance".' },
+      time_budget_s: TIME_BUDGET_SCHEMA,
     },
     additionalProperties: false,
   },
@@ -203,17 +252,20 @@ const clashCheck: Tool = {
       ...(clearance != null ? { clearance } : {}),
     };
 
-    const result = await runRules(m, [rule], ctx);
+    const result = await runRules(m, [rule], ctx, timeBudgetMs(input));
     const { rows, truncated } = topClashes(result.clashes, CLASH_DISPLAY_CAP);
+    const coverage = coverageOf(result);
 
     const settings = { a, b: b ?? null, mode, tolerance: tolerance ?? null, clearance: clearance ?? null };
     const capNote = truncated
       ? ` Showing top ${truncated.shown} by distance; ${truncated.dropped} more not shown.`
       : '';
     return okResult(
-      `Found ${result.summary.total} clash(es) for ${label} (mode=${mode}).${capNote}`,
+      `Found ${result.summary.total} clash(es) for ${label} (mode=${mode}).${coverage.note}${capNote}`,
       {
         summary: result.summary,
+        ruleCoverageOutcome: coverage.ruleCoverageOutcome,
+        ruleCoverage: coverage.ruleCoverage,
         settings,
         engineSettings: result.settings,
         truncated: result.truncated ?? null,
@@ -237,6 +289,7 @@ const clashMatrix: Tool = {
       model_id: { type: 'string' },
       mode: { type: 'string', enum: ['hard', 'clearance'], default: 'hard' },
       clearance: { type: 'number', description: 'Required gap (m) applied to every matrix rule when mode="clearance". Without it a clearance matrix reports nothing.' },
+      time_budget_s: TIME_BUDGET_SCHEMA,
     },
     additionalProperties: false,
   },
@@ -246,15 +299,18 @@ const clashMatrix: Tool = {
     const clearance = input.clearance as number | undefined;
     const rules = disciplineMatrixRules(mode, clearance);
 
-    const result = await runRules(m, rules, ctx);
+    const result = await runRules(m, rules, ctx, timeBudgetMs(input));
     const { rows, truncated } = topClashes(result.clashes, CLASH_DISPLAY_CAP);
+    const coverage = coverageOf(result);
 
     const capNote = truncated
       ? ` Sampling top ${truncated.shown} by distance; ${truncated.dropped} more not shown.`
       : '';
     return okResult(
-      `Discipline matrix (mode=${mode}, ${rules.length} rules): ${result.summary.total} clash(es).${capNote}`,
+      `Discipline matrix (mode=${mode}, ${rules.length} rules): ${result.summary.total} clash(es).${coverage.note}${capNote}`,
       {
+        ruleCoverageOutcome: coverage.ruleCoverageOutcome,
+        ruleCoverage: coverage.ruleCoverage,
         mode,
         ruleCount: rules.length,
         byRule: result.summary.byRule,

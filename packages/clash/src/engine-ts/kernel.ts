@@ -34,6 +34,15 @@ export interface RuleDetection {
 }
 
 /**
+ * The run's time budget as a kernel sees it: `check` throws
+ * `ClashTimeBudgetExceededError` once the wall clock passes the deadline.
+ * Created by the orchestrator from `ClashSettings.timeBudgetMs`.
+ */
+export interface ClashDeadline {
+  check(progress?: { pair?: [string, string]; triangles?: [number, number] }): void;
+}
+
+/**
  * The geometry backend: broad phase + narrow phase for one rule. Implementations
  * must be interchangeable — given the same elements and rule they produce the
  * same records (modulo floating-point), which is what the differential test
@@ -69,6 +78,8 @@ export interface ClashKernel {
      * so a long run on the main thread stays responsive and can paint progress.
      */
     onProgress?: (done: number, total: number) => void,
+    /** The run's time budget; the TS kernel checks it between pairs and inside one. */
+    deadline?: ClashDeadline,
   ): RuleDetection | Promise<RuleDetection>;
   /** Release any resources (e.g. a WASM session). Optional. */
   dispose?(): void;

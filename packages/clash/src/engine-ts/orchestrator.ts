@@ -7,6 +7,7 @@ import { inferClashSeverity } from '../disciplines.js';
 import { isExcluded, qualifiedKey } from '../exclude.js';
 import { summarizeClashes } from '../analysis.js';
 import {
+  ClashTimeBudgetExceededError,
   DEFAULT_CLASH_SETTINGS,
   type Clash,
   type ClashElement,
@@ -16,7 +17,7 @@ import {
   type ClashRuleCoverage,
   type ClashSettings,
 } from '../types.js';
-import type { ClashKernel, NarrowRecord } from './kernel.js';
+import type { ClashDeadline, ClashKernel, NarrowRecord } from './kernel.js';
 
 /**
  * Thrown by {@link runClash} when a `tolerance` — either the run-level
@@ -97,6 +98,18 @@ export async function runClash(
   // so `maxCandidatePairs` is an honest end-to-end guardrail.
   let remaining = maxPairs;
 
+  // One wall-clock budget for the whole run (`ClashSettings.timeBudgetMs`).
+  const budgetMs = settings.timeBudgetMs !== undefined && settings.timeBudgetMs > 0 ? settings.timeBudgetMs : undefined;
+  const clock = (): number => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+  const startedAt = clock();
+  let currentRule: string | undefined;
+  const deadline: ClashDeadline | undefined = budgetMs === undefined ? undefined : {
+    check(progress) {
+      const elapsed = clock() - startedAt;
+      if (elapsed > budgetMs) throw new ClashTimeBudgetExceededError(budgetMs, elapsed, { rule: currentRule, ...progress });
+    },
+  };
+
   // `finally` guarantees the kernel is disposed even on abort / kernel error /
   // a throw inside prepare() — otherwise a `WasmKernel`'s `ClashSession` (and
   // its arenas) would leak.
@@ -106,6 +119,8 @@ export async function runClash(
       if (settings.signal?.aborted) {
         throw new DOMException('Clash run aborted', 'AbortError');
       }
+      currentRule = rule.id;
+      deadline?.check();
 
       const groupA: number[] = [];
       // A second side exists when the rule names one — by selector OR by
@@ -162,6 +177,7 @@ export async function runClash(
         settings.onProgress
           ? (done, total) => settings.onProgress!({ phase: 'narrow', rule: rule.id, done, total })
           : undefined,
+        deadline,
       );
       // Threaded onto the coverage entry already pushed above — see
       // `ClashRuleCoverage.candidatesExamined`'s doc for why this is a
