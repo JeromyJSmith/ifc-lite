@@ -10,6 +10,8 @@
  * building rotation into coordinate info.
  */
 
+import { attachCanonicalMeshMetadata } from './canonical-mesh-metadata.js';
+import { readSpecularMaterial } from './mesh-specular.js';
 import type { MeshData, CoordinateInfo } from './types.js';
 import type { DynamicBatchConfig } from './index.js';
 import {
@@ -89,6 +91,10 @@ export function convertMeshCollectionToBatch(
           originArr && originArr.length === 3 && (originArr[0] || originArr[1] || originArr[2])
             ? [originArr[0], originArr[1], originArr[2]]
             : undefined;
+        // #3199: the two DISJOINT source ids. Read ONCE each, like `origin`
+        // above -- every access crosses the wasm boundary and copies.
+        const sourceGeometryItemId = (mesh as { geometryItemId?: number }).geometryItemId;
+        const sourceMaterialId = (mesh as { materialId?: number }).materialId;
         // Local (pre-placement) AABB + placement transform (issue #1474);
         // absent on older bundles (no getter) or when not captured (e.g. an
         // instancing template).
@@ -103,6 +109,7 @@ export function convertMeshCollectionToBatch(
         const localToWorldArr = (mesh as { localToWorld?: ArrayLike<number> }).localToWorld;
         const localToWorld =
           localToWorldArr && localToWorldArr.length === 16 ? Array.from(localToWorldArr) : undefined;
+        const material = readSpecularMaterial(mesh as { metallic?: number; roughness?: number }); // #5582
         const meshData: MeshData = {
           expressId: mesh.expressId,
           ifcType: mesh.ifcType,
@@ -117,6 +124,14 @@ export function convertMeshCollectionToBatch(
           // #957 follow-up: carry the Model/Types geometry class so the viewer's
           // view-mode filter can show/hide type-library geometry.
           geometryClass: (mesh as { geometryClass?: number }).geometryClass ?? 0,
+          // #3199: the representation item this piece came from, or the
+          // material layer it slices. DISJOINT -- the wasm getters return
+          // `undefined` for whichever does not apply, and spreading only the
+          // defined one keeps them from both landing on the object. Older wasm
+          // bundles lack both getters, so both spread to nothing.
+          ...(sourceGeometryItemId !== undefined ? { geometryItemId: sourceGeometryItemId } : {}),
+          ...(sourceMaterialId !== undefined ? { materialId: sourceMaterialId } : {}),
+          ...(material ? { material } : {}),
         };
 
         // #961: copy the Rust-decoded surface texture + per-vertex UVs (the
@@ -144,15 +159,7 @@ export function convertMeshCollectionToBatch(
           };
         }
 
-        // #924 / #1891: attach the per-entity geometry fingerprint — hash and,
-        // when the pass produced them, the absolute world box and the proved
-        // enclosed volume (empty Map → no-op unless geometry hashing was
-        // enabled).
-        if (fingerprint) {
-          meshData.geometryHash = fingerprint.hash;
-          if (fingerprint.aabb) meshData.geometryAabb = fingerprint.aabb;
-          if (fingerprint.volume !== undefined) meshData.geometryVolume = fingerprint.volume;
-        }
+        attachCanonicalMeshMetadata(meshData, fingerprint);
 
         batch.push(meshData);
       } finally {

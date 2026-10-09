@@ -18,6 +18,8 @@ import {
   type RelationshipGraph,
 } from '@ifc-lite/data';
 import { SpatialHierarchyBuilder } from '@ifc-lite/parser';
+import { MATERIAL_DEF_TYPES } from './materialDefinitionTypes';
+import { findSpatialNode } from './spatialNode';
 
 /**
  * Rebuild the spatial hierarchy from cache data (entities + relationships only,
@@ -37,15 +39,6 @@ export function rebuildSpatialHierarchy(
   return new SpatialHierarchyBuilder().buildFromCache(entities, relationships);
 }
 
-/** Depth-first search for a spatial node by express id. */
-function findSpatialNode(node: SpatialNode, expressId: number): SpatialNode | null {
-  if (node.expressId === expressId) return node;
-  for (const child of node.children) {
-    const hit = findSpatialNode(child, expressId);
-    if (hit) return hit;
-  }
-  return null;
-}
 
 /**
  * Classify a spatial node into the federation-identity container level it
@@ -133,8 +126,8 @@ export interface SpatialAncestryIndex {
  *
  * `getName` resolves an entity's real IFC `Name` — pass the store's
  * `entities.getName` so an UNNAMED container resolves to '' (matching how the
- * storey column behaves), rather than the `SpatialNode.name` placeholder the
- * hierarchy builder synthesizes (`Entity #N`). `getClass` (optional) resolves an
+ * storey column behaves). The hierarchy builder no longer synthesizes an
+ * `Entity #N` placeholder for `SpatialNode.name` (#3530). `getClass` (optional) resolves an
  * entity's IFC class name, used only as the `containerOf` fallback for an
  * unnamed immediate container. "Building" spans every
  * building-like spatial type (IFC4X3 IfcFacility / IfcBridge / IfcRoad / …), so
@@ -269,6 +262,14 @@ export function registerAuthoredElement(
   } else {
     hierarchy.byStorey.set(storeyExpressId, [entityId]);
   }
+  // The storey NODE's `elements` is what the tree walkers read (storey Solo /
+  // isolation, the basket, exports). The parser builds it as the same array as
+  // `byStorey`, but a hierarchy that crossed a worker or the cache is a copy,
+  // so the element has to be listed there too, or Solo hides it (#6232).
+  const storeyNode = findSpatialNode(hierarchy.project, storeyExpressId);
+  if (storeyNode && storeyNode.elements !== hierarchy.byStorey.get(storeyExpressId) && !storeyNode.elements.includes(entityId)) {
+    storeyNode.elements.push(entityId);
+  }
 }
 
 /**
@@ -291,29 +292,6 @@ export interface OnDemandMaps {
   onDemandMaterialMap: Map<number, number[]>;
 }
 
-/** IFC material *definition* classes that can be the RelatingMaterial of an
- *  IfcRelAssociatesMaterial — the source nodes of AssociatesMaterial edges. */
-const MATERIAL_DEF_TYPES = new Set([
-  'IFCMATERIAL',
-  'IFCMATERIALLAYERSET',
-  'IFCMATERIALLAYERSETUSAGE',
-  'IFCMATERIALPROFILESET',
-  'IFCMATERIALPROFILESETUSAGE',
-  'IFCMATERIALCONSTITUENTSET',
-  'IFCMATERIALLIST',
-  // Bare IfcMaterialSelect members — legal (if unusual) RelatingMaterial
-  // targets. Without these a fresh parse maps the association but a cache
-  // rebuild silently drops it (parse/cache divergence).
-  'IFCMATERIALLAYER',
-  'IFCMATERIALPROFILE',
-  'IFCMATERIALCONSTITUENT',
-  // IFC4 subtypes — also legal RelatingMaterial targets; completes the
-  // IfcMaterialSelect membership so cache rebuilds match fresh parses.
-  'IFCMATERIALLAYERWITHOFFSETS',
-  'IFCMATERIALPROFILEWITHOFFSETS',
-  'IFCMATERIALPROFILESETUSAGETAPERING',
-]);
-
 /**
  * Rebuild on-demand property/quantity maps from relationships and entity types
  * Uses FORWARD direction: pset -> elements (more efficient than inverse lookup)
@@ -334,24 +312,22 @@ export function rebuildOnDemandMaps(
   const onDemandQuantityMap = new Map<number, number[]>();
   const onDemandMaterialMap = new Map<number, number[]>();
 
-  // Use entityIndex.byType if available (needed for cache loads where entity table
-  // doesn't include IfcPropertySet/IfcElementQuantity entities)
-  // Fall back to entities.getByType() for fresh parses where entity table has these types
+  // Cache loads may omit property sets from the entity table.
   let propertySets: number[];
   let quantitySets: number[];
 
+  // @raw-entity-enumeration-ok cache hydration tests the source index before rebuilding parsed associations
   if (entityIndex?.byType) {
-    // entityIndex.byType keys are the original type strings from the IFC file
-    // Check both common casings (STEP files may use either)
-    propertySets =
-      entityIndex.byType.get('IFCPROPERTYSET') || entityIndex.byType.get('IfcPropertySet') || [];
-    quantitySets =
-      entityIndex.byType.get('IFCELEMENTQUANTITY') ||
-      entityIndex.byType.get('IfcElementQuantity') ||
-      [];
+    // byType keys are upper case: the parser, the v4 cache columns and the v3
+    // rebuild in useIfcCache all normalise them (#4712).
+    // @raw-entity-enumeration-ok cache hydration rebuilds source-only property associations before a mutation view exists
+    propertySets = entityIndex.byType.get('IFCPROPERTYSET') ?? [];
+    // @raw-entity-enumeration-ok cache hydration rebuilds source-only quantity associations before a mutation view exists
+    quantitySets = entityIndex.byType.get('IFCELEMENTQUANTITY') ?? [];
   } else {
-    // Fallback for when entityIndex is not provided
+    // @raw-entity-enumeration-ok source-only fallback while hydrating a parsed cache with no entity index
     propertySets = entities.getByType(IfcTypeEnum.IfcPropertySet);
+    // @raw-entity-enumeration-ok source-only fallback while hydrating a parsed cache with no entity index
     quantitySets = entities.getByType(IfcTypeEnum.IfcElementQuantity);
   }
 
@@ -400,6 +376,7 @@ export function rebuildOnDemandMaps(
   // model-wide usage index). Requires entityIndex.byType to enumerate material
   // definitions — the cached graph preserves AssociatesMaterial edges.
   let materialDefCount = 0;
+  // @raw-entity-enumeration-ok cache hydration tests the source index before rebuilding material associations
   if (entityIndex?.byType) {
     // Determinism parity with the columnar parser: the map preserves EVERY
     // association (multiple IfcRelAssociatesMaterial on one element are
@@ -409,7 +386,11 @@ export function rebuildOnDemandMaps(
     // edge relationshipId — which the cached CSR columns preserve — or a
     // cache load could disagree with a fresh parse of the same file.
     const materialRelIds = new Map<number, number[]>();
+    // @raw-entity-enumeration-ok source-only cache hydration before any live mutation view exists
     for (const [typeKey, ids] of entityIndex.byType) {
+      // Source nodes of AssociatesMaterial edges: every class an
+      // IfcMaterialSelect can resolve to. Anything omitted here is an
+      // association a fresh parse maps and a cache rebuild drops.
       if (!MATERIAL_DEF_TYPES.has(typeKey.toUpperCase())) continue;
       for (const materialId of ids) {
         materialDefCount += 1;

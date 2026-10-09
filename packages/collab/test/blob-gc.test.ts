@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest';
 import { createCollabDoc } from '../src/doc/schema.js';
 import { createEntity, addGeometryRef } from '../src/doc/entity.js';
 import { createGeometry, setGeometryBlobHash } from '../src/doc/geometry.js';
+import { createModelSlot } from '../src/doc/model-slot.js';
 import { MemoryBlobStore } from '../src/geometry/blob-store.js';
 import {
   collectReferencedBlobHashes,
@@ -22,6 +23,12 @@ describe('blob GC', () => {
 
     const referenced = collectReferencedBlobHashes(doc);
     expect(referenced.has('a'.repeat(32))).toBe(true);
+  });
+
+  it('keeps a portable model source referenced by its room slot (#4604)', () => {
+    const doc = createCollabDoc();
+    createModelSlot(doc, 'm0', { name: 'annotation.ifc', order: 0, stepSourceBlobHash: 'b'.repeat(32) });
+    expect(collectReferencedBlobHashes(doc)).toContain('b'.repeat(32));
   });
 
   it('plans + sweeps unreferenced blobs older than the epoch', async () => {
@@ -90,5 +97,35 @@ describe('blob GC', () => {
     });
     expect(decision.drop).toEqual([orphan.hash]);
     expect(decision.reclaimBytes).toBe(3);
+  });
+
+  it('does not report bytes as reclaimed when the underlying delete() fails', async () => {
+    const inner = new MemoryBlobStore();
+    const a = await inner.put(new Uint8Array([1, 1, 1]));
+    const b = await inner.put(new Uint8Array([2, 2, 2, 2]));
+
+    // A store whose delete() reports failure for one of the two blobs —
+    // e.g. a remote backend that 404s or races with another sweep.
+    const flaky = {
+      put: inner.put.bind(inner),
+      get: inner.get.bind(inner),
+      has: inner.has.bind(inner),
+      list: inner.list.bind(inner),
+      stat: inner.stat.bind(inner),
+      delete: async (hash: string) => (hash === a.hash ? false : inner.delete(hash)),
+    };
+
+    const referenced = new Set<string>();
+    const decision = await planBlobSweep(flaky, referenced, { epochMs: 0 });
+    expect(decision.drop.sort()).toEqual([a.hash, b.hash].sort());
+    expect(decision.reclaimBytes).toBe(7);
+
+    const freed = await sweepBlobs(flaky, decision);
+
+    // Only `b` (4 bytes) was actually deleted; `a` (3 bytes) failed to
+    // delete and must still be present in the store.
+    expect(await inner.has(a.hash)).toBe(true);
+    expect(await inner.has(b.hash)).toBe(false);
+    expect(freed).toBe(4);
   });
 });

@@ -31,6 +31,7 @@ import {
   createEmptyFlatSymbolic,
   type FlatSymbolic,
 } from './symbolic-flat.js';
+import { isGridChannelOwnerType } from './overlay-channels.js';
 import {
   circleToSegments,
   createEmptyParseResult,
@@ -69,6 +70,8 @@ export interface SymbolicParseInput {
   elementToStorey?: ReadonlyMap<number, number>;
   /** store.spatialHierarchy?.storeyElevations */
   storeyElevations?: ReadonlyMap<number, number>;
+  /** See {@link SymbolicHierarchyInput.elevationRebase}. */
+  elevationRebase?: ElevationRebase;
 }
 
 /** The spatial-hierarchy half of {@link SymbolicParseInput}. Structured-clone
@@ -76,6 +79,37 @@ export interface SymbolicParseInput {
 export interface SymbolicHierarchyInput {
   elementToStorey?: ReadonlyMap<number, number>;
   storeyElevations?: ReadonlyMap<number, number>;
+  /**
+   * The render-frame rebasing this model's elevations still need, as
+   * `{ primitive, storeyTable }` offsets to SUBTRACT.
+   *
+   * The two elevation sources `ensureBucket` picks between arrive in
+   * different frames, and the buckets they feed are lifted into one scene:
+   * `primitive.worldY` comes from the wasm symbolic extractor, which already
+   * subtracts the model RTC offset's Z
+   * (`rust/processing/src/symbolic/rebase.rs`), while
+   * `IfcBuildingStorey.Elevation` is raw unit-scaled IFC Z. The renderer's Y
+   * is `ifcZ - rtc.z - originShift.y` (`lib/geo/ifc-origin.ts`'s
+   * `totalYupOffset`, mirrored in `lib/wall-rects-from-meshes.ts:141-144`),
+   * so the two need different offsets to land in the same frame — hence one
+   * value each, derived together by the caller rather than one shared number
+   * that must be right for both.
+   *
+   * Absent → both zero, which is exactly right for a model with no RTC
+   * offset and no origin shift.
+   */
+  elevationRebase?: ElevationRebase;
+  /** Exclude a source primitive whose owner was tombstoned in the live overlay. */
+  isOwnerDeleted?: (expressId: number) => boolean;
+}
+
+/** Render-frame offsets to subtract from each elevation source. See
+ *  {@link SymbolicHierarchyInput.elevationRebase}. */
+export interface ElevationRebase {
+  /** For `primitive.worldY` (wasm already removed the RTC Z). */
+  primitive: number;
+  /** For a raw `IfcBuildingStorey.Elevation`. */
+  storeyTable: number;
 }
 
 /**
@@ -92,6 +126,8 @@ export function buildParseResult(
   const result: ParseResult = createEmptyParseResult();
   const elementToStorey = hierarchy.elementToStorey;
   const storeyElevations = hierarchy.storeyElevations;
+  const rebase = hierarchy.elevationRebase ?? { primitive: 0, storeyTable: 0 };
+  const isOwnerDeleted = hierarchy.isOwnerDeleted ?? (() => false);
 
   // Resolve a bucket by elevation rather than by storey id.
   //
@@ -125,12 +161,18 @@ export function buildParseResult(
       // (the 3DEXPERIENCE / IfcPlusPlus exports this priority order was
       // written for) that fallback has nothing to resolve to either, so it
       // landed in the loose bucket instead of its storey (issue #2256).
-      effectiveY = primitiveWorldY;
+      effectiveY = primitiveWorldY - rebase.primitive;
     } else {
       const storeyId = elementToStorey?.get(expressId);
       if (storeyId !== undefined) {
         const elev = storeyElevations?.get(storeyId);
-        if (typeof elev === 'number' && Number.isFinite(elev)) effectiveY = elev;
+        // Raw IFC elevation → the same render frame the primitive branch
+        // above lands in. Both bucket kinds are lifted into one scene by
+        // `useSymbolicAnnotations`, so a bucket's frame must not depend on
+        // which source resolved it.
+        if (typeof elev === 'number' && Number.isFinite(elev)) {
+          effectiveY = elev - rebase.storeyTable;
+        }
       }
     }
     if (effectiveY === null) return null;
@@ -138,7 +180,7 @@ export function buildParseResult(
     // Issue #862: IfcGridAxis primitives land in a parallel bucket
     // collection so the renderer can section-clip + visibility-toggle
     // them independently of IfcAnnotation (text/dimension symbols).
-    const storeyMap = ifcType === 'IfcGridAxis' ? result.gridByStorey : result.byStorey;
+    const storeyMap = isGridChannelOwnerType(ifcType) ? result.gridByStorey : result.byStorey;
     let bucket = storeyMap.get(key);
     if (!bucket) {
       bucket = {
@@ -158,8 +200,9 @@ export function buildParseResult(
   for (let i = 0; i < flat.polyOwner.length; i++) {
     const ifcType = typeNames[flat.polyType[i]];
     const expressId = flat.polyOwner[i];
+    if (expressId === 0 || isOwnerDeleted(expressId)) continue;
     const bucket = ensureBucket(expressId, flat.polyWorldY[i], ifcType);
-    const looseTarget = ifcType === 'IfcGridAxis' ? result.gridLoose : result.loose;
+    const looseTarget = isGridChannelOwnerType(ifcType) ? result.gridLoose : result.loose;
     const out = bucket ? bucket.lines : looseTarget;
     // The points are consumed synchronously here (not stored), so a subarray
     // view over the shared buffer is enough — no copy needed.
@@ -172,8 +215,9 @@ export function buildParseResult(
   for (let i = 0; i < flat.circleOwner.length; i++) {
     const ifcType = typeNames[flat.circleType[i]];
     const expressId = flat.circleOwner[i];
+    if (expressId === 0 || isOwnerDeleted(expressId)) continue;
     const bucket = ensureBucket(expressId, flat.circleWorldY[i], ifcType);
-    const looseTarget = ifcType === 'IfcGridAxis' ? result.gridLoose : result.loose;
+    const looseTarget = isGridChannelOwnerType(ifcType) ? result.gridLoose : result.loose;
     const out = bucket ? bucket.lines : looseTarget;
     circleToSegments(
       flat.circleCenterX[i],
@@ -190,6 +234,7 @@ export function buildParseResult(
   for (let i = 0; i < flat.textOwner.length; i++) {
     const ifcType = typeNames[flat.textType[i]];
     const expressId = flat.textOwner[i];
+    if (expressId === 0 || isOwnerDeleted(expressId)) continue;
     // Skip empty literals so the renderer doesn't waste an instance slot.
     //
     // The content arrives ALREADY DECODED: the Rust extractor reads it through
@@ -216,7 +261,7 @@ export function buildParseResult(
     // a little air between rows so descenders don't kiss the next cap.
     const lineSpacing = perLineHeight * 1.2;
     const bucket = ensureBucket(expressId, flat.textWorldY[i], ifcType);
-    const looseTextTarget = ifcType === 'IfcGridAxis' ? result.gridLooseTexts : result.looseTexts;
+    const looseTextTarget = isGridChannelOwnerType(ifcType) ? result.gridLooseTexts : result.looseTexts;
     // All annotation text — grid bubbles, dimension callouts, leader labels —
     // billboards to the camera so it stays legible in any view orientation
     // (top-down, eye-level, oblique). The shader rebuilds the quad in the
@@ -257,6 +302,7 @@ export function buildParseResult(
   for (let i = 0; i < flat.fillOwner.length; i++) {
     const ifcType = typeNames[flat.fillType[i]];
     const expressId = flat.fillOwner[i];
+    if (expressId === 0 || isOwnerDeleted(expressId)) continue;
     // The ring vertices and hole table are STORED into f2d (they outlive this
     // iteration), so slice them out of the shared buffers rather than viewing
     // them. Element types match the AnnotationFill2D fields.
@@ -264,6 +310,7 @@ export function buildParseResult(
     if (points.length < 6) continue; // <3 vertices = no polygon
     const holesOffsets = flat.fillHoles.slice(flat.fillHoleStart[i], flat.fillHoleStart[i + 1]);
     const f2d: AnnotationFill2D = {
+      geometryItemId: flat.fillGeometryItem[i] || undefined,
       points,
       holesOffsets,
       color: [
@@ -283,7 +330,7 @@ export function buildParseResult(
         : undefined,
     };
     const bucket = ensureBucket(expressId, flat.fillWorldY[i], ifcType);
-    const looseFillTarget = ifcType === 'IfcGridAxis' ? result.gridLooseFills : result.looseFills;
+    const looseFillTarget = isGridChannelOwnerType(ifcType) ? result.gridLooseFills : result.looseFills;
     (bucket ? bucket.fills : looseFillTarget).push(f2d);
   }
 
@@ -291,7 +338,7 @@ export function buildParseResult(
 }
 
 export async function parseSymbolicAnnotations(
-  input: SymbolicParseInput,
+  input: SymbolicParseInput & { frame?: import('@ifc-lite/geometry').RtcFrame },
 ): Promise<ParseResult> {
   const source = input.source;
   if (!source || source.byteLength === 0) {
@@ -310,7 +357,7 @@ export async function parseSymbolicAnnotations(
     // deterministically (AGENTS.md §7). Leaking them to GC lets the
     // FinalizationRegistry free them later against an already-grown/reused
     // shared dlmalloc heap, corrupting the allocator free-list.
-    const collection = processor.parseSymbolicRepresentations(source);
+    const collection = processor.parseSymbolicRepresentations(source, input.frame);
     if (debugEnabled()) {
       console.log(
         `[annotations] parsed ${source.byteLength} bytes →`,

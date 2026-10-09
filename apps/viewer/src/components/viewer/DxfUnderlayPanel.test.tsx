@@ -26,6 +26,7 @@ import { useViewerStore } from '@/store';
 import type { DxfUnderlayState } from '@/store/slices/drawing2DSlice';
 import { DEFAULT_DXF_PLACEMENT, type DxfUnderlay } from '@ifc-lite/drawing-2d';
 import { DxfUnderlayPanel } from './DxfUnderlayPanel.js';
+import { type as typeInto } from '@/test/render';
 
 function emptyUnderlay(name: string): DxfUnderlay {
   return {
@@ -62,7 +63,6 @@ function renderPanel(georeferenceAvailable: boolean): HTMLElement {
   act(() => {
     root.render(
       <DxfUnderlayPanel
-        onClose={() => {}}
         onCenterOnModel={() => {}}
         planViewActive={true}
         georeferenceAvailable={georeferenceAvailable}
@@ -96,6 +96,25 @@ describe('DxfUnderlayPanel: "Align to model georeference" tri-state control (PR 
       container.remove();
     }
     useViewerStore.setState({ dxfUnderlays: [] });
+  });
+
+  it('DXF placement fields expose their visible labels and commit an offset edit (#6342)', () => {
+    useViewerStore.setState({ dxfUnderlays: [underlayState()] });
+    const container = renderPanel(false);
+    const placement = [...container.querySelectorAll('button')].find((button) =>
+      button.textContent?.includes('Placement'),
+    );
+    assert.ok(placement instanceof HTMLButtonElement);
+    act(() => placement.click());
+
+    const fields = [...container.querySelectorAll('input[type="number"]')]
+      .filter((input): input is HTMLInputElement => input instanceof HTMLInputElement &&
+        ['Offset X (m)', 'Offset Y (m)', 'Rotation (°)', 'Scale'].includes(input.labels?.[0]?.textContent ?? ''));
+    assert.deepEqual(fields.map((input) => input.labels?.[0]?.textContent),
+      ['Offset X (m)', 'Offset Y (m)', 'Rotation (°)', 'Scale']);
+
+    typeInto(fields[0], '3.5');
+    assert.equal(useViewerStore.getState().dxfUnderlays[0].placement.offsetX, 3.5);
   });
 
   it('auto entry (georeferenced === undefined) shows checked when the anchor georeference is available', () => {
@@ -163,7 +182,7 @@ describe('DxfUnderlayPanel: independent 2D/3D visibility toggles (issue #2043)',
 
   function toggleButton(container: HTMLElement, titleSubstring: string): HTMLButtonElement {
     const btn = [...container.querySelectorAll('button')].find((el) =>
-      el.getAttribute('title')?.includes(titleSubstring),
+      el.getAttribute('aria-label')?.includes(titleSubstring),
     );
     assert.ok(btn instanceof HTMLButtonElement, `expected a button titled like "${titleSubstring}"`);
     return btn;
@@ -190,5 +209,44 @@ describe('DxfUnderlayPanel: independent 2D/3D visibility toggles (issue #2043)',
     entry = useViewerStore.getState().dxfUnderlays.find((u) => u.id === 'u1');
     assert.equal(entry?.visible, false, '2D toggle must flip visible');
     assert.equal(entry?.visible3D, false, '2D toggle must NOT touch visible3D');
+  });
+});
+
+describe('DxfUnderlayPanel: surfacing skipped entity types', () => {
+  beforeEach(() => {
+    useViewerStore.setState({ dxfUnderlays: [] });
+  });
+
+  afterEach(() => {
+    for (const { root, container } of mounted.splice(0)) {
+      act(() => {
+        root.unmount();
+      });
+      container.remove();
+    }
+    useViewerStore.setState({ dxfUnderlays: [] });
+  });
+
+  it('an underlay with skipped entity types shows a "Not imported" notice naming type and count', () => {
+    const underlay = emptyUnderlay('site.dxf');
+    underlay.skipped = { WIPEOUT: 40, HATCH: 2 };
+    useViewerStore.setState({ dxfUnderlays: [underlayState({ id: 'u1', underlay })] });
+    const container = renderPanel(false);
+    assert.ok(
+      container.textContent?.includes('Not imported'),
+      'expected a "Not imported" notice for skipped entity types',
+    );
+    assert.ok(container.textContent?.includes('40× WIPEOUT'), 'expected the WIPEOUT count to render');
+    assert.ok(container.textContent?.includes('2× HATCH'), 'expected the HATCH count to render');
+  });
+
+  it('an underlay with no skipped entity types shows no "Not imported" notice', () => {
+    const underlay = emptyUnderlay('clean.dxf');
+    useViewerStore.setState({ dxfUnderlays: [underlayState({ id: 'u1', underlay })] });
+    const container = renderPanel(false);
+    assert.ok(
+      !container.textContent?.includes('Not imported'),
+      'expected no "Not imported" notice when nothing was skipped',
+    );
   });
 });

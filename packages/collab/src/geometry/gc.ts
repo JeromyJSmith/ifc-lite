@@ -8,9 +8,9 @@
  * Mesh blobs grow without bound during long sessions. This module
  * implements an epoch + reference-count sweep:
  *
- *   1. `collectReferencedBlobHashes(doc)` walks every entity, collects
- *      its `geometryRef.geomId`, then resolves each geometry node to
- *      its `blobHash`. Returns the set of currently-referenced hashes.
+ *   1. `collectReferencedBlobHashes(doc)` walks every entity and model slot,
+ *      resolving geometry blobs and portable STEP/IFCZIP sidecars. Returns
+ *      the set of currently-referenced hashes.
  *
  *   2. `planBlobSweep(store, referenced, opts)` returns the list of
  *      blob hashes that exist in `store` but aren't referenced. With
@@ -33,17 +33,18 @@ import {
   GEOMETRY_KEY,
   entitiesMap,
   geometryMap,
+  modelsMap,
 } from '../doc/schema.js';
 import type { BlobHash, BlobMeta, BlobStore } from './blob-store.js';
 
 /**
  * Collect every blob hash currently referenced from a Y.Doc.
  *
- * An entity's `geometryRef.geomId` points at a `geometry` top-level
- * entry whose `blobHash` (if any) we want to keep. We also include any
- * `blobHash` that appears directly in `geometry.params.<*>` so apps
- * that store auxiliary blob refs in params (e.g. textures) survive
- * gc.
+ * An entity's `geometryRef.geomId` points at a `geometry` top-level entry
+ * whose `blobHash` (if any) we want to keep. Model slots can independently
+ * own a portable STEP/IFCZIP sidecar. We also include any `blobHash` that
+ * appears directly in `geometry.params.<*>` so apps that store auxiliary
+ * blob refs in params (e.g. textures) survive gc.
  */
 export function collectReferencedBlobHashes(doc: Y.Doc): Set<BlobHash> {
   const referenced = new Set<BlobHash>();
@@ -74,6 +75,15 @@ export function collectReferencedBlobHashes(doc: Y.Doc): Set<BlobHash> {
   //    in any geometry entry.
   geom.forEach((nodeUntyped) => {
     addBlobHashesFromGeometry(nodeUntyped as Y.Map<unknown>, referenced);
+  });
+
+  // 3. Portable STEP/IFCZIP sidecars are model-slot roots, independent of
+  // geometry records. They are required for native annotation/texture
+  // reconstruction and must remain live for the lifetime of the room.
+  modelsMap(doc).forEach((slotUntyped) => {
+    if (!slotUntyped || typeof slotUntyped !== 'object' || Array.isArray(slotUntyped)) return;
+    const hash = (slotUntyped as Record<string, unknown>).stepSourceBlobHash;
+    if (typeof hash === 'string' && /^[a-f0-9]{32}$/.test(hash)) referenced.add(hash);
   });
 
   return referenced;
@@ -114,6 +124,12 @@ export interface SweepDecision {
   drop: BlobHash[];
   /** Bytes that will be reclaimed once `drop` is processed. May be undefined when the store doesn't expose sizes. */
   reclaimBytes: number;
+  /**
+   * Per-hash byte size for every entry in `drop`, so `sweepBlobs` can
+   * report the bytes actually reclaimed rather than the bytes merely
+   * planned — a `store.delete()` failure must not be counted.
+   */
+  dropByteLengths: Record<BlobHash, number>;
 }
 
 /**
@@ -134,6 +150,7 @@ export async function planBlobSweep(
   const now = options.now ? options.now() : Date.now();
   const all = await store.list();
   const drop: BlobHash[] = [];
+  const dropByteLengths: Record<BlobHash, number> = {};
   let reclaim = 0;
   for (const hash of all) {
     if (referenced.has(hash)) continue;
@@ -147,16 +164,18 @@ export async function planBlobSweep(
       // so the grace window keeps protecting in-flight uploads.
       if (!options.sweepUnknownAge) continue;
       drop.push(hash);
+      dropByteLengths[hash] = meta.byteLength;
       reclaim += meta.byteLength;
       continue;
     }
     const ageMs = Math.max(0, now - new Date(meta.uploadedAt).getTime());
     if (ageMs >= epochMs) {
       drop.push(hash);
+      dropByteLengths[hash] = meta.byteLength;
       reclaim += meta.byteLength;
     }
   }
-  return { drop, reclaimBytes: reclaim };
+  return { drop, reclaimBytes: reclaim, dropByteLengths };
 }
 
 async function metaFromGet(store: BlobStore, hash: BlobHash): Promise<BlobMeta | null> {
@@ -177,13 +196,20 @@ async function metaFromGet(store: BlobStore, hash: BlobHash): Promise<BlobMeta |
   };
 }
 
-/** Apply a sweep decision: delete the candidates from `store`. */
+/**
+ * Apply a sweep decision: delete the candidates from `store`.
+ *
+ * Returns the bytes actually reclaimed — i.e. only for hashes whose
+ * `store.delete()` reported success. A failed delete (backend race,
+ * 404, transient error) must not be counted as freed: callers use this
+ * return value for capacity accounting, and overstating it hides a
+ * blob that is still consuming storage.
+ */
 export async function sweepBlobs(store: BlobStore, decision: SweepDecision): Promise<number> {
   let freed = 0;
   for (const hash of decision.drop) {
     const ok = await store.delete(hash);
-    if (ok) freed += 1;
+    if (ok) freed += decision.dropByteLengths[hash] ?? 0;
   }
-  void freed;
-  return decision.reclaimBytes;
+  return freed;
 }

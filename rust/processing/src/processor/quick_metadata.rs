@@ -2,8 +2,14 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use crate::types::response::{QuickMetadataEntitySummary, QuickMetadataSpatialNode};
+use crate::types::response::{
+    QuickMetadataEntitySummary, QuickMetadataPrunedEdge, QuickMetadataPrunedEdgeKind as EdgeKind,
+    QuickMetadataSpatialNode,
+};
+use ifc_lite_core::limits::LARGE_COORD_THRESHOLD_METERS;
+use ifc_lite_core::{keyword_eq, IfcType, StepListItems, IFC_TYPES};
 use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
 
 #[derive(Clone)]
 pub(super) struct QuickSpatialNodeEntry {
@@ -11,70 +17,74 @@ pub(super) struct QuickSpatialNodeEntry {
     pub(super) type_name: String,
     pub(super) name: String,
     pub(super) elevation: Option<f64>,
+    /// `IfcRelAggregates` children.
     pub(super) children: Vec<u32>,
+    /// Spatial elements an `IfcRelContainedInSpatialStructure` names, promoted
+    /// to child nodes (#1075). Kept apart from `children`: they are not
+    /// aggregate edges, and an aggregate that places the same node wins.
+    pub(super) contained: Vec<u32>,
     pub(super) elements: Vec<u32>,
-    pub(super) parent: Option<u32>,
+    /// Some aggregate or spatial containment edge lists this node as a child.
+    /// Read only to pick a root when the file has no `IfcProject`.
+    pub(super) named_as_child: bool,
 }
 
-/// Case-insensitive spatial-type check that avoids to_ascii_uppercase() allocation.
+/// Which types the schema calls nodes of the quick-metadata spatial tree.
+///
+/// `IfcProject` is the tree root and is an `IfcObject`, not a spatial element at
+/// all. Everything else is the whole `IfcSpatialElement` branch EXCEPT the
+/// external-spatial sub-branch (`IfcExternalSpatialElement` and friends), which
+/// models a space *boundary* volume -- external air, ground -- rather than a
+/// container, carries no `WR41`, and would sit permanently parentless in a tree
+/// built from `IfcRelAggregates`. The TypeScript half excludes it for the same
+/// reason. `IfcSpatialZone` is inside the branch and outside
+/// `IfcSpatialStructureElement`; it is carried deliberately since #1075 (Revit /
+/// Dynamo GFA volumes attached with `IfcRelContainedInSpatialStructure`).
+fn is_quick_spatial_type(ifc_type: IfcType) -> bool {
+    ifc_type == IfcType::IfcProject
+        || (ifc_type.is_subtype_of(IfcType::IfcSpatialElement)
+            && !ifc_type.is_subtype_of(IfcType::IfcExternalSpatialStructureElement))
+}
+
+/// The uppercase STEP keywords [`is_quick_spatial_type`] accepts, derived once
+/// from the generated schema catalog.
+///
+/// This used to be a name list typed out by hand, and it had already been caught
+/// missing `IfcMarineFacility`, `IfcMarinePart` and `IfcFacilityPartCommon`
+/// (#3245): an IFC4.3 harbour lost its entire branch from the tree shown during
+/// load. A hand list can only ever be as complete as whoever last audited the
+/// schema, so the list is no longer written down -- it is derived from the rule,
+/// the same move `rooted_type.rs` made for `IfcRoot` for the same reason (#3015).
+///
+/// Materialised as a name slice rather than resolved per call: the gate runs
+/// once for every entity in the scan loop, and `IfcType::from_str` normalises to
+/// uppercase first, which allocates. A linear `keyword_eq` sweep over
+/// ~18 short names is what the hand-written chain already cost, so the
+/// derivation is free at the call site.
+static QUICK_SPATIAL_TYPE_NAMES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+    IFC_TYPES
+        .iter()
+        .filter(|ifc_type| is_quick_spatial_type((*ifc_type).clone()))
+        .map(|ifc_type| ifc_type.as_str())
+        .collect()
+});
+
+/// Is this STEP keyword a node of the quick-metadata spatial tree?
+///
+/// Case-insensitive without allocating an uppercase copy. A name this predicate
+/// misses is not just skipped -- every `IfcRelAggregates` edge into or out of it
+/// is dropped too, so its entire subtree is severed from the tree.
 #[inline]
-pub(super) fn is_quick_spatial_type_ci(type_name: &str) -> bool {
-    type_name.eq_ignore_ascii_case("IFCPROJECT")
-        || type_name.eq_ignore_ascii_case("IFCSITE")
-        || type_name.eq_ignore_ascii_case("IFCBUILDING")
-        || type_name.eq_ignore_ascii_case("IFCBUILDINGSTOREY")
-        || type_name.eq_ignore_ascii_case("IFCSPACE")
-        || type_name.eq_ignore_ascii_case("IFCSPATIALZONE")
-        || type_name.eq_ignore_ascii_case("IFCFACILITY")
-        || type_name.eq_ignore_ascii_case("IFCFACILITYPART")
-        || type_name.eq_ignore_ascii_case("IFCBRIDGE")
-        || type_name.eq_ignore_ascii_case("IFCBRIDGEPART")
-        || type_name.eq_ignore_ascii_case("IFCROAD")
-        || type_name.eq_ignore_ascii_case("IFCROADPART")
-        || type_name.eq_ignore_ascii_case("IFCRAILWAY")
-        || type_name.eq_ignore_ascii_case("IFCRAILWAYPART")
+pub fn is_quick_spatial_type_ci(type_name: &str) -> bool {
+    QUICK_SPATIAL_TYPE_NAMES
+        .iter()
+        .any(|candidate| keyword_eq(type_name, candidate))
 }
 
+/// A record's top-level attributes, trimmed of STEP trivia. The split is
+/// core's [`StepListItems`], so a comment is trivia here too (#4687).
 pub(super) fn parse_step_arguments(entity_bytes: &[u8]) -> Vec<&[u8]> {
-    let Some(open_idx) = entity_bytes.iter().position(|byte| *byte == b'(') else {
-        return Vec::new();
-    };
-    let Some(close_idx) = entity_bytes.iter().rposition(|byte| *byte == b')') else {
-        return Vec::new();
-    };
-    if close_idx <= open_idx {
-        return Vec::new();
-    }
-    let args = &entity_bytes[open_idx + 1..close_idx];
-    let mut parts = Vec::new();
-    let mut in_string = false;
-    let mut depth = 0i32;
-    let mut start = 0usize;
-    let bytes = args;
-    let mut index = 0usize;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'\'' => {
-                if in_string && index + 1 < bytes.len() && bytes[index + 1] == b'\'' {
-                    index += 1;
-                } else {
-                    in_string = !in_string;
-                }
-            }
-            b'(' if !in_string => depth += 1,
-            b')' if !in_string => depth -= 1,
-            b',' if !in_string && depth == 0 => {
-                parts.push(args[start..index].trim_ascii());
-                start = index + 1;
-            }
-            _ => {}
-        }
-        index += 1;
-    }
-    if start <= args.len() {
-        parts.push(args[start..].trim_ascii());
-    }
-    parts
+    StepListItems::of_record(entity_bytes).map(Iterator::collect).unwrap_or_default()
 }
 
 fn parse_step_string(token: &[u8]) -> Option<String> {
@@ -96,12 +106,10 @@ pub(super) fn parse_step_ref(token: &[u8]) -> Option<u32> {
 }
 
 pub(super) fn parse_step_ref_list(token: &[u8]) -> Vec<u32> {
-    let trimmed = token.trim_ascii();
-    let inner = trimmed
-        .strip_prefix(b"(")
-        .and_then(|value| value.strip_suffix(b")"))
-        .unwrap_or(trimmed);
-    inner.split(|byte| *byte == b',').filter_map(parse_step_ref).collect()
+    match StepListItems::of_list(token) {
+        Some(items) => items.filter_map(parse_step_ref).collect(),
+        None => parse_step_ref(token).into_iter().collect(),
+    }
 }
 
 pub(super) fn extract_name_from_args(args: &[&[u8]], fallback: &str) -> String {
@@ -121,49 +129,150 @@ pub(super) fn extract_storey_elevation_from_args(args: &[&[u8]]) -> Option<f64> 
             return Some(value);
         }
     }
+    // A storey elevation is a local coordinate: the first numeric attribute
+    // inside the large-coordinate threshold is taken, anything beyond it is a
+    // world coordinate (a georeferenced placement, not an elevation).
     args.iter()
         .filter_map(|token| std::str::from_utf8(token.trim_ascii()).ok())
         .filter_map(|token| token.parse::<f64>().ok())
-        .find(|value| value.abs() < 10_000.0)
+        .find(|value| value.abs() < LARGE_COORD_THRESHOLD_METERS)
 }
+
+/// Deepest level of the quick-metadata spatial tree; the root is level 0. The
+/// builder and the derived `Clone`, `Serialize` and `Drop` of
+/// [`QuickMetadataSpatialNode`] each recurse once per level, so an acyclic
+/// aggregate chain of 100 000 nodes overflowed the stack and aborted (#4689);
+/// making the builder iterative alone would leave the other three. A child of a
+/// node at this level is left out and reported as a depth-limit edge.
+///
+/// Not the server's and viewer's `MAX_SPATIAL_TREE_DEPTH` of 100: their tree is
+/// flat on the wire, while this one nests two JSON levels (node, `children`)
+/// per tree level, and `serde_json` refuses input nested deeper than 128. At 60
+/// the bootstrap still reads back through its own `Deserialize` with room for
+/// an envelope; `quick_metadata_deep_chain.rs` pins that round trip.
+const MAX_QUICK_SPATIAL_TREE_DEPTH: usize = 60;
 
 pub(super) fn build_quick_spatial_tree_node(
     express_id: u32,
     nodes: &HashMap<u32, QuickSpatialNodeEntry>,
     element_summaries: &HashMap<u32, QuickMetadataEntitySummary>,
-) -> Result<QuickMetadataSpatialNode, String> {
-    let mut ancestors = HashSet::new();
-    build_quick_spatial_tree_node_inner(express_id, nodes, element_summaries, &mut ancestors)
+) -> Result<(QuickMetadataSpatialNode, Vec<QuickMetadataPrunedEdge>), String> {
+    let mut placed = HashMap::with_capacity(nodes.len());
+    placed.insert(express_id, None);
+    let mut pruned = Vec::new();
+    let containment = ContainmentPlan::new(express_id, nodes);
+    build_subtree(
+        express_id,
+        0,
+        nodes,
+        element_summaries,
+        &containment,
+        &mut placed,
+        &mut pruned,
+    )
+    .map(|tree| (tree, pruned))
 }
 
-/// A malformed IfcRelAggregates graph can make a spatial node its own
-/// descendant; the recursion would then overflow the stack, an uncatchable
-/// abort. `ancestors` holds the current root-to-node path, so a child already on
-/// it is a back-edge: skip just that child and keep building the rest of the tree.
-fn build_quick_spatial_tree_node_inner(
+/// Which promoted containment edges the tree walk follows (#4689).
+///
+/// A containment of a node no `IfcRelAggregates` names is always followed. A
+/// containment of an aggregated node is followed unless the node is settled:
+/// reached from the root through aggregates and those always-followed
+/// containments alone. So an aggregate from a settled parent, including one
+/// placed by an ordinary containment, places the node, while a node whose
+/// aggregates come only from orphans, from its own descendants, or from other
+/// unsettled nodes keeps every containment, and the walk's order picks among
+/// them. Not depth-aware: a containment of a settled node is not followed even
+/// when the depth limit cuts the aggregate path. One pass, each node and edge
+/// visited once.
+struct ContainmentPlan {
+    settled: HashSet<u32>,
+}
+
+impl ContainmentPlan {
+    fn new(root: u32, nodes: &HashMap<u32, QuickSpatialNodeEntry>) -> Self {
+        let aggregated: HashSet<u32> = nodes
+            .values()
+            .flat_map(|n| n.children.iter().copied())
+            .collect();
+        let mut reached = HashSet::from([root]);
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            let Some(node) = nodes.get(&id) else { continue };
+            let contained = node.contained.iter().filter(|c| !aggregated.contains(c));
+            for &child in node.children.iter().chain(contained) {
+                if reached.insert(child) {
+                    stack.push(child);
+                }
+            }
+        }
+        reached.retain(|id| aggregated.contains(id));
+        Self { settled: reached }
+    }
+
+    fn follows(&self, child: u32) -> bool {
+        !self.settled.contains(&child)
+    }
+}
+
+/// Each spatial node is emitted once, where the depth-first walk from the root
+/// first reaches it, aggregate children before the contained ones `containment`
+/// follows; a skipped containment is not recorded (it is not an aggregate
+/// edge). A
+/// malformed IfcRelAggregates graph can list a child twice,
+/// under two parents, or as its own ancestor; all three are skipped and recorded
+/// in `pruned` (#4662). `placed` spans the whole tree, not the root-to-node path
+/// (k repeats per level would emit k^depth nodes): `None` while a node is still
+/// being built, `Some(parent)` once it is finished. With each node built once,
+/// the walk visits every child edge at most once, so `depth` is the only bound
+/// it still needs.
+fn build_subtree(
     express_id: u32,
+    depth: usize,
     nodes: &HashMap<u32, QuickSpatialNodeEntry>,
     element_summaries: &HashMap<u32, QuickMetadataEntitySummary>,
-    ancestors: &mut HashSet<u32>,
+    containment: &ContainmentPlan,
+    placed: &mut HashMap<u32, Option<u32>>,
+    pruned: &mut Vec<QuickMetadataPrunedEdge>,
 ) -> Result<QuickMetadataSpatialNode, String> {
     let node = nodes
         .get(&express_id)
         .ok_or_else(|| format!("Quick spatial node #{express_id} not found"))?;
-    ancestors.insert(express_id);
-    let mut children = Vec::with_capacity(node.children.len());
-    for child_id in &node.children {
-        if ancestors.contains(child_id) {
-            // Cyclic aggregate edge: skip this back-edge child, keep the rest.
+    let mut children = Vec::with_capacity(node.children.len() + node.contained.len());
+    let aggregated = node.children.iter().map(|&id| (id, true));
+    let contained = node.contained.iter().map(|&id| (id, false));
+    for (child_id, via_aggregate) in aggregated.chain(contained) {
+        if !via_aggregate && (placed.contains_key(&child_id) || !containment.follows(child_id)) {
             continue;
         }
-        children.push(build_quick_spatial_tree_node_inner(
-            *child_id,
+        let skipped = match placed.get(&child_id) {
+            Some(None) => Some(EdgeKind::BackEdge),
+            Some(Some(parent)) if *parent == express_id => Some(EdgeKind::SiblingRepeat),
+            Some(Some(_)) => Some(EdgeKind::SecondParent),
+            // Not marked placed: a shorter path met later may still place it.
+            None if depth == MAX_QUICK_SPATIAL_TREE_DEPTH => Some(EdgeKind::DepthLimit),
+            None => None,
+        };
+        if let Some(kind) = skipped {
+            pruned.push(QuickMetadataPrunedEdge {
+                parent_express_id: express_id,
+                child_express_id: child_id,
+                kind,
+            });
+            continue;
+        }
+        placed.insert(child_id, None);
+        children.push(build_subtree(
+            child_id,
+            depth + 1,
             nodes,
             element_summaries,
-            ancestors,
+            containment,
+            placed,
+            pruned,
         )?);
+        placed.insert(child_id, Some(express_id));
     }
-    ancestors.remove(&express_id);
     let elements = node
         .elements
         .iter()
@@ -190,7 +299,7 @@ fn build_quick_spatial_tree_node_inner(
             name: node.name.clone(),
             global_id: None,
             kind: "spatial".to_string(),
-            has_children: !node.children.is_empty() || !node.elements.is_empty(),
+            has_children: !children.is_empty() || !node.elements.is_empty(),
             element_count: Some(node.elements.len()),
             elevation: node.elevation,
         },
@@ -200,65 +309,5 @@ fn build_quick_spatial_tree_node_inner(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn node(id: u32, children: Vec<u32>) -> QuickSpatialNodeEntry {
-        QuickSpatialNodeEntry {
-            express_id: id,
-            type_name: "IfcSpace".to_string(),
-            name: format!("#{id}"),
-            elevation: None,
-            children,
-            elements: vec![],
-            parent: None,
-        }
-    }
-
-    // A malformed IfcRelAggregates graph making two nodes each other's child would
-    // recurse forever (stack-overflow abort). The back-edge child is skipped and
-    // the rest of the tree still builds.
-    /// #2323 double-collapse guard. This module un-doubles `''` on its OWN
-    /// raw-byte path (it never builds a `Token`, so `AttributeValue::from_token`
-    /// never runs over the same bytes). Exactly ONE un-doubling pass must
-    /// happen here: `''''` is two literal apostrophes, not one.
-    #[test]
-    fn parse_step_string_un_doubles_exactly_once() {
-        assert_eq!(parse_step_string(b"'O''Brien'").as_deref(), Some("O'Brien"));
-        assert_eq!(parse_step_string(b"''''''").as_deref(), Some("''"));
-        // The decoder now collapses the doubled reverse solidus too, and this
-        // path picks that up for free rather than needing its own pass.
-        assert_eq!(parse_step_string(br"'C:\\temp'").as_deref(), Some(r"C:\temp"));
-        // Unicode escapes still decode, and plain text is untouched.
-        assert_eq!(parse_step_string(br"'caf\X2\00E9\X0\'").as_deref(), Some("caf\u{e9}"));
-        assert_eq!(parse_step_string(b"'Plain Name'").as_deref(), Some("Plain Name"));
-    }
-
-    #[test]
-    fn cyclic_aggregate_graph_does_not_stack_overflow() {
-        let mut nodes = HashMap::new();
-        nodes.insert(1, node(1, vec![2]));
-        nodes.insert(2, node(2, vec![1]));
-        let summaries = HashMap::new();
-        let tree = build_quick_spatial_tree_node(1, &nodes, &summaries);
-        assert!(tree.is_ok(), "cyclic tree should build (cycle pruned), got {tree:?}");
-    }
-
-    /// `IfcBuildingStorey`'s `Elevation` attribute sits at index 9 in the IFC4
-    /// attribute layout this parser targets; index 8 is only a fallback (e.g. an
-    /// off-by-one attribute count from a schema variant). Indices 8 and 9 hold
-    /// DIFFERENT numeric values here specifically so a priority swap (checking 8
-    /// before 9) is observable — equal values would let a `[9, 8]` -> `[8, 9]`
-    /// swap pass silently.
-    #[test]
-    fn storey_elevation_prefers_index_9_over_index_8() {
-        let args: Vec<&[u8]> = vec![
-            b"$", b"$", b"$", b"$", b"$", b"$", b"$", b"$", b"3.5", b"7.25",
-        ];
-        assert_eq!(
-            extract_storey_elevation_from_args(&args),
-            Some(7.25),
-            "index 9 (the real Elevation attribute) must win over index 8"
-        );
-    }
-}
+#[path = "quick_metadata_tests.rs"]
+mod tests;

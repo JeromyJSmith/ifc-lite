@@ -60,6 +60,29 @@ Edits accumulate in the same overlay used by `setProperty` / `setAttribute`
 and materialise the next time you call
 `StepExporter.export({ applyMutations: true })`.
 
+For a query that needs to revisit source entities whose attributes changed,
+`view.getAttributeOverrideEntityIds()` returns a snapshot of the current named,
+positional and type override IDs, including edits made without history records.
+It is a candidate set: use effective entity reads to check deletion, the live
+type and attribute layout. Created entities are enumerated separately by
+`iterateEffectiveEntityIds`.
+
+### Compound undo records
+
+`recordCompoundMutation(view, draft => ...)` runs a synchronous edit atomically
+and records the complete earlier overlay as one operation. Write through the
+supplied draft. This supports commands that replace profiles or axes and forget
+entities created earlier in the session, as well as commands that create graphs.
+
+`undoRecordedMutationOperations(view, count, revertRaw)` restores the last
+`count` operations atomically. Recorded compounds restore their whole earlier
+graph and journal; `revertRaw(draft, mutation)` handles other journal entries.
+The result counts mutation records reverted. A thrown inverse leaves both IFC
+state and compound history unchanged. Both edit and inverse callbacks must be synchronous.
+Retained history stores only changed overlay entries and removed journal records;
+unchanged graph and journal prefixes are not copied per operation. Allocated express IDs remain monotonic.
+This in-memory history belongs to the live view and does not survive serialization.
+
 ### Whole numbers on REAL-typed attributes
 
 ISO 10303-21 requires a REAL-typed attribute (`IfcLengthMeasure` coordinates,
@@ -69,6 +92,10 @@ is unambiguously REAL-backed, a whole-number value is serialized with the
 decimal point automatically, so the natural call just works:
 
 ```typescript
+const profile = editor.addEntity('IfcRectangleProfileDef', [
+  '.AREA.', null, '#34', 0.6, 0.4,
+]);
+
 editor.setPositionalAttribute(profile.expressId, 3, 1);  // XDim → 1.  (dotted)
 ```
 
@@ -77,6 +104,8 @@ For the rare slot that a bare value genuinely can't disambiguate — a
 the number in the write-only `{ real }` marker to force a REAL literal:
 
 ```typescript
+const unitRef = '#34';  // STEP reference to an IfcNamedUnit
+
 editor.addEntity('IfcQuantityLength', ['L', null, unitRef, { real: 3 }]); // → IFCLENGTHMEASURE-safe 3.
 ```
 
@@ -88,6 +117,12 @@ type-QUALIFIED — `IFCBOOLEAN(.T.)`, not a bare `.T.`, in an
 the member is unambiguous, so the natural call just works:
 
 ```typescript
+// IfcBoundaryNodeCondition: Name, TranslationalStiffnessX/Y/Z,
+//                           RotationalStiffnessX/Y/Z
+const condition = editor.addEntity('IfcBoundaryNodeCondition', [
+  'Pinned', null, null, null, null, null, null,
+]);
+
 // TranslationalStiffnessX : SELECT(IfcBoolean, IfcLinearStiffnessMeasure)
 editor.setPositionalAttribute(condition.expressId, 1, true);  // → IFCBOOLEAN(.T.)
 editor.setPositionalAttribute(condition.expressId, 1, 1000);  // → IFCLINEARSTIFFNESSMEASURE(1000.)
@@ -146,6 +181,8 @@ To carry a created entity across, call `restoreNewEntity()` with its
 view) **before** calling `importMutations`:
 
 ```typescript
+const json = view.exportMutations();
+
 const created = view.getNewEntity(expressId)!;
 mutationView.restoreNewEntity(created);
 mutationView.importMutations(json); // dependent property/attribute/quantity mutations now replay
@@ -157,6 +194,14 @@ round-trip — this caveat is scoped to entities created via `createEntity` /
 
 ## Bulk updates
 
+Use `@ifc-lite/rules` to evaluate property filter groups and pass the resulting Express IDs in `select.expressIds`.
+
+Spatial filters (`storeys`, `buildings`, `sites`, `spaces`) use the supplied
+`SpatialHierarchy` for an unchanged source model. After session edits, supply a
+live container-membership reader as the seventh `BulkQueryEngine` constructor
+argument. A spatial filter throws if its hierarchy is missing or an edited
+session has no live reader, so a bulk edit cannot silently target a wider set.
+
 ```typescript
 import { BulkQueryEngine } from '@ifc-lite/mutations';
 import { PropertyValueType } from '@ifc-lite/data';
@@ -166,12 +211,6 @@ const engine = new BulkQueryEngine(store.entities, view);
 const result = engine.execute({
   select: {
     entityTypes: [/* IfcWall enum value */],
-    propertyFilters: [{
-      psetName: 'Pset_WallCommon',
-      propName: 'IsExternal',
-      operator: '=',
-      value: true,
-    }],
   },
   action: {
     type: 'SET_PROPERTY',
@@ -188,7 +227,26 @@ console.log(`Updated ${result.affectedEntityCount} walls`);
 Preview without applying:
 
 ```typescript
-const preview = engine.preview(query);
+import { BulkQueryEngine, type BulkQuery } from '@ifc-lite/mutations';
+import { PropertyValueType } from '@ifc-lite/data';
+
+const engine = new BulkQueryEngine(store.entities, view);
+
+// The same query the execute example above runs.
+const bulkQuery: BulkQuery = {
+  select: {
+    entityTypes: [/* IfcWall enum value */],
+  },
+  action: {
+    type: 'SET_PROPERTY',
+    psetName: 'Pset_WallCommon',
+    propName: 'ThermalTransmittance',
+    value: 0.18,
+    valueType: PropertyValueType.Real,
+  },
+};
+
+const preview = engine.preview(bulkQuery);
 console.log(`Would update ${preview.matchedCount} entities`);
 ```
 
@@ -201,6 +259,8 @@ import { CsvConnector } from '@ifc-lite/mutations';
 import { PropertyValueType } from '@ifc-lite/data';
 
 const connector = new CsvConnector(store.entities, view);
+
+const csvText = await file.text();  // or any string of CSV
 
 const stats = connector.import(csvText, {
   matchStrategy: { type: 'globalId', column: 'GlobalId' },

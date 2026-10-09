@@ -317,6 +317,23 @@ describe('DropboxProvider', () => {
       expect(clampSearchPageSize(0.5)).toBe(1);
       expect(clampRevisionsPageSize(0.5)).toBe(1);
     });
+
+    // `limit && limit > 0 ? ... : DEFAULT` treats a `0` or negative `limit`
+    // as "not really a limit" and falls back to the default page size,
+    // rather than floor-clamping it up to 1 the way a sub-1 fraction is.
+    // Nothing exercised `0` itself: every existing fixture is either a large
+    // limit, a fraction strictly between 0 and 1, or `undefined` — none of
+    // which distinguish "falls back to the default" from "clamps up to 1",
+    // since `0` is the one input where those two behaviors produce visibly
+    // different page sizes (200/100/10 vs 1).
+    it('falls back to the default page size for a zero or negative limit, not clamped up to 1', () => {
+      expect(clampPageSize(0)).toBe(200);
+      expect(clampPageSize(-5)).toBe(200);
+      expect(clampSearchPageSize(0)).toBe(100);
+      expect(clampSearchPageSize(-5)).toBe(100);
+      expect(clampRevisionsPageSize(0)).toBe(10);
+      expect(clampRevisionsPageSize(-5)).toBe(10);
+    });
   });
 
   describe('download', () => {
@@ -335,6 +352,30 @@ describe('DropboxProvider', () => {
         revisionId: 'rev-v1',
       });
       expect(new TextDecoder().decode(buf)).toBe('MODEL-BYTES-1-OLD');
+    });
+
+    // #6375: with no Content-Length on the streamed body, the ring's total
+    // comes from the `size` Dropbox sends back in `Dropbox-API-Result`.
+    it('reports streamed progress with the Dropbox-API-Result size as the total when Content-Length is missing', async () => {
+      const content = 'IFC-BYTES-STREAMED-IN-CHUNKS';
+      const sizedWorld: DropboxMockWorld = {
+        ...WORLD,
+        items: [
+          ...WORLD.items,
+          { id: 'id:file-sized', name: 'big.ifc', parentId: 'id:f-alpha', kind: 'file', size: content.length, content },
+        ],
+      };
+      const ctx = createDropboxMockContext(sizedWorld);
+      const calls: Array<readonly [number, number | undefined]> = [];
+      const buf = await provider.download(
+        ctx,
+        { projectId: 'me', containerId: 'id:f-alpha', fileId: 'id:file-sized' },
+        { onProgress: (received, total) => calls.push([received, total]) },
+      );
+
+      expect(new TextDecoder().decode(buf)).toBe(content);
+      expect(calls[0]).toEqual([0, content.length]);
+      expect(calls.at(-1)).toEqual([content.length, content.length]);
     });
 
     it('throws (via DropboxHttpError) for an unknown file', async () => {

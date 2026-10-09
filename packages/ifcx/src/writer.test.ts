@@ -22,7 +22,9 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { StringTable, EntityTableBuilder, IfcTypeEnum } from '@ifc-lite/data';
 import type { EntityTable, PropertySet, PropertyTable, SpatialHierarchy } from '@ifc-lite/data';
-import type { MutablePropertyView } from '@ifc-lite/mutations';
+// Import the built view without the mutations barrel's unrelated query engine;
+// tsx's test loader resolves that engine's regex-guard types condition.
+import { MutablePropertyView } from '../../mutations/dist/mutable-property-view.js';
 import { IfcxWriter, exportToIfcx } from './writer.js';
 import type { IfcxExportData } from './writer.js';
 import type { IfcxFile } from './types.js';
@@ -113,12 +115,23 @@ function parse(content: string): IfcxFile {
   return JSON.parse(content) as IfcxFile;
 }
 
+/**
+ * The GlobalIds `buildTable` gives its two entities. These are also the node
+ * paths the writer emits for them: an IFCX node's path IS its identity, so an
+ * entity that has a GlobalId is keyed by it (see the "uses the entity's IFC
+ * GlobalId as the node path" test). Tests below look nodes up by these rather
+ * than by a substring of the synthetic `ifc:<Type>.<expressId>` fallback,
+ * which only applies to an entity with no GlobalId at all.
+ */
+const BUILT_WALL_GUID = '0YvCT2_$X3_xJG3rzD8L_8';
+const BUILT_DOOR_GUID = '1abCT2_$X3_xJG3rzD8L_8';
+
 /** Real StringTable + EntityTableBuilder rather than a structural stub. */
 function buildTable() {
   const strings = new StringTable();
   const builder = new EntityTableBuilder(2, strings);
-  builder.add(101, 'IFCWALL', '0YvCT2_$X3_xJG3rzD8L_8', 'Wall-A', 'desc', 'Standard', true, false);
-  builder.add(102, 'IFCDOOR', '1abCT2_$X3_xJG3rzD8L_8', 'Door-A', '', '', true, false);
+  builder.add(101, 'IFCWALL', BUILT_WALL_GUID, 'Wall-A', 'desc', 'Standard', true, false);
+  builder.add(102, 'IFCDOOR', BUILT_DOOR_GUID, 'Door-A', '', '', true, false);
   return { strings, table: builder.build() };
 }
 
@@ -366,6 +379,43 @@ describe('IfcxWriter — node attributes and paths', () => {
     assert.strictEqual(file.data[1].path, 'ifc:IfcBuildingStorey.43');
   });
 
+  it('uses the entity\'s IFC GlobalId as the node path, since IFCX has nowhere else to carry it', () => {
+    // A node's `path` IS the entity's identity in IFCX: entity-extractor.ts
+    // hands it straight back as the GlobalId, packages/export's IFC5 exporter
+    // keys nodes by GlobalId for that reason, and the buildingSMART v5a
+    // schemas committed under packages/export/src/__fixtures__/schemas/ define
+    // no attribute that could carry a GlobalId instead. Synthesizing
+    // `ifc:<Type>.<expressId>` for an entity that HAS one therefore threw the
+    // real IFC identity away and invented a replacement that is not stable
+    // across files. Invisible until now because no fixture in this file ever
+    // set `globalId`, so every path assertion only ever saw the fallback.
+    const { entities, strings } = makeEntities([
+      { expressId: 42, typeEnum: TYPE_WALL, globalId: '0YvCT2_$X3_xJG3rzD8L_8' },
+      { expressId: 43, typeEnum: TYPE_STOREY },
+    ]);
+    const file = parse(new IfcxWriter({ entities, strings }).export().content);
+
+    assert.strictEqual(file.data[0].path, '0YvCT2_$X3_xJG3rzD8L_8');
+    // An entity with no GlobalId still gets the synthetic fallback.
+    assert.strictEqual(file.data[1].path, 'ifc:IfcBuildingStorey.43');
+  });
+
+  it('references a child by its GlobalId path, the same path the child node itself carries', () => {
+    // The child-reference path and the child's own node path are derived
+    // twice; letting only one of them learn about GlobalId would leave every
+    // containment link dangling for exactly the entities that have one.
+    const { entities, strings } = makeEntities([
+      { expressId: 1, typeEnum: TYPE_STOREY, globalId: '2StoreyGuid_______0000' },
+      { expressId: 101, typeEnum: TYPE_WALL, globalId: '3WallGuid_________0000' },
+    ]);
+    const spatialHierarchy = makeSpatialHierarchy({ byStorey: new Map([[1, [101]]]) });
+    const file = parse(new IfcxWriter({ entities, strings, spatialHierarchy }).export().content);
+
+    const allPaths = new Set(file.data.map((n) => n.path));
+    assert.deepStrictEqual(file.data[0].children, { element_101: '3WallGuid_________0000' });
+    assert.ok(allPaths.has('3WallGuid_________0000'), 'child reference must resolve to a real node');
+  });
+
   it('falls back to IfcElement in the path for an unmapped type', () => {
     const { entities, strings } = makeEntities([{ expressId: 42, typeEnum: TYPE_UNMAPPED }]);
     const file = parse(new IfcxWriter({ entities, strings }).export().content);
@@ -512,8 +562,8 @@ describe('IfcxWriter.export', () => {
     const result = writer.export({ includeProperties: false });
     const file = JSON.parse(result.content);
 
-    const wallNode = file.data.find((n: { path: string }) => n.path.includes('101'));
-    const doorNode = file.data.find((n: { path: string }) => n.path.includes('102'));
+    const wallNode = file.data.find((n: { path: string }) => n.path === BUILT_WALL_GUID);
+    const doorNode = file.data.find((n: { path: string }) => n.path === BUILT_DOOR_GUID);
     assert.strictEqual(wallNode.attributes['bsi::ifc::class'].code, 'IfcWall');
     assert.strictEqual(doorNode.attributes['bsi::ifc::class'].code, 'IfcDoor');
   });
@@ -532,8 +582,8 @@ describe('IfcxWriter.export', () => {
     const result = writer.export({ includeProperties: false });
     const file = JSON.parse(result.content);
 
-    const wallNode = file.data.find((n: { path: string }) => n.path.includes('101'));
-    assert.deepStrictEqual(wallNode.children, { element_102: 'ifc:IfcDoor.102' });
+    const wallNode = file.data.find((n: { path: string }) => n.path === BUILT_WALL_GUID);
+    assert.deepStrictEqual(wallNode.children, { element_102: BUILT_DOOR_GUID });
   });
 
   it('falls back to bySite when the id is absent from byStorey and byBuilding', () => {
@@ -545,8 +595,8 @@ describe('IfcxWriter.export', () => {
     const result = writer.export({ includeProperties: false });
     const file = JSON.parse(result.content);
 
-    const wallNode = file.data.find((n: { path: string }) => n.path.includes('101'));
-    assert.deepStrictEqual(wallNode.children, { element_102: 'ifc:IfcDoor.102' });
+    const wallNode = file.data.find((n: { path: string }) => n.path === BUILT_WALL_GUID);
+    assert.deepStrictEqual(wallNode.children, { element_102: BUILT_DOOR_GUID });
   });
 
   it('requests the IFC prop schema import only for bsi::ifc::prop:: keys, not presentation keys', () => {
@@ -589,5 +639,77 @@ describe('exportToIfcx', () => {
     const direct = writer.export({ includeProperties: false }).content;
     // Both invocations mint a fresh header id/timestamp, so compare only the data payload.
     assert.deepStrictEqual(JSON.parse(content).data, JSON.parse(direct).data);
+  });
+});
+
+describe('IfcxWriter effective entity set (#5249)', () => {
+  it('writes creations, omits tombstones and dangling child links, and honors the source-only option', () => {
+    const { strings, table } = buildTable();
+    const view = new MutablePropertyView(null, 'model');
+    view.setExpressIdWatermark(102);
+    const created = view.createEntity('IfcWindow', ['2newWindowGuid', null, 'New window', 'Authored']);
+    const property = view.createEntity('IfcPropertySingleValue', ['FireRating', 'Rated', '2h', null]);
+    const cancelled = view.createEntity('IfcWall', ['2cancelledGuid', null, 'Cancelled']);
+    view.deleteEntity(cancelled.expressId);
+    view.deleteEntity(101);
+    view.setEntityType(102, 'IfcWindow');
+
+    const hierarchy = stubHierarchy({ byStorey: new Map([[102, [101, created.expressId]]]) });
+    const writer = new IfcxWriter({ entities: table, strings, spatialHierarchy: hierarchy, mutationView: view });
+    const live = parse(writer.export().content);
+    assert.deepStrictEqual(live.data.map((node) => node.path), [
+      BUILT_DOOR_GUID, '2newWindowGuid', `ifc:IfcPropertySingleValue.${property.expressId}`,
+    ]);
+    assert.deepStrictEqual(live.data[0].attributes?.['bsi::ifc::class'], {
+      code: 'IfcWindow',
+      uri: 'https://identifier.buildingsmart.org/uri/buildingsmart/ifc/5/class/IfcWindow',
+    });
+    assert.deepStrictEqual(live.data[0].children, { [`element_${created.expressId}`]: '2newWindowGuid' });
+    assert.equal(live.data[1].attributes?.['bsi::ifc::prop::Name'], 'New window');
+    assert.equal(live.data[1].attributes?.['bsi::ifc::prop::Description'], 'Authored');
+    assert.equal(live.data[2].attributes?.['bsi::ifc::prop::Name'], 'FireRating');
+    assert.equal(live.data[2].attributes?.['bsi::ifc::prop::Description'], 'Rated');
+
+    const sourceOnly = parse(writer.export({ applyMutations: false }).content);
+    assert.deepStrictEqual(sourceOnly.data.map((node) => node.path), [BUILT_WALL_GUID, BUILT_DOOR_GUID]);
+  });
+});
+
+describe('IfcxWriter effective spatial edges (#5249)', () => {
+  it('moves a child to its live container and removes the stale parsed link', () => {
+    const { entities, strings } = makeEntities([
+      { expressId: 1, typeEnum: TYPE_STOREY },
+      { expressId: 2, typeEnum: TYPE_STOREY },
+      { expressId: 3, typeEnum: TYPE_WALL },
+    ]);
+    const spatialHierarchy = makeSpatialHierarchy({ byStorey: new Map([[1, [3]]]) });
+    const file = parse(new IfcxWriter({
+      entities, strings, spatialHierarchy,
+      effectiveSpatialEdges: [{ sourceId: 2, targetId: 3, relationshipType: 'IfcRelContainedInSpatialStructure' }],
+    }).export().content);
+    assert.equal(file.data[0].children, undefined);
+    assert.deepStrictEqual(file.data[1].children, { element_3: 'ifc:IfcWall.3' });
+  });
+
+  it('requires complete effective edges when a spatial relationship was edited', () => {
+    const { entities, strings } = makeEntities([
+      { expressId: 1, typeEnum: TYPE_STOREY },
+      { expressId: 2, typeEnum: TYPE_WALL },
+    ]);
+    const view = new MutablePropertyView(null, 'model');
+    view.setExpressIdWatermark(2);
+    view.createEntity('IfcRelContainedInSpatialStructure', [
+      '2newRelationGuid', null, null, null, ['#2'], '#1',
+    ]);
+    const spatialHierarchy = makeSpatialHierarchy({ byStorey: new Map() });
+    const writer = new IfcxWriter({ entities, strings, spatialHierarchy, mutationView: view });
+    assert.throws(() => writer.export(), /needs effectiveSpatialEdges/);
+    assert.doesNotThrow(() => writer.export({ applyMutations: false }));
+
+    const live = parse(new IfcxWriter({
+      entities, strings, spatialHierarchy, mutationView: view,
+      effectiveSpatialEdges: [{ sourceId: 1, targetId: 2, relationshipType: 'IfcRelContainedInSpatialStructure' }],
+    }).export().content);
+    assert.deepStrictEqual(live.data[0].children, { element_2: 'ifc:IfcWall.2' });
   });
 });

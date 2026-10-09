@@ -30,8 +30,10 @@
 //! both tests passing). Predicate correctness needs its own fixture, derived
 //! independently of these functions.
 
+mod bounded;
+
 type Tri = [[f64; 3]; 3];
-type Aabb = ([f64; 3], [f64; 3]);
+pub(crate) type Aabb = ([f64; 3], [f64; 3]);
 
 pub fn tri_aabb(t: &Tri) -> Aabb {
     let mut lo = t[0];
@@ -103,6 +105,27 @@ pub struct Bvh {
     pad: f64,
 }
 
+/// The "no box" value: inverted bounds no point can satisfy, so nothing can be
+/// reported inside it. Only [`tris_aabb`] returns it; `Bvh::root_aabb` says the
+/// same thing with `None`, and the two are deliberately separate because their
+/// callers want different shapes.
+pub(crate) const EMPTY_AABB: Aabb = ([f64::MAX; 3], [f64::MIN; 3]);
+
+/// Per-axis AABB over a triangle slice, or [`EMPTY_AABB`] when there are none.
+/// The slice case of [`tri_aabb`]; the union-of-boxes case is `bounds`.
+pub(crate) fn tris_aabb(tris: &[Tri]) -> Aabb {
+    let (mut lo, mut hi) = EMPTY_AABB;
+    for t in tris {
+        for v in t {
+            for k in 0..3 {
+                lo[k] = lo[k].min(v[k]);
+                hi[k] = hi[k].max(v[k]);
+            }
+        }
+    }
+    (lo, hi)
+}
+
 impl Bvh {
     pub fn build(tris: &[Tri]) -> Bvh {
         let mut items: Vec<(u32, Aabb, [f64; 3])> = tris
@@ -133,6 +156,13 @@ impl Bvh {
             (diag * 1.0e-9).max(1.0e-12)
         };
         Bvh { nodes, root, pad }
+    }
+
+    /// The UNPADDED root AABB over every triangle (`None` for an empty tree).
+    /// Lets `point_inside_bvh` bound its parity segment's far endpoint outside
+    /// the mesh without an O(N) rescan.
+    pub(crate) fn root_aabb(&self) -> Option<Aabb> {
+        (self.root != u32::MAX).then(|| self.nodes[self.root as usize].aabb)
     }
 
     /// Append the index of every triangle whose (padded) AABB the segment
@@ -345,3 +375,5 @@ mod tests {
         assert!(candidate_pairs(&a, &far).is_empty());
     }
 }
+
+mod nearest;

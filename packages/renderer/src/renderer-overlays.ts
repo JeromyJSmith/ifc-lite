@@ -43,17 +43,28 @@
 
 import type { Camera } from './camera.js';
 import { SectionPlaneRenderer } from './section-plane.js';
-import { Section2DOverlayRenderer, type CutPolygon2D, type DrawingLine2D } from './section-2d-overlay.js';
+import {
+    Section2DOverlayRenderer,
+    LINE_OVERLAY_CHANNELS,
+    type CutPolygon2D,
+    type DrawingLine2D,
+    type LineOverlayChannel,
+} from './section-2d-overlay.js';
 import { SymbolicOverlays } from './renderer-symbolic-overlays.js';
 import type { SymbolicFillInput, SymbolicTextInput } from './symbolic-overlay-pipelines.js';
-import { ClashSolidPipeline, type ClashSolidInput } from './clash-solid-pipeline.js';
-import { aabbEdgeLineList } from './aabb-edges.js';
+import { ClashSolidPipeline } from './clash-solid-pipeline.js';
+import { anchoredAabbEdgeLineList } from './aabb-edges.js';
 import { projectedBoundsRange } from './render-section-plane.js';
 import { drawSectionOverlays, type ModelBounds } from './render-section-draw.js';
+import type { RelativeToEyeFrame } from './relative-to-eye.js';
 import type { RenderOptions } from './types.js';
+import type { DeviceRecoveryOmission } from './device-recovery.js';
+import { lineVertexFloatCount, type LineVertices } from './section-2d-line-buffer.js';
+import type { OverlayTheme } from './overlay-theme.js';
+import { OverlayThemeApplier, type ThemedClashSolidInput } from './overlay-theme-uniforms.js';
 
 /**
- * The slice of `Renderer` the overlays need. Deliberately four methods wide:
+ * The slice of `Renderer` the overlays need. Deliberately narrow:
  * the overlays own their GPU objects outright, and borrow only the model-bounds
  * bookkeeping that the rest of the renderer also owns.
  */
@@ -62,6 +73,12 @@ export interface OverlayHost {
     getModelBounds(): ModelBounds | null;
     /** Grow (or seed) the model AABB from a flat `[x,y,z,...]` buffer. */
     expandModelBoundsWithFlatVertices(positions: Float32Array, stride: number): void;
+    /** Fold f32-local overlay vertices through their source f64 anchor. */
+    expandModelBoundsWithAnchoredLineVertices(
+        positions: Float32Array,
+        origin: readonly [number, number, number],
+        stride: number,
+    ): void;
     /** Push the current model AABB to the camera's near/far fit. */
     syncCameraSceneBounds(): void;
     /** Mark the viewport dirty for the next animation frame. */
@@ -75,21 +92,69 @@ export interface OverlayDrawContext {
     /** The bounds this frame resolved the section slider against. */
     modelBounds: ModelBounds | null;
     camera: Camera;
+    /** Viewport in CSS px (buffer / `pixelRatio`, see `SectionDrawContext`), as glyph sizes are. */
     canvasWidth: number;
     canvasHeight: number;
+    pixelRatio?: number;
+    relativeToEyeFrame?: RelativeToEyeFrame;
+    rteViewProj?: Float32Array;
+    rteCamera?: readonly [number, number, number];
 }
+
+/**
+ * Whether setting a channel grows the scene AABB.
+ *
+ * The one behavioural difference between the line-overlay channels, and the reason
+ * `setLineOverlay` is a table lookup rather than a plain forward. The
+ * per-channel rationale is on `Renderer.setLineOverlay`, which is what
+ * consumers read in the emitted `.d.ts`; it is not repeated here.
+ *
+ * The rule is "does this content DEFINE the model's extent, so that a file
+ * containing only it must still be framable". It is NOT "is it behind a
+ * visibility toggle" — annotations sit behind `ifcAnnotationsVisible` too and
+ * they DO expand. Anyone adding a channel should answer the first
+ * question, not the second.
+ *
+ * IfcGrid and IfcAnnotation content used to share one buffer feeding
+ * `setLineOverlay('annotation', ...)`, so an annotations-off / grid-on
+ * session could reach `annotation` carrying only grid lines and inflate the
+ * bounds that `grid: false` exists to protect (#3359). Fixed:
+ * `apps/viewer/src/hooks/symbolic-line-channels.ts` keeps the two channels
+ * separate and uploads each to its like-named channel, so this table's
+ * per-channel keying now matches the content it is keyed by.
+ */
+const CHANNEL_EXPANDS_MODEL_BOUNDS: Record<LineOverlayChannel, boolean> = {
+    annotation: true,
+    alignment: true,
+    grid: false,
+    dxf: false,
+    // A LandXML source may consist entirely of authored terrain lines.
+    terrain: true,
+    centreline: false, // Selected source never reframes the model or camera.
+};
 
 export class RendererOverlays {
     private sectionPlaneRenderer: SectionPlaneRenderer | null = null;
     private section2DOverlayRenderer: Section2DOverlayRenderer | null = null;
-    // Overlay/section-cut line colour, kept here so it survives a
-    // pre-init call and a section2DOverlayRenderer re-creation (re-applied below).
-    private overlayLineColor: readonly [number, number, number, number] = [0, 0, 0, 1];
+    // The overlay theme (#5484) — see overlay-theme-uniforms.ts.
+    private readonly themeApplier = new OverlayThemeApplier();
     private readonly symbolic: SymbolicOverlays;
     private clashSolidPipeline: ClashSolidPipeline | null = null;
 
     constructor(private readonly host: OverlayHost) {
         this.symbolic = new SymbolicOverlays(host);
+    }
+
+    /** Snapshot which transient GPU-only layers will be dropped by recovery. */
+    recoveryOmissions(): DeviceRecoveryOmission[] {
+        const omissions: DeviceRecoveryOmission[] = [];
+        const overlay = this.section2DOverlayRenderer;
+        if (overlay?.hasGeometry()) omissions.push('section-2d-overlay');
+        if (overlay && (LINE_OVERLAY_CHANNELS.some((channel) => overlay.hasLineOverlay(channel)) || overlay.hasClashBoxLines3D() || (this.clashSolidPipeline?.hasGeometry() ?? false))) {
+            omissions.push('line-overlays');
+        }
+        if (this.symbolic.hasGeometry()) omissions.push('symbolic-overlays');
+        return omissions;
     }
 
     /**
@@ -99,8 +164,8 @@ export class RendererOverlays {
     init(device: GPUDevice, format: GPUTextureFormat, sampleCount: number): void {
         this.sectionPlaneRenderer = new SectionPlaneRenderer(device, format, sampleCount);
         this.section2DOverlayRenderer = new Section2DOverlayRenderer(device, format, sampleCount);
-        // Re-apply any colour set before this (re)creation so it isn't lost.
-        this.section2DOverlayRenderer.setOverlayLineColor(this.overlayLineColor);
+        // Re-apply any theme set before this (re)creation so it isn't lost.
+        this.themeApplier.reapply(this.sectionPlaneRenderer, this.section2DOverlayRenderer);
         this.symbolic.init(device, format, sampleCount);
         this.clashSolidPipeline = new ClashSolidPipeline(device, format, sampleCount);
     }
@@ -139,30 +204,37 @@ export class RendererOverlays {
         //
         // Order: fills (background) → lines (outlines on top) →
         // texts (labels above everything).
-        this.symbolic.drawFills(pass, viewProj);
-        if (this.section2DOverlayRenderer?.hasAnnotationLines3D()) {
-            this.section2DOverlayRenderer.drawAnnotationLines3D(pass, viewProj);
-        }
-        if (this.section2DOverlayRenderer?.hasAlignmentLines3D()) {
-            this.section2DOverlayRenderer.drawAlignmentLines3D(pass, viewProj);
-        }
-        if (this.section2DOverlayRenderer?.hasGridLines3D()) {
-            this.section2DOverlayRenderer.drawGridLines3D(pass, viewProj);
-        }
-        if (this.section2DOverlayRenderer?.hasDxfLines3D()) {
-            this.section2DOverlayRenderer.drawDxfLines3D(pass, viewProj);
-        }
-        if (this.section2DOverlayRenderer?.hasClashBoxLines3D()) {
-            this.section2DOverlayRenderer.drawClashBoxLines3D(pass, viewProj);
+        this.symbolic.drawFills(pass, viewProj, ctx.rteViewProj, ctx.rteCamera);
+        // `LINE_OVERLAY_CHANNELS` is in draw order: annotation, alignment,
+        // grid, DXF, LandXML, centreline. Centreline uses always-visible depth;
+        // within each depth mode, draw order breaks depth ties.
+        const overlay = this.section2DOverlayRenderer;
+        if (overlay) {
+            for (const channel of LINE_OVERLAY_CHANNELS) {
+                if (overlay.hasLineOverlay(channel)) {
+                    overlay.drawLineOverlay(pass, viewProj, channel, ctx.rteViewProj, ctx.rteCamera);
+                }
+            }
+            if (overlay.hasClashBoxLines3D()) {
+                overlay.drawClashBoxLines3D(pass, viewProj, ctx.rteViewProj, ctx.rteCamera);
+            }
         }
         // Drawn after the box/contact lines and — crucially — after every
         // ghosted (depth-non-writing) element in the main pass, so the true
         // overlap volume shows opaque through both ghosted parents rather
         // than being buried inside them.
         if (this.clashSolidPipeline?.hasGeometry()) {
-            this.clashSolidPipeline.render(pass, viewProj);
+            this.clashSolidPipeline.render(pass, viewProj, ctx.rteViewProj, ctx.rteCamera);
         }
-        this.symbolic.drawTexts(pass, viewProj, ctx.canvasWidth, ctx.canvasHeight, camera);
+        this.symbolic.drawTexts(
+            pass,
+            viewProj,
+            ctx.canvasWidth,
+            ctx.canvasHeight,
+            camera,
+            ctx.rteViewProj,
+            ctx.rteCamera,
+        );
     }
 
     /** See `Renderer.uploadSection2DOverlay` for the published contract. */
@@ -183,7 +255,7 @@ export class RendererOverlays {
         // overlay geometry has to request a frame or the new drawing only
         // appears when something unrelated next dirties the viewport (#2442).
         // The two early returns below leave the geometry untouched, so they
-        // correctly ask for nothing — matching `uploadGridLines3D` and friends.
+        // correctly ask for nothing — matching `setLineOverlay` before init.
         if (!this.section2DOverlayRenderer) return;
 
         if (customPlane) {
@@ -237,96 +309,42 @@ export class RendererOverlays {
         }
     }
 
-    /** See `Renderer.setOverlayLineColor` for the published contract. */
-    setOverlayLineColor(color: readonly [number, number, number, number]): void {
-        // Persist here so a pre-init call (and any later overlay
-        // re-creation) keeps the colour — init() re-applies this.overlayLineColor.
-        this.overlayLineColor = color;
-        this.section2DOverlayRenderer?.setOverlayLineColor(color);
+    /** See `Renderer.setOverlayTheme` for the published contract. */
+    setTheme(theme: OverlayTheme): void {
+        this.themeApplier.set(theme, this.sectionPlaneRenderer, this.section2DOverlayRenderer, this.clashSolidPipeline);
         this.host.requestRender();
     }
 
-    /** See `Renderer.uploadAnnotationLines3D` for the published contract. */
-    uploadAnnotationLines3D(vertices: Float32Array): void {
+    /** See `Renderer.setLineOverlay` for the published contract. */
+    setLineOverlay(channel: LineOverlayChannel, vertices: LineVertices | null): void {
         if (!this.section2DOverlayRenderer) return;
-        this.section2DOverlayRenderer.uploadAnnotationLines3D(vertices);
-        // Contribute annotation extents to modelBounds + camera sceneBounds
-        // so an annotation-only model (no IfcProduct meshes — common for
-        // separate "annotation sheets") gets framed by Home / fit-to-view
-        // AND has correct near/far clipping. Without sceneBounds the camera
-        // frustum doesn't include the annotation cluster and they're clipped
-        // away even when the camera is pointed at them. Mirror the
-        // point-cloud upload path (`addPointClouds`, `setPointClouds`) which
-        // does the same thing.
-        this.host.expandModelBoundsWithFlatVertices(vertices, 3);
-        this.host.syncCameraSceneBounds();
-        this.host.requestRender();
-    }
-
-    /** See `Renderer.clearAnnotationLines3D` for the published contract. */
-    clearAnnotationLines3D(): void {
-        if (this.section2DOverlayRenderer) {
-            this.section2DOverlayRenderer.clearAnnotationLines3D();
-            this.host.requestRender();
+        this.section2DOverlayRenderer.setLineOverlay(channel, vertices);
+        if (CHANNEL_EXPANDS_MODEL_BOUNDS[channel] && vertices) {
+            // Mirrors the point-cloud upload path (`addPointClouds`,
+            // `setPointClouds`): without `syncCameraSceneBounds` the frustum
+            // excludes the cluster and it is clipped away even when the camera
+            // points straight at it. See CHANNEL_EXPANDS_MODEL_BOUNDS.
+            if (vertices instanceof Float32Array) {
+                this.host.expandModelBoundsWithFlatVertices(vertices, 3);
+            } else if ('localVertices' in vertices) {
+                this.host.expandModelBoundsWithAnchoredLineVertices(vertices.localVertices, vertices.origin, 3);
+            } else {
+                for (const partition of vertices) {
+                    this.host.expandModelBoundsWithAnchoredLineVertices(partition.localVertices, partition.origin, 3);
+                }
+            }
+            this.host.syncCameraSceneBounds();
         }
-    }
-
-    /** See `Renderer.uploadAlignmentLines3D` for the published contract. */
-    uploadAlignmentLines3D(vertices: Float32Array): void {
-        if (!this.section2DOverlayRenderer) return;
-        this.section2DOverlayRenderer.uploadAlignmentLines3D(vertices);
-        // Frame alignment-only files the same way annotation overlays are
-        // framed (see uploadAnnotationLines3D).
-        this.host.expandModelBoundsWithFlatVertices(vertices, 3);
-        this.host.syncCameraSceneBounds();
+        // Rendering is dirty-flag gated (#2442): a channel that changed has to
+        // ask for a frame or the change waits for something unrelated to
+        // dirty the viewport. Clearing counts as a change; a pre-init call
+        // returns above without asking, because it changed nothing.
         this.host.requestRender();
-    }
-
-    /** See `Renderer.clearAlignmentLines3D` for the published contract. */
-    clearAlignmentLines3D(): void {
-        if (this.section2DOverlayRenderer) {
-            this.section2DOverlayRenderer.clearAlignmentLines3D();
-            this.host.requestRender();
-        }
-    }
-
-    /**
-     * See `Renderer.uploadGridLines3D` for the published contract. Unlike
-     * alignment, grids do NOT expand model bounds: they're behind a visibility
-     * toggle, so toggling them on must not reframe the camera.
-     */
-    uploadGridLines3D(vertices: Float32Array): void {
-        if (!this.section2DOverlayRenderer) return;
-        this.section2DOverlayRenderer.uploadGridLines3D(vertices);
-        this.host.requestRender();
-    }
-
-    /** See `Renderer.clearGridLines3D` for the published contract. */
-    clearGridLines3D(): void {
-        if (this.section2DOverlayRenderer) {
-            this.section2DOverlayRenderer.clearGridLines3D();
-            this.host.requestRender();
-        }
-    }
-
-    /** See `Renderer.uploadDxfLines3D` for the published contract. */
-    uploadDxfLines3D(vertices: Float32Array): void {
-        if (!this.section2DOverlayRenderer) return;
-        this.section2DOverlayRenderer.uploadDxfLines3D(vertices);
-        this.host.requestRender();
-    }
-
-    /** See `Renderer.clearDxfLines3D` for the published contract. */
-    clearDxfLines3D(): void {
-        if (this.section2DOverlayRenderer) {
-            this.section2DOverlayRenderer.clearDxfLines3D();
-            this.host.requestRender();
-        }
     }
 
     /** See `Renderer.setClashOverlapBox` for the published contract. */
     setClashOverlapBox(
-        box: { min: [number, number, number]; max: [number, number, number]; color: [number, number, number, number] } | null,
+        box: { min: [number, number, number]; max: [number, number, number]; color?: [number, number, number, number] } | null,
     ): void {
         if (!this.section2DOverlayRenderer) return;
         if (!box) {
@@ -334,8 +352,8 @@ export class RendererOverlays {
             this.host.requestRender();
             return;
         }
-        this.section2DOverlayRenderer.setClashBoxLineColor(box.color);
-        this.section2DOverlayRenderer.uploadClashBoxLines3D(aabbEdgeLineList(box.min, box.max));
+        this.section2DOverlayRenderer.setClashBoxLineColor(this.themeApplier.clashLineColor(box.color));
+        this.section2DOverlayRenderer.uploadClashBoxLines3D(anchoredAabbEdgeLineList(box.min, box.max));
         this.host.requestRender();
     }
 
@@ -344,23 +362,23 @@ export class RendererOverlays {
      * clash-box line buffer, so only one of this / setClashOverlapBox shows.
      */
     setClashContactLines(
-        lines: { vertices: Float32Array; color: [number, number, number, number] } | null,
+        lines: { vertices: LineVertices; color?: [number, number, number, number] } | null,
     ): void {
         if (!this.section2DOverlayRenderer) return;
-        if (!lines || lines.vertices.length === 0) {
+        if (!lines || lineVertexFloatCount(lines.vertices) === 0) {
             this.section2DOverlayRenderer.clearClashBoxLines3D();
             this.host.requestRender();
             return;
         }
-        this.section2DOverlayRenderer.setClashBoxLineColor(lines.color);
+        this.section2DOverlayRenderer.setClashBoxLineColor(this.themeApplier.clashLineColor(lines.color));
         this.section2DOverlayRenderer.uploadClashBoxLines3D(lines.vertices);
         this.host.requestRender();
     }
 
     /** See `Renderer.setClashIntersectionSolid` for the published contract. */
-    setClashIntersectionSolid(input: ClashSolidInput | null): void {
+    setClashIntersectionSolid(input: ThemedClashSolidInput | null): void {
         if (!this.clashSolidPipeline) return;
-        this.clashSolidPipeline.upload(input);
+        this.clashSolidPipeline.upload(this.themeApplier.clashSolid(input));
         this.host.requestRender();
     }
 

@@ -252,6 +252,72 @@ describe('createBCFFromClashResult', () => {
     expect(vp?.components?.selection?.length).toBeGreaterThan(0);
     expect(vp?.components?.coloring?.length).toBe(2);
     expect(vp?.perspectiveCamera).toBeDefined();
+
+    // Camera must actually frame this group's bounds ([0,0,0]-[4,3,2], center
+    // [2, 1.5, 1]), not some other point (e.g. the origin). Expected numbers
+    // are computed independently here from the documented formula (radius =
+    // 0.5*diagonal, standoff = radius*distanceFactor, direction =
+    // normalize([1, 0.7, 1])) and the viewer(Y-up)->BCF(Z-up) axis mapping
+    // (bcf.x=viewer.x, bcf.y=-viewer.z, bcf.z=viewer.y) documented in
+    // packages/bcf/src/viewpoint.ts, rather than by calling the production
+    // helper, so a bug in that helper can't hide from this assertion.
+    const cam = vp?.perspectiveCamera;
+    expect(cam?.cameraViewPoint.x).toBeCloseTo(6.265886914190135, 6);
+    expect(cam?.cameraViewPoint.y).toBeCloseTo(-5.265886914190135, 6);
+    expect(cam?.cameraViewPoint.z).toBeCloseTo(4.486120839933094, 6);
+    // Direction must point from the camera towards the group's center
+    // ([2, -1, 1.5] in BCF coords), not e.g. towards the origin.
+    const towardCenter = {
+      x: 2 - cam!.cameraViewPoint.x,
+      y: -1 - cam!.cameraViewPoint.y,
+      z: 1.5 - cam!.cameraViewPoint.z,
+    };
+    const towardCenterLen = Math.sqrt(
+      towardCenter.x ** 2 + towardCenter.y ** 2 + towardCenter.z ** 2,
+    );
+    expect(cam?.cameraDirection.x).toBeCloseTo(towardCenter.x / towardCenterLen, 6);
+    expect(cam?.cameraDirection.y).toBeCloseTo(towardCenter.y / towardCenterLen, 6);
+    expect(cam?.cameraDirection.z).toBeCloseTo(towardCenter.z / towardCenterLen, 6);
+
+    // Coloring must map each color to the correct side: red (FFFF3333) to the
+    // 'a' members, orange (FFFFA500) to the 'b' members. group-critical has
+    // c1 = (GUID_A1, GUID_B1) and c2 = (GUID_A1, GUID_B2), so 'a' is the
+    // single guid GUID_A1 and 'b' is {GUID_B1, GUID_B2}. A test that only
+    // checks `coloring.length === 2` cannot see the two colors' guid lists
+    // swapped.
+    const coloring = vp?.components?.coloring ?? [];
+    const red = coloring.find((c) => c.color === 'FFFF3333');
+    const orange = coloring.find((c) => c.color === 'FFFFA500');
+    expect(red?.components.map((c) => c.ifcGuid)).toEqual(['GUID_A1']);
+    expect(orange?.components.map((c) => c.ifcGuid).sort()).toEqual(['GUID_B1', 'GUID_B2']);
+  });
+
+  it('writes the framing camera in world coordinates when given the render-frame offset (#4806)', async () => {
+    // Clash bounds come from origin-shifted meshes. A georeferenced model
+    // (the #4806 report sat near X 41266 / Y 308208 / Z 123) must still get
+    // a camera that looks at the group's WORLD centre, or BIMcollab / usBIM
+    // put the camera kilometres from the building.
+    const { result, groups } = makeFixture();
+    const worldOffset = { x: 41266, y: 308208, z: 123 };
+    const project = await createBCFFromClashResult(result, groups, { author: 'tester', worldOffset });
+    const cam = project.topics.get(uuidFromSeed('group-critical'))?.viewpoints[0]?.perspectiveCamera;
+    expect(cam).toBeDefined();
+    // Local centre [2, 1.5, 1] (Y-up) is BCF [2, -1, 1.5]; plus the offset.
+    const worldCentre = { x: 2 + worldOffset.x, y: -1 + worldOffset.y, z: 1.5 + worldOffset.z };
+    expect(cam!.cameraViewPoint.x).toBeCloseTo(6.265886914190135 + worldOffset.x, 6);
+    expect(cam!.cameraViewPoint.y).toBeCloseTo(-5.265886914190135 + worldOffset.y, 6);
+    expect(cam!.cameraViewPoint.z).toBeCloseTo(4.486120839933094 + worldOffset.z, 6);
+    // The camera ray passes through the world centre: the point at the
+    // camera-to-centre distance along CameraDirection IS that centre.
+    const d = Math.hypot(
+      worldCentre.x - cam!.cameraViewPoint.x,
+      worldCentre.y - cam!.cameraViewPoint.y,
+      worldCentre.z - cam!.cameraViewPoint.z,
+    );
+    expect(d).toBeLessThan(20);
+    expect(cam!.cameraViewPoint.x + cam!.cameraDirection.x * d).toBeCloseTo(worldCentre.x, 6);
+    expect(cam!.cameraViewPoint.y + cam!.cameraDirection.y * d).toBeCloseTo(worldCentre.y, 6);
+    expect(cam!.cameraViewPoint.z + cam!.cameraDirection.z * d).toBeCloseTo(worldCentre.z, 6);
   });
 
   it('invokes the snapshot provider per group', async () => {
@@ -465,6 +531,21 @@ describe('BCF round-trip', () => {
     // Topic guids survive the round-trip and remain the deterministic ones.
     expect(map.get('clash-1')?.[0]?.topicGuid).toBe(uuidFromSeed('group-critical'));
     expect(map.get('clash-3')?.[0]?.topicGuid).toBe(uuidFromSeed('group-major'));
+  });
+
+  // The "Export to BCF" dialog path: a clash has no section, so the written
+  // viewpoints must carry no <ClippingPlanes> for BIMcollab / usBIM to apply (#4806).
+  it('writes clash viewpoints without clipping planes', async () => {
+    const { result, groups } = makeFixture();
+    const { writeBCF } = await import('@ifc-lite/bcf');
+    const project = await createBCFFromClashResult(result, groups, { author: 'tester', worldOffset: { x: 41266.679, y: 308208.972, z: 125.95 } });
+    const reloaded = await readBCF(await (await writeBCF(project)).arrayBuffer());
+    const viewpoints = [...reloaded.topics.values()].flatMap((t) => t.viewpoints);
+    expect(viewpoints.length).toBe(groups.length);
+    for (const vp of viewpoints) {
+      expect(vp.perspectiveCamera).toBeDefined();
+      expect(vp.clippingPlanes ?? []).toEqual([]);
+    }
   });
 
   // Federation provenance (#1591): a cross-model clash topic must record one

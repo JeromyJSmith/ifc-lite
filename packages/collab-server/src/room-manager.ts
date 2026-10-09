@@ -23,13 +23,15 @@ import type { WebSocket } from 'ws';
 import type { Persistence } from './persistence.js';
 import type { Principal } from './auth.js';
 import { canWrite } from './auth.js';
+import { closeExpiredConnections, isPrincipalExpired, sweepExpiredAcrossRooms } from './principal-expiry.js';
+import type { VerifyDecision, VerifyMessageFn, RoomOptions, PeerConnection } from './room-types.js';
 import {
   noopAuditSink,
   shortHash,
   type AuditOpType,
   type AuditSink,
 } from './audit-log.js';
-import { createRateLimiter, type RateLimitOptions, type RateLimiter } from './rate-limit.js';
+import { createRateLimiter, type RateLimitOptions } from './rate-limit.js';
 
 const MESSAGE_SYNC = 0;
 const MESSAGE_AWARENESS = 1;
@@ -64,50 +66,9 @@ const MAX_SYNC_PAYLOAD_BYTES = 8 * 1024 * 1024;
  */
 const MAX_AWARENESS_BYTES = 128 * 1024;
 
-export interface VerifyDecision {
-  ok: boolean;
-  /** Audit-friendly reason string when ok=false. */
-  reason?: string;
-}
-
-export type VerifyMessageFn = (msg: Uint8Array, conn: PeerConnection) => VerifyDecision;
-
-export interface RoomOptions {
-  persistence: Persistence;
-  /** Compact the persisted log every N updates (default 1000). */
-  compactEvery?: number;
-  /** Idle timeout before a room is unloaded (default 60s). */
-  idleUnloadMs?: number;
-  /** Audit sink for connect/update/awareness events (default = no-op). */
-  auditSink?: AuditSink;
-  /**
-   * Per-peer rate-limit knobs. Applied per connection. Service accounts
-   * (e.g. MCP agents) typically get a tighter budget than humans.
-   */
-  rateLimit?: RateLimitOptions | ((principal: Principal) => RateLimitOptions);
-  /**
-   * Optional per-message verifier. For plain sync write-frames the cheap
-   * role + rate-limit + payload-size gate (preCheckWriteFrame) runs FIRST,
-   * so a non-writer / rate-limited / oversized frame is rejected before the
-   * verifier parses it (avoids Y.Doc-parse amplification). Signed-envelope
-   * frames (e.g. the anti-replay protector's `0xff`-tagged frames) aren't
-   * recognised as sync write-frames, so the verifier still runs first for
-   * them and sees every signed frame. Returning `{ ok: false }` audits as
-   * `reject` with `reason`.
-   */
-  verifyMessage?: VerifyMessageFn;
-  /** Internal: metric counters injected by the manager. */
-  counters?: { update?: () => void; reject?: (reason: string) => void };
-}
-
-export interface PeerConnection {
-  ws: WebSocket;
-  principal: Principal;
-  /** Subscribed clientIDs that this peer's awareness has reported (for cleanup). */
-  awarenessClients: Set<number>;
-  /** Per-connection rate limiter. */
-  limiter?: RateLimiter;
-}
+// Public type surface lives in room-types.ts (module-size budget, AGENTS.md);
+// re-exported here unchanged so this split is not a public API move.
+export type { VerifyDecision, VerifyMessageFn, RoomOptions, PeerConnection };
 
 export class Room {
   readonly id: string;
@@ -210,6 +171,11 @@ export class Room {
     return { kicked: false };
   }
 
+  /** #3441 periodic expiry re-check; see principal-expiry.ts. */
+  sweepExpiredPrincipals(now: number = Date.now()): number {
+    return closeExpiredConnections(this.conns, now);
+  }
+
   /** Number of currently connected peers. */
   get peerCount(): number {
     return this.conns.size;
@@ -288,6 +254,7 @@ export class Room {
     // 'viewer' could force unbounded full-Y.Doc parses by flooding
     // write-tagged frames (asymmetric CPU/GC DoS). Cheap peeks only here.
     if (!this.preCheckWriteFrame(conn, msg)) return;
+    let dispatchable = msg;
     if (this.verifyMessage) {
       const decision = this.verifyMessage(msg, conn);
       if (!decision.ok) {
@@ -296,9 +263,26 @@ export class Room {
         this.counters.reject?.(reason);
         return;
       }
+      // A verifier that unwraps an outer envelope (e.g. the anti-replay
+      // protector's signed frame) hands back the inner y-protocol frame
+      // here; dispatch THAT, not the raw envelope bytes — the envelope
+      // isn't itself a valid sync/awareness frame.
+      if (decision.payload) {
+        dispatchable = decision.payload;
+        // The preCheckWriteFrame call above read the ENVELOPE (msg), whose
+        // outer varint is the verifier's own tag (e.g. SIGNED_TAG) and never
+        // MESSAGE_SYNC, so it returned true without consulting the role, the
+        // limiter, or the size cap (see preCheckWriteFrame's early return).
+        // decision.payload is a real, unwrapped write frame that peek never
+        // saw — re-run the same gate on the bytes we are actually about to
+        // dispatch, or a viewer holding a valid signing key can write to the
+        // doc, and an oversized/unrate-limited envelope bypasses the caps
+        // meant to bound Y.Doc-parse amplification.
+        if (!this.preCheckWriteFrame(conn, dispatchable)) return;
+      }
     }
     try {
-      this.dispatchMessage(conn, msg);
+      this.dispatchMessage(conn, dispatchable);
     } catch {
       // Malformed/truncated frame from a peer. lib0 decoding throws
       // (errorUnexpectedEndOfArray / RangeError) on short or oversized
@@ -334,6 +318,12 @@ export class Room {
     }
     const isWriteFrame = subtype === SYNC_UPDATE || subtype === SYNC_STEP2;
     if (!isWriteFrame) return true;
+    // Immediate half of the #3441 expiry re-check; see principal-expiry.ts.
+    if (isPrincipalExpired(conn.principal, Date.now())) {
+      this.audit(conn.principal, 'reject', shortHash(msg), { reason: 'expired' });
+      this.counters.reject?.('expired');
+      return false;
+    }
     if (!canWrite(conn.principal)) {
       this.audit(conn.principal, 'reject', shortHash(msg), { reason: 'role' });
       this.counters.reject?.('role');
@@ -462,7 +452,9 @@ export class Room {
     }
   };
 
-  async destroy(): Promise<void> {
+  /** Close connections and detach the doc/awareness listeners. Shared by
+   * `destroy()` and `disposeUnloaded()`; does not touch persistence. */
+  private closeConnsAndListeners(): void {
     this.destroyed = true;
     for (const conn of this.conns) {
       try { conn.ws.close(); } catch { /* socket may already be torn down */ }
@@ -470,6 +462,24 @@ export class Room {
     this.conns.clear();
     this.doc.off('update', this.onDocUpdate);
     this.awareness.off('update', this.onAwarenessUpdate);
+  }
+
+  /**
+   * Tear down a room that never finished loading. Same disposal as
+   * `destroy()` MINUS the final compaction: this room's `doc` is empty or
+   * partial because `loadFromDisk()` threw, so compacting it would replace
+   * the persisted log with that emptiness -- turning a transient disk error
+   * (EMFILE, ENOSPC, an NFS blip) or a corrupt log into permanent data loss.
+   * Compaction is only ever valid for a doc that loaded successfully.
+   */
+  async disposeUnloaded(): Promise<void> {
+    this.closeConnsAndListeners();
+    this.awareness.destroy();
+    this.doc.destroy();
+  }
+
+  async destroy(): Promise<void> {
+    this.closeConnsAndListeners();
     // Final compaction so the next load picks up the freshest state.
     try {
       await this.persistence.compact(this.id, Y.encodeStateAsUpdate(this.doc));
@@ -527,7 +537,30 @@ export class RoomManager {
     const verifyMessage = this.options.verifyMessage;
     pending = (async () => {
       const room = new Room(roomId, { ...this.options, counters, verifyMessage });
-      await room.loadFromDisk();
+      // `new Room(...)` already started disposables (notably y-protocols'
+      // `Awareness`, which self-starts a `setInterval` renewal/eviction
+      // timer in its constructor) and wired `doc`/`awareness` listeners.
+      // If loadFromDisk() throws, `room` is never returned to any caller,
+      // so nothing outside this closure can reach it to dispose those
+      // handles — they would otherwise leak for the life of the process.
+      // Tear the half-built room down here, where we still hold the only
+      // reference, then rethrow so the promise still rejects as before.
+      //
+      // Use disposeUnloaded(), NOT destroy(): destroy() ends with a final
+      // compact() of `room.doc` onto the persisted log, and on this path
+      // `room.doc` is empty or partial (that is what loadFromDisk() failing
+      // means). A transient EMFILE/ENOSPC blip -- or a corrupt log -- would
+      // otherwise be turned into permanent data loss by the "cleanup" that
+      // runs right here.
+      try {
+        await room.loadFromDisk();
+      } catch (err) {
+        await room.disposeUnloaded().catch((disposeErr) => {
+          // eslint-disable-next-line no-console
+          console.error(`[collab-server] disposeUnloaded error for ${roomId} (original error wins):`, disposeErr);
+        });
+        throw err;
+      }
       return room;
     })();
     // Evict the cached promise if initialization fails so a transient load
@@ -640,6 +673,11 @@ export class RoomManager {
     }
     for (const roomId of candidates) await this.unload(roomId);
     return candidates;
+  }
+
+  /** Across every loaded room; see principal-expiry.ts. Timer: server.ts. */
+  sweepExpiredPrincipals(now: number = Date.now()): Promise<number> {
+    return sweepExpiredAcrossRooms(this.rooms.values(), now);
   }
 }
 

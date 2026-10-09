@@ -2,10 +2,12 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import { drawDxfUnderlaysScreenSpace } from './drawing-underlays';
+import { drawReferenceImages } from './drawing-reference-images';
+import { useReferenceImagesForDrawing } from '@/hooks/useReferenceImagesForDrawing';
 import React, { useRef, useState, useEffect } from 'react';
 import {
   GraphicOverrideEngine,
-  calculateDrawingTransform,
   type Drawing2D,
   type ElementData,
 } from '@ifc-lite/drawing-2d';
@@ -17,46 +19,13 @@ import type { PolygonArea2DResult, TextAnnotation2D, CloudAnnotation2D, Annotati
 import type { DxfUnderlayRenderData } from '@/hooks/useDxfUnderlay';
 import type { AnnotationFill2D, AnnotationText2D } from '@/hooks/useSymbolicAnnotations';
 import type { ScanBandPoint } from '@/hooks/scanSectionMath';
-import { sheetGeometryKeyOf, type CachedSheetTransform } from '@/lib/drawing/sheet-geometry-key';
-
-// Fill colors for IFC types (architectural convention)
-const IFC_TYPE_FILL_COLORS: Record<string, string> = {
-  // Structural elements - solid gray
-  IfcWall: '#b0b0b0',
-  IfcWallStandardCase: '#b0b0b0',
-  IfcColumn: '#909090',
-  IfcBeam: '#909090',
-  IfcSlab: '#c8c8c8',
-  IfcRoof: '#d0d0d0',
-  IfcFooting: '#808080',
-  IfcPile: '#707070',
-
-  // Windows/Doors - lighter
-  IfcWindow: '#e8f4fc',
-  IfcDoor: '#f5e6d3',
-
-  // Stairs/Railings
-  IfcStair: '#d8d8d8',
-  IfcStairFlight: '#d8d8d8',
-  IfcRailing: '#c0c0c0',
-
-  // MEP - distinct colors
-  IfcPipeSegment: '#a0d0ff',
-  IfcDuctSegment: '#c0ffc0',
-
-  // Furniture
-  IfcFurnishingElement: '#ffe0c0',
-
-  // Spaces (usually not shown in section)
-  IfcSpace: '#f0f0f0',
-
-  // Default
-  default: '#d0d0d0',
-};
-
-export function getFillColorForType(ifcType: string): string {
-  return IFC_TYPE_FILL_COLORS[ifcType] || IFC_TYPE_FILL_COLORS.default;
-}
+import { type CachedSheetTransform } from '@/lib/drawing/sheet-geometry-key';
+import { resolveSheetTransform } from '@/lib/drawing/sheet-transform';
+import { useDrawingElementPropertiesLookup } from '@/hooks/useDrawingElementPropertiesLookup';
+import { markActiveDrawingCanvasRendered, registerActiveDrawingCanvas } from '@/lib/drawing/active-canvas-snapshot';
+import { getFillColorForType } from './drawing/ifc-fill-colors';
+import { resolveDrawingPaperTheme, type DrawingPaperTheme } from './drawing/paper-theme';
+export { getFillColorForType } from './drawing/ifc-fill-colors';
 
 // ─── IFC annotation overlay helpers (issue #812) ─────────────────────────────
 
@@ -194,103 +163,6 @@ function drawIfcAnnotationsScreenSpace(
   }
 }
 
-// ─── DXF reference underlays (issue #1782) ───────────────────────────────────
-
-/** Map a DXF vertical justification onto a canvas text baseline. */
-function dxfValignToBaseline(valign: 'baseline' | 'bottom' | 'middle' | 'top'): CanvasTextBaseline {
-  switch (valign) {
-    case 'bottom': return 'bottom';
-    case 'middle': return 'middle';
-    case 'top': return 'top';
-    default: return 'alphabetic';
-  }
-}
-
-/**
- * Render imported DXF underlays beneath the generated drawing, in screen
- * pixels. Geometry arrives pre-mapped to drawing space (render-frame
- * shift, flipped-section mirror, and user placement already applied by
- * useDxfUnderlaysForDrawing — plan sections only), so the caller supplies
- * the plain drawing→screen transform. Text is drawn in screen space (like
- * the IFC annotation overlay) so canvas scaling never mirrors glyphs.
- */
-function drawDxfUnderlaysScreenSpace(
-  ctx: CanvasRenderingContext2D,
-  underlays: readonly DxfUnderlayRenderData[] | undefined,
-  modelToScreen: (x: number, y: number) => { x: number; y: number },
-  mmLineToScreen: (mmWeight: number) => number,
-  worldHeightToScreenPx: (worldHeight: number) => number,
-): void {
-  if (!underlays || underlays.length === 0) return;
-
-  for (const data of underlays) {
-    if (data.opacity <= 0) continue;
-    ctx.save();
-    ctx.globalAlpha = data.opacity;
-
-    // Fills first so linework composites on top.
-    for (const fill of data.fills) {
-      ctx.fillStyle = fill.color;
-      ctx.globalAlpha = data.opacity * (fill.pattern ? 0.25 : 1);
-      ctx.beginPath();
-      for (const ring of fill.loops) {
-        if (ring.length < 3) continue;
-        const first = modelToScreen(ring[0].x, ring[0].y);
-        ctx.moveTo(first.x, first.y);
-        for (let i = 1; i < ring.length; i++) {
-          const p = modelToScreen(ring[i].x, ring[i].y);
-          ctx.lineTo(p.x, p.y);
-        }
-        ctx.closePath();
-      }
-      ctx.fill('evenodd');
-      ctx.globalAlpha = data.opacity;
-    }
-
-    for (const line of data.lines) {
-      if (line.points.length < 2) continue;
-      ctx.strokeStyle = line.color;
-      ctx.lineWidth = mmLineToScreen(line.widthMm ?? 0.18);
-      ctx.setLineDash(line.dashed ? [5, 4] : []);
-      ctx.beginPath();
-      const first = modelToScreen(line.points[0].x, line.points[0].y);
-      ctx.moveTo(first.x, first.y);
-      for (let i = 1; i < line.points.length; i++) {
-        const p = modelToScreen(line.points[i].x, line.points[i].y);
-        ctx.lineTo(p.x, p.y);
-      }
-      if (line.closed) ctx.closePath();
-      ctx.stroke();
-    }
-    ctx.setLineDash([]);
-
-    for (const text of data.texts) {
-      const fontPx = worldHeightToScreenPx(text.height);
-      if (fontPx < 4) continue; // declutter when zoomed far out
-      const anchor = modelToScreen(text.x, text.y);
-      const tip = modelToScreen(text.x + text.dirX, text.y + text.dirY);
-      const sx = tip.x - anchor.x;
-      const sy = tip.y - anchor.y;
-      const angle = Math.abs(sx) + Math.abs(sy) > 1e-6 ? Math.atan2(sy, sx) : 0;
-
-      ctx.save();
-      ctx.fillStyle = text.color;
-      ctx.font = `${fontPx}px system-ui, sans-serif`;
-      ctx.textAlign = text.align;
-      ctx.textBaseline = dxfValignToBaseline(text.valign);
-      ctx.translate(anchor.x, anchor.y);
-      ctx.rotate(angle);
-      const lines = text.text.split('\n');
-      for (let i = 0; i < lines.length; i++) {
-        ctx.fillText(lines[i], 0, i * fontPx * 1.3);
-      }
-      ctx.restore();
-    }
-
-    ctx.restore();
-  }
-}
-
 /** Dot half-size in screen pixels — constant regardless of zoom, like the DXF underlay's text. */
 const SCAN_DOT_HALF_PX = 0.75;
 const SCAN_DOT_NEUTRAL_COLOR = '#8a8a8a';
@@ -331,7 +203,6 @@ function drawScanSectionScreenSpace(
   ctx.restore();
 }
 
-// Static constants to avoid creating new objects/arrays on every render
 const CANVAS_STYLE = { imageRendering: 'crisp-edges' as const };
 const EMPTY_MEASURE_RESULTS: Measure2DResultData[] = [];
 const EMPTY_UNIT_DISPLAY_OVERRIDES: Record<string, string> = {};
@@ -345,6 +216,7 @@ export interface Measure2DResultData {
 
 interface Drawing2DCanvasProps {
   drawing: Drawing2D;
+  snapshotSourceDrawing?: Drawing2D;
   transform: { x: number; y: number; scale: number };
   showHiddenLines: boolean;
   overrideEngine: GraphicOverrideEngine;
@@ -391,10 +263,18 @@ interface Drawing2DCanvasProps {
   // `unitDisplayOverrides` but left this canvas's own `formatDistance()`
   // calls on the pre-#2199 no-argument (always-metric) form).
   unitDisplayOverrides?: Record<string, string>;
+  // Paper/ink follow the app theme in direct mode; sheet mode's paper stays
+  // white regardless (#5496). Defaults to the light-theme reading so every
+  // existing caller (there is exactly one, `DrawingCanvasView`) that doesn't
+  // pass it yet keeps today's white-paper look.
+  paperTheme?: DrawingPaperTheme;
 }
+
+const DEFAULT_PAPER_THEME: DrawingPaperTheme = resolveDrawingPaperTheme('light', false);
 
 export function Drawing2DCanvas({
   drawing,
+  snapshotSourceDrawing = drawing,
   transform,
   showHiddenLines,
   overrideEngine,
@@ -427,11 +307,14 @@ export function Drawing2DCanvas({
   scanPoints,
   scanOpacity = 1,
   unitDisplayOverrides = EMPTY_UNIT_DISPLAY_OVERRIDES,
+  paperTheme = DEFAULT_PAPER_THEME,
 }: Drawing2DCanvasProps): React.ReactElement {
+  const referenceImages = useReferenceImagesForDrawing(drawing.config.plane);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [canvasSize, setCanvasSize] = useState({ width: 0, height: 0 });
-
-  // ResizeObserver to track canvas size changes
+  // Resolved once per (model set, polygon set) change, never per draw frame.
+  const getElementProperties = useDrawingElementPropertiesLookup(drawing, overrideEngine, overridesEnabled);
+  useEffect(() => canvasRef.current ? registerActiveDrawingCanvas(canvasRef.current, snapshotSourceDrawing) : undefined, [snapshotSourceDrawing]);
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -466,8 +349,10 @@ export function Drawing2DCanvas({
     canvas.height = canvasSize.height * dpr;
     ctx.scale(dpr, dpr);
 
-    // Clear with light gray background (shows paper edge when in sheet mode)
-    ctx.fillStyle = sheetEnabled && activeSheet ? '#e5e5e5' : '#ffffff';
+    // Clear with the desk (shows the paper edge when in sheet mode) or the
+    // theme's paper colour in direct mode (#5496: dark paper in dark theme,
+    // print preview always white).
+    ctx.fillStyle = sheetEnabled && activeSheet ? paperTheme.desk : paperTheme.paper;
     ctx.fillRect(0, 0, canvasSize.width, canvasSize.height);
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -489,6 +374,9 @@ export function Drawing2DCanvas({
       // ─────────────────────────────────────────────────────────────────────
       // 1. Draw paper background (white with shadow)
       // ─────────────────────────────────────────────────────────────────────
+      // Always white regardless of theme (#5496): a sheet models a physical
+      // printed page, and only the desk around it (the clear above) follows
+      // the theme.
       ctx.save();
       // Paper shadow
       ctx.shadowColor = 'rgba(0, 0, 0, 0.2)';
@@ -733,44 +621,33 @@ export function Drawing2DCanvas({
         maxY: drawing.bounds.max.y,
       };
 
-      // Axis-specific flipping
-      const flipY = sectionAxis !== 'down';
-      const flipX = sectionAxis === 'side';
+      // Flips, cache read and the axis-corrected transform all come from the
+      // ONE resolver the print/export path also calls (`resolveSheetTransform`)
+      // — so preview and print cannot derive any of the three separately.
+      // The cached entry is validated against the CURRENT sheet's own
+      // geometry key AND the current section axis inside the resolver (the
+      // transform carries the axis's flips), not trusted because it's present:
+      // `useViewControls`'s effect that nulls this ref on a geometry change
+      // runs in the SAME commit as this drawing effect, but as the PARENT
+      // hook its effect commits AFTER this (child) effect — so on the very
+      // render the sheet's geometry changes, a stale (still non-null) cached
+      // entry would otherwise be reused for one frame, and nothing forces a
+      // second draw to correct it (PR #2853 review).
+      const resolved = resolveSheetTransform({
+        sheet: activeSheet,
+        drawingBounds,
+        axis: sectionAxis,
+        isPinned: Boolean(isPinned),
+        cached: cachedSheetTransformRef?.current,
+      });
+      const { flipX, flipY } = resolved;
+      const drawingTransform = resolved.transform;
 
-      // Use cached transform when pinned, otherwise calculate new one
-      let drawingTransform: { translateX: number; translateY: number; scaleFactor: number };
-
-      // Validated against the CURRENT sheet's own geometry key, not just
-      // trusted because it's present: `useViewControls`'s effect that nulls
-      // this ref on a geometry change runs in the SAME commit as this
-      // drawing effect, but as the PARENT hook its effect commits AFTER this
-      // (child) effect — so on the very render the sheet's geometry changes,
-      // a stale (still non-null) cached entry would otherwise be reused for
-      // one frame, and nothing forces a second draw to correct it (PR #2853
-      // review). Comparing `key` here makes this effect correct on its own,
-      // independent of that ordering.
-      const currentSheetGeometryKey = sheetGeometryKeyOf(activeSheet);
-      if (isPinned && cachedSheetTransformRef?.current && cachedSheetTransformRef.current.key === currentSheetGeometryKey) {
-        // Use cached transform to keep model fixed in place
-        drawingTransform = cachedSheetTransformRef.current;
-      } else {
-        // Calculate new transform
-        const baseTransform = calculateDrawingTransform(drawingBounds, viewport, activeSheet.scale);
-
-        // Adjust for axis-specific flipping
-        // calculateDrawingTransform assumes Y-flip (uses maxY), but for 'down' view we don't flip Y
-        drawingTransform = {
-          ...baseTransform,
-          translateY: flipY
-            ? baseTransform.translateY
-            : baseTransform.translateY - (drawingBounds.maxY + drawingBounds.minY) * baseTransform.scaleFactor,
-        };
-
-        // Cache the transform for pinned mode, tagged with the geometry it
-        // was computed for (see the validation above).
-        if (cachedSheetTransformRef) {
-          cachedSheetTransformRef.current = { ...drawingTransform, key: currentSheetGeometryKey };
-        }
+      // The PREVIEW owns the cache: it is the only path that writes. Export
+      // reads through the same resolver but never writes, so printing can
+      // never perturb the placement on screen.
+      if (!resolved.fromCache && cachedSheetTransformRef) {
+        cachedSheetTransformRef.current = { ...drawingTransform, key: resolved.key };
       }
 
       // Apply combined transform: sheet mm -> screen, then drawing coords -> sheet mm
@@ -794,6 +671,8 @@ export function Drawing2DCanvas({
           return { x: mmToScreenX(sheetX), y: mmToScreenY(sheetY) };
         };
 
+        drawReferenceImages(ctx, referenceImages, modelToScreen);
+
         // Line width in screen pixels (convert mm to screen)
         const mmLineToScreen = (mmWeight: number) => Math.max(0.5, mmToScreen(mmWeight / drawingTransform.scaleFactor * 0.001));
 
@@ -815,8 +694,7 @@ export function Drawing2DCanvas({
 
         // Fill cut polygons
         for (const polygon of drawing.cutPolygons) {
-          let fillColor = getFillColorForType(polygon.ifcType);
-          let opacity = 1;
+          let fillColor = getFillColorForType(polygon.ifcType), opacity = 1;
 
           if (useIfcMaterials) {
             // Per-layer fill (material-layer wall/slab) wins over the per-entity
@@ -834,7 +712,7 @@ export function Drawing2DCanvas({
           } else if (overridesEnabled) {
             const elementData: ElementData = {
               expressId: polygon.entityId,
-              ifcType: polygon.ifcType,
+              ifcType: polygon.ifcType, properties: getElementProperties(polygon.entityId),
             };
             const result = overrideEngine.applyOverrides(elementData);
             fillColor = result.style.fillColor;
@@ -878,7 +756,7 @@ export function Drawing2DCanvas({
           if (overridesEnabled) {
             const elementData: ElementData = {
               expressId: polygon.entityId,
-              ifcType: polygon.ifcType,
+              ifcType: polygon.ifcType, properties: getElementProperties(polygon.entityId),
             };
             const result = overrideEngine.applyOverrides(elementData);
             strokeColor = result.style.strokeColor;
@@ -987,7 +865,52 @@ export function Drawing2DCanvas({
       // 6. Draw scale bar at BOTTOM LEFT of title block
       // Uses actual drawingTransform.scaleFactor which accounts for dynamic scaling
       // ─────────────────────────────────────────────────────────────────────
-      if (scaleBar.visible && tbH > 10) {
+      // The scale bar is sized by two loops, and BOTH can fail to terminate:
+      //
+      //   while (sbLengthMm > maxBarWidth && targetLengthM > 0.5)   // halving
+      //     targetLengthM = targetLengthM / 2;
+      //   while (sbLengthMm < maxBarWidth * 0.3 && targetLengthM < 100)  // doubling
+      //     targetLengthM = targetLengthM * 2;
+      //
+      // They wedge on different inputs, which is why the guard needs three
+      // clauses and not one. Measured against the real component, each one a
+      // render that had to be killed by the test runner's timeout:
+      //
+      //     totalLengthM=0         doubling loop   0 * 2 is 0, forever
+      //     totalLengthM=-1        doubling loop   halves toward -Infinity,
+      //                                            which stays < 100
+      //     totalLengthM=Infinity  HALVING loop    Infinity / 2 is Infinity
+      //     scaleFactor=NaN        terminates
+      //     scaleFactor=0          terminates
+      //
+      // The Infinity case is the one I missed first time round, because I
+      // reasoned about the doubling loop the bug report named and never looked
+      // at the one above it. `Infinity > 0` passes a positivity check, so a
+      // guard without `Number.isFinite` reads as complete and is not.
+      //
+      // title-block-renderer.ts:410 already had this exactly right, and says so:
+      // "Checked BEFORE the clamp, and the ordering is load-bearing: testing
+      // the clamped result loses the infinite case". This is the canvas
+      // catching up with the exporter, which is also why `calculateOptimal-
+      // ScaleBarLength` is left alone: it returns 0 for "no usable bar" and the
+      // exporter already declines to draw that. The canvas was the half not
+      // holding up its end.
+      //
+      // The two scaleFactor clauses do a different job. Neither prevents a
+      // hang; they stop a bar being drawn with a `NaNm` label when
+      // `actualTotalLength` comes out 0/0.
+      //
+      // Guards only the scale bar: the north arrow is drawn after this block in
+      // the same function, so an early return would silently drop it. That was
+      // my first attempt.
+      if (
+        scaleBar.visible &&
+        tbH > 10 &&
+        scaleBar.totalLengthM > 0 &&
+        Number.isFinite(scaleBar.totalLengthM) &&
+        Number.isFinite(drawingTransform.scaleFactor) &&
+        drawingTransform.scaleFactor > 0
+      ) {
         // Position: bottom left with small margin
         const sbX = tbX + 3;
         const sbY = tbY + tbH - 8; // 8mm from bottom (leaves room for label)
@@ -1110,6 +1033,7 @@ export function Drawing2DCanvas({
       // - 'side': also flip X to look from conventional direction
       const scaleX = sectionAxis === 'side' ? -transform.scale : transform.scale;
       const scaleY = sectionAxis === 'down' ? transform.scale : -transform.scale;
+      drawReferenceImages(ctx, referenceImages, (x, y) => ({ x: x * scaleX + transform.x, y: y * scaleY + transform.y }));
 
       // DXF reference underlays render first, beneath the cut geometry
       // (issue #1782). Data is pre-mapped drawing space and exists only
@@ -1133,10 +1057,10 @@ export function Drawing2DCanvas({
       // 1. FILL CUT POLYGONS (with color from IFC materials, override engine, or type fallback)
       // ═══════════════════════════════════════════════════════════════════════
       for (const polygon of drawing.cutPolygons) {
-        // Get fill color - priority: IFC materials > override engine > IFC type fallback
-        let fillColor = getFillColorForType(polygon.ifcType);
-        let strokeColor = '#000000';
-        let opacity = 1;
+        // Get fill color - priority: IFC materials > override engine > IFC type fallback.
+        // Direct mode only (#5496): the dark-paper analogue applies here, never
+        // in sheet mode above, which stays on white paper.
+        let fillColor = getFillColorForType(polygon.ifcType, paperTheme.isDark), strokeColor = paperTheme.ink, opacity = 1;
 
         // Use actual IFC material colors from the mesh data
         if (useIfcMaterials) {
@@ -1156,7 +1080,7 @@ export function Drawing2DCanvas({
         } else if (overridesEnabled) {
           const elementData: ElementData = {
             expressId: polygon.entityId,
-            ifcType: polygon.ifcType,
+            ifcType: polygon.ifcType, properties: getElementProperties(polygon.entityId),
           };
           const result = overrideEngine.applyOverrides(elementData);
           fillColor = result.style.fillColor;
@@ -1193,13 +1117,13 @@ export function Drawing2DCanvas({
       // 2. STROKE CUT POLYGON OUTLINES (with color from override engine)
       // ═══════════════════════════════════════════════════════════════════════
       for (const polygon of drawing.cutPolygons) {
-        let strokeColor = '#000000';
+        let strokeColor = paperTheme.ink;
         let lineWeight = 0.5;
 
         if (overridesEnabled) {
           const elementData: ElementData = {
             expressId: polygon.entityId,
-            ifcType: polygon.ifcType,
+            ifcType: polygon.ifcType, properties: getElementProperties(polygon.entityId),
           };
           const result = overrideEngine.applyOverrides(elementData);
           strokeColor = result.style.strokeColor;
@@ -1258,15 +1182,16 @@ export function Drawing2DCanvas({
           continue;
         }
 
-        // Set line style based on category
-        let strokeColor = '#000000';
+        // Set line style based on category. Ink follows the paper (#5496):
+        // direct mode only, sheet mode above stays black-on-white.
+        let strokeColor = paperTheme.ink;
         let lineWidth = 0.25;
         let dashPattern: number[] = [];
 
         switch (line.category) {
           case 'projection':
             lineWidth = 0.25;
-            strokeColor = '#000000';
+            strokeColor = paperTheme.ink;
             break;
           case 'hidden':
             lineWidth = 0.18;
@@ -1275,19 +1200,19 @@ export function Drawing2DCanvas({
             break;
           case 'silhouette':
             lineWidth = 0.35;
-            strokeColor = '#000000';
+            strokeColor = paperTheme.ink;
             break;
           case 'crease':
             lineWidth = 0.18;
-            strokeColor = '#000000';
+            strokeColor = paperTheme.ink;
             break;
           case 'boundary':
             lineWidth = 0.25;
-            strokeColor = '#000000';
+            strokeColor = paperTheme.ink;
             break;
           case 'annotation':
             lineWidth = 0.13;
-            strokeColor = '#000000';
+            strokeColor = paperTheme.ink;
             break;
         }
 
@@ -1700,7 +1625,6 @@ export function Drawing2DCanvas({
       ctx.setLineDash([]);
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
     // 8. RENDER SELECTION HIGHLIGHT
     // ═══════════════════════════════════════════════════════════════════════
     if (selectedAnnotation) {
@@ -1796,7 +1720,8 @@ export function Drawing2DCanvas({
         }
       }
     }
-  }, [drawing, transform, showHiddenLines, canvasSize, overrideEngine, overridesEnabled, entityColorMap, useIfcMaterials, measureMode, measureStart, measureCurrent, measureResults, measureSnapPoint, sheetEnabled, activeSheet, sectionAxis, isPinned, annotation2DActiveTool, annotation2DCursorPos, polygonAreaPoints, polygonAreaResults, textAnnotations, textAnnotationEditing, cloudAnnotationPoints, cloudAnnotations, selectedAnnotation, ifcAnnotationLines, ifcAnnotationTexts, ifcAnnotationFills, dxfUnderlays, scanPoints, scanOpacity, unitDisplayOverrides]);
+    markActiveDrawingCanvasRendered(canvas, snapshotSourceDrawing, textAnnotationEditing === null);
+  }, [referenceImages, drawing, snapshotSourceDrawing, transform, showHiddenLines, canvasSize, overrideEngine, overridesEnabled, getElementProperties, entityColorMap, useIfcMaterials, measureMode, measureStart, measureCurrent, measureResults, measureSnapPoint, sheetEnabled, activeSheet, sectionAxis, isPinned, annotation2DActiveTool, annotation2DCursorPos, polygonAreaPoints, polygonAreaResults, textAnnotations, textAnnotationEditing, cloudAnnotationPoints, cloudAnnotations, selectedAnnotation, ifcAnnotationLines, ifcAnnotationTexts, ifcAnnotationFills, dxfUnderlays, scanPoints, scanOpacity, unitDisplayOverrides, paperTheme]);
 
   return (
     <canvas

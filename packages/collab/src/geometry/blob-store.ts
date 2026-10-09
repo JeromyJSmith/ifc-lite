@@ -47,6 +47,8 @@ export interface BlobPutOptions {
 }
 
 export interface BlobStore {
+  /** Recompute this backend's content identity without writing the blob. */
+  hashBytes?(bytes: Uint8Array): BlobHash;
   put(bytes: Uint8Array, contentType?: string, options?: BlobPutOptions): Promise<BlobMeta>;
   get(hash: BlobHash): Promise<Uint8Array | null>;
   has(hash: BlobHash): Promise<boolean>;
@@ -93,6 +95,8 @@ export class MemoryBlobStore implements BlobStore {
   private readonly blobs = new Map<BlobHash, { bytes: Uint8Array; meta: BlobMeta }>();
   constructor(private readonly hasher: BlobHasher = fnv128) {}
 
+  hashBytes(bytes: Uint8Array): BlobHash { return this.hasher(bytes); }
+
   async put(bytes: Uint8Array, contentType?: string): Promise<BlobMeta> {
     const hash = this.hasher(bytes);
     const meta: BlobMeta = {
@@ -101,10 +105,16 @@ export class MemoryBlobStore implements BlobStore {
       contentType,
       uploadedAt: new Date().toISOString(),
     };
-    if (!this.blobs.has(hash)) {
-      // Defensive copy so callers can mutate `bytes` after put().
-      this.blobs.set(hash, { bytes: new Uint8Array(bytes), meta });
-    }
+    const existing = this.blobs.get(hash);
+    // Always store the fresh meta, even on a re-put of already-known content:
+    // blob-gc's race protection (see blob-gc-worker.ts) relies on a re-PUT
+    // refreshing the upload timestamp, and both other backends (IndexedDB
+    // `put()`, and the HTTP server's own PUT semantics) already do this —
+    // only this in-memory store used to keep the FIRST put's timestamp
+    // forever, so a blob re-referenced long after its original upload read
+    // back as old enough to sweep. The bytes are identical (same hash), so
+    // reuse the already-stored copy instead of paying for another one.
+    this.blobs.set(hash, { bytes: existing ? existing.bytes : new Uint8Array(bytes), meta });
     return meta;
   }
   async get(hash: BlobHash): Promise<Uint8Array | null> {
@@ -169,6 +179,9 @@ export async function createIndexedDbBlobStore(
     });
 
   return {
+    hashBytes(bytes) {
+      return hasher(bytes);
+    },
     async put(bytes: Uint8Array, contentType?: string) {
       const hash = hasher(bytes);
       const meta: BlobMeta = {
@@ -244,6 +257,10 @@ export class HttpBlobStore implements BlobStore {
     const h: Record<string, string> = { ...(extra ?? {}) };
     if (this.opts.token) h['authorization'] = `Bearer ${this.opts.token}`;
     return h;
+  }
+
+  hashBytes(bytes: Uint8Array): BlobHash {
+    return this.hasher(bytes);
   }
 
   async put(
@@ -326,6 +343,17 @@ export class HttpBlobStore implements BlobStore {
  */
 export class LayeredBlobStore implements BlobStore {
   constructor(private readonly local: BlobStore, private readonly remote: BlobStore) {}
+
+  hashBytes(bytes: Uint8Array): BlobHash {
+    const local = this.local.hashBytes?.(bytes);
+    const remote = this.remote.hashBytes?.(bytes);
+    if (local && remote && local !== remote) {
+      throw new Error('@ifc-lite/collab: layered blob stores use different content hashers');
+    }
+    const hash = local ?? remote;
+    if (!hash) throw new Error('@ifc-lite/collab: blob store cannot verify content identity');
+    return hash;
+  }
 
   async put(
     bytes: Uint8Array,

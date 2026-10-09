@@ -5,10 +5,13 @@
 import { beforeAll, describe, expect, it } from 'vitest';
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { IfcTypeEnum, spatialLookups, type SpatialHierarchy, type SpatialNode } from '@ifc-lite/data';
 import { IfcParser } from '../src/index.js';
 import {
   collectTransferables,
   fromTransport,
+  spatialHierarchyFromColumns,
+  spatialHierarchyToColumns,
   toTransport,
   transportByteSize,
 } from '../src/data-store-transport.js';
@@ -317,5 +320,115 @@ describe('fromTransport source identity (#2183)', () => {
     const two = fromTransport(transportOf(), bytes);
     expect(one.source.contentKey).toBe(two.source.contentKey);
     expect(one.source.byteLength).toBe(bytes.byteLength);
+  });
+});
+
+describe('spatialHierarchyToColumns / spatialHierarchyFromColumns: ambiguousStorey (#4311)', () => {
+  function minimalHierarchy(ambiguousStorey: Set<number>): SpatialHierarchy {
+    const project: SpatialNode = {
+      expressId: 1,
+      type: IfcTypeEnum.IfcProject,
+      name: 'Project',
+      longName: undefined,
+      elevation: undefined,
+      children: [],
+      elements: [],
+    };
+    return {
+      project,
+      byStorey: new Map(),
+      byBuilding: new Map(),
+      bySite: new Map(),
+      bySpace: new Map(),
+      storeyElevations: new Map(),
+      storeyHeights: new Map(),
+      elementToStorey: new Map(),
+      ambiguousStorey,
+      getStoreyElements: () => [],
+      getStoreyByElevation: () => null,
+      getContainingSpace: () => null,
+      getPath: () => [],
+    };
+  }
+
+  it('carries a non-empty ambiguousStorey across the worker transport, not just elementToStorey', () => {
+    const hierarchy = minimalHierarchy(new Set([4]));
+    const columns = spatialHierarchyToColumns(hierarchy);
+    const rebuilt = spatialHierarchyFromColumns(columns);
+    expect(rebuilt.ambiguousStorey).toBeDefined();
+    expect(rebuilt.ambiguousStorey!.has(4)).toBe(true);
+  });
+
+  it('round-trips an empty ambiguousStorey as empty, not absent', () => {
+    const hierarchy = minimalHierarchy(new Set());
+    const columns = spatialHierarchyToColumns(hierarchy);
+    const rebuilt = spatialHierarchyFromColumns(columns);
+    expect(rebuilt.ambiguousStorey).toBeDefined();
+    expect(rebuilt.ambiguousStorey!.size).toBe(0);
+  });
+
+  // #4314: `EntityNode.containedIn()` resolves duplicate containment against
+  // this set, so a store rehydrated in the main thread must still carry it -
+  // dropping it silently returns containedIn() to its pre-#4314 answer on the
+  // worker path only, while elementToStorey (which survives the transport)
+  // keeps the fixed one.
+  it('carries reachableSpatialNodes across the worker transport', () => {
+    const hierarchy = minimalHierarchy(new Set());
+    hierarchy.reachableSpatialNodes = new Set([1, 3]);
+    const rebuilt = spatialHierarchyFromColumns(structuredClone(spatialHierarchyToColumns(hierarchy)));
+    expect(rebuilt.reachableSpatialNodes).toBeDefined();
+    expect([...rebuilt.reachableSpatialNodes!].sort((a, b) => a - b)).toEqual([1, 3]);
+  });
+
+  it('leaves reachableSpatialNodes absent when the source hierarchy has none', () => {
+    const rebuilt = spatialHierarchyFromColumns(spatialHierarchyToColumns(minimalHierarchy(new Set())));
+    expect(rebuilt.reachableSpatialNodes).toBeUndefined();
+  });
+});
+
+
+it('worker hydration resolves spatial nodes and live authored space membership (#4308)', () => {
+  const room: SpatialNode = { expressId: 3, type: IfcTypeEnum.IfcSpace, name: 'Room', children: [], elements: [4] };
+  const project: SpatialNode = { expressId: 1, type: IfcTypeEnum.IfcProject, name: 'Project', children: [room], elements: [] };
+  const original = { project, bySpace: new Map([[3, room.elements]]), byStorey: new Map(), byBuilding: new Map(),
+    bySite: new Map(), storeyElevations: new Map(), storeyHeights: new Map(), elementToStorey: new Map(),
+    elementToContainer: new Map([[4, 3]]), getStoreyElements: () => [], getStoreyByElevation: () => null,
+    ...spatialLookups(project, new Map([[3, room.elements]]), new Map([[4, 3]])) } satisfies SpatialHierarchy;
+  const hydrated = spatialHierarchyFromColumns(structuredClone(spatialHierarchyToColumns(original)));
+  expect(hydrated.getPath(3).map(node => node.expressId)).toEqual([1, 3]);
+  expect(hydrated.getPath(4).map(node => node.expressId)).toEqual([1, 3]);
+  hydrated.project.children[0].elements.push(5);
+  hydrated.bySpace.get(3)!.push(5);
+  hydrated.elementToContainer!.set(5, 3);
+  expect(hydrated.getPath(5).map(node => node.expressId)).toEqual([1, 3]);
+  expect(hydrated.getContainingSpace(5)).toBe(3);
+  hydrated.project.children[0].elements.splice(1, 1);
+  hydrated.bySpace.get(3)!.splice(1, 1);
+  hydrated.elementToContainer!.delete(5);
+  expect(hydrated.getPath(5)).toEqual([]);
+  expect(hydrated.getContainingSpace(5)).toBeNull();
+});
+
+// #6499: a source-less reconstructed store must retain its pre-extracted fact
+// across a second worker handoff, rather than reverting to a STEP-byte scan.
+describe('pre-extracted georeferencing transport (#6499)', () => {
+  it('preserves rotated CRS metadata and explicit absence through repeated structured-clone handoffs', async () => {
+    const sample = resolve(__dirname, '../../../apps/viewer/public/samples/building-architecture.ifc');
+    const bytes = readFileSync(sample);
+    const store = await new IfcParser().parseColumnar(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer);
+    const { extractGeoreferencingOnDemand } = await import('../src/on-demand-georeferencing.js');
+    const expected = extractGeoreferencingOnDemand(store);
+    expect(expected?.projectedCRS?.name).toBe('EPSG:32760');
+    store.georeferencing = expected;
+    let payload = structuredClone(toTransport(store).payload);
+    // No resource bytes are required when the immutable fact was transmitted.
+    const empty = contiguousSourceBytes(new Uint8Array());
+    const restored = fromTransport(payload, empty);
+    expect(extractGeoreferencingOnDemand(restored)).toEqual(expected);
+    expect(restored.lengthUnitScale).toBe(0.001);
+    payload = structuredClone(toTransport(restored).payload);
+    expect(extractGeoreferencingOnDemand(fromTransport(payload, empty))).toEqual(expected);
+    restored.georeferencing = null;
+    expect(extractGeoreferencingOnDemand(fromTransport(structuredClone(toTransport(restored).payload), store.source))).toBeNull();
   });
 });

@@ -51,6 +51,100 @@
         assert!((gross - 13.44).abs() < 1e-3, "gross (outer faces) = 13.44, got {gross}");
     }
 
+    /// `gap_boundary` must offset each edge by ITS OWN wall's half-thickness.
+    ///
+    /// Every other fixture in this file gives all four walls the same thickness,
+    /// which makes the per-edge read at the top of `gap_boundary` unobservable:
+    /// permuting `half_thickness` around the cycle moves nothing, so the entire
+    /// crate suite stayed green with that read pointing at the neighbouring edge
+    /// (#3013). The read is reached -- `build_from_wall_rects` calls
+    /// `gap_boundary` for its axis lift -- it just was not pinned.
+    ///
+    /// Area does not separate the cases either: offsetting a rectangle by a
+    /// permutation of the same four numbers only permutes which side each one
+    /// lands on, and an opposite-side swap leaves the area identical. That is
+    /// the lesson #2913 recorded -- assert a POSITION the mutation actually
+    /// moves.
+    ///
+    /// So: four DISTINCT half-thicknesses and an assertion per side. Each side
+    /// of the offset rectangle is displaced by exactly one edge's
+    /// half-thickness, so any misrouting of the read moves at least one side.
+    /// Bounds are taken as min/max rather than by vertex index, so this pins the
+    /// geometry and not which corner the face cycle happens to start at.
+    #[test]
+    fn gap_boundary_offsets_each_edge_by_its_own_half_thickness() {
+        // CCW 4x3 centreline room; `rect` yields bottom, right, top, left.
+        let corners = rect(0.0, 0.0, 4.0, 3.0);
+        let halves: [f64; 4] = [0.10, 0.25, 0.40, 0.55]; // bottom, right, top, left
+        // The fixture can only see the defect while these differ; a future edit
+        // making them uniform would silently restore the blind spot this test
+        // exists to close.
+        for i in 0..halves.len() {
+            for j in (i + 1)..halves.len() {
+                assert!(
+                    (halves[i] - halves[j]).abs() > 1e-9,
+                    "the four half-thicknesses must stay distinct, or a permuted \
+                     read becomes unobservable again"
+                );
+            }
+        }
+        let segs: Vec<InputSegment> = (0..4)
+            .map(|i| {
+                InputSegment::new(corners[i], corners[(i + 1) % 4], Some(200 + i as u32))
+                    .with_half_thickness(halves[i])
+            })
+            .collect();
+        let plate = SpacePlate::build(&segs, BuildOptions::default());
+        assert_eq!(plate.room_count(), 1);
+        let room = plate.rooms().next().unwrap();
+
+        let bounds = |ring: &[[f64; 2]]| {
+            ring.iter().fold(
+                [f64::MAX, f64::MIN, f64::MAX, f64::MIN],
+                |[lo_x, hi_x, lo_y, hi_y], p| {
+                    [lo_x.min(p[0]), hi_x.max(p[0]), lo_y.min(p[1]), hi_y.max(p[1])]
+                },
+            )
+        };
+        // Sanity: the un-offset outline is the centreline rectangle itself.
+        let [cx0, cx1, cy0, cy1] = bounds(&plate.face_outline(room));
+        for (got, want, what) in
+            [(cx0, 0.0, "left"), (cx1, 4.0, "right"), (cy0, 0.0, "bottom"), (cy1, 3.0, "top")]
+        {
+            assert!((got - want).abs() < 1e-9, "centreline {what} = {want}, got {got}");
+        }
+
+        // factor = 1 pushes each side out by that side's own half-thickness.
+        let [x0, x1, y0, y1] = bounds(&plate.gap_boundary(room, 1.0));
+        for (got, want, what) in [
+            (x0, -0.55, "left (half 0.55)"),
+            (x1, 4.25, "right (half 0.25)"),
+            (y0, -0.10, "bottom (half 0.10)"),
+            (y1, 3.40, "top (half 0.40)"),
+        ] {
+            assert!(
+                (got - want).abs() < 1e-6,
+                "factor=1: {what} side must sit at {want}, got {got} — a side at \
+                 another edge's offset means the per-edge half_thickness read is \
+                 misrouted"
+            );
+        }
+
+        // factor = 2 must scale each side's OWN offset, not a shared one.
+        let [dx0, dx1, dy0, dy1] = bounds(&plate.gap_boundary(room, 2.0));
+        for (got, want, what) in [
+            (dx0, -1.10, "left (2 x 0.55)"),
+            (dx1, 4.50, "right (2 x 0.25)"),
+            (dy0, -0.20, "bottom (2 x 0.10)"),
+            (dy1, 3.80, "top (2 x 0.40)"),
+        ] {
+            assert!(
+                (got - want).abs() < 1e-6,
+                "factor=2: {what} side must sit at {want}, got {got}"
+            );
+        }
+    }
+
     #[test]
     fn face_based_edits_preserve_room_classification() {
         // The 4-wall box → one gap room. `is_room` is set once at build and
@@ -762,6 +856,135 @@
         assert!((inner - 8.75).abs() < 1e-6, "the split edge keeps its wall thickness: {inner}");
     }
 
+    #[test]
+    fn net_outline_uses_each_edges_own_thickness_not_a_neighbours() {
+        // Every prior net_outline fixture uses a UNIFORM half_thickness on all four
+        // edges, so a bug that reads the wrong edge's half_thickness (e.g. cycle[i]
+        // vs cycle[(i+1)%n], an off-by-one into the neighbouring edge) is invisible:
+        // the offset applied is the same number either way. Give each of the four
+        // edges of a 4x3 room a DISTINCT thickness so only the correctly-indexed
+        // half_thickness reproduces the expected area.
+        //
+        // loop_segments(&rect(0,0,4,3)) edges, in order: bottom (0,0)->(4,0),
+        // right (4,0)->(4,3), top (4,3)->(0,3), left (0,3)->(0,0).
+        let corners = rect(0.0, 0.0, 4.0, 3.0);
+        let n = corners.len();
+        let halves = [0.1_f64, 0.2, 0.3, 0.4]; // bottom, right, top, left
+        let segs: Vec<InputSegment> = (0..n)
+            .map(|i| {
+                InputSegment::new(corners[i], corners[(i + 1) % n], Some(100 + i as u32))
+                    .with_half_thickness(halves[i])
+            })
+            .collect();
+        let plate = SpacePlate::build(&segs, BuildOptions::default());
+        let room = plate.rooms().next().unwrap();
+
+        // Axis-aligned rectangle, so each side's inset is exactly its own edge's
+        // half-thickness: width shrinks by (left + right), height by (bottom + top).
+        let expected_inner = (4.0 - halves[3] - halves[1]) * (3.0 - halves[0] - halves[2]);
+        let ring = plate.net_outline(room, true);
+        let inner = polygon_area(&ring).abs();
+        assert!(
+            (inner - expected_inner).abs() < 1e-6,
+            "net inset with distinct per-edge thickness: expected {expected_inner}, got {inner}"
+        );
+
+        // Area alone cannot see an OPPOSITE-edge swap (bottom↔top, left↔right):
+        // it only reads the sums (bottom + top) and (left + right), which such a
+        // swap leaves unchanged for any thickness values. Pin each side's inset
+        // POSITION as well — that is what distinguishes an edge from the one
+        // across the room. Each bound is the corresponding edge's own half-
+        // thickness by construction, so this reads as the property, not as magic
+        // numbers.
+        //
+        // Measured, not assumed: sweeping the half_thickness lookup over all 256
+        // index maps in {0,1,2,3}^4, the area check plus these four bounds leave
+        // the identity map as the only survivor. Individually, though, only the
+        // two `min` bounds ever fire first — with `{0.1, 0.2, 0.3, 0.4}` no pair
+        // solves the equation that would let a mis-index keep the area AND both
+        // `min` corners, so `max_x` / `max_y` are never reached. They are kept
+        // because they state the same property for the far sides: drop the area
+        // check and they become load-bearing.
+        let (mut min_x, mut min_y) = (f64::INFINITY, f64::INFINITY);
+        let (mut max_x, mut max_y) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for p in &ring {
+            min_x = min_x.min(p[0]);
+            min_y = min_y.min(p[1]);
+            max_x = max_x.max(p[0]);
+            max_y = max_y.max(p[1]);
+        }
+        assert!(
+            (min_x - halves[3]).abs() < 1e-6,
+            "left inset must use the LEFT edge's thickness: expected {}, got {min_x}",
+            halves[3]
+        );
+        assert!(
+            (min_y - halves[0]).abs() < 1e-6,
+            "bottom inset must use the BOTTOM edge's thickness: expected {}, got {min_y}",
+            halves[0]
+        );
+        assert!(
+            (max_x - (4.0 - halves[1])).abs() < 1e-6,
+            "right inset must use the RIGHT edge's thickness: expected {}, got {max_x}",
+            4.0 - halves[1]
+        );
+        assert!(
+            (max_y - (3.0 - halves[2])).abs() < 1e-6,
+            "top inset must use the TOP edge's thickness: expected {}, got {max_y}",
+            3.0 - halves[2]
+        );
+
+        // The OUTSET ring needs the same treatment, and independently: `net_outline`
+        // reads `cycle[i]` a second time on this path (the shared-edge pin), so it
+        // could be mis-indexed on its own. Area is invariant under the opposite-edge
+        // swap here too — sweeping all 256 index maps, the area check alone leaves
+        // nine passing: the identity plus eight mis-indexings, among them the
+        // permutations (0,3,2,1), (2,1,0,3) and (2,3,0,1). Adding the four bounds
+        // below cuts that to the identity alone. As on the inset side, though, only
+        // the two `min` bounds ever fire first — the area check plus
+        // `out_min_x`/`out_min_y` already leaves the identity as the only survivor,
+        // so `out_max_x` / `out_max_y` are never reached. They are kept because they
+        // state the same property for the far sides, and either pair suffices: area
+        // plus the two `max` bounds also leaves only the identity, and with the area
+        // check dropped the four bounds alone still do.
+        let expected_outer = (4.0 + halves[3] + halves[1]) * (3.0 + halves[0] + halves[2]);
+        let outer_ring = plate.net_outline(room, false);
+        let outer = polygon_area(&outer_ring).abs();
+        assert!(
+            (outer - expected_outer).abs() < 1e-6,
+            "net outset with distinct per-edge thickness: expected {expected_outer}, got {outer}"
+        );
+
+        let (mut out_min_x, mut out_min_y) = (f64::INFINITY, f64::INFINITY);
+        let (mut out_max_x, mut out_max_y) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for p in &outer_ring {
+            out_min_x = out_min_x.min(p[0]);
+            out_min_y = out_min_y.min(p[1]);
+            out_max_x = out_max_x.max(p[0]);
+            out_max_y = out_max_y.max(p[1]);
+        }
+        assert!(
+            (out_min_x + halves[3]).abs() < 1e-6,
+            "left outset must use the LEFT edge's thickness: expected {}, got {out_min_x}",
+            -halves[3]
+        );
+        assert!(
+            (out_min_y + halves[0]).abs() < 1e-6,
+            "bottom outset must use the BOTTOM edge's thickness: expected {}, got {out_min_y}",
+            -halves[0]
+        );
+        assert!(
+            (out_max_x - (4.0 + halves[1])).abs() < 1e-6,
+            "right outset must use the RIGHT edge's thickness: expected {}, got {out_max_x}",
+            4.0 + halves[1]
+        );
+        assert!(
+            (out_max_y - (3.0 + halves[2])).abs() < 1e-6,
+            "top outset must use the TOP edge's thickness: expected {}, got {out_max_y}",
+            3.0 + halves[2]
+        );
+    }
+
     // Test-only helper.
     impl SpacePlate {
         fn find_vertex(&self, pt: [f64; 2]) -> VertexId {
@@ -775,4 +998,528 @@
                 })
                 .unwrap_or_else(|| panic!("no live vertex near {pt:?}"))
         }
+    }
+
+    /// A 4x3 room whose four edges carry DISTINCT half-thicknesses, in
+    /// `loop_segments` order: bottom, right, top, left.
+    ///
+    /// `net_outline_uses_each_edges_own_thickness_not_a_neighbours` builds the
+    /// same shape inline and is deliberately left alone here, to keep this diff
+    /// to the function it is about. If either fixture's halves are ever
+    /// retuned, retune both: each test's "only the identity index map survives"
+    /// argument depends on those four values staying pairwise distinct.
+    const ROOM_W: f64 = 4.0;
+    const ROOM_H: f64 = 3.0;
+
+    fn per_edge_thickness_room() -> (SpacePlate, FaceId, [f64; 4]) {
+        let halves = [0.1_f64, 0.2, 0.3, 0.4];
+        let segs: Vec<InputSegment> = loop_segments(&rect(0.0, 0.0, ROOM_W, ROOM_H), 100)
+            .into_iter()
+            .zip(halves)
+            .map(|(s, half)| s.with_half_thickness(half))
+            .collect();
+        let plate = SpacePlate::build(&segs, BuildOptions::default());
+        let room = plate.rooms().next().unwrap();
+        (plate, room, halves)
+    }
+
+    fn bbox(ring: &[[f64; 2]]) -> (f64, f64, f64, f64) {
+        let (mut nx, mut ny) = (f64::INFINITY, f64::INFINITY);
+        let (mut xx, mut xy) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for p in ring {
+            nx = nx.min(p[0]);
+            ny = ny.min(p[1]);
+            xx = xx.max(p[0]);
+            xy = xy.max(p[1]);
+        }
+        (nx, ny, xx, xy)
+    }
+
+    /// `gap_boundary` reads each edge's OWN `half_thickness` (mod.rs, the
+    /// `cycle[i]` lookup). Nothing tested that indexing, because every prior
+    /// fixture gives all four edges of a face the same thickness, and a lookup
+    /// that reads the wrong edge then returns the identical number.
+    ///
+    /// It is uniform TEST PLANS that hid this, not an unreachable path. A gap
+    /// room is bounded by edges from several different rectangles, so an
+    /// exterior wall meeting an interior partition puts distinct halves on one
+    /// cycle, and `build_from_wall_rects` calls `gap_boundary(f, 1.0)` on
+    /// exactly that face to lift each room to its wall axis. Mis-indexing this
+    /// read moves the axis lines and gross faces of any mixed-thickness plan.
+    ///
+    /// The magnitude of the read WAS covered — forcing `half = 0.0` fails two
+    /// tests — which is why this looked tested. Mis-indexing it did not:
+    /// `cycle[i]` to `cycle[0]` left the whole workspace green at 1981 passed.
+    /// So the surviving mutation meant untested, not redundant. #3013
+    ///
+    /// Distinct per-edge thicknesses make only the correct index reproduce the
+    /// result, and each assertion below is that edge's own half by
+    /// construction, so it reads as the property rather than as magic numbers.
+    #[test]
+    fn gap_boundary_pushes_each_edge_out_by_its_own_thickness() {
+        let (plate, room, halves) = per_edge_thickness_room();
+        let [bottom, right, top, left] = halves;
+
+        // 0, 1 and 2 are the three documented values of `factor`: the net gap,
+        // the wall axis, and the gross outer face. Testing 1 and 2 here (0 is
+        // the control below) covers the contract rather than sampling it, and
+        // catches a factor applied nonlinearly, which a single factor cannot.
+        for factor in [1.0_f64, 2.0] {
+            let ring = plate.gap_boundary(room, factor);
+            assert_eq!(ring.len(), 4, "an axis-aligned room stays a quad at factor {factor}");
+
+            // Outward on every side, so the offset rectangle is (4 + left + right)
+            // wide and (3 + bottom + top) tall.
+            // Not redundant with the bounds below: a diamond inscribed in the
+            // same bounding box satisfies all four of them, so area is what
+            // pins the ring to the full rectangle.
+            let expected_area =
+                (ROOM_W + factor * (left + right)) * (ROOM_H + factor * (bottom + top));
+            let area = polygon_area(&ring).abs();
+            assert!(
+                (area - expected_area).abs() < 1e-9,
+                "factor {factor}: expected outward area {expected_area}, got {area}"
+            );
+
+            // Area alone cannot see an OPPOSITE-edge swap: it reads only the sums
+            // (left + right) and (bottom + top), which such a swap leaves
+            // unchanged for any values. Pin each side's POSITION too — that is
+            // what tells an edge apart from the one across the room. Same
+            // reasoning as `net_outline_uses_each_edges_own_thickness_not_a_neighbours`,
+            // where asserting area alone could not have caught the bug.
+            //
+            // These four bounds are exhaustive over mis-indexing, not a sample:
+            // on an axis-aligned quad each bound is set by exactly one edge, so
+            // with four DISTINCT halves the identity map is the only index map
+            // that satisfies all four. That argument covers all 256 maps,
+            // collapses included. Separately confirmed by running the four
+            // uniform shift/collapse mutations of `cycle[i]` — to one edge, to
+            // either neighbour, and to the opposite edge — each of which fails
+            // this test and all of which passed before it.
+            let (min_x, min_y, max_x, max_y) = bbox(&ring);
+            for (got, want, side) in [
+                (min_x, -factor * left, "left"),
+                (max_x, ROOM_W + factor * right, "right"),
+                (min_y, -factor * bottom, "bottom"),
+                (max_y, ROOM_H + factor * top, "top"),
+            ] {
+                assert!(
+                    (got - want).abs() < 1e-9,
+                    "factor {factor}: the {side} edge must sit at {want}, got {got}"
+                );
+            }
+        }
+
+        // Control. `factor = 0` is the net gap itself, so the ring must be the
+        // untouched centreline: if this drifted, every assertion above would be
+        // measuring an offset that was never applied.
+        let (min_x, min_y, max_x, max_y) = bbox(&plate.gap_boundary(room, 0.0));
+        assert!(
+            min_x.abs() < 1e-9 && min_y.abs() < 1e-9
+                && (max_x - ROOM_W).abs() < 1e-9 && (max_y - ROOM_H).abs() < 1e-9,
+            "factor 0 must return the centreline {ROOM_W}x{ROOM_H}, got [{min_x},{min_y}]..[{max_x},{max_y}]"
+        );
+    }
+
+    /// Reachability, run rather than argued. The unit test above pins
+    /// `gap_boundary`'s per-edge read directly; this proves the production
+    /// caller reaches it with edges that actually differ.
+    ///
+    /// `build_from_wall_rects` derives ONE half per RECTANGLE, which is what
+    /// makes the read look unreachable at a glance. But a gap room is bounded
+    /// by edges from SEVERAL rectangles, so four walls of different thickness
+    /// put four distinct halves on one cycle — measured here as
+    /// `[0.25, 0.1, 0.15, 0.2]` — and stage 2 lifts the room to its wall axis
+    /// through `gap_boundary(f, 1.0)`. Mis-indexing that read shuffles the axis
+    /// lines of any mixed-thickness plan, which is ordinary input: an exterior
+    /// wall meeting an interior partition.
+    #[test]
+    fn build_from_wall_rects_lifts_each_wall_by_its_own_half_thickness() {
+        // Interior room (0,0)-(10,6) enclosed by four walls, each a different
+        // thickness, so every edge of the room's cycle carries a distinct half.
+        let rects: Vec<[[f64; 2]; 4]> = vec![
+            [[-0.5, -0.2], [10.3, -0.2], [10.3, 0.0], [-0.5, 0.0]], // bottom, 0.2 thick
+            [[-0.5, 6.0], [10.3, 6.0], [10.3, 6.4], [-0.5, 6.4]],   // top,    0.4
+            [[-0.5, 0.0], [0.0, 0.0], [0.0, 6.0], [-0.5, 6.0]],     // left,   0.5
+            [[10.0, 0.0], [10.3, 0.0], [10.3, 6.0], [10.0, 6.0]],   // right,  0.3
+        ];
+        let plate = SpacePlate::build_from_wall_rects(&rects, BuildOptions::default());
+        let rooms: Vec<FaceId> = plate.rooms().collect();
+        assert_eq!(rooms.len(), 1, "the four walls enclose exactly one room");
+
+        // Control: the cycle really does carry four DIFFERENT halves. Without
+        // this, a build that collapsed them to one value would leave every
+        // assertion below true for the wrong reason — which is precisely how
+        // this read went untested in the first place.
+        let mut halves: Vec<f64> = plate
+            .face_half_edges(rooms[0])
+            .map(|h| plate.half_edges[h.0 as usize].half_thickness)
+            .collect();
+        halves.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        // `zip` truncates, so without this a three-edge cycle would satisfy the
+        // loop below while the message still claimed four were checked.
+        assert_eq!(halves.len(), 4, "the room cycle must be four edges, got {halves:?}");
+        for (got, want) in halves.iter().zip([0.1, 0.15, 0.2, 0.25]) {
+            assert!(
+                (got - want).abs() < 1e-9,
+                "expected the four wall halves on one cycle, got {halves:?}"
+            );
+        }
+
+        // Stage 2 already ran `gap_boundary(f, 1.0)`, so the room outline sits on
+        // each wall's own axis: the interior expanded by that wall's half, and
+        // by no other wall's.
+        let (min_x, min_y, max_x, max_y) = bbox(&plate.face_outline(rooms[0]));
+        for (got, want, side) in [
+            (min_x, -0.25, "left (0.5 thick)"),
+            (min_y, -0.1, "bottom (0.2 thick)"),
+            (max_x, 10.15, "right (0.3 thick)"),
+            (max_y, 6.2, "top (0.4 thick)"),
+        ] {
+            assert!(
+                (got - want).abs() < 1e-9,
+                "the {side} wall axis must sit at {want}, got {got}"
+            );
+        }
+    }
+
+    // ─── Concave faces and free wall ends ───
+
+    /// Wall rectangles (0.2 thick) enclosing an L-shaped corridor: a 40 m long
+    /// arm with a short stub at its left end.
+    fn l_corridor_rects() -> Vec<[[f64; 2]; 4]> {
+        vec![
+            [[-0.2, -0.2], [40.2, -0.2], [40.2, 0.0], [-0.2, 0.0]], // below the long arm
+            [[40.0, -0.2], [40.2, -0.2], [40.2, 1.2], [40.0, 1.2]], // the far end cap
+            [[1.0, 1.0], [40.2, 1.0], [40.2, 1.2], [1.0, 1.2]],     // over the long arm
+            [[1.0, 1.0], [1.2, 1.0], [1.2, 2.6], [1.0, 2.6]],       // beside the short arm
+            [[-0.2, 2.4], [1.2, 2.4], [1.2, 2.6], [-0.2, 2.6]],     // over the short arm
+            [[-0.2, -0.2], [0.0, -0.2], [0.0, 2.6], [-0.2, 2.6]],   // the outer end
+        ]
+    }
+
+    /// A 10×6 room with a 0.2 thick stub wall rising off the bottom wall to
+    /// y = 3 and stopping there, free, in the middle of the room.
+    fn free_end_rects() -> Vec<[[f64; 2]; 4]> {
+        vec![
+            [[-0.2, -0.2], [10.2, -0.2], [10.2, 0.0], [-0.2, 0.0]],
+            [[-0.2, 6.0], [10.2, 6.0], [10.2, 6.2], [-0.2, 6.2]],
+            [[-0.2, -0.2], [0.0, -0.2], [0.0, 6.2], [-0.2, 6.2]],
+            [[10.0, -0.2], [10.2, -0.2], [10.2, 6.2], [10.0, 6.2]],
+            [[4.9, 0.0], [5.1, 0.0], [5.1, 3.0], [4.9, 3.0]],
+        ]
+    }
+
+    /// The average of a ring's corners is not a point of the ring. Both fixtures
+    /// below are built so that it lands in a WALL, which is what made the room
+    /// vanish: the gap test read the wall's answer instead of the room's.
+    fn corner_average(pts: &[[f64; 2]]) -> [f64; 2] {
+        let n = pts.len() as f64;
+        let (mut x, mut y) = (0.0, 0.0);
+        for p in pts {
+            x += p[0];
+            y += p[1];
+        }
+        [x / n, y / n]
+    }
+
+    #[test]
+    fn representative_point_leaves_the_notch_of_a_concave_ring() {
+        // A U: the centroid sits in the gap between the prongs, outside the ring.
+        let u = [
+            [0.0, 0.0], [6.0, 0.0], [6.0, 6.0], [4.0, 6.0],
+            [4.0, 2.0], [2.0, 2.0], [2.0, 6.0], [0.0, 6.0],
+        ];
+        let p = representative_point(&u).expect("a ring with area has an interior point");
+        assert!(point_in_polygon(p, &u), "representative point {p:?} is outside the ring");
+    }
+
+    #[test]
+    fn an_l_shaped_corridor_is_detected_though_its_corner_average_lies_in_a_wall() {
+        let rects = l_corridor_rects();
+        let plate = SpacePlate::build_from_wall_rects(&rects, BuildOptions::default());
+        assert_eq!(plate.room_count(), 1, "the L-shaped corridor is one room");
+        let room = plate.rooms().next().unwrap();
+        // Guard the guard: if the fixture ever stops putting the corner average
+        // inside a wall, this test still passes but no longer bites, and the
+        // regression it exists for could come back unnoticed.
+        let avg = corner_average(&plate.face_outline(room));
+        assert!(
+            rects.iter().any(|r| point_in_quad(avg, r)),
+            "fixture no longer exercises the defect: corner average {avg:?} is in no wall",
+        );
+    }
+
+    #[test]
+    fn a_room_keeps_its_identity_when_a_stub_wall_stands_inside_it() {
+        let rects = free_end_rects();
+        let plate = SpacePlate::build_from_wall_rects(&rects, BuildOptions::default());
+        assert_eq!(plate.room_count(), 1, "a stub wall divides nothing — the room is still one room");
+        let room = plate.rooms().next().unwrap();
+        let avg = corner_average(&plate.face_outline(room));
+        assert!(
+            rects.iter().any(|r| point_in_quad(avg, r)),
+            "fixture no longer exercises the defect: corner average {avg:?} is in no wall",
+        );
+    }
+
+    #[test]
+    fn a_free_wall_end_is_capped_square_rather_than_sliced_across() {
+        let plate = SpacePlate::build_from_wall_rects(&free_end_rects(), BuildOptions::default());
+        let room = plate.rooms().next().unwrap();
+        let net = plate.net_outline(room, true);
+        assert!(is_simple_polygon(&net), "net outline crosses itself: {net:?}");
+        // 10×6 room less the 0.2×3 stub standing in it. The old outline ran
+        // diagonally from one flank's base to the other's tip and measured
+        // 59.71 — too much room, and through a wall.
+        let area = polygon_area(&net).abs();
+        assert!((area - 59.4).abs() < 1e-6, "net area {area}, want 59.4");
+        // Both flanks must reach the wall's REAL end at y = 3.0 (the axis stops
+        // half a thickness short of it, so the cap is what squares the end off).
+        for want in [[4.9, 3.0], [5.1, 3.0]] {
+            assert!(
+                net.iter().any(|p| (p[0] - want[0]).abs() < 1e-9 && (p[1] - want[1]).abs() < 1e-9),
+                "cap corner {want:?} missing from {net:?}",
+            );
+        }
+    }
+
+    // ───────────── removal edits: termination and cycle re-homing ─────────────
+
+    /// Every live half-edge must be reachable from the anchor of the face it is
+    /// tagged with. A face whose boundary has silently become two cycles fails
+    /// this for the cycle the anchor does not sit on.
+    fn assert_face_walks_cover_every_half_edge(plate: &SpacePlate) {
+        for (i, he) in plate.half_edges.iter().enumerate() {
+            if !he.alive {
+                continue;
+            }
+            let h = HalfEdgeId(i as u32);
+            assert!(
+                plate.face_half_edges(he.face).any(|x| x == h),
+                "half-edge {i} is tagged face {:?} but that face's walk never reaches it",
+                he.face,
+            );
+        }
+    }
+
+    /// The outgoing half-edge of `from` whose destination is `to`.
+    fn edge_between(plate: &SpacePlate, from: VertexId, to: VertexId) -> HalfEdgeId {
+        plate.outgoing_half_edges(from).find(|&h| plate.dest(h) == to).expect("edge between the two vertices")
+    }
+
+    /// Run an edit that used to spin forever on a worker thread, so a
+    /// regression reads as a named failure within `TERMINATION_TIMEOUT`
+    /// instead of a suite that never finishes. The worker sends the plate
+    /// back on its last line, so `Disconnected` means it panicked (#2945).
+    const TERMINATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    fn edit_or_diagnose<T: Send + 'static>(
+        what: &str,
+        edit: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let _ = tx.send(edit());
+        });
+        let value = crate::test_support::recv_or_diagnose(
+            &rx,
+            TERMINATION_TIMEOUT,
+            &format!("{what} did not terminate within {TERMINATION_TIMEOUT:?}"),
+            &format!("{what}'s worker PANICKED (not a hang); its panic is printed above"),
+        );
+        let _ = handle.join();
+        value
+    }
+
+    /// Split the shared partition of `two_room_plate` into P-M-N-Q, merge the
+    /// rooms across P-M (which leaves M a degree-1 tip and N-Q a bridge inside
+    /// the merged room), then remove the non-tip bridge N-Q.
+    ///
+    /// Without the fix this spun forever: the bridge splice left M-N as a
+    /// 2-cycle still tagged with the room, `remove_spur_edge` refused it
+    /// because a lone stick "cannot bound a room", and Phase A of
+    /// `prune_orphans` had no exit other than "no degree-1 vertices left".
+    /// Both removals auto-prune, so the whole edit sequence runs under
+    /// `edit_or_diagnose`, whose timeout is the assertion.
+    /// Regression test (#4640).
+    #[test]
+    fn remove_edge_on_a_non_tip_bridge_after_a_merge_terminates_and_cleans_up() {
+        let (plate, m, n, patches) = edit_or_diagnose("split, merge across P-M, remove N-Q", || {
+            let mut plate = two_room_plate();
+            let p = plate.find_vertex([4.0, 0.0]);
+            let q = plate.find_vertex([4.0, 3.0]);
+            let m = plate.split_edge(edge_between(&plate, p, q), 4.0, 1.0).expect("split at M");
+            let n = plate.split_edge(edge_between(&plate, m, q), 4.0, 2.0).expect("split at N");
+            plate.remove_edge(edge_between(&plate, p, m)).expect("merge the rooms across P-M");
+            assert_eq!(plate.room_count(), 1, "P-M separated two rooms, so removing it merges them");
+            assert_eq!(plate.vertex_degree(m), 1, "M is left dangling by the merge");
+            let patches = plate.remove_edge(edge_between(&plate, n, q)).expect("remove the bridge N-Q");
+            (plate, m, n, patches)
+        });
+        assert_eq!(plate.room_count(), 1, "the merged room survives");
+        assert_eq!(patches.len(), 1);
+        assert!((patches[0].area - 24.0).abs() < 1e-6, "full box: {}", patches[0].area);
+        let room = plate.rooms().next().unwrap();
+        assert_eq!(plate.face_outline(room).len(), 4, "stick pruned, P and Q dissolved as collinear");
+        assert_eq!(plate.vertex_position(m), None, "M tombstoned");
+        assert_eq!(plate.vertex_position(n), None, "N tombstoned");
+        assert_eq!(live_vertex_count(&plate), 4, "only the four box corners remain");
+        assert_face_walks_cover_every_half_edge(&plate);
+    }
+
+    /// Phase A's own exit guard, pinned directly: a degree-1 tip that
+    /// `remove_spur_edge` refuses (here: its twin is mis-tagged with another
+    /// face, so the peninsula check fails) must not spin the sweep forever.
+    /// The lone-stick change above means the edit path no longer produces such
+    /// a tip, so this corrupts one tag by hand to reach the guard. Without the
+    /// guard the sweep spins, so it runs under `edit_or_diagnose`.
+    /// Regression test (#4640).
+    #[test]
+    fn prune_orphans_terminates_when_a_tip_refuses_removal() {
+        let mut plate = spur_plate_unpruned();
+        let tip = plate.find_vertex([6.0, 1.5]);
+        let s = plate.outgoing_half_edges(tip).next().expect("spur half-edge");
+        let t = plate.half_edges[s.0 as usize].twin;
+        let other_face = (0..plate.faces.len())
+            .map(|i| FaceId(i as u32))
+            .find(|&f| f != plate.half_edges[s.0 as usize].face)
+            .expect("a second face");
+        plate.half_edges[t.0 as usize].face = other_face;
+        assert_eq!(plate.remove_spur_edge(s), Err(EditError::StaleHandle), "the tip is refused");
+        let (plate, removed) = edit_or_diagnose("prune_orphans", move || {
+            let removed = plate.prune_orphans();
+            (plate, removed)
+        });
+        assert_eq!(plate.vertex_degree(tip), 1, "the refused tip is still there");
+        assert_eq!(removed, 0, "nothing else to prune: {removed}");
+    }
+
+    /// A bridge that is NOT a spur tip: a 2x2 column loop inside an 8x6 room,
+    /// tied to the right wall by one wall. Removing the tie splits the room's
+    /// boundary into the outer rectangle and the column's outside; the second
+    /// cycle must get its own (outer) face rather than staying tagged with the
+    /// room, where no walk from the room's anchor could reach it.
+    /// Regression test (#4640).
+    #[test]
+    fn remove_edge_on_a_bridge_to_an_island_gives_the_island_cycle_its_own_face() {
+        let mut segs = loop_segments(&rect(0.0, 0.0, 8.0, 6.0), 100);
+        segs.extend(loop_segments(&rect(3.0, 2.0, 5.0, 4.0), 200));
+        segs.push(InputSegment::new([5.0, 3.0], [8.0, 3.0], Some(300)));
+        let mut plate = SpacePlate::build(&segs, BuildOptions::default());
+        assert_eq!(plate.room_count(), 2, "the big room and the column interior");
+        let big = plate.rooms().max_by(|a, b| plate.face_area(*a).total_cmp(&plate.face_area(*b))).unwrap();
+        assert!((plate.face_area(big) - 44.0).abs() < 1e-6, "48 minus the 4 m² column: {}", plate.face_area(big));
+        let column = plate.rooms().find(|&f| f != big).unwrap();
+        let tie = edge_between(&plate, plate.find_vertex([5.0, 3.0]), plate.find_vertex([8.0, 3.0]));
+        assert_eq!(plate.neighbor_across(tie), Some(plate.half_edges[tie.0 as usize].face), "the tie is a bridge");
+
+        let patches = plate.remove_edge(tie).expect("remove the tie");
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].face, big, "the room keeps its id");
+        assert!((patches[0].area - 48.0).abs() < 1e-6, "the room is the whole box now: {}", patches[0].area);
+        assert_eq!(plate.face_outline(big).len(), 4, "the tie's ends were dissolved as collinear");
+        assert_eq!(plate.room_count(), 2, "the column interior is still a room");
+        assert!((plate.face_area(column) - 4.0).abs() < 1e-6);
+        for h in plate.face_half_edges(column) {
+            let outside = plate.neighbor_across(h).expect("live");
+            assert_ne!(outside, big, "the column's outside is no longer tagged with the room");
+            assert!(plate.faces[outside.0 as usize].is_outer, "a cut-off CW cycle is an outer face");
+        }
+        assert_face_walks_cover_every_half_edge(&plate);
+    }
+
+    /// A 200 mm wall continuing in line as a 150 mm one: the node between them
+    /// is where the thickness changes, so neither the build-time collinear
+    /// sweep nor a user dissolve may weld the two into one edge (the welded
+    /// edge carries ONE `half_thickness` for both twins).
+    /// Regression test (#4640).
+    #[test]
+    fn dissolve_refuses_a_collinear_node_where_the_wall_thickness_changes() {
+        let segs = vec![
+            InputSegment::new([0.0, 0.0], [4.0, 0.0], Some(1)).with_half_thickness(0.100),
+            InputSegment::new([4.0, 0.0], [8.0, 0.0], Some(2)).with_half_thickness(0.075),
+            InputSegment::new([8.0, 0.0], [8.0, 3.0], Some(3)).with_half_thickness(0.100),
+            InputSegment::new([8.0, 3.0], [0.0, 3.0], Some(4)).with_half_thickness(0.100),
+            InputSegment::new([0.0, 3.0], [0.0, 0.0], Some(5)).with_half_thickness(0.100),
+        ];
+        let mut plate = SpacePlate::build(&segs, BuildOptions::default());
+        assert_eq!(plate.room_count(), 1);
+        let room = plate.rooms().next().unwrap();
+        assert_eq!(plate.face_outline(room).len(), 5, "build keeps the thickness-change node");
+        let node = plate.find_vertex([4.0, 0.0]);
+        assert_eq!(plate.vertex_degree(node), 2);
+        assert_eq!(plate.dissolve_vertex(node), Err(EditError::VertexNotDissolvable));
+        // The net inset still reads each run's own thickness: the bottom edge
+        // sits at y = 0.100 under the thick run and y = 0.075 under the thin one.
+        let net = plate.net_outline(room, true);
+        let y_at = |x: f64| {
+            net.iter().filter(|p| (p[0] - x).abs() < 1.5).map(|p| p[1]).fold(f64::INFINITY, f64::min)
+        };
+        assert!((y_at(0.5) - 0.100).abs() < 1e-9, "thick run inset: {}", y_at(0.5));
+        assert!((y_at(7.5) - 0.075).abs() < 1e-9, "thin run inset: {}", y_at(7.5));
+        // The same node with EQUAL thickness on both sides dissolves as before.
+        let uniform: Vec<InputSegment> = segs.iter().map(|s| s.with_half_thickness(0.1)).collect();
+        let plate = SpacePlate::build(&uniform, BuildOptions::default());
+        assert_eq!(plate.face_outline(plate.rooms().next().unwrap()).len(), 4, "uniform run is dissolved at build");
+    }
+
+    /// `gap_boundary`'s fallback is the un-offset net ring, which has exactly
+    /// as many points as the face cycle, so the axis lift in
+    /// `build_from_wall_rects` could not tell a failed offset from a real one
+    /// and consumed the net ring as the wall axis. A 1 m² gap walled by 6 m
+    /// thick rectangles trips the runaway guard (7x7 = 49 > 4·1 + 25); it must
+    /// be skipped, leaving only the ordinary room that lifted cleanly.
+    /// Regression test (#4640).
+    #[test]
+    fn axis_lift_skips_a_gap_whose_offset_failed_instead_of_lifting_the_net_ring() {
+        let dx = 30.0;
+        let mut rects: Vec<[[f64; 2]; 4]> = vec![
+            [[dx - 0.1, -0.1], [dx + 4.1, -0.1], [dx + 4.1, 0.1], [dx - 0.1, 0.1]],
+            [[dx - 0.1, 2.9], [dx + 4.1, 2.9], [dx + 4.1, 3.1], [dx - 0.1, 3.1]],
+            [[dx - 0.1, -0.1], [dx + 0.1, -0.1], [dx + 0.1, 3.1], [dx - 0.1, 3.1]],
+            [[dx + 3.9, -0.1], [dx + 4.1, -0.1], [dx + 4.1, 3.1], [dx + 3.9, 3.1]],
+        ];
+        // A 1x1 gap at [0,1]x[0,1] boxed by four 6 m thick walls.
+        let thick: [[[f64; 2]; 4]; 4] = [
+            [[-6.0, -6.0], [7.0, -6.0], [7.0, 0.0], [-6.0, 0.0]],
+            [[-6.0, 1.0], [7.0, 1.0], [7.0, 7.0], [-6.0, 7.0]],
+            [[-6.0, -6.0], [0.0, -6.0], [0.0, 7.0], [-6.0, 7.0]],
+            [[1.0, -6.0], [7.0, -6.0], [7.0, 7.0], [1.0, 7.0]],
+        ];
+        rects.extend(thick);
+        // Stage 1 does see the small gap as a room; its offset is what fails.
+        let mut thick_edges = Vec::new();
+        for (wi, r) in thick.iter().enumerate() {
+            for i in 0..4 {
+                thick_edges.push(InputSegment::new(r[i], r[(i + 1) % 4], Some(wi as u32)).with_half_thickness(3.0));
+            }
+        }
+        let gap_only = SpacePlate::from_arrangement(Arrangement::resolve(&thick_edges, 0.1), 0.5);
+        let small = (0..gap_only.faces.len())
+            .map(|i| FaceId(i as u32))
+            .find(|&f| !gap_only.faces[f.0 as usize].is_outer && (gap_only.face_area(f) - 1.0).abs() < 1e-6)
+            .expect("the 1 m² gap face exists");
+        assert_eq!(gap_only.try_gap_boundary(small, 1.0), None, "the runaway guard fires for this gap");
+
+        let plate = SpacePlate::build_from_wall_rects(&rects, BuildOptions::default());
+        let areas: Vec<f64> = plate.rooms().map(|f| plate.face_area(f)).collect();
+        assert_eq!(areas.len(), 1, "only the ordinary room lifts; got areas {areas:?}");
+        assert!((areas[0] - 12.0).abs() < 1e-6, "the ordinary room's axis outline: {}", areas[0]);
+    }
+
+    /// The bbox reject in `snap_corners` pads by 2·tol, not tol: the corner
+    /// `p` may be a full `tol` from the end AND a full `tol` from the other
+    /// wall's extent, in different directions. Here `e = (1,0)` is 0.15 from
+    /// the slanted wall's bbox with tol 0.1, and must still snap to (1.09, 0).
+    /// Regression test (#4640).
+    #[test]
+    fn corner_snap_reaches_a_corner_two_tolerances_from_the_other_walls_extent() {
+        let mut segs = vec![
+            InputSegment::new([0.0, 0.0], [1.0, 0.0], None),
+            InputSegment::new([1.15, 0.06], [2.15, 1.06], None), // line y = x - 1.09
+        ];
+        super::arrangement::snap_corners(&mut segs, 0.1);
+        let e = segs[0].b;
+        assert!((e[0] - 1.09).abs() < 1e-9 && e[1].abs() < 1e-9, "end must snap to (1.09, 0): {e:?}");
     }

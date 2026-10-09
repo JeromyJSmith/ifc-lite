@@ -7,6 +7,7 @@ import assert from 'node:assert';
 
 import {
   detectScaleUnitMismatch,
+  getEffectiveGeoreference,
   getEffectiveHorizontalScale,
   hasStandardGeoreferencing,
   inferMapUnitScale,
@@ -15,8 +16,8 @@ import {
   resolveEpsetMapUnitScale,
   supportsStandardGeoreferencing,
 } from './effective-georef.js';
-import { resolveMapUnitToMetreScale } from './geo-scale.js';
-import type { MapConversion, ProjectedCRS } from '@ifc-lite/parser';
+import { getEffectiveAxisScales, resolveMapUnitToMetreScale } from './geo-scale.js';
+import { IfcParser, type MapConversion, type ProjectedCRS } from '@ifc-lite/parser';
 
 describe('effective georeferencing', () => {
   it('recomputes map unit scale when the edited MapUnit changes', () => {
@@ -212,7 +213,42 @@ describe('effective georeferencing', () => {
       xAxisAbscissa: 0,
       xAxisOrdinate: 1,
       scale: 0.9999,
+      factorX: undefined,
+      factorY: undefined,
+      factorZ: undefined,
     });
+  });
+
+  it('keeps IfcMapConversionScaled factors from a parsed file, with and without an edit (#4615)', async () => {
+    // The viewer reads every conversion through getEffectiveGeoreference, so a
+    // factor the parser reads but the merge drops reaches no consumer. Distinct
+    // factors per axis so a swapped or shared slot fails too.
+    const source = `ISO-10303-21;
+HEADER;
+FILE_SCHEMA(('IFC4X3_ADD2'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('Proj0000000000000000001',$,'P',$,$,$,$,(#10),#20);
+#10=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.E-5,$,$);
+#20=IFCUNITASSIGNMENT((#21));
+#21=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+#30=IFCPROJECTEDCRS('EPSG:2056',$,$,$,$,$,#21);
+#31=IFCMAPCONVERSIONSCALED(#10,#30,2600000.,1200000.,400.,1.,0.,1.,0.5,0.25,3.);
+ENDSEC;
+END-ISO-10303-21;
+`;
+    const store = await new IfcParser().parseColumnar(
+      new TextEncoder().encode(source).buffer as ArrayBuffer,
+      { disableWorkerScan: true },
+    );
+    for (const mutations of [undefined, { mapConversion: { eastings: 2600010 } }]) {
+      const conversion = getEffectiveGeoreference(store, undefined, mutations)?.mapConversion;
+      assert.deepStrictEqual(
+        [conversion?.factorX, conversion?.factorY, conversion?.factorZ],
+        [0.5, 0.25, 3],
+        `factors with mutations ${JSON.stringify(mutations)}`,
+      );
+    }
   });
 
   describe('resolveEpsetMapUnitScale (IFC2x3 ePset offsets use the project unit)', () => {
@@ -280,6 +316,28 @@ describe('effective georeferencing', () => {
     assert.strictEqual(inferMapUnitScale('MILLIMETRE'), 0.001);
   });
 
+  it('infers the SI prefixes between milli and kilo, and keeps them apart', () => {
+    // CENTI, DECI and KILO were the three branches no assertion reached: each
+    // could return any other branch's factor with the suite still green. They
+    // are one `includes` apart from each other and from MILLIMETRE, so a
+    // mis-ordered or mistyped prefix lands on a neighbour rather than failing.
+    assert.strictEqual(inferMapUnitScale('CENTIMETRE'), 0.01);
+    assert.strictEqual(inferMapUnitScale('DECIMETRE'), 0.1);
+    assert.strictEqual(inferMapUnitScale('KILOMETRE'), 1000);
+    // Every prefixed name also contains METRE, so the bare-METRE branch must
+    // stay LAST; if it moved up, all four of these would collapse to 1.
+    assert.notStrictEqual(inferMapUnitScale('KILOMETRE'), 1);
+  });
+
+  it('keeps the US survey foot distinct from the international foot', () => {
+    // The survey-foot branch is tested before FOOT because 'US SURVEY FOOT'
+    // matches both; reversing the two makes it 0.3048 and moves a state-plane
+    // site by ~2 ppm, which is metres over a survey grid.
+    assert.strictEqual(inferMapUnitScale('US SURVEY FOOT'), 0.3048006096);
+    assert.strictEqual(inferMapUnitScale('FTUS'), 0.3048006096);
+    assert.notStrictEqual(inferMapUnitScale('US SURVEY FOOT'), inferMapUnitScale('FOOT'));
+  });
+
   describe('getEffectiveHorizontalScale (issue #595)', () => {
     it('returns 1 when project mm and map m, with Scale=0.001 (Bonsai-style)', () => {
       // mm project (lengthUnitScale=0.001), m map (mapUnitScale=1), Scale=0.001
@@ -334,17 +392,127 @@ describe('effective georeferencing', () => {
     });
   });
 
+  describe('getEffectiveAxisScales (#4615)', () => {
+    it('treats a Scaled factor as part of the authored unit conversion', () => {
+      // Feet-authored local coordinates, metre map coordinates: Scale=1 and
+      // Factor=0.3048 together bridge the units, so metre-converted viewer
+      // geometry remains at 1x rather than being scaled by 0.3048 again.
+      assert.deepStrictEqual(
+        getEffectiveAxisScales({ scale: 1, factorX: 0.3048, factorY: 0.3048, factorZ: 0.3048 }, 1, 0.3048),
+        { x: 1, y: 1, z: 1 },
+      );
+    });
+
+    it('preserves a deliberate factor when project and map units match', () => {
+      assert.strictEqual(getEffectiveAxisScales({ scale: 1, factorX: 0.5 }, 1, 1).x, 0.5);
+    });
+
+    it('places unit factors like the plain conversion in a mm project with metre map units', () => {
+      // IFCMAPCONVERSIONSCALED(...,1.,1.,1.,1.) and IFCMAPCONVERSION(...,1.)
+      // are the same transform; the subtype must not draw 1000x larger.
+      assert.deepStrictEqual(
+        getEffectiveAxisScales({ scale: 1, factorX: 1, factorY: 1, factorZ: 1 }, 1, 0.001),
+        getEffectiveAxisScales({ scale: 1 }, 1, 0.001),
+      );
+      assert.strictEqual(getEffectiveAxisScales({ scale: 1, factorX: 1 }, 1, 0.001).x, 1);
+    });
+
+    it('reads an omitted Scale with a unit-bridging factor like Scale=1', () => {
+      // Feet project, metre map, Scale $ (schema default 1), FactorX 0.3048.
+      assert.strictEqual(getEffectiveAxisScales({ factorX: 0.3048 }, 1, 0.3048).x, 1);
+    });
+
+    it('decides the unset-Scale heuristic once, so grid factors stay on every axis', () => {
+      // mm project, metre map, Scale $, FactorX/Y 0.9996 (a grid scale), FactorZ 1.
+      // Deciding per axis read Z's product of 1 as unset and X/Y as spec-strict:
+      // 999.6 wide and 1 tall.
+      assert.deepStrictEqual(
+        getEffectiveAxisScales({ factorX: 0.9996, factorY: 0.9996, factorZ: 1 }, 1, 0.001),
+        { x: 0.9996, y: 0.9996, z: 1 },
+      );
+    });
+  });
+
   describe('detectScaleUnitMismatch', () => {
+    it('checks every axis factor, and names the factor unless every axis reads the same (#4615, #4675)', () => {
+      // Feet project, metre map: Scale 1 x FactorX 0.3048 is spec-correct.
+      const feet = { factorX: 0.3048, factorY: 0.3048, factorZ: 0.3048 };
+      assert.strictEqual(detectScaleUnitMismatch({ scale: 1, ...feet }, 1, 0.3048), null);
+      // metre project and map, Scale 1 x FactorZ 2: Scale already bridges the
+      // units, so the attribute to change is FactorZ (to 1). Advising Scale 0.5
+      // would halve X and Y.
+      const found = detectScaleUnitMismatch({ scale: 1, factorZ: 2 }, 1, 1);
+      assert.ok(found, 'a FactorZ-only deviation is reported');
+      assert.strictEqual(found!.attribute, 'FactorZ');
+      assert.strictEqual(found!.authoredValue, 2);
+      assert.strictEqual(found!.expectedValue, 1);
+      assert.strictEqual(found!.specEffectiveScale, 2);
+      assert.strictEqual(found!.effectiveScale, 2);
+      // mm project, metre map, Scale $ (the #595 rule places X and Y at 1),
+      // FactorZ 2: Z is drawn at 2 because of FactorZ, not Scale. The Scale
+      // that would "fix" Z on paper, 0.0005, would draw X and Y at 0.5.
+      const unsetScale = detectScaleUnitMismatch({ factorZ: 2 }, 1, 0.001);
+      assert.ok(unsetScale);
+      assert.strictEqual(unsetScale!.effectiveScale, 2);
+      assert.strictEqual(unsetScale!.attribute, 'FactorZ');
+      assert.strictEqual(unsetScale!.expectedValue, 1);
+      // Every axis at 2: Scale fixes them all, so Scale is named.
+      const uniform = detectScaleUnitMismatch({ scale: 2 }, 1, 1);
+      assert.ok(uniform);
+      assert.strictEqual(uniform!.attribute, 'Scale');
+      assert.strictEqual(uniform!.authoredValue, 2);
+      assert.strictEqual(uniform!.expectedValue, 1);
+      // mm project, metre map, factors (0.001, 0.001, 1): X and Y are bridged
+      // by their factors and Z reads 1000. Scale 0.001 would put X and Y at
+      // 0.001; FactorZ 0.001 is the change that leaves them alone.
+      const mixed = detectScaleUnitMismatch({ factorX: 0.001, factorY: 0.001, factorZ: 1 }, 1, 0.001);
+      assert.ok(mixed);
+      assert.strictEqual(mixed!.attribute, 'FactorZ');
+      assert.strictEqual(mixed!.authoredValue, 1);
+      assert.ok(Math.abs(mixed!.expectedValue - 0.001) < 1e-12);
+      // Scale 2 x FactorZ 0.5: X reads 2 and Z reads 1. FactorX 0.5 fixes X
+      // without moving Z, where Scale 1 would put Z at 0.5. An absent factor reads 1.
+      const scaleAndFactor = detectScaleUnitMismatch({ scale: 2, factorZ: 0.5 }, 1, 1);
+      assert.ok(scaleAndFactor);
+      assert.strictEqual(scaleAndFactor!.attribute, 'FactorX');
+      assert.strictEqual(scaleAndFactor!.authoredValue, 1);
+      assert.strictEqual(scaleAndFactor!.expectedValue, 0.5);
+      // Scale 0 reads 0 on every axis: Scale is named, not a factor divided by 0.
+      const zero = detectScaleUnitMismatch({ scale: 0 }, 1, 1);
+      assert.ok(zero);
+      assert.strictEqual(zero!.attribute, 'Scale');
+      assert.strictEqual(zero!.expectedValue, 1);
+      // mm project, Scale 1 x factors (1, 1, 1): compensated, so the advice is
+      // for a spec-strict tool, which reads 1000 on every axis: Scale 0.001.
+      const unitFactors = detectScaleUnitMismatch({ scale: 1, factorX: 1, factorY: 1, factorZ: 1 }, 1, 0.001);
+      assert.ok(unitFactors);
+      assert.strictEqual(unitFactors!.compensated, true);
+      assert.strictEqual(unitFactors!.attribute, 'Scale');
+      assert.strictEqual(unitFactors!.expectedValue, 0.001);
+      // Compensated with factors 0.8% apart: still Scale. FactorZ 0.001 would
+      // bridge the units, turn the #595 rule off, and draw X and Y at 996.
+      const spread = detectScaleUnitMismatch({ factorX: 0.996, factorY: 0.996, factorZ: 1.004 }, 1, 0.001);
+      assert.ok(spread);
+      assert.strictEqual(spread!.compensated, true);
+      assert.strictEqual(spread!.attribute, 'Scale');
+      // mm project, metre map, Scale $, factors (0.5, 0.5, 1): Z is furthest
+      // from 1 on paper (1000) and compensated, but X and Y are drawn at 0.5.
+      const partly = detectScaleUnitMismatch({ factorX: 0.5, factorY: 0.5, factorZ: 1 }, 1, 0.001);
+      assert.ok(partly);
+      assert.strictEqual(partly!.compensated, false);
+      assert.strictEqual(partly!.effectiveScale, 0.5);
+    });
+
     it('returns null for spec-compliant Scale (mm/m with Scale=0.001)', () => {
-      assert.strictEqual(detectScaleUnitMismatch(0.001, 1, 0.001), null);
+      assert.strictEqual(detectScaleUnitMismatch({ scale: 0.001 }, 1, 0.001), null);
     });
 
     it('returns null when project=map=metres and Scale=1', () => {
-      assert.strictEqual(detectScaleUnitMismatch(1, 1, 1), null);
+      assert.strictEqual(detectScaleUnitMismatch({ scale: 1 }, 1, 1), null);
     });
 
     it('returns null when project=map=metres and Scale is undefined', () => {
-      assert.strictEqual(detectScaleUnitMismatch(undefined, 1, 1), null);
+      assert.strictEqual(detectScaleUnitMismatch({ scale: undefined }, 1, 1), null);
     });
 
     it('flags the common Scale=1 + mm-project + m-map error as COMPENSATED', () => {
@@ -352,17 +520,18 @@ describe('effective georeferencing', () => {
       // heuristic already places the geometry at 1×. Reporting effectiveScale
       // 1000 here claimed a mis-sizing the code prevents, and that false
       // warning was the only thing the panel said about the #2526 file.
-      const m = detectScaleUnitMismatch(1, 1, 0.001);
+      const m = detectScaleUnitMismatch({ scale: 1 }, 1, 0.001);
       assert.ok(m, 'expected a mismatch report');
-      assert.strictEqual(m!.rawScale, 1);
+      assert.strictEqual(m!.attribute, 'Scale');
+      assert.strictEqual(m!.authoredValue, 1);
       assert.strictEqual(m!.specEffectiveScale, 1000);
       assert.strictEqual(m!.effectiveScale, 1);
       assert.strictEqual(m!.compensated, true);
-      assert.strictEqual(m!.expectedScale, 0.001);
+      assert.strictEqual(m!.expectedValue, 0.001);
     });
 
     it('flags Scale omitted when units differ as COMPENSATED', () => {
-      const m = detectScaleUnitMismatch(undefined, 1, 0.001);
+      const m = detectScaleUnitMismatch({ scale: undefined }, 1, 0.001);
       assert.ok(m);
       assert.strictEqual(m!.specEffectiveScale, 1000);
       assert.strictEqual(m!.effectiveScale, 1);
@@ -372,7 +541,7 @@ describe('effective georeferencing', () => {
     it('does NOT mark a genuine mis-scaling as compensated', () => {
       // Scale explicitly 1000 on a mm project: the heuristic only rescues an
       // unset/1 Scale, so this really is applied and really does mis-size.
-      const m = detectScaleUnitMismatch(1000, 1, 0.001);
+      const m = detectScaleUnitMismatch({ scale: 1000 }, 1, 0.001);
       assert.ok(m);
       assert.strictEqual(m!.effectiveScale, 1e6);
       assert.strictEqual(m!.specEffectiveScale, 1e6);
@@ -381,20 +550,43 @@ describe('effective georeferencing', () => {
 
     it('tolerates tiny floating-point noise around 1.0', () => {
       // Scale = 1.0 ± 0.4% should still be considered consistent.
-      assert.strictEqual(detectScaleUnitMismatch(1.004, 1, 1), null);
-      assert.strictEqual(detectScaleUnitMismatch(0.996, 1, 1), null);
+      assert.strictEqual(detectScaleUnitMismatch({ scale: 1.004 }, 1, 1), null);
+      assert.strictEqual(detectScaleUnitMismatch({ scale: 0.996 }, 1, 1), null);
     });
 
     it('flags a deliberate non-unit scaling (Scale=2 with metres)', () => {
-      const m = detectScaleUnitMismatch(2, 1, 1);
+      const m = detectScaleUnitMismatch({ scale: 2 }, 1, 1);
       assert.ok(m);
       assert.strictEqual(m!.effectiveScale, 2);
+      assert.strictEqual(m!.compensated, false);
+    });
+
+    it('reports a deviation just OUTSIDE the 0.5% band, not just tolerates one inside', () => {
+      // The noise test above pins 1.004 and 0.996 as null, so the band cannot be
+      // TIGHTENED without failing -- but nothing failed when it was widened, and
+      // at 5% it still passed every test in this file. A band is two-sided: pin
+      // the first value that must be reported, or only one direction is guarded.
+      assert.strictEqual(detectScaleUnitMismatch({ scale: 1.004 }, 1, 1), null);
+      const over = detectScaleUnitMismatch({ scale: 1.006 }, 1, 1);
+      assert.ok(over, '0.6% off unity must be reported, not swallowed by the band');
+      const under = detectScaleUnitMismatch({ scale: 0.994 }, 1, 1);
+      assert.ok(under, '-0.6% off unity must be reported too');
+    });
+
+    it('does not call a small genuine mis-scaling compensated', () => {
+      // Every other `compensated` fixture sits at exactly 1 (heuristic fired) or
+      // far away (2, 1e6), so the 0.5% width of that band was never load-bearing:
+      // it could be widened a hundredfold unnoticed. Scale=1.2 is applied for
+      // real and is small enough to fall inside a sloppy band.
+      const m = detectScaleUnitMismatch({ scale: 1.2 }, 1, 1);
+      assert.ok(m);
+      assert.strictEqual(m!.effectiveScale, 1.2);
       assert.strictEqual(m!.compensated, false);
     });
   });
 
   describe('hasStandardGeoreferencing (federation alignment gate)', () => {
-    // Federation affine alignment (extractModelGeoref → buildGeorefAlignmentTransform)
+    // Federation affine alignment (extractModelSpatialPlacement → resolveSpatialPlacement)
     // gates on this predicate. A site-location-only georef must NOT qualify: it is
     // EPSG:4326 lat/long degrees + a raw, un-unit-scaled IfcSite RefElevation, which
     // the projected-CRS transform misreads as metres and flings the second federated

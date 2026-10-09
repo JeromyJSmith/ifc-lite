@@ -1,5 +1,176 @@
 # @ifc-lite/collab-server
 
+## 0.8.1
+
+### Patch Changes
+
+- Updated dependencies [[`ec983d3`](https://github.com/LTplus-AG/ifc-lite/commit/ec983d378bfccc2b65fb636a76e321a2c9482aa4)]:
+  - @ifc-lite/collab@0.10.0
+
+## 0.8.0
+
+### Minor Changes
+
+- [#6413](https://github.com/LTplus-AG/ifc-lite/pull/6413) [`02b1291`](https://github.com/LTplus-AG/ifc-lite/commit/02b1291fb0f3b6e645dd93ef93728537fd8ae8df) Thanks [@louistrue](https://github.com/louistrue)! - `FsBlobStorage` no longer raises an unhandled rejection when creating its `blobs` directory fails before any method has run ([#6286](https://github.com/LTplus-AG/ifc-lite/issues/6286)). The failure is still reported: every storage method rethrows it, and `ready` is now public. It resolves once the directory exists and rejects with the `mkdir` error otherwise. The reference server entrypoint awaits `ready` at startup, so a data directory it cannot write fails the boot instead of the first blob request.
+
+### Patch Changes
+
+- Updated dependencies [[`8901816`](https://github.com/LTplus-AG/ifc-lite/commit/8901816fa9171b1af0a9af5036105db0fa72cb24), [`8ac81f7`](https://github.com/LTplus-AG/ifc-lite/commit/8ac81f7346ac346d2b8279b44df72a1679d105f3)]:
+  - @ifc-lite/collab@0.9.2
+  - @ifc-lite/ifcx@4.3.0
+
+## 0.7.3
+
+### Patch Changes
+
+- Updated dependencies [[`dec98a2`](https://github.com/LTplus-AG/ifc-lite/commit/dec98a2c97e03e70e8b78c55bb27e87b5b4013a6), [`074178f`](https://github.com/LTplus-AG/ifc-lite/commit/074178f651c21dacbfbec33534701a59a7e81ace), [`dabc489`](https://github.com/LTplus-AG/ifc-lite/commit/dabc48987aca1392685218dd31641f8dbadf9590), [`f942fb6`](https://github.com/LTplus-AG/ifc-lite/commit/f942fb6c48ac9be1464e49fd963340835a72945d), [`58691b3`](https://github.com/LTplus-AG/ifc-lite/commit/58691b362d67ab87f666d76d6ee27e39d1ec45f9), [`685b541`](https://github.com/LTplus-AG/ifc-lite/commit/685b5414f57eec64c74e056b9b51b6b8ffe3a88f)]:
+  - @ifc-lite/collab@0.9.0
+  - @ifc-lite/ifcx@4.2.0
+  - @ifc-lite/merge@0.4.7
+
+## 0.7.2
+
+### Patch Changes
+
+- Updated dependencies [[`e18a434`](https://github.com/LTplus-AG/ifc-lite/commit/e18a434ec2258e474728bd9a90146486b38efedb), [`53003de`](https://github.com/LTplus-AG/ifc-lite/commit/53003de1e36a956b7f51e9dffc035218477d5d3c), [`4ab63cd`](https://github.com/LTplus-AG/ifc-lite/commit/4ab63cd72e374dbdc98b6f59599fb9d2050f0f85)]:
+  - @ifc-lite/collab@0.8.0
+  - @ifc-lite/ifcx@4.1.1
+
+## 0.7.1
+
+### Patch Changes
+
+- Updated dependencies [[`b0700f2`](https://github.com/LTplus-AG/ifc-lite/commit/b0700f25434d1cf1ec5f7438a8e27c09188208ec), [`7179a9c`](https://github.com/LTplus-AG/ifc-lite/commit/7179a9c6c2d0620f6bd3260e37b80c771697ce85), [`dbf513b`](https://github.com/LTplus-AG/ifc-lite/commit/dbf513b785f1dbc2f2dce5c173d28fd5ab65aa0c)]:
+  - @ifc-lite/ifcx@4.1.0
+  - @ifc-lite/collab@0.7.0
+
+## 0.7.0
+
+### Minor Changes
+
+- [#3579](https://github.com/LTplus-AG/ifc-lite/pull/3579) [`b50283e`](https://github.com/LTplus-AG/ifc-lite/commit/b50283e99b4e34a8a28b69f35497ad9379c4565b) Thanks [@BIMvoice](https://github.com/BIMvoice)! - `Principal.expiresAt` is now enforced, not just carried. It was documented in `auth.ts` as "checked again every 5 minutes per spec", populated from a room token's `exp` claim, and never read anywhere on any post-connect path ([#3441](https://github.com/LTplus-AG/ifc-lite/issues/3441)): an established WebSocket session kept write access indefinitely after its credential's stated expiry, since `verifyRoomToken` only checks expiry at connect and nothing re-examined it afterward.
+  
+  Two enforcement paths, covering different exposure:
+  
+  - `Room`'s write-gate (`preCheckWriteFrame`) now denies a sync write-frame with reason `expired` once `Date.now()` passes `principal.expiresAt` (plus the same clock-skew tolerance `verifyRoomToken` applies at connect).
+  - A new periodic sweep, `Room.sweepExpiredPrincipals` / `RoomManager.sweepExpiredPrincipals`, closes any connection whose principal has expired — every 5 minutes by default, matching the documented interval — so read and presence access stop too, not only writes. It reuses the same close-and-let-`ws.on('close', ...)`-clean-up path as an explicit admin kick.
+
+- [#3470](https://github.com/LTplus-AG/ifc-lite/pull/3470) [`ac00630`](https://github.com/LTplus-AG/ifc-lite/commit/ac0063028517e471b58e741c2018b21b37509a63) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix `/metrics` reporting a stale, permanent peer count for a room after it unloads.
+  
+  `peersGauge` is keyed by `roomId`, an identifier the connecting peer picks (the websocket URL path). Every scrape re-`set` the gauge for each currently-loaded room, but nothing ever removed a series for a room that had since unloaded, so `collab_room_peers{room="<id>"}` kept reporting that room's last-known (non-zero) peer count forever, and the registry grew one label series per distinct room id that was loaded at the time of some scrape over the life of a long-running server rather than tracking only currently-loaded rooms. `MetricsRegistry`'s gauge now exposes `reset()`, and the `/metrics` handler resets `peersGauge` before repopulating it from the live room list on each scrape.
+
+### Patch Changes
+
+- [#3855](https://github.com/LTplus-AG/ifc-lite/pull/3855) [`182215a`](https://github.com/LTplus-AG/ifc-lite/commit/182215a835c4beac6a776bcb4eb1d019cab9063e) Thanks [@louistrue](https://github.com/louistrue)! - Corrected the code samples on each package's npm landing page: the README fences are now typechecked against the package's real exports, so the snippets import what they call, declare the values they read, and no longer show removed options or renamed methods. Patch-bumping every package whose README changed so the corrections actually reach npmjs.com.
+- Updated dependencies [[`53a92b1`](https://github.com/LTplus-AG/ifc-lite/commit/53a92b1f7cc5770f164dc4867fc2adc33470e245), [`cebcb21`](https://github.com/LTplus-AG/ifc-lite/commit/cebcb2133ef672e9199ee2f158578499d449d9e0), [`e986c81`](https://github.com/LTplus-AG/ifc-lite/commit/e986c81bf6d28fec57f1953fa53bf315dbd80a3a), [`8c181c9`](https://github.com/LTplus-AG/ifc-lite/commit/8c181c99f91964402ad352aead36d9619af5b427), [`6e48c4c`](https://github.com/LTplus-AG/ifc-lite/commit/6e48c4c5f441e8a42e4cc55440cf747ad8679f0a), [`8f08715`](https://github.com/LTplus-AG/ifc-lite/commit/8f087158a662a02c01a21dd2546fb863bb24e665), [`9b709c5`](https://github.com/LTplus-AG/ifc-lite/commit/9b709c51480fbabb68167aa4892f7e4c87b0e4e6), [`f8e03d4`](https://github.com/LTplus-AG/ifc-lite/commit/f8e03d4d5bb620fc9e807d5233091d145a201165), [`32b31bc`](https://github.com/LTplus-AG/ifc-lite/commit/32b31bc8501f04e110733289bde0389b9899bc76), [`c78ce8c`](https://github.com/LTplus-AG/ifc-lite/commit/c78ce8c3f1da3b8b2c6fa0f982595adc8c48b7d6), [`4735f1c`](https://github.com/LTplus-AG/ifc-lite/commit/4735f1cbb6635016e83c7890f670e615bbdc48c3), [`182215a`](https://github.com/LTplus-AG/ifc-lite/commit/182215a835c4beac6a776bcb4eb1d019cab9063e)]:
+  - @ifc-lite/collab@0.6.1
+  - @ifc-lite/ifcx@4.0.0
+  - @ifc-lite/merge@0.4.5
+
+## 0.6.1
+
+### Patch Changes
+
+- Updated dependencies [[`66697fc`](https://github.com/LTplus-AG/ifc-lite/commit/66697fc57de1de4475a2c5eed4361e0e378e0f7a), [`228bbe7`](https://github.com/LTplus-AG/ifc-lite/commit/228bbe730522148ea797780c5acd08502b18a3a3), [`e6caf11`](https://github.com/LTplus-AG/ifc-lite/commit/e6caf11a8f8d9d8634a6811b6705ab3367cd02e0), [`2580830`](https://github.com/LTplus-AG/ifc-lite/commit/25808308bbbc63eb0fd8b25e6dd0c08864adb6a8), [`b25b2e7`](https://github.com/LTplus-AG/ifc-lite/commit/b25b2e7387bd365fda02d48095266f16b4f05cd7), [`f7e26e4`](https://github.com/LTplus-AG/ifc-lite/commit/f7e26e4200e1475728d4976142b49cb408400a8e)]:
+  - @ifc-lite/collab@0.6.0
+  - @ifc-lite/ifcx@3.0.0
+  - @ifc-lite/merge@0.4.4
+
+## 0.6.0
+
+### Minor Changes
+
+- [#2794](https://github.com/LTplus-AG/ifc-lite/pull/2794) [`eadb0e0`](https://github.com/LTplus-AG/ifc-lite/commit/eadb0e09e304701d0774467335dd482fafdb045c) Thanks [@louistrue](https://github.com/louistrue)! - Add garbage collection for content-addressed blobs. Blobs were one file per mesh
+  and were never deleted, so a long-lived server exhausted its volume's INODES
+  rather than its bytes: production hit 305,741 blobs against a 5 GB volume's
+  305,175 inodes with only 2.9 GB of 4.9 GB used, and every geometry upload began
+  failing with ENOSPC. Mean blob size is well under the default 16 KB-per-inode
+  ratio, so a larger volume only delays this.
+  
+  The sweep deletes a blob only when no persisted room log references it, no
+  loaded room references it, and it is older than a 24h grace window covering the
+  upload-then-reference race. References are unioned across every room, since
+  content-addressed blobs are shared between rooms and branch forks. Enabled by
+  default; `COLLAB_BLOB_GC=0` disables it.
+
+### Patch Changes
+
+- [#2806](https://github.com/LTplus-AG/ifc-lite/pull/2806) [`7544c9d`](https://github.com/LTplus-AG/ifc-lite/commit/7544c9d36f735cf52a7c0494a4e7ff9c3c3a3954) Thanks [@louistrue](https://github.com/louistrue)! - The blob sweep now runs once at startup IN ADDITION to the configured interval,
+  and the configurable grace window has a floor. The periodic sweeps are unchanged;
+  what was missing was the first one.
+  
+  `setInterval` does not fire immediately, so with the default six-hour period a
+  server that restarts more often than that never completed a sweep at all: the GC
+  was present in the code and absent in effect. Hosted deploys restart on
+  redeploy, OOM and platform events, so that was the normal case rather than an
+  edge one.
+  
+  `COLLAB_BLOB_GC_GRACE_MS` also accepted `0`, which is the destructive value: it
+  makes the cutoff equal to now, condemning every unreferenced blob regardless of
+  age, including one uploaded moments earlier by an in-flight share whose document
+  reference has not landed yet. The minimum is now one minute.
+
+- [#2793](https://github.com/LTplus-AG/ifc-lite/pull/2793) [`f4a6cdc`](https://github.com/LTplus-AG/ifc-lite/commit/f4a6cdc1d2179bc406cf41da79580ce4f03ffeb5) Thanks [@louistrue](https://github.com/louistrue)! - Stop the collab server counting itself as a room participant, and give it a real
+  keepalive. y-protocols' `Awareness` constructor self-registers a local state of
+  `{}` and renews it every 15 seconds, so every room's peer badge read one too
+  high: it showed "(2)" directly above a roster saying "You're the only one here",
+  because the roster filters on a `user` field and the badge did not.
+  
+  That renewal was also the only server-to-client traffic in a single-occupant
+  room, and so was accidentally feeding y-websocket's 30-second reconnect
+  watchdog. Clearing the ghost alone put every lone client into a permanent ~30
+  second disconnect/reconnect loop, so the server now sends an explicit
+  application-level keepalive instead of relying on that side effect.
+
+- [#2848](https://github.com/LTplus-AG/ifc-lite/pull/2848) [`35594ee`](https://github.com/LTplus-AG/ifc-lite/commit/35594eeb99bd01757c945b4fe841870c7487fb9b) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Pin the path-lock accept path end to end: a write to an *unlocked* prefix, verified by `verifyAgainstPathLocks`, actually reaches a second peer through a real `startCollabServer` instance.
+  
+  `path-locks.test.ts` already had a real reject-path test (`rejects writes to locked prefixes via verifyAgainstPathLocks`) but no accept-path equivalent — the remaining coverage was pure-function tests of `harvestUpdatePaths` / `registry.matches`. That asymmetry is exactly the shape that let the anti-replay protector's accept path go silently broken (fixed in [#2846](https://github.com/LTplus-AG/ifc-lite/issues/2846)): `handleMessage` ignored the transformed `payload` the verifier returned, so every accepted edit vanished while the reject-path test stayed green.
+  
+  `verifyAgainstPathLocks` doesn't transform its input (pure allow/deny), so it isn't exposed to that exact bug shape, but the accept path through `Room.dispatchMessage` was still unverified end to end. Confirmed the new test pins something: mutating `dispatchMessage`'s `MESSAGE_SYNC` branch to swallow accepted `messageYjsUpdate` frames without applying them fails only the new test (the reject-path test and the pure-function tests stay green); reverting restores 5/5.
+  
+  No production code changed; this is coverage only.
+
+- [#2846](https://github.com/LTplus-AG/ifc-lite/pull/2846) [`cbd9d7a`](https://github.com/LTplus-AG/ifc-lite/commit/cbd9d7afb0d63a1d04a95a461605cf5b3d482579) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix the anti-replay protector silently dropping every update it verified.
+  
+  `verifyWithReplayProtector` unwraps a signed envelope (tag + clientId + clock + hmac + inner y-protocol frame) down to the inner frame and returns it as `payload`, exactly as documented for wiring into `RoomOptions.verifyMessage`. But `VerifyDecision` never declared a `payload` field, and `Room.handleMessage` always dispatched the raw envelope bytes it received — never the verifier's unwrapped `payload`. The envelope isn't itself a valid sync/awareness frame, so `dispatchMessage`'s outer varint decode fell into its `default: // Unknown frame; ignore` case: every signed, HMAC-verified, non-replayed update was accepted by the verifier and then discarded with no audit entry and no error.
+  
+  `VerifyDecision` now carries an optional `payload`, and `handleMessage` dispatches it in place of the raw message when a verifier supplies one. Verified end to end: a real signed sync-update frame sent over a live websocket to a room wired with `verifyMessage: verifyWithReplayProtector(...)` now lands in the room's `Y.Doc`, where before the fix it silently vanished.
+  
+  **Also fixed:** dispatching the unwrapped payload bypassed the role, rate-limit, and payload-size gate. `preCheckWriteFrame` runs on the *envelope*, and a signed envelope's outer byte is never `MESSAGE_SYNC`, so it always took the early `return true` — no role, limiter, or size check. That was harmless while the envelope was silently dropped; after unwrapping it, the real write frame inside reached the doc having passed none of those gates. Confirmed by execution: a `viewer`-role connection sending one correctly-signed envelope had its write land in `room.doc` with zero `reason: 'role'` audit entries. `handleMessage` now re-runs `preCheckWriteFrame` on `decision.payload` before dispatch, so an unwrapped write frame is gated exactly like a plain one. Two regression tests pin the negative cases: a viewer's signed write is rejected with `reason: 'role'` and does not land, and a signed envelope whose inner frame exceeds `MAX_SYNC_PAYLOAD_BYTES` is rejected with `reason: 'sync-size'`.
+
+- [#2821](https://github.com/LTplus-AG/ifc-lite/pull/2821) [`a75a59c`](https://github.com/LTplus-AG/ifc-lite/commit/a75a59c7158a5bad920a90fa93878a8fa506b3b6) Thanks [@BIMvoice](https://github.com/BIMvoice)! - `RoomManager.getOrCreate` now disposes a `Room` whose `loadFromDisk()` rejects, instead of leaking it.
+  
+  The `Room` constructor already starts disposable resources — notably y-protocols'
+  `Awareness`, which self-starts a `setInterval` renewal/eviction timer — and wires
+  `doc`/`awareness` listeners, before `loadFromDisk()` runs. When `loadFromDisk()`
+  threw (corrupt persisted log, transient disk error), the room was never returned
+  to any caller, so nothing outside the closure could reach it to dispose those
+  handles. Every failed load leaked one `Awareness` timer for the life of the
+  process. Confirmed with `process.getActiveResourcesInfo()`: a live `Timeout`
+  survived a rejected `getOrCreate()` before this fix, and none does after it.
+  
+  The reject path now tears the half-built room down (best-effort) before
+  rethrowing, so the promise still rejects exactly as before.
+  
+  **Fixed in the same patch:** the disposal above must not call `Room.destroy()`,
+  because `destroy()` ends with a final `compact()` of the room's (empty or
+  partial) `doc` onto the persisted log. On the reject path `loadFromDisk()`
+  never applied anything to `doc` — that is what "reject" means here — so a
+  transient disk error (`EMFILE`, `ENOSPC`, an NFS blip) or a corrupt log would
+  have been turned into permanent data loss by the very cleanup meant to fix the
+  timer leak. Reproduced with a real OS-level `EMFILE` (fds exhausted via a
+  lowered `ulimit -n`, not a stubbed throw): a room with real persisted content,
+  a `load()` that fails once with a genuine `EMFILE`, and the descriptor
+  exhaustion clearing before cleanup ran — `Room.destroy()` compacted the empty
+  doc over the log, replacing real bytes with an empty Yjs update. The reject
+  path now calls a new `Room.disposeUnloaded()`, which does everything
+  `destroy()` does except the compaction, so nothing is ever persisted from a
+  doc that never finished loading.
+- Updated dependencies [[`b14e710`](https://github.com/LTplus-AG/ifc-lite/commit/b14e710ae8d56f518f84abb4d4ec8d1f98aacad8), [`4ce3879`](https://github.com/LTplus-AG/ifc-lite/commit/4ce38798211b6b5f84e5b21ed335aa80fe1514c4), [`a29b040`](https://github.com/LTplus-AG/ifc-lite/commit/a29b04069fec3c6b726f49fc58054e535c255034), [`cc19a8d`](https://github.com/LTplus-AG/ifc-lite/commit/cc19a8d4a79a5e8563a90ab663b28e1b93ef9c18), [`36e4eca`](https://github.com/LTplus-AG/ifc-lite/commit/36e4eca3b19a2fe02f1679acc9a2a43cd90aa163), [`a7b8a20`](https://github.com/LTplus-AG/ifc-lite/commit/a7b8a201eaecd411a4246421893e887bf55aafd3), [`f31822b`](https://github.com/LTplus-AG/ifc-lite/commit/f31822b0833e1bcd76c43736daf1d76cb3e59914), [`4d1c611`](https://github.com/LTplus-AG/ifc-lite/commit/4d1c611b822e80a6123b040887a31cdb43c460da)]:
+  - @ifc-lite/collab@0.5.0
+  - @ifc-lite/ifcx@2.3.7
+  - @ifc-lite/merge@0.4.3
+
 ## 0.5.3
 
 ### Patch Changes
@@ -306,7 +477,7 @@
   already closed in prior batches.
 
 - [#616](https://github.com/louistrue/ifc-lite/pull/616) [`2fc15b4`](https://github.com/louistrue/ifc-lite/commit/2fc15b45fbd06ebb57120d87db9a0ab06ed18142) Thanks [@louistrue](https://github.com/louistrue)! - Big reach-for-the-stars batch. Closes (or near-closes) the remaining
-  substantial items in `docs/architecture/collab-plan.md` for v0.2,
+  substantial items in `docs/architecture/collaboration.md` for v0.2,
   v0.5, v0.7, and v1.0. **+21 tests, total 140 passing.**
 
   `@ifc-lite/collab`
@@ -506,7 +677,7 @@ name, buckets, help)` accumulates observations into upper-bound
   end-to-end sync through the websocket server, undo isolation, and
   per-user layer extraction.
 
-  See `docs/architecture/collab-plan.md` for the v0.1 → v1.0 roadmap.
+  See `docs/architecture/collaboration.md` for the v0.1 → v1.0 roadmap.
 
 - [#616](https://github.com/louistrue/ifc-lite/pull/616) [`2fc15b4`](https://github.com/louistrue/ifc-lite/commit/2fc15b45fbd06ebb57120d87db9a0ab06ed18142) Thanks [@louistrue](https://github.com/louistrue)! - Continuing the v0.1 → v1.0 plan. Lands foundational pieces of v0.3
   (geometry), v0.4 (federation), and v0.6 (MCP) so each upstack consumer

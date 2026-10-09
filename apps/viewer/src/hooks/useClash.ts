@@ -11,8 +11,11 @@
  */
 
 import { useCallback, useRef } from 'react';
+import { beginAbortableRun, cancelClashRun, invalidateAbortableRun } from './analysisRunCancellation';
+import { captureAnalysisStamp, stampAnalysisReport, type AnalysisStamp } from './useAnalysisStaleness';
+import { rememberPlacementSnapshot, jobPlacementIsCurrent } from '@/lib/model-placement/placement-snapshot';
 import { useViewerStore } from '@/store';
-import type { ClashFocusMode } from '@/store/slices/clashSlice';
+import type { ClashFocusMode, ClashPreset } from '@/store/slices/clashSlice';
 import {
   createClashEngine,
   rulesFromPresets,
@@ -20,7 +23,6 @@ import {
   groupDuplicateSets,
   findDuplicates,
   clashReviewKey,
-  summarizeClashes,
   type Clash,
   type ClashElement,
   type ClashElementRef,
@@ -33,10 +35,12 @@ import {
 } from '@ifc-lite/clash';
 import { elementsFromStep } from '@ifc-lite/clash/step';
 import { createBCFFromClashResult } from '@ifc-lite/clash/bcf';
-import { contactClusters, type SharedFaceCluster, type Vec3 } from '@ifc-lite/clash/contact';
+import { contactClusters } from '@ifc-lite/clash/contact';
 import { writeBCF } from '@ifc-lite/bcf';
 import { getGlobalRenderer } from '@/hooks/useBCF';
-import { buildClashPairColors, CLASH_COLOR_A, CLASH_COLOR_OVERLAP } from '@/lib/clash/clash-colors';
+import { bcfWorldOffset } from '@/hooks/bcf/viewpoint-world-frame';
+import { withInstancedMeshes } from '@/utils/instancedExport';
+import { buildClashPairColors, CLASH_COLOR_A } from '@/lib/clash/clash-colors';
 import {
   elementPairExclusion,
   typeAnyExclusion,
@@ -44,8 +48,12 @@ import {
   type ClashExclusionRule,
 } from '@/lib/clash/exclusions';
 import { clashFramingBounds } from '@/lib/clash/clash-framing';
+import { contactLineList } from '@/lib/clash/contact-lines';
+import { filterResultBySeverity } from '@/lib/clash/severity-filter';
+import { withResolvedClashSetFilters } from '@/lib/clash/set-filter-resolve';
 import { computeClashIntersectionSolid } from '@/lib/clash/intersection-solid';
 import { restoreOverridesForGhosting } from '@/lib/clash/ghost-color-overrides';
+import { focusClashGroup } from '@/lib/clash/group-focus';
 import { releaseOwnedClashVisibility } from '@/lib/clash/visibility-ownership';
 import {
   clashFederationIsCurrent,
@@ -54,9 +62,12 @@ import {
   rememberFederationIdentity,
   type ClashFederationIdentity,
 } from '@/lib/clash/federation-identity';
-import { posthog } from '@/lib/analytics';
+import { definedModelTagIdsOf, evaluatorModelsFromState } from '@/lib/model-tags/evaluator-models';
+import { captureModelTagInputs, rememberModelTagInputs, type ClashModelTagInputs } from '@/lib/clash/model-tag-inputs';
+import { allElementsRule, rememberRunRequest, type ClashRunRequest } from '@/lib/clash/run-request';
+import { posthog, trackExportCompleted } from '@/lib/analytics';
 import { errorCaptureProps } from '@/lib/load-errors';
-import { downloadBlob } from '@/lib/export/download';
+import { downloadBlob, dataUrlToBytes } from '@/lib/export/download';
 import { nextFrameOrTimeout } from '@/utils/frameWait';
 
 /**
@@ -100,7 +111,7 @@ export const CLASH_SUPERSEDED_MESSAGE =
  * loading the model again.
  *
  * The model is not NAMED in the message: `ClashElementRef.model` is a store id
- * (`room:<roomId>`, or a load-time key), the display name lived on the model
+ * (`room:<roomId>:<slotId>`, or a load-time key), the display name lived on the model
  * entry that has just been dropped from `state.models`, and a message quoting
  * an internal id would be worse than one that quotes nothing.
  */
@@ -125,39 +136,6 @@ export const CLASH_REF_UNRESOLVED_MESSAGE =
 interface SelectionRef {
   modelId: string;
   expressId: number;
-}
-
-/**
- * Flatten contact clusters into a world-frame line-list (x,y,z per endpoint, two
- * per segment) for the focused-clash overlay. Prefer the shared-FACE polygon
- * outlines when any surface contact exists (flush/coincident members); otherwise
- * the intersection LINES (angled crossings); otherwise small crosses at POINT
- * contacts. This is the real contact interface, not an AABB box (#1402).
- */
-function contactLineList(clusters: readonly SharedFaceCluster[]): number[] {
-  const surfaces = clusters.filter((c) => c.kind === 'surface' && c.boundary.length >= 3);
-  const lines = clusters.filter((c) => c.kind === 'line' && c.boundary.length >= 2);
-  const points = clusters.filter((c) => c.kind === 'point');
-  const out: number[] = [];
-  const seg = (p: Vec3, q: Vec3) => out.push(p[0], p[1], p[2], q[0], q[1], q[2]);
-  // Shared-face polygon outlines (the contact patches) and intersection lines
-  // (penetration boundary) together describe the contact; render both so a thin
-  // patch still reads. Points only matter when there is no surface or line.
-  for (const c of surfaces) {
-    const b = c.boundary;
-    for (let i = 0; i < b.length; i += 1) seg(b[i], b[(i + 1) % b.length]);
-  }
-  for (const c of lines) seg(c.boundary[0], c.boundary[1]);
-  if (surfaces.length === 0 && lines.length === 0) {
-    const s = 0.05;
-    for (const c of points) {
-      const [x, y, z] = c.centroid;
-      seg([x - s, y, z], [x + s, y, z]);
-      seg([x, y - s, z], [x, y + s, z]);
-      seg([x, y, z - s], [x, y, z + s]);
-    }
-  }
-  return out;
 }
 
 /**
@@ -191,31 +169,6 @@ export interface ClashBcfConfig {
 /** Dark, neutral background for offscreen snapshot captures (Tokyo Night base). */
 const SNAPSHOT_CLEAR_COLOR: [number, number, number, number] = [0.04, 0.05, 0.1, 1];
 
-/** Decode a `data:image/png;base64,...` URL into raw PNG bytes for the BCF zip. */
-function dataUrlToBytes(dataUrl: string): Uint8Array | undefined {
-  const comma = dataUrl.indexOf(',');
-  if (comma < 0) return undefined;
-  try {
-    const binary = atob(dataUrl.slice(comma + 1));
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
-    return bytes;
-  } catch {
-    return undefined;
-  }
-}
-
-/**
- * Drop clashes whose severity is not selected, rebuilding the WHOLE summary
- * (not just `total`): this feeds `exportBcf`/`bcfPreview`, and a stale
- * `byTypePair`/`byRule`/`bySeverity` would still advertise buckets the filter
- * just removed.
- */
-export function filterResultBySeverity(result: ClashResult, severities: Set<ClashSeverity>): ClashResult {
-  const clashes = result.clashes.filter((c) => severities.has(c.severity));
-  return { ...result, clashes, summary: summarizeClashes(clashes) };
-}
-
 export function useClash() {
   const result = useViewerStore((s) => s.clashResult);
   const groups = useViewerStore((s) => s.clashGroups);
@@ -226,7 +179,6 @@ export function useClash() {
   const tolerance = useViewerStore((s) => s.clashTolerance);
   const clearance = useViewerStore((s) => s.clashClearance);
   const groupBy = useViewerStore((s) => s.clashGroupBy);
-  const clusterEpsilon = useViewerStore((s) => s.clashClusterEpsilon);
   const reportTouch = useViewerStore((s) => s.clashReportTouch);
   const clashPresets = useViewerStore((s) => s.clashPresets);
   const selectedId = useViewerStore((s) => s.clashSelectedId);
@@ -254,10 +206,40 @@ export function useClash() {
   const toggleStatusFilter = useViewerStore((s) => s.toggleClashStatusFilter);
   const clear = useViewerStore((s) => s.clearClash);
 
-  // Geometry of the last-gathered clash elements, keyed by federated ref, so a
-  // focused clash can compute its real contact interface for that one pair.
-  const elementsByRef = useRef(new Map<number, ClashElement>());
+  // Geometry of the last-gathered clash elements, keyed by (model, key) IDENTITY —
+  // not by `ref` — so a focused clash can compute its real contact interface for
+  // that one pair. `ref` is derived from the bare expressId (see step.ts) and is
+  // deliberately SHARED across every occurrence of a GPU-instanced entity, while
+  // `key` folds in `mesh.occurrenceKey` to stay distinct per physical occurrence
+  // (#2865). Keying this cache by `ref` collapsed multiple occurrences onto one
+  // map entry (last-write-wins), so `focusClash` below could build the contact
+  // interface / intersection solid from the WRONG occurrence's geometry whenever
+  // two instanced copies of one element actually clashed.
+  const elementsByIdentity = useRef(new Map<string, ClashElement>());
+  const elementIdentity = (element: Pick<ClashElement, 'model' | 'key'>): string =>
+    JSON.stringify([element.model, element.key]);
 
+  /**
+   * Per-call supersession guard for `run()` / `runDuplicates()` (#2802).
+   *
+   * `publishClashResult`'s `clashFederationIsCurrent` check is keyed on the
+   * MODEL SET, not on which call started it — two detection jobs issued while
+   * the federation is untouched (a slow "All elements" run, then a quick
+   * duplicate scan started while it is still going) carry the identical
+   * identity, so that guard alone cannot tell a call the user is still
+   * waiting on from one they have moved past. `run()` holds the thread for as
+   * long as its geometry takes; nothing stopped an OLDER call from finishing
+   * after a NEWER one and overwriting its (more current) answer.
+   *
+   * Each run owns an epoch checked before post-await writes, including
+   * `finally`; otherwise an older run could clear a newer run's busy state.
+   * Clear and cancel also bump it so late results cannot reappear.
+   */
+  const runEpochRef = useRef(0);
+  const runAbortRef = useRef<AbortController | null>(null);
+  const stillWanted = useCallback((epoch: number): boolean => runEpochRef.current === epoch, []);
+
+  const cancelRun = useCallback((): void => cancelClashRun(runEpochRef, runAbortRef), []);
   // The intersection-solid staleness guard that used to live here (a
   // `createLatestWinsGuard()` ref) is gone: it was private to one `useClash()`
   // instance, so no teardown outside this hook could invalidate it. It is now
@@ -277,22 +259,22 @@ export function useClash() {
   /** Install clash isolation into the shared channel, recording exactly what
    *  was installed so `releaseClashVisibility` can release only that. */
   const installClashIsolation = useCallback((ids: Set<number>): void => {
-    const state = useViewerStore.getState();
-    state.setIsolatedEntities(ids);
-    // Read the set BACK from the store: the slice setter clones, and the record
-    // must hold what the channel actually shows. Recording the isolate channel
-    // also drops any ghost claim — `setIsolatedEntities` cleared the ghosting.
-    const installed = useViewerStore.getState().isolatedEntities;
-    state.setClashVisibilityOwned(installed ? { channel: 'isolate', ids: installed } : null);
+    useViewerStore.setState({
+      isolatedEntities: ids, ghostExceptEntities: null,
+      hiddenEntities: new Set<number>(),
+      idsFocusVisibilityOwned: null, basketVisibilityOwned: null, chartVisibilityOwned: null, listVisibilityOwned: null,
+      clashVisibilityOwned: { channel: 'isolate', ids },
+    });
   }, []);
 
   /** Install clash ghosting (X-Ray context) into the shared channel, with the
    *  same install-record contract as `installClashIsolation`. */
   const installClashGhost = useCallback((ids: Set<number>): void => {
-    const state = useViewerStore.getState();
-    state.setGhostExceptEntities(ids);
-    const installed = useViewerStore.getState().ghostExceptEntities;
-    state.setClashVisibilityOwned(installed ? { channel: 'ghost', ids: installed } : null);
+    useViewerStore.setState({
+      isolatedEntities: null, ghostExceptEntities: ids,
+      idsFocusVisibilityOwned: null, basketVisibilityOwned: null, chartVisibilityOwned: null, listVisibilityOwned: null,
+      clashVisibilityOwned: { channel: 'ghost', ids },
+    });
   }, []);
 
   /**
@@ -300,7 +282,7 @@ export function useClash() {
    * that. Isolation or ghosting established by another feature (#2532 / #2531
    * / spaces X-ray) no longer content-matches the ownership record, so it
    * survives a clash run untouched - while a clash focus that round-tripped
-   * through a snapshot/restore flow (Space Sketch open/close) still matches
+   * through a snapshot/restore flow (a view snapshot's open/close) still matches
    * and is discarded (#2662 P2).
    *
    * The predicate is `releaseOwnedClashVisibility`, shared verbatim with the
@@ -336,8 +318,34 @@ export function useClash() {
 
     for (const [modelId, model] of state.models) {
       const store = model.ifcDataStore;
-      const meshes = model.geometryResult?.meshes;
-      if (!store || !meshes || meshes.length === 0) continue;
+      const geometryResult = model.geometryResult;
+      if (!store || !geometryResult) continue;
+      // Every entity whose geometry went fully GPU-instanced (8+ repeats,
+      // `INSTANCE_MIN_OCCURRENCES` in the wasm mesher) is ABSENT from
+      // `geometryResult.meshes` — doors, windows, columns, sprinklers, the
+      // exact repeated components a clash run exists to catch (#2865).
+      // `withInstancedMeshes` is the SAME helper the glTF/IFC5 export path
+      // (#2558/#2576) uses to restore them: it materializes every occurrence
+      // from the live renderer scene's GPU instance buffers
+      // (`Scene.getAllInstancedMeshData`) and appends real triangles, not an
+      // approximation — no separate AABB-only code path, so a clash reported
+      // off an instanced entity is exactly as exact as one reported off a flat
+      // one. GPU instancing stopped being primary-only on 2026-08-06 (#2255) —
+      // federated models get instanced shards too, re-homed onto their own
+      // global id space at drain — so every model in this loop can have
+      // instanced entities, not just the one at idOffset 0 (#2865/#2878
+      // follow-up). `{ idOffset, maxExpressId }` scopes the (unfiltered,
+      // all-models) scene data down to THIS model's global-id bracket, so a
+      // federation of N models does not count each instanced entity N times
+      // over as this loop visits every model. Returns the SAME object back
+      // when there is nothing to add (no renderer mounted, or nothing
+      // instanced for this model), so this is a no-op for every case this bug
+      // did not touch.
+      const meshes = withInstancedMeshes(geometryResult, {
+        modelId: model.id, idOffset: model.idOffset ?? 0,
+        maxExpressId: model.maxExpressId ?? 0,
+      }).meshes;
+      if (meshes.length === 0) continue;
       // `useIfcLoader` shifts every `mesh.expressId` into the GLOBAL id space by
       // this model's `idOffset` while `ifcDataStore` stays LOCAL, so the adapter
       // has to be told the offset or it addresses the store with ids that are
@@ -363,7 +371,7 @@ export function useClash() {
         federation,
         meshIdOffset: model.idOffset ?? 0,
       });
-      elements.push(...built.elements);
+      for (const element of built.elements) elements.push(element); // #6575: avoid JS argument limits.
       for (const key of built.exclusions) exclusions.add(key);
       // Only models that actually CONTRIBUTED elements — the condition the
       // module doc's correctness argument is stated on, so it is checked here
@@ -374,15 +382,14 @@ export function useClash() {
       if (built.elements.length === 0) continue;
       recordGatheredModel(federationIdentity, modelId, model);
     }
+    rememberPlacementSnapshot(federationIdentity, state, federationIdentity.keys());
     return { elements, exclusions, federationIdentity };
   }, []);
 
   /**
-   * The ONE publish site for a detection result — both `run()` and
-   * `runDuplicates()` go through it, so the staleness check and the
-   * "`setClashResult` then `bumpClashRunSeq`" pairing exist in exactly one
-   * place and cannot drift apart (two sites with two copies of a check is this
-   * repo's defining bug class, #2637).
+   * The one publish site for `run()` and `runDuplicates()`: federation and
+   * epoch checks, the report's version stamp, and the completed-run signal
+   * stay together so the two run paths cannot drift (#2637).
    *
    * A run holds the thread for as long as the geometry takes, and the user can
    * tear the federation down while it does: "Clear all" / "Open file"
@@ -395,24 +402,32 @@ export function useClash() {
    * completion signal bumped AFTER a successful write, not a cancellation
    * guard (see its field doc in `clashSlice`).
    *
+   * `epoch` is the calling `run()` / `runDuplicates()` invocation's own token
+   * from `runEpochRef` (see its doc above `elementsByRef`): a SECOND call
+   * issued while the federation is untouched carries the same
+   * `federationIdentity`, so that check alone cannot refuse an older call
+   * that is merely finishing after a newer one. `stillWanted(epoch)` is what
+   * catches that case immediately before the write.
+   *
    * @returns whether the result was published. A discarded run must not go on
    *   to write its dependent state (groups, selection, telemetry) either.
    */
   const publishClashResult = useCallback(
-    (federationIdentity: ClashFederationIdentity, res: ClashResult): boolean => {
+    (federationIdentity: ClashFederationIdentity, res: ClashResult, epoch: number, stamp: AnalysisStamp): boolean => {
+      if (!stillWanted(epoch)) return false;
       const state = useViewerStore.getState();
-      if (!clashFederationIsCurrent(federationIdentity, state.models)) return false;
+      if (!clashFederationIsCurrent(federationIdentity, state.models) || !jobPlacementIsCurrent(federationIdentity, state)) return false;
       // The identity travels WITH the result object. Publish-time currency is
       // not the end of the question: the federation can be superseded while the
       // result is on screen, and only a result that remembers what it was
       // computed on can refuse to resolve afterwards (see `refOf`).
       rememberFederationIdentity(res, federationIdentity);
-      state.setClashResult(res);
+      state.setClashResult(stampAnalysisReport(res, stamp));
       // Completed-run signal for baseline consumers (clash tour run gate).
       state.bumpClashRunSeq();
       return true;
     },
-    [],
+    [stillWanted],
   );
 
   /**
@@ -446,7 +461,13 @@ export function useClash() {
   }, [releaseClashVisibility]);
 
   const run = useCallback(
-    async (rules: ClashRule[]): Promise<void> => {
+    async (rules: ClashRule[], tagInputs: ClashModelTagInputs | null = null, request: ClashRunRequest | null = null): Promise<void> => {
+      // Captured before anything else so a call issued while this one is
+      // already in flight (`runAll` again, a duplicate scan, a preset) makes
+      // every write below — including this call's own error/finally, once
+      // superseded — a no-op instead of clobbering the newer call (#2802).
+      const { runEpoch: myEpoch, controller: abortController } = beginAbortableRun(runEpochRef, runAbortRef);
+      const stamp = captureAnalysisStamp(true);
       const state = useViewerStore.getState();
       discardSolidPresentation();
       state.setClashRunning(true);
@@ -460,23 +481,30 @@ export function useClash() {
         await nextFrameOrTimeout(PAINT_FRAME_WAIT_MS);
         const { elements, exclusions, federationIdentity } = gatherElements();
         if (elements.length === 0) {
-          state.setClashError('No model geometry is loaded. Load an IFC model first.');
+          if (stillWanted(myEpoch)) state.setClashError('No model geometry is loaded. Load an IFC model first.');
           return;
         }
-        // Keep per-ref geometry so focusClash can build the contact interface.
-        elementsByRef.current = new Map(elements.map((e) => [e.ref, e]));
+        // Keep per-occurrence geometry so focusClash can build the contact interface.
+        elementsByIdentity.current = new Map(elements.map((e) => [elementIdentity(e), e]));
         const engine = createClashEngine({ backend: 'ts' });
         const res = await engine.run(elements, rules, {
           exclusions,
           tolerance: state.clashTolerance,
+          signal: abortController.signal,
           // The TS engine yields between chunks, so these updates actually paint.
-          onProgress: (p) => useViewerStore.getState().setClashProgress(p),
+          // A superseded run keeps reporting progress harmlessly — `clashProgress`
+          // is re-armed by the call that superseded it and this write loses any
+          // race against that the same way every other write here does.
+          onProgress: (p) => { if (stillWanted(myEpoch)) useViewerStore.getState().setClashProgress(p); },
         });
         // Publishes the raw run, the user's exclusion-filtered view of it, and
         // the spatial clusters (the BCF unit) in one commit; the panel list
         // groups by its own dimension separately. Discarded outright if the
-        // federation it examined is gone — see `publishClashResult`.
-        if (!publishClashResult(federationIdentity, res)) return;
+        // federation it examined is gone, or if a newer call has started —
+        // see `publishClashResult`.
+        if (!publishClashResult(federationIdentity, res, myEpoch, stamp)) return;
+        rememberModelTagInputs(res, tagInputs);
+        rememberRunRequest(res, request);
         state.setClashSelectedId(null);
         posthog.capture('clash_detection_run', {
           clash_count: res.clashes.length,
@@ -484,15 +512,58 @@ export function useClash() {
           mode: state.clashMode,
         });
       } catch (err) {
+        if (!stillWanted(myEpoch)) return;
         console.error('[clash] detection run failed', err);
         state.setClashError(err instanceof Error ? err.message : String(err));
         posthog.captureException(err, { context: 'clash_detection', ...errorCaptureProps(err) });
       } finally {
-        state.setClashRunning(false);
-        state.setClashProgress(null);
+        if (runAbortRef.current === abortController) runAbortRef.current = null;
+        // A superseded call must not report itself as no-longer-running: the
+        // call that superseded it is the one actually in flight, and this
+        // would flip `clashRunning` off underneath it (#2802).
+        if (stillWanted(myEpoch)) {
+          state.setClashRunning(false);
+          state.setClashProgress(null);
+        }
       }
     },
-    [gatherElements, discardSolidPresentation, publishClashResult],
+    [gatherElements, discardSolidPresentation, publishClashResult, stillWanted],
+  );
+
+  /** Run rules built from PRESETS, resolving each side's optional advanced
+   *  filter (#3902) against the loaded models first. A side with no filter is
+   *  left to its type selector, so a rule set from before filters existed runs
+   *  through here exactly as it did. Models + tag inputs: ONE `getState()` snapshot (#4215). */
+  const runPresets = useCallback(
+    async (presets: ClashPreset[], request: ClashRunRequest): Promise<void> => {
+      const state = useViewerStore.getState();
+      const models = evaluatorModelsFromState(state);
+      const tagInputs = captureModelTagInputs(presets, state.modelTagAssignments);
+      const rules = rulesFromPresets(presets, mode, mode === 'clearance' ? clearance : undefined, reportTouch);
+      // Resolving the filters is a federation scan that happens BEFORE `run()`
+      // takes over the epoch and the running/error state. Take an epoch here
+      // anyway: without it a second, filterless run started during the scan
+      // would enter `run()` first and then be overwritten by this older one
+      // (#2802's ordering, which only holds while every start bumps). The
+      // running flag is set for the same window, so the panel says it is
+      // working instead of looking idle for the length of the scan.
+      const myEpoch = invalidateAbortableRun(runEpochRef, runAbortRef);
+      state.setClashError(null);
+      state.setClashRunning(true);
+      let resolved: ClashRule[];
+      try {
+        resolved = await withResolvedClashSetFilters(rules, presets, models, state.toGlobalId, { definedModelTagIds: definedModelTagIdsOf(state) });
+      } catch (err) {
+        // A refused filter reports itself here or nothing on screen changes.
+        if (!stillWanted(myEpoch)) return;
+        state.setClashError(err instanceof Error ? err.message : String(err));
+        state.setClashRunning(false);
+        return;
+      }
+      if (!stillWanted(myEpoch)) return;
+      return run(resolved, tagInputs, request);
+    },
+    [run, mode, clearance, reportTouch, stillWanted],
   );
 
   /**
@@ -506,8 +577,8 @@ export function useClash() {
       useViewerStore.getState().setClashError('All rules are disabled — enable at least one in Clash settings (⚙).');
       return Promise.resolve();
     }
-    return run(rulesFromPresets(enabled, mode, mode === 'clearance' ? clearance : undefined, reportTouch));
-  }, [run, mode, clearance, reportTouch, clashPresets]);
+    return runPresets(enabled, { kind: 'matrix' });
+  }, [runPresets, clashPresets]);
 
   /**
    * Detect ALL clashes in the loaded geometry — a single self-clash rule over
@@ -516,27 +587,17 @@ export function useClash() {
    * the model".
    */
   const runAll = useCallback(
-    (): Promise<void> =>
-      run([
-        {
-          id: 'all-clashes',
-          name: 'All elements',
-          a: '*',
-          mode,
-          ...(mode === 'clearance' ? { clearance } : {}),
-          ...(reportTouch ? { reportTouch: true } : {}),
-        },
-      ]),
+    (): Promise<void> => run([allElementsRule(mode, clearance, reportTouch)], null, { kind: 'all' }),
     [run, mode, clearance, reportTouch],
   );
 
   const runPreset = useCallback(
     (presetId: string): Promise<void> => {
       const preset = useViewerStore.getState().clashPresets.find((p) => p.id === presetId);
-      if (!preset) return Promise.resolve();
-      return run(rulesFromPresets([preset], mode, mode === 'clearance' ? clearance : undefined, reportTouch));
+      if (!preset) { useViewerStore.getState().setClashError('That rule no longer exists — pick a rule to run, or restore it in Clash settings (⚙).'); return Promise.resolve(); }
+      return runPresets([preset], { kind: 'preset', presetId, name: preset.name });
     },
-    [run, mode, clearance, reportTouch],
+    [runPresets],
   );
 
   /**
@@ -546,6 +607,14 @@ export function useClash() {
    * shape, so the panel, grouping and BCF export render it unchanged.
    */
   const runDuplicates = useCallback(async (): Promise<void> => {
+    // Same epoch capture as `run()`, and for the same reason: a duplicate
+    // scan started while an "All elements" run (or another scan) is still
+    // in flight — the two share one Run panel and neither disables the
+    // other's trigger while it's the other one running — must not have its
+    // OWN eventual completion, or the older call's, win by landing last
+    // (#2802).
+    const myEpoch = invalidateAbortableRun(runEpochRef, runAbortRef);
+    const stamp = captureAnalysisStamp(true);
     const state = useViewerStore.getState();
     discardSolidPresentation();
     state.setClashRunning(true);
@@ -557,7 +626,7 @@ export function useClash() {
       await nextFrameOrTimeout(PAINT_FRAME_WAIT_MS);
       const { elements, exclusions, federationIdentity } = gatherElements();
       if (elements.length === 0) {
-        state.setClashError('No model geometry is loaded. Load an IFC model first.');
+        if (stillWanted(myEpoch)) state.setClashError('No model geometry is loaded. Load an IFC model first.');
         return;
       }
       // The duplicate scan has its own tolerance ("how far apart may two
@@ -575,7 +644,8 @@ export function useClash() {
       // must not be one line apart in correctness: adding a yield to the
       // duplicate scan tomorrow would otherwise reopen the defect on this path
       // alone, silently.
-      if (!publishClashResult(federationIdentity, res)) return;
+      if (!publishClashResult(federationIdentity, res, myEpoch, stamp)) return;
+      rememberRunRequest(res, { kind: 'duplicates' });
       // Coincident SETS, not spatial clusters: three copies of one column are one
       // finding, and two unrelated duplicate pairs a metre apart stay two. The
       // panel renders these as its sections (see duplicate-set-sections.ts).
@@ -589,14 +659,17 @@ export function useClash() {
         pair_count: res.clashes.length,
       });
     } catch (err) {
+      if (!stillWanted(myEpoch)) return;
       console.error('[clash] duplicate scan failed', err);
       state.setClashError(err instanceof Error ? err.message : String(err));
       posthog.captureException(err, { context: 'clash_duplicates', ...errorCaptureProps(err) });
     } finally {
-      state.setClashRunning(false);
-      state.setClashProgress(null);
+      if (stillWanted(myEpoch)) {
+        state.setClashRunning(false);
+        state.setClashProgress(null);
+      }
     }
-  }, [gatherElements, discardSolidPresentation, publishClashResult]);
+  }, [gatherElements, discardSolidPresentation, publishClashResult, stillWanted]);
 
   /**
    * Resolve a clash ref back to its model + local expressId. `null` means "this
@@ -616,9 +689,9 @@ export function useClash() {
    *
    * The `federationRegistry` singleton (`fromGlobalId`) did that search, and
    * knows only models that went through `registerModelOffset`. A model put into
-   * `state.models` any other way is invisible to it. That is exactly the collab
-   * room model: `collabSlice`'s recipient reconstruct registers it with
-   * `upsertModel({ id: 'room:<id>', ..., idOffset: 0 })` and never calls
+   * `state.models` any other way is invisible to it. That was the collab room
+   * model until #4444: the recipient reconstruct registered it with
+   * `upsertModel({ id: 'room:<id>', ..., idOffset: 0 })` and never called
    * `registerModelOffset`, so in a room EVERY clash row was dead — while
    * clicking the same element in the 3D view selected it normally, that path
    * resolving through `state.models` (`resolveEntityRef`).
@@ -658,10 +731,10 @@ export function useClash() {
    * `federationRegistry.clear()`), so the registry had forgotten it too and the
    * answer was `null` anyway. That does NOT hold for a model the registry never
    * held, which is precisely the class this resolver was fixed for: the collab
-   * room model is created by `upsertModel` with `idOffset: 0` and no
-   * `registerModelOffset` call (`collabSlice`), so `unregisterModel` is a no-op
-   * for it and there is nothing to forget. Leaving the room while a published
-   * clash result is kept drops `room:<roomId>` from `state.models` and sent its
+   * room model was (until #4444) created by `upsertModel` with `idOffset: 0`
+   * and no `registerModelOffset` call, so `unregisterModel` was a no-op for it
+   * and there was nothing to forget. Leaving the room while a published
+   * clash result is kept drops `room:<roomId>:<slotId>` from `state.models` and sent its
    * refs down this fallback, where `fromGlobalId` range-searched the registry
    * and landed inside a DIFFERENT, still-loaded file — isolating and painting
    * two of its elements, with no error. Established by review with an executed
@@ -692,7 +765,7 @@ export function useClash() {
    * order (`packages/ifcx/src/entity-extractor.ts`), so any structural edit
    * renumbers everything after it — and every stale ref then still looks
    * resolvable, and resolves to the WRONG element. Leaving a room and rejoining
-   * rebuilds `room:<roomId>` the same way.
+   * rebuilds `room:<roomId>:<slotId>` the same way.
    *
    * So the result's own recorded federation identity — captured by the run and
    * bound to the result object at the publish site
@@ -745,13 +818,7 @@ export function useClash() {
     return state.fromGlobalId(ref.ref);
   }, []);
 
-  /**
-   * Apply a focus mode to a set of global ids in the shared visibility channels:
-   * - `highlight`: clear isolation + ghosting (pair highlighted in full context);
-   * - `isolate`:   hide everything except the ids (#1275);
-   * - `ghost`:     keep the ids solid and fade the rest to translucent context
-   *                via the renderer's X-Ray path (#1275 "see them in context").
-   */
+  /** Apply a focus mode to global ids through the shared visibility channels. */
   const applyFocusMode = useCallback((globalIds: number[], mode: ClashFocusMode): void => {
     if (mode === 'isolate') installClashIsolation(new Set(globalIds));
     else if (mode === 'ghost') installClashGhost(new Set(globalIds));
@@ -768,6 +835,9 @@ export function useClash() {
       state.setClashVisibilityOwned(null);
     }
   }, [installClashIsolation, installClashGhost]);
+
+  const focusClashes = useCallback((clashes: readonly Clash[], mode: ClashFocusMode = 'highlight') =>
+    focusClashGroup(clashes, refOf, applyFocusMode, mode), [refOf, applyFocusMode]);
 
   /**
    * Select both elements of a clash, highlight them, frame the camera, and apply
@@ -786,13 +856,11 @@ export function useClash() {
       const globalIds: number[] = [];
       if (a) globalIds.push(clash.a.ref);
       if (b) globalIds.push(clash.b.ref);
-      // Do NOT select the pair. Selecting forced a "selected" state (the 2-SEL
-      // counter, and in isolate/ghost the elements read as selected). Instead we
-      // just glow the two elements in distinct vibrant colours via the clash
-      // highlight channel — the renderer gives highlighted ids the same glow /
-      // opaque / stay-solid-through-ghost treatment as a selection, so the
-      // colours show in highlight, isolate AND ghost with no selection. (#1277/#1339)
+      // Select in both id spaces, with A last as the Inspector primary. The
+      // render loop preserves applied amber/cyan paint (#1277/#1339).
       state.clearEntitySelection();
+      state.setSelectedEntityIds([...globalIds].reverse());
+      state.addEntitiesToSelection([...refs].reverse());
       // Colour the two elements via the renderer COLOUR-OVERRIDE channel (the
       // same path the lens uses) — this repaints their actual albedo, so it
       // works on batched AND GPU-instanced geometry (e.g. Tekla steel members),
@@ -805,8 +873,8 @@ export function useClash() {
       // REAL contact interface (shared-face polygon / intersection line) computed
       // for this one pair; fall back to the AABB box if it can't be built.
       let contactDrawn = false;
-      const elA = elementsByRef.current.get(clash.a.ref);
-      const elB = elementsByRef.current.get(clash.b.ref);
+      const elA = elementsByIdentity.current.get(elementIdentity(clash.a));
+      const elB = elementsByIdentity.current.get(elementIdentity(clash.b));
       if (elA && elB) {
         try {
           const clusters = contactClusters(
@@ -816,7 +884,7 @@ export function useClash() {
           );
           const vertices = contactLineList(clusters);
           if (vertices.length >= 6) {
-            state.setClashContactLines({ vertices, color: CLASH_COLOR_OVERLAP });
+            state.setClashContactLines({ vertices });
             state.setClashOverlapBox(null);
             contactDrawn = true;
           }
@@ -860,7 +928,7 @@ export function useClash() {
       // a hook-private ref: `setClashSelectedId` just above already bumped it
       // for this focus, so reading it now captures this request's identity.
       // ANY later call to `setClashSelectedId` or `clearClashSolid` — from
-      // this hook, a tour cleanup, the Home reset, or any future teardown
+      // this hook, a tour cleanup, Show all, or any future teardown
       // path nobody has written yet — bumps it again and this compute drops
       // its result instead of painting over whatever came after it. That is
       // the fix for the class of bug, not just the two reported call sites.
@@ -1161,9 +1229,8 @@ export function useClash() {
         }
       }
 
-      // Each topic's status follows its members' review status (least-resolved
-      // wins), mapped to a BCF status in the bridge. Read the live reviews map so
-      // an edit made just before export is reflected. (#1468)
+      // Topic status follows the members' least-resolved review status, mapped in
+      // the bridge; the live reviews map reflects an edit made just before export (#1468).
       const reviewsMap = state.clashReviews;
       const reviewStatusOf = (clash: Clash): ClashReviewStatus =>
         reviewsMap.get(clashReviewKey(clash))?.status ?? 'open';
@@ -1173,21 +1240,26 @@ export function useClash() {
           author: 'clash@ifc-lite',
           projectName: 'Clash report',
           reviewStatusOf,
-          // Resolve model ids to file names for the BCF Header (#1591).
-          modelNameOf: (id) => state.models.get(id)?.name ?? id,
+          modelNameOf: (id) => state.models.get(id)?.name ?? id, // BCF Header file names (#1591)
+          worldOffset: bcfWorldOffset(state.models, state.geometryResult), // render frame -> world (#4806)
           maxTopics: config.maxTopics,
           ...(snapshotProvider ? { snapshotProvider } : {}),
         });
         const blob = await writeBCF(project);
         downloadBlob(blob, 'clashes.bcfzip');
+        trackExportCompleted({ format: 'bcfzip', surface: 'clash_results' });
       } finally {
         restore?.();
       }
     },
     [],
   );
-
   const clearAll = useCallback((): void => {
+    // Bump the run epoch FIRST: a `run()` / `runDuplicates()` still in flight
+    // when the user clears must not be able to resurrect what they just
+    // cleared once it lands — see `runEpochRef`'s doc above `elementsByRef`
+    // (#2802).
+    invalidateAbortableRun(runEpochRef, runAbortRef);
     const state = useViewerStore.getState();
     state.clearEntitySelection();
     state.clearIsolation();
@@ -1262,7 +1334,9 @@ export function useClash() {
     runMatrix,
     runPreset,
     runDuplicates,
+    cancelRun,
     focusClash,
+    focusClashes,
     selectElement,
     highlightAll,
     clearHighlight,

@@ -10,13 +10,17 @@
 //!
 //! Performance: 3-5x faster than standard path for IfcTriangulatedFaceSet
 
-/// Check if byte is a digit, minus sign, or decimal point (start of number)
-#[inline(always)]
-fn is_number_start(b: u8) -> bool {
-    b.is_ascii_digit() || b == b'-' || b == b'.'
-}
+#[path = "fast_parse_comments.rs"]
+mod comments;
+
+#[path = "fast_parse_coordinates.rs"]
+mod coordinates;
+
+pub use coordinates::{parse_coordinates_direct, parse_coordinates_direct_f64};
 
 /// Estimate number of floats in coordinate data
+///
+/// Shared with the split-out `coordinates` module.
 #[inline]
 fn estimate_float_count(bytes: &[u8]) -> usize {
     // Rough estimate: ~8 bytes per float on average (including delimiters)
@@ -28,79 +32,6 @@ fn estimate_float_count(bytes: &[u8]) -> usize {
 fn estimate_int_count(bytes: &[u8]) -> usize {
     // Rough estimate: ~4 bytes per integer on average
     bytes.len() / 4
-}
-
-/// Parse coordinate list directly from raw bytes to `Vec<f32>`
-///
-/// This parses IFC coordinate data like:
-/// `((0.,0.,150.),(0.,40.,140.),...)`
-///
-/// Returns flattened f32 array: [x0, y0, z0, x1, y1, z1, ...]
-///
-/// # Performance
-/// - Zero intermediate allocations (no Token, no AttributeValue)
-/// - Uses fast-float for SIMD-accelerated parsing
-/// - Pre-allocates result vector
-#[inline]
-pub fn parse_coordinates_direct(bytes: &[u8]) -> Vec<f32> {
-    let mut result = Vec::with_capacity(estimate_float_count(bytes));
-    let mut pos = 0;
-    let len = bytes.len();
-
-    while pos < len {
-        // Skip to next number using SIMD-accelerated search
-        while pos < len && !is_number_start(bytes[pos]) {
-            pos += 1;
-        }
-        if pos >= len {
-            break;
-        }
-
-        // Parse float directly
-        match fast_float2::parse_partial::<f32, _>(&bytes[pos..]) {
-            Ok((value, consumed)) if consumed > 0 => {
-                result.push(value);
-                pos += consumed;
-            }
-            _ => {
-                // Skip this character and continue
-                pos += 1;
-            }
-        }
-    }
-
-    result
-}
-
-/// Parse coordinate list directly from raw bytes to `Vec<f64>`
-///
-/// Same as parse_coordinates_direct but with f64 precision.
-#[inline]
-pub fn parse_coordinates_direct_f64(bytes: &[u8]) -> Vec<f64> {
-    let mut result = Vec::with_capacity(estimate_float_count(bytes));
-    let mut pos = 0;
-    let len = bytes.len();
-
-    while pos < len {
-        while pos < len && !is_number_start(bytes[pos]) {
-            pos += 1;
-        }
-        if pos >= len {
-            break;
-        }
-
-        match fast_float2::parse_partial::<f64, _>(&bytes[pos..]) {
-            Ok((value, consumed)) if consumed > 0 => {
-                result.push(value);
-                pos += consumed;
-            }
-            _ => {
-                pos += 1;
-            }
-        }
-    }
-
-    result
 }
 
 /// Parse index list directly from raw bytes to `Vec<u32>`
@@ -115,73 +46,89 @@ pub fn parse_coordinates_direct_f64(bytes: &[u8]) -> Vec<f64> {
 /// - Uses inline integer parsing
 #[inline]
 pub fn parse_indices_direct(bytes: &[u8]) -> Vec<u32> {
+    if comments::may_contain_step_comment(bytes) {
+        return comments::parse_indices(bytes);
+    }
     let mut result = Vec::with_capacity(estimate_int_count(bytes));
     let mut pos = 0;
     let len = bytes.len();
-
     while pos < len {
-        // Skip to next digit
         while pos < len && !bytes[pos].is_ascii_digit() {
             pos += 1;
         }
         if pos >= len {
             break;
         }
-
-        // Parse integer inline (avoiding any allocation). Use CHECKED
-        // arithmetic so a pathologically large index in malformed input
-        // SATURATES to u32::MAX — an obviously out-of-range vertex the
-        // downstream bounds checks drop — instead of WRAPPING modulo 2^32 to an
-        // arbitrary, valid-looking (wrong) vertex. Digits keep being consumed
-        // after overflow so `pos` still advances past the whole number.
-        let mut value: u32 = 0;
-        let mut overflowed = false;
-        while pos < len && bytes[pos].is_ascii_digit() {
-            if !overflowed {
-                match value
-                    .checked_mul(10)
-                    .and_then(|v| v.checked_add((bytes[pos] - b'0') as u32))
-                {
-                    Some(v) => value = v,
-                    None => overflowed = true,
-                }
-            }
-            pos += 1;
-        }
-        if overflowed {
-            value = u32::MAX;
-        }
-
-        // Convert from 1-based to 0-based. NOTE: after saturation this yields
-        // u32::MAX - 1, while schema_gen's to_zero_based yields u32::MAX —
-        // consumers must bounds-check (i >= vertex_count), never compare
-        // against a single sentinel value.
-        result.push(value.saturating_sub(1));
+        parse_index_value(bytes, &mut pos, &mut result);
     }
-
     result
 }
 
-/// Parse a single entity's coordinate list attribute
-///
-/// Takes the raw bytes of an entity line like:
-/// `#78=IFCCARTESIANPOINTLIST3D(((0.,0.,150.),(0.,40.,140.),...));`
-///
-/// And extracts just the coordinate data.
+/// Parse the digit run at `pos`; shared by the comment-free and aware scans.
+#[inline(always)]
+fn parse_index_value(bytes: &[u8], pos: &mut usize, result: &mut Vec<u32>) {
+    // Use checked arithmetic so a pathologically large index saturates to an
+    // obviously out-of-range value instead of wrapping to a valid-looking one.
+    let mut value: u32 = 0;
+    let mut overflowed = false;
+    while *pos < bytes.len() && bytes[*pos].is_ascii_digit() {
+        if !overflowed {
+            match value
+                .checked_mul(10)
+                .and_then(|v| v.checked_add((bytes[*pos] - b'0') as u32))
+            {
+                Some(v) => value = v,
+                None => overflowed = true,
+            }
+        }
+        *pos += 1;
+    }
+    if overflowed {
+        value = u32::MAX;
+    }
+    result.push(value.saturating_sub(1));
+}
+
+/// Parse a whole point-list record's `CoordList` (attribute 0), found by depth, not by the
+/// last `))`: an IFC4X3 `TagList` after it ends in `))` and its digits became phantom
+/// vertices (core review behind #4577, finding 6). `None` when attribute 0 is not a list
+/// or the list is refused as corrupt (#5266).
 #[inline]
 pub fn extract_coordinate_list_from_entity(bytes: &[u8]) -> Option<Vec<f32>> {
-    // Find the opening '((' which starts the coordinate list
-    let start = memchr::memmem::find(bytes, b"((")?;
+    coordinates::try_parse_coordinates_direct(coordinate_list_span(bytes)?)
+}
 
-    // Find matching closing '))'
-    let end = memchr::memmem::rfind(bytes, b"))")?;
+/// [`extract_coordinate_list_from_entity`] at f64 precision. A caller that
+/// rebases national-grid coordinates must subtract its offset from these
+/// values: narrowing first can merge vertices that differ by less than one
+/// f32 ULP (0.25 m at 2,600 km) before the offset is removed (#5698).
+#[inline]
+pub fn extract_coordinate_list_from_entity_f64(bytes: &[u8]) -> Option<Vec<f64>> {
+    coordinates::try_parse_coordinates_direct_f64(coordinate_list_span(bytes)?)
+}
 
-    if end <= start {
+/// The bytes of attribute 0's balanced list, including its outer parentheses.
+fn coordinate_list_span(bytes: &[u8]) -> Option<&[u8]> {
+    let head = crate::parser::argument_list_start(bytes)?;
+    let open = crate::parser::skip_step_trivia(bytes, head)?;
+    if bytes.get(open) != Some(&b'(') {
         return None;
     }
-
-    // Parse the coordinate data
-    Some(parse_coordinates_direct(&bytes[start..end + 2]))
+    let (mut i, mut depth) = (open + 1, 1usize);
+    loop {
+        i += memchr::memchr3(b'(', b')', b'/', &bytes[i..])?;
+        match bytes[i] {
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i = crate::parser::skip_step_comment(bytes, i)?;
+                continue;
+            }
+            b'(' => depth += 1,
+            b')' if depth == 1 => return Some(&bytes[open..=i]),
+            b')' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
 }
 
 /// Parse face indices from IfcTriangulatedFaceSet entity
@@ -252,6 +199,15 @@ pub fn should_use_fast_path(type_name: &str) -> bool {
 /// Extract entity type name from raw bytes
 ///
 /// From `#77=IFCTRIANGULATEDFACESET(...)` extracts `IFCTRIANGULATEDFACESET`
+///
+/// TRIMMED, because STEP permits whitespace around `=` and real exporters use
+/// it: buildingSMART's own `column-straight-rectangle-tessellation.ifc` writes
+/// `#71= IFCCOLUMN(` on all 26 of its entity lines. Until #3179 this returned
+/// `" IFCCOLUMN"` with the leading space for those files, which no lookup
+/// keyed on a type name can match — the function's own doc comment above
+/// promised otherwise. It had no production caller at the time, so nothing
+/// noticed; `legacy_aware_ifc_type_from_record` is the first, and it silently
+/// resolved every entity in such a file to `Unknown` until this was fixed.
 #[inline]
 pub fn extract_entity_type_name(bytes: &[u8]) -> Option<&str> {
     // Find '=' position
@@ -261,11 +217,12 @@ pub fn extract_entity_type_name(bytes: &[u8]) -> Option<&str> {
     let type_start = eq_pos + 1;
     let type_end = eq_pos + paren_pos;
 
-    if type_end <= type_start {
-        return None;
-    }
-
-    std::str::from_utf8(&bytes[type_start..type_end]).ok()
+    // No `type_end <= type_start` guard: `bytes[eq_pos]` is `=`, never `(`, so
+    // `paren_pos >= 1` and `type_end >= type_start` always. The one reachable
+    // equality is `#1=(`, which yields an empty slice that the `is_empty` below
+    // rejects. `an_unreadable_record_changes_nothing` covers that input.
+    let name = std::str::from_utf8(&bytes[type_start..type_end]).ok()?.trim();
+    (!name.is_empty()).then_some(name)
 }
 
 /// Extract the first entity reference from an entity's first attribute
@@ -281,16 +238,17 @@ pub fn extract_first_entity_ref(bytes: &[u8]) -> Option<u32> {
     let hash_pos = content.iter().position(|&b| b == b'#')?;
     let id_start = hash_pos + 1;
 
-    // Parse the ID number
-    let mut id: u32 = 0;
+    // Find the end of the digit run, then parse it through the single
+    // checked accumulator shared with every other reference reader and the
+    // definition scanner (issue #3421) — an id above `u32::MAX` is refused
+    // (`None`) rather than wrapped onto a real low-numbered entity.
     let mut i = id_start;
     while i < content.len() && content[i].is_ascii_digit() {
-        id = id.wrapping_mul(10).wrapping_add((content[i] - b'0') as u32);
         i += 1;
     }
 
     if i > id_start {
-        Some(id)
+        crate::express_id::parse_express_id(&content[id_start..i])
     } else {
         None
     }
@@ -328,8 +286,7 @@ where
     // Get raw bytes of coordinate list entity
     let coord_bytes = get_entity_bytes(coord_entity_id)?;
 
-    // Parse coordinates directly
-    let positions = parse_coordinates_direct(&coord_bytes);
+    let positions = extract_coordinate_list_from_entity(&coord_bytes)?;
 
     // Extract and parse indices from attribute 3 (CoordIndex)
     let indices = extract_face_indices_from_entity(faceset_bytes)?;
@@ -356,14 +313,19 @@ pub fn extract_entity_refs_from_list(bytes: &[u8]) -> Vec<u32> {
         }
         i += 1; // Skip '#'
 
-        // Parse ID
-        let mut id: u32 = 0;
+        // Parse ID through the shared checked accumulator (issue #3421): an
+        // id above `u32::MAX` is refused (`None`, dropped from `ids`) rather
+        // than wrapped onto a real low-numbered entity.
+        let id_start = i;
         while i < len && bytes[i].is_ascii_digit() {
-            id = id.wrapping_mul(10).wrapping_add((bytes[i] - b'0') as u32);
             i += 1;
         }
-        if id > 0 {
-            ids.push(id);
+        if i > id_start {
+            if let Some(id) = crate::express_id::parse_express_id(&bytes[id_start..i]) {
+                if id > 0 {
+                    ids.push(id);
+                }
+            }
         }
     }
 

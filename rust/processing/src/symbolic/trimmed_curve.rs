@@ -5,10 +5,13 @@
 //! `IfcTrimmedCurve` tessellation, split out of `items.rs` to keep that
 //! module's dispatch table under the module-size ratchet (#2256 follow-up).
 
+use super::output_cap::SymbolicAccumulator;
+use super::rebase::RenderFrameRebase;
 use ifc_lite_core::{AttributeValue, DecodedEntity, EntityDecoder, IfcType};
 
-use super::primitives::{SymbolicData, SymbolicPolyline};
-use super::transform::{parse_axis2_placement_2d, Transform2D};
+use super::primitives::{SymbolicPolyline};
+use super::conic::Conic;
+use super::transform::{push_finite_point, Transform2D};
 
 /// Tessellate an `IfcTrimmedCurve` whose `BasisCurve` is an `IfcCircle`.
 /// Honours `PLANEANGLEUNIT` scaling, `SenseAgreement`, and wrap-around so
@@ -17,9 +20,9 @@ use super::transform::{parse_axis2_placement_2d, Transform2D};
 /// (parameter and Cartesian point) are accepted — see [`resolve_trim`].
 ///
 /// Near-collinear arcs collapse to a straight segment. The test is purely
-/// RELATIVE (sagitta vs chord, radius vs chord): a big circle is not by
-/// itself a straight line, and the absolute `radius > 100.0` that used to
-/// sit here flattened genuinely curved long-radius arcs.
+/// RELATIVE (sagitta vs chord): a big circle is not by itself a straight
+/// line, and the absolute `radius > 100.0` that used to sit here flattened
+/// genuinely curved long-radius arcs.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn extract_trimmed_curve(
     item: &DecodedEntity,
@@ -29,36 +32,22 @@ pub(super) fn extract_trimmed_curve(
     rep_identifier: &str,
     unit_scale: f32,
     transform: &Transform2D,
-    rtc_x: f32,
-    rtc_z: f32,
-    out: &mut SymbolicData,
+    rebase: RenderFrameRebase,
+    out: &mut SymbolicAccumulator,
 ) {
     let Some(basis_ref) = item.get_ref(0) else { return };
     let Ok(basis_curve) = decoder.decode_by_id(basis_ref) else { return };
     if basis_curve.ifc_type != IfcType::IfcCircle {
         return;
     }
-    let radius = basis_curve.get(1).and_then(|a| a.as_float()).unwrap_or(0.0) as f32 * unit_scale;
-    if radius <= 0.0 || !radius.is_finite() {
-        return;
-    }
     // The trim angles are measured in the circle's OWN placement basis, not
     // in world X/Y: `IfcCircle.Position.RefDirection` defines local +X and the
-    // angles run from there. `parse_axis2_placement_2d` yields exactly that
-    // basis — translation = the centre, linear block = the RefDirection
-    // rotation, which degrades to identity when RefDirection is absent, so a
-    // plain world-aligned circle is bit-identical to the old world-XY maths.
-    let basis = match basis_curve.get_ref(0) {
-        Some(pos_ref) => match decoder.decode_by_id(pos_ref) {
-            Ok(position) => parse_axis2_placement_2d(&position, decoder, unit_scale),
-            Err(_) => Transform2D::identity(),
-        },
-        None => Transform2D::identity(),
-    };
-    if !basis.tx.is_finite() || !basis.ty.is_finite() {
-        return;
-    }
-    let world_y = basis.tz + transform.tz;
+    // angles run from there. `Conic::read` is the same reader the circle and
+    // ellipse items use, so a dangling or absent `Position` gives the arc an
+    // unresolved elevation (`null`), not a finite 0.0.
+    let Some(circle) = Conic::read(&basis_curve, decoder, unit_scale) else { return };
+    let (basis, radius) = (&circle.basis, circle.semi_a);
+    let world_y = rebase.elevation(basis.tz + transform.tz);
 
     let angle_scale = decoder.plane_angle_to_radians() as f32;
     // MasterRepresentation (attr 4) picks the form when the SET carries both.
@@ -69,7 +58,7 @@ pub(super) fn extract_trimmed_curve(
     let raw_trim1 = resolve_trim(
         item.get(1),
         decoder,
-        &basis,
+        basis,
         unit_scale,
         angle_scale,
         prefer_cartesian,
@@ -77,7 +66,7 @@ pub(super) fn extract_trimmed_curve(
     let raw_trim2 = resolve_trim(
         item.get(2),
         decoder,
-        &basis,
+        basis,
         unit_scale,
         angle_scale,
         prefer_cartesian,
@@ -101,35 +90,28 @@ pub(super) fn extract_trimmed_curve(
         return;
     }
 
-    let point_at = |angle: f32| basis.transform_point(radius * angle.cos(), radius * angle.sin());
-    let (start_x, start_y) = point_at(start_angle);
-    let (end_x, end_y) = point_at(end_angle);
+    let (start_x, start_y) = circle.point_at(start_angle);
+    let (end_x, end_y) = circle.point_at(end_angle);
     let chord_dx = end_x - start_x;
     let chord_dy = end_y - start_y;
     let chord_len = (chord_dx * chord_dx + chord_dy * chord_dy).sqrt();
-    // A circle is injective mod TAU, so the chord can only shrink toward 0
-    // for two reasons: the trim barely moves at all (angle_span ~ 0), or
-    // the trim sweeps one or more FULL turns (angle_span ~ k*TAU, k >= 1)
-    // and the start/end points coincide by construction. Only the first
-    // case is degenerate; the second is a full circle (or a near-full
-    // circle, whose small-but-nonzero chord previously slipped through
-    // the `radius > chord_len * 10.0` shortcut below) and must still be
-    // tessellated as an arc/loop, not collapsed to a 2-point chord.
+    // A sweep of at least a half turn passes through two opposite points, so
+    // it is never a straight segment whatever its chord (a near-full turn has
+    // a short one). Under a half turn the sagitta test decides:
+    // sagitta/chord = tan(sweep/4)/2, under 0.02 below 0.16 rad. A former
+    // `radius > chord_len * 10.0` term flattened 355 degree arcs (G2).
     let angle_span = (end_angle - start_angle).abs();
-    let turns = (angle_span / std::f32::consts::TAU).round();
-    let is_full_turn =
-        turns >= 1.0 && (angle_span - turns * std::f32::consts::TAU).abs() < 0.02;
-    let is_near_collinear = if is_full_turn {
+    let is_near_collinear = if angle_span >= std::f32::consts::PI {
         false
     } else if chord_len > 0.0001 {
         let mid_angle = (start_angle + end_angle) / 2.0;
-        let (mid_x, mid_y) = point_at(mid_angle);
+        let (mid_x, mid_y) = circle.point_at(mid_angle);
         let sagitta = ((end_y - start_y) * mid_x - (end_x - start_x) * mid_y
             + end_x * start_y
             - end_y * start_x)
             .abs()
             / chord_len;
-        sagitta < chord_len * 0.02 || radius > chord_len * 10.0
+        sagitta < chord_len * 0.02
     } else {
         true
     };
@@ -137,8 +119,19 @@ pub(super) fn extract_trimmed_curve(
     if is_near_collinear {
         let (wsx, wsy) = transform.transform_point(start_x, start_y);
         let (wex, wey) = transform.transform_point(end_x, end_y);
-        let points = vec![wsx - rtc_x, -wsy + rtc_z, wex - rtc_x, -wey + rtc_z];
-        out.polylines.push(SymbolicPolyline {
+        let (sx, sy) = rebase.plan(wsx, wsy);
+        let (ex, ey) = rebase.plan(wex, wey);
+        // Same hazard as the arc-tessellation branch below (a poisoned
+        // AMBIENT `transform` — not `basis`, already checked above — makes
+        // an otherwise-finite local chord non-finite post-transform); that
+        // branch routes every point through `push_finite_point`, this one
+        // must reject the whole two-point chord the same way rather than
+        // push a partly-finite pair.
+        if !sx.is_finite() || !sy.is_finite() || !ex.is_finite() || !ey.is_finite() {
+            return;
+        }
+        let points = vec![sx, sy, ex, ey];
+        out.push_polyline(SymbolicPolyline {
             express_id,
             ifc_type: ifc_type.to_string(),
             points,
@@ -153,17 +146,13 @@ pub(super) fn extract_trimmed_curve(
         for i in 0..=num_segments {
             let t = i as f32 / num_segments as f32;
             let angle = start_angle + t * (end_angle - start_angle);
-            let (local_x, local_y) = point_at(angle);
+            let (local_x, local_y) = circle.point_at(angle);
             let (wx, wy) = transform.transform_point(local_x, local_y);
-            let x = wx - rtc_x;
-            let y = -wy + rtc_z;
-            if x.is_finite() && y.is_finite() {
-                points.push(x);
-                points.push(y);
-            }
+            let (x, y) = rebase.plan(wx, wy);
+            push_finite_point(&mut points, x, y);
         }
         if points.len() >= 4 {
-            out.polylines.push(SymbolicPolyline {
+            out.push_polyline(SymbolicPolyline {
                 express_id,
                 ifc_type: ifc_type.to_string(),
                 points,

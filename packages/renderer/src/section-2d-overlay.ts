@@ -13,16 +13,19 @@
  * Everything that could leave without dragging a GPU resource across a module
  * boundary has left — the WGSL to `shaders/section-2d-overlay.wgsl.ts`, the
  * 2D→3D lift and cap triangulation to `section-2d-lift.ts`, the per-family
- * vertex buffer to `section-2d-line-buffer.ts`. What is left is one nullable,
- * `init()`-created / `dispose()`-destroyed GPU object (two pipelines, one
+ * vertex buffer to `section-2d-line-buffer.ts`, the cap pipeline descriptors
+ * to `section-cap-pipelines.ts`. What is left is one nullable,
+ * `init()`-created / `dispose()`-destroyed GPU object (pipelines, one
  * bind-group layout, one bind group, one uniform buffer holding a 160-byte
- * record per draw site) plus
- * the published `upload*`/`clear*`/`has*`/`draw*` API over it. Splitting that
- * further means giving those shared resources a second owner, which is the cut
- * #2456 explicitly refuses. Do not "fix" the line count by doing it.
+ * record per draw site) plus the published API over it: one
+ * `setLineOverlay`/`hasLineOverlay`/`drawLineOverlay` trio covering every
+ * standalone line channel and the section cut's own upload/draw. Splitting further gives
+ * shared resources a second owner, which #2456 explicitly refuses.
  */
 
 import { PIPELINE_CONSTANTS } from './constants.js';
+import { createSectionCapPipelines } from './section-cap-pipelines.js';
+import { tryPackRteDrawableDelta } from './relative-to-eye.js';
 import {
   SECTION_2D_CAP_FILL_WGSL,
   SECTION_2D_OVERLAY_LINE_WGSL,
@@ -45,50 +48,25 @@ import {
 import {
   WorldLineBuffer,
   type SectionLinePipelineResources,
+  type LineVertices,
 } from './section-2d-line-buffer.js';
+import {
+  LINE_OVERLAY_CHANNELS,
+  type LineOverlayChannel,
+  type Section2DOverlayOptions,
+} from './section-2d-types.js';
 
 export type { CutPolygon2D, DrawingLine2D, SectionCustomPlane } from './section-2d-lift.js';
-
-export interface Section2DOverlayCapStyle {
-  fillColor:         [number, number, number, number];
-  strokeColor:       [number, number, number, number];
-  patternId:         number;   // 0..7, matches HATCH_PATTERN_IDS in section-cap.ts
-  spacingPx:         number;
-  angleRad:          number;
-  widthPx:           number;
-  secondaryAngleRad: number;
-}
-
-export interface Section2DOverlayOptions {
-  axis: 'down' | 'front' | 'side';  // Semantic axis: down (Y), front (Z), side (X)
-  position: number; // 0-100 percentage
-  bounds: {
-    min: { x: number; y: number; z: number };
-    max: { x: number; y: number; z: number };
-  };
-  viewProj: Float32Array;
-  flipped?: boolean;
-  min?: number;  // Optional override for min range
-  max?: number;  // Optional override for max range
-  /**
-   * If provided, the 2D overlay's polygon fills render as the 3D section
-   * cap with this screen-space hatch style. If omitted or `showFills` is
-   * false, the filled hatch is skipped.
-   */
-  capStyle?: Section2DOverlayCapStyle;
-  showFills?: boolean;
-  /**
-   * Whether to draw the polygon outline + hidden lines on the cap. Users
-   * can turn surfaces and outlines on/off independently. Defaults to true
-   * so existing call sites keep showing outlines.
-   */
-  showOutlines?: boolean;
-}
+export { LINE_OVERLAY_CHANNELS } from './section-2d-types.js';
+export type { LineOverlayChannel, Section2DOverlayCapStyle, Section2DOverlayOptions } from './section-2d-types.js';
 
 export class Section2DOverlayRenderer {
   private device: GPUDevice;
   private fillPipeline: GPURenderPipeline | null = null;
+  private fillDepthPipeline: GPURenderPipeline | null = null;
   private linePipeline: GPURenderPipeline | null = null;
+  private centrelinePipeline: GPURenderPipeline | null = null;
+  private linePipelineDescriptor: GPURenderPipelineDescriptor | null = null;
   private bindGroupLayout: GPUBindGroupLayout | null = null;
   private uniformBuffer: GPUBuffer | null = null;
   private bindGroup: GPUBindGroup | null = null;
@@ -112,32 +90,29 @@ export class Section2DOverlayRenderer {
   private fillIndexCount = 0;
   private lineVertexBuffer: GPUBuffer | null = null;
   private lineVertexCount = 0;
+  /** f64 cap anchor retained separately from the local cap vertices. */
+  private capAnchor: [number, number, number] | null = null;
 
-  // Standalone 3D annotation line overlay. Same line pipeline as the section
-  // cut, but vertices are already in world space when uploaded so the draw
-  // does not depend on a section plane being active. Used by the
-  // "Show IFC Annotations" toggle so that authored 2D drawing curves
-  // (IfcAnnotation polylines/arcs) are visible in any view.
-  private annotationLines = new WorldLineBuffer(SECTION_2D_UNIFORM_SLOT_INDEX.annotation);
-
-  // Standalone 3D alignment centerline overlay. Independent buffer from the
-  // annotation lines (separate visibility toggle) but reuses the same line
-  // pipeline. IfcAlignment renders as a thin line here — not a ribbon mesh —
-  // to match IfcGrid axes / IfcAnnotation curves.
-  private alignmentLines = new WorldLineBuffer(SECTION_2D_UNIFORM_SLOT_INDEX.alignment);
-
-  // Standalone 3D structural-grid (IfcGridAxis) overlay. Independent buffer so
-  // grid visibility is independent of the annotation/alignment overlays, but
-  // reuses the same line pipeline (issue #967).
-  private gridLines = new WorldLineBuffer(SECTION_2D_UNIFORM_SLOT_INDEX.grid);
-
-  // Standalone 3D DXF reference-layer overlay (issue #2043, follow-up to
-  // #1782/#1929's 2D-only DXF underlay). Independent buffer so 3D DXF
-  // visibility is independent of the 2D underlay and the other overlays
-  // above, but reuses the same line pipeline + shared overlay colour —
-  // mirrors the grid overlay exactly. Line paths only (walls/boundaries);
-  // DXF fills/text are not lifted to 3D in this iteration.
-  private dxfLines = new WorldLineBuffer(SECTION_2D_UNIFORM_SLOT_INDEX.dxf);
+  /**
+   * One world-space vertex buffer per {@link LineOverlayChannel}, each on its
+   * own uniform slot.
+   *
+   * Independent `WorldLineBuffer`s, not one: the draws are encoded into a single
+   * pass and `queue.writeBuffer` lands before the pass runs, so a shared buffer
+   * or a shared uniform slot would give every channel whatever the last write said.
+   * Keying them by channel unifies the LOOKUP, which is all that was ever
+   * duplicated; the buffers stay separate because their independence is what
+   * makes annotation (#653), alignment, grid (#967), DXF (#2043), terrain, and centreline visibility
+   * toggle independently.
+   */
+  private readonly lineOverlays: Record<LineOverlayChannel, WorldLineBuffer> = {
+    annotation: new WorldLineBuffer(SECTION_2D_UNIFORM_SLOT_INDEX.annotation),
+    alignment: new WorldLineBuffer(SECTION_2D_UNIFORM_SLOT_INDEX.alignment),
+    grid: new WorldLineBuffer(SECTION_2D_UNIFORM_SLOT_INDEX.grid),
+    dxf: new WorldLineBuffer(SECTION_2D_UNIFORM_SLOT_INDEX.dxf),
+    terrain: new WorldLineBuffer(SECTION_2D_UNIFORM_SLOT_INDEX.terrain),
+    centreline: new WorldLineBuffer(SECTION_2D_UNIFORM_SLOT_INDEX.centreline),
+  };
 
   // Standalone 3D clash-overlap-box overlay (#1277): the wireframe AABB of a
   // focused clash, drawn in its OWN distinct colour (not the shared overlay
@@ -180,72 +155,14 @@ export class Section2DOverlayRenderer {
     const fillShader = this.device.createShaderModule({ code: SECTION_2D_CAP_FILL_WGSL });
     const lineShader = this.device.createShaderModule({ code: SECTION_2D_OVERLAY_LINE_WGSL });
 
-    // Pipeline for filled polygons
-    this.fillPipeline = this.device.createRenderPipeline({
-      layout: pipelineLayout,
-      vertex: {
-        module: fillShader,
-        entryPoint: 'vs_main',
-        buffers: [
-          {
-            arrayStride: 28, // 3 position + 4 color = 7 floats
-            attributes: [
-              { shaderLocation: 0, offset: 0, format: 'float32x3' as const },
-              { shaderLocation: 1, offset: 12, format: 'float32x4' as const },
-            ],
-          },
-        ],
-      },
-      fragment: {
-        module: fillShader,
-        entryPoint: 'fs_main',
-        // The main render pass has two colour attachments (main colour +
-        // picker objectId). Pipelines used inside that pass must declare
-        // matching targets — the objectId slot writes nothing so the pass's
-        // picking IDs underneath are preserved.
-        targets: [
-          {
-            format: this.format,
-            blend: {
-              color: {
-                srcFactor: 'src-alpha' as const,
-                dstFactor: 'one-minus-src-alpha' as const,
-                operation: 'add' as const,
-              },
-              alpha: {
-                srcFactor: 'one' as const,
-                dstFactor: 'one-minus-src-alpha' as const,
-                operation: 'add' as const,
-              },
-            },
-          },
-          { format: 'rgba8unorm' as const, writeMask: 0 },
-        ],
-      },
-      primitive: {
-        topology: 'triangle-list' as const,
-        cullMode: 'none' as const,
-      },
-      depthStencil: {
-        format: PIPELINE_CONSTANTS.DEPTH_FORMAT,
-        depthWriteEnabled: false,
-        // 'greater-equal' (reverse-Z): draw the cap fill when its depth is at
-        // least as close as whatever the main opaque pass already wrote. The
-        // cap polygons live exactly on the section plane, which coincides
-        // with below-plane top faces — 'greater-equal' lets them tie cleanly
-        // there. Where nearer model geometry (e.g. a wall in front of the
-        // cut, viewed at an angle) wrote a closer depth, the cap fails the
-        // test and is occluded — the user no longer sees cap hatch painted
-        // through model elements that ought to be in front of it.
-        depthCompare: 'greater-equal' as const,
-      },
-      multisample: {
-        count: this.sampleCount,
-      },
-    });
+    // Pipelines for filled polygons: the cap colour, and its depth (#5384).
+    const cap = createSectionCapPipelines(this.device, pipelineLayout, fillShader, this.format, this.sampleCount);
+    this.fillPipeline = cap.fill;
+    this.fillDepthPipeline = cap.depth;
 
-    // Pipeline for lines
-    this.linePipeline = this.device.createRenderPipeline({
+    // The descriptor is retained so the selected-centreline depth variant can
+    // be created only when used; normal model loads pay for one line pipeline.
+    this.linePipelineDescriptor = {
       layout: pipelineLayout,
       vertex: {
         module: lineShader,
@@ -274,18 +191,15 @@ export class Section2DOverlayRenderer {
       depthStencil: {
         format: PIPELINE_CONSTANTS.DEPTH_FORMAT,
         depthWriteEnabled: false,
-        // Same z-respect logic as the fill pipeline above — outline lines
-        // are drawn on the cut plane, so closer model geometry should hide
-        // them when the camera looks through it. The decal nudge for the
-        // #812 coplanar case is applied in the line vertex shader (clip-z
-        // offset) — WebGPU forbids depthStencil.depthBias on non-triangle
-        // topologies.
-        depthCompare: 'greater-equal' as const,
+        // Section and authored surface lines respect depth. The shader carries
+        // the #812 decal nudge; WebGPU forbids depthBias on line topologies.
+        depthCompare: 'greater-equal',
       },
       multisample: {
         count: this.sampleCount,
       },
-    });
+    };
+    this.linePipeline = this.device.createRenderPipeline(this.linePipelineDescriptor);
 
     // One 160-byte uniform buffer shared by BOTH pipelines: the fill fragment
     // shader reads up to params2 (144 B), the line shader reads
@@ -294,7 +208,7 @@ export class Section2DOverlayRenderer {
     // the WGSL that defines them.
     // …once per draw site (SECTION_2D_UNIFORM_SLOT_COUNT of them), spaced by
     // the device's dynamic-offset alignment. Still one buffer under one owner;
-    // what changed is that the six draws no longer overwrite each other.
+    // what changed is that the draw sites no longer overwrite each other.
     this.uniformStride = sectionUniformSlotStride(this.device);
     this.uniformBuffer = this.device.createBuffer({
       size: this.uniformStride * SECTION_2D_UNIFORM_SLOT_COUNT,
@@ -320,13 +234,13 @@ export class Section2DOverlayRenderer {
   /**
    * The shared line-pipeline resources a WorldLineBuffer borrows for a draw.
    * Returns null before `init()` has produced them (or after `dispose()`), so
-   * every `draw*Lines3D` bails on the same condition it always did.
+   * every line draw bails on the same condition it always did.
    */
-  private lineResources(): SectionLinePipelineResources | null {
-    if (!this.linePipeline || !this.uniformBuffer || !this.bindGroup) return null;
+  private lineResources(pipeline: GPURenderPipeline | null = this.linePipeline): SectionLinePipelineResources | null {
+    if (!pipeline || !this.uniformBuffer || !this.bindGroup) return null;
     return {
       device: this.device,
-      pipeline: this.linePipeline,
+      pipeline,
       bindGroup: this.bindGroup,
       uniformBuffer: this.uniformBuffer,
       uniformStride: this.uniformStride,
@@ -358,8 +272,24 @@ export class Section2DOverlayRenderer {
     this.clearGeometry();
 
     const lift = createSectionLift(axis, planePosition, flipped, customPlane);
+    const planeAnchor: [number, number, number] = customPlane
+      ? [...customPlane.origin]
+      : axis === 'side' ? [planePosition, 0, 0]
+        : axis === 'down' ? [0, planePosition, 0] : [0, 0, planePosition];
+    // The plane-coordinate anchor was enough when every model was near the
+    // origin. At a survey offset it leaves both in-plane coordinates absolute
+    // in the f32 vertex buffer, collapsing centimetre cap edges. Anchor at an
+    // actual lifted point instead, while retaining the old plane point for an
+    // empty upload that produces no vertex buffer to draw.
+    const firstPoint = polygons.find((polygon) => polygon.polygon.outer.length > 0)?.polygon.outer[0]
+      ?? lines[0]?.line.start;
+    const anchor = firstPoint ? lift(firstPoint.x, firstPoint.y) : planeAnchor;
 
-    const fill = buildCapFillGeometry(polygons, lift);
+    // Lift/subtract while the coordinates are JS f64. Building a world-space
+    // Float32Array first then subtracting the cap anchor loses centimetre
+    // detail in both the plane normal and its in-plane axes at national-grid
+    // offsets.
+    const fill = buildCapFillGeometry(polygons, lift, anchor);
     if (fill) {
       this.fillVertexBuffer = this.device.createBuffer({
         size: fill.vertices.byteLength,
@@ -375,7 +305,7 @@ export class Section2DOverlayRenderer {
       this.fillIndexCount = fill.indices.length;
     }
 
-    const outline = buildDrawingOutlineVertices(polygons, lines, lift);
+    const outline = buildDrawingOutlineVertices(polygons, lines, lift, anchor);
     if (outline) {
       this.lineVertexBuffer = this.device.createBuffer({
         size: outline.byteLength,
@@ -384,6 +314,7 @@ export class Section2DOverlayRenderer {
       this.device.queue.writeBuffer(this.lineVertexBuffer, 0, outline);
       this.lineVertexCount = outline.length / 3;  // Each vertex is 3 floats
     }
+    this.capAnchor = anchor;
   }
 
   /**
@@ -404,6 +335,7 @@ export class Section2DOverlayRenderer {
     }
     this.fillIndexCount = 0;
     this.lineVertexCount = 0;
+    this.capAnchor = null;
   }
 
   /**
@@ -417,129 +349,56 @@ export class Section2DOverlayRenderer {
   }
 
   /**
-   * Upload a flat Float32Array of 3D line-list vertices for the standalone
-   * annotation overlay. Each segment is `[x1, y1, z1, x2, y2, z2]` in world
-   * space. The buffer is independent of the section cut's line buffer and
-   * is drawn regardless of `sectionPlane.enabled`.
+   * Set one standalone world-space line overlay, or clear it with `null`.
    *
-   * Pass an empty array (or omit) to clear.
+   * `vertices` is a flat line-list, `[x1,y1,z1, x2,y2,z2, …]`, already in world
+   * space: unlike the section-cut outline these do not ride the section plane,
+   * so they draw regardless of `sectionPlane.enabled`. A short array clears too.
+   *
+   * Every channel gets its own buffer and its own uniform slot, so setting one
+   * leaves every other channel exactly as it was — that independence is the
+   * whole point of having channels rather than one merged buffer.
    */
-  uploadAnnotationLines3D(vertices: Float32Array): void {
+  setLineOverlay(channel: LineOverlayChannel, vertices: LineVertices | null): void {
+    if (vertices === null) {
+      // Deliberately no `init()`: clearing destroys a buffer that only an
+      // upload could have created, so a clear before first use must not be
+      // what brings the pipeline into existence.
+      this.lineOverlays[channel].clear();
+      return;
+    }
     this.init();
-    this.annotationLines.upload(this.device, vertices);
+    this.lineOverlays[channel].upload(this.device, vertices);
   }
 
-  clearAnnotationLines3D(): void {
-    this.annotationLines.clear();
-  }
-
-  hasAnnotationLines3D(): boolean {
-    return this.annotationLines.has();
+  /** Whether `channel` currently holds at least one whole segment. */
+  hasLineOverlay(channel: LineOverlayChannel): boolean {
+    return this.lineOverlays[channel].has();
   }
 
   /**
-   * Draw the standalone annotation line overlay. Uses the same line pipeline
-   * as the section cut outlines (vertex format: 3 floats per vertex, line-list
-   * topology) but reads from a separate vertex buffer. The pipeline's
-   * `planeOffset` uniform is zeroed so vertices render at their authored
-   * world position.
+   * Draw one channel with its line depth mode and the shared overlay
+   * colour, binding that channel's own uniform slot. No-ops when the channel is
+   * empty or the pipeline could not be built.
    */
-  drawAnnotationLines3D(pass: GPURenderPassEncoder, viewProj: Float32Array): void {
+  drawLineOverlay(
+    pass: GPURenderPassEncoder,
+    viewProj: Float32Array,
+    channel: LineOverlayChannel, rteViewProj?: Float32Array, camera?: readonly [number, number, number],
+  ): void {
     this.init();
-    const resources = this.lineResources();
+    if (channel === 'centreline' && this.lineOverlays.centreline.has()
+      && !this.centrelinePipeline && this.linePipelineDescriptor) {
+      // A directrix lies inside its opaque swept disk. Draw it through the
+      // solid, without changing the occlusion policy of any other channel.
+      this.centrelinePipeline = this.device.createRenderPipeline({
+        ...this.linePipelineDescriptor,
+        depthStencil: { ...this.linePipelineDescriptor.depthStencil!, depthCompare: 'always' },
+      });
+    }
+    const resources = this.lineResources(channel === 'centreline' ? this.centrelinePipeline : this.linePipeline);
     if (!resources) return;
-    this.annotationLines.draw(pass, resources, viewProj, this.overlayLineColor);
-  }
-
-  /**
-   * Upload a flat Float32Array of 3D line-list vertices for the alignment
-   * centerline overlay. Same format/pipeline as the annotation lines, kept in
-   * a separate buffer so alignment visibility is independent.
-   * Pass an empty array (or omit) to clear.
-   */
-  uploadAlignmentLines3D(vertices: Float32Array): void {
-    this.init();
-    this.alignmentLines.upload(this.device, vertices);
-  }
-
-  clearAlignmentLines3D(): void {
-    this.alignmentLines.clear();
-  }
-
-  hasAlignmentLines3D(): boolean {
-    return this.alignmentLines.has();
-  }
-
-  /**
-   * Draw the alignment centerline overlay. Identical pipeline/uniform setup as
-   * `drawAnnotationLines3D`, reading from the separate alignment buffer.
-   */
-  drawAlignmentLines3D(pass: GPURenderPassEncoder, viewProj: Float32Array): void {
-    this.init();
-    const resources = this.lineResources();
-    if (!resources) return;
-    this.alignmentLines.draw(pass, resources, viewProj, this.overlayLineColor);
-  }
-
-  /**
-   * Upload structural-grid (IfcGridAxis) segments as a flat
-   * `[x,y,z, x,y,z, …]` line-list in world space (issue #967). Mirrors
-   * `uploadAlignmentLines3D` with a separate buffer so grid visibility is
-   * independent. Pass an empty array (or omit) to clear.
-   */
-  uploadGridLines3D(vertices: Float32Array): void {
-    this.init();
-    this.gridLines.upload(this.device, vertices);
-  }
-
-  clearGridLines3D(): void {
-    this.gridLines.clear();
-  }
-
-  hasGridLines3D(): boolean {
-    return this.gridLines.has();
-  }
-
-  /**
-   * Draw the structural-grid overlay. Identical pipeline/uniform setup as
-   * `drawAlignmentLines3D`, reading from the separate grid buffer.
-   */
-  drawGridLines3D(pass: GPURenderPassEncoder, viewProj: Float32Array): void {
-    this.init();
-    const resources = this.lineResources();
-    if (!resources) return;
-    this.gridLines.draw(pass, resources, viewProj, this.overlayLineColor);
-  }
-
-  /**
-   * Upload the DXF reference-layer's line paths as a flat `[x,y,z, x,y,z, …]`
-   * line-list in world space (issue #2043). Mirrors `uploadGridLines3D` with
-   * a separate buffer so 3D DXF visibility is independent of the 2D
-   * underlay and the other overlays above. Pass an empty array (or omit)
-   * to clear.
-   */
-  uploadDxfLines3D(vertices: Float32Array): void {
-    this.init();
-    this.dxfLines.upload(this.device, vertices);
-  }
-
-  clearDxfLines3D(): void {
-    this.dxfLines.clear();
-  }
-
-  hasDxfLines3D(): boolean {
-    return this.dxfLines.has();
-  }
-
-  /**
-   * Draw the 3D DXF reference-layer overlay. Identical pipeline/uniform
-   * setup as `drawGridLines3D`, reading from the separate DXF buffer.
-   */
-  drawDxfLines3D(pass: GPURenderPassEncoder, viewProj: Float32Array): void {
-    this.init();
-    const resources = this.lineResources();
-    if (!resources) return;
-    this.dxfLines.draw(pass, resources, viewProj, this.overlayLineColor);
+    this.lineOverlays[channel].draw(pass, resources, viewProj, this.overlayLineColor, rteViewProj, camera);
   }
 
   /** Colour for the clash-overlap box (its own, not the shared overlay colour). */
@@ -552,7 +411,7 @@ export class Section2DOverlayRenderer {
    * world space (12 AABB edges = 24 vertices). Separate buffer + colour from the
    * other overlays. Pass an empty array to clear. (#1277)
    */
-  uploadClashBoxLines3D(vertices: Float32Array): void {
+  uploadClashBoxLines3D(vertices: LineVertices): void {
     this.init();
     this.clashBoxLines.upload(this.device, vertices);
   }
@@ -566,11 +425,16 @@ export class Section2DOverlayRenderer {
   }
 
   /** Draw the clash-overlap box in its own colour. Same line pipeline. (#1277) */
-  drawClashBoxLines3D(pass: GPURenderPassEncoder, viewProj: Float32Array): void {
+  drawClashBoxLines3D(
+    pass: GPURenderPassEncoder,
+    viewProj: Float32Array,
+    rteViewProj?: Float32Array,
+    camera?: readonly [number, number, number],
+  ): void {
     this.init();
     const resources = this.lineResources();
     if (!resources) return;
-    this.clashBoxLines.draw(pass, resources, viewProj, this.clashBoxLineColor);
+    this.clashBoxLines.draw(pass, resources, viewProj, this.clashBoxLineColor, rteViewProj, camera);
   }
 
   /**
@@ -589,7 +453,7 @@ export class Section2DOverlayRenderer {
   ): void {
     this.init();
 
-    if (!this.fillPipeline || !this.linePipeline || !this.uniformBuffer || !this.bindGroup) {
+    if (!this.fillPipeline || !this.fillDepthPipeline || !this.linePipeline || !this.uniformBuffer || !this.bindGroup) {
       return;
     }
 
@@ -603,16 +467,37 @@ export class Section2DOverlayRenderer {
     // 0.3m bias was there to keep the outline lines clear of below-plane
     // geometry, but it made the cap visually drift off the slider plane
     // (users could see a 0.3m gap between the plane preview and the cap).
-    // The fill pipeline uses depthCompare 'always' so z-fighting with
-    // coincident below-plane top faces is not an issue; the stencil gate
-    // keeps the fill restricted to the actual cap polygons.
-    const offset: [number, number, number] = [0, 0, 0];
+    // The fill pipeline uses depthCompare 'greater-equal' (reverse-Z) so the
+    // cap ties cleanly with coincident below-plane top faces and is occluded
+    // by nearer model geometry — see the depthStencil comment in
+    // `section-cap-pipelines.ts`. There is no stencil test; the fill is restricted
+    // to the actual cap polygons by the triangle-plane intersection geometry
+    // `SectionCutter` produces, not by a stencil gate.
+    // Cap vertices are stored relative to capAnchor so that the RTE path can
+    // retain their small in-plane residuals. The legacy view-projection path
+    // still transforms world coordinates, however, so it must add that anchor
+    // back through planeOffset. Leaving it zero placed every rebased legacy
+    // cap around the world origin. Do not combine the two: RTE adds this same
+    // anchor as an f64 split drawable delta below.
+    const capAnchor = this.capAnchor;
+    const rteViewProj = options.rteViewProj;
+    const rteCamera = options.rteCamera;
+    const offset: [number, number, number] = capAnchor === null || (rteViewProj !== undefined && rteCamera !== undefined)
+      ? [0, 0, 0]
+      : capAnchor;
 
     // Update uniforms. Field offsets come from SECTION_2D_UNIFORM_SLOTS, which
     // sits next to the WGSL struct it describes.
     const S = SECTION_2D_UNIFORM_SLOTS;
     const uniforms = new Float32Array(SECTION_2D_UNIFORM_FLOATS);
     uniforms.set(viewProj, S.viewProj);
+    if (capAnchor !== null && rteViewProj !== undefined && rteCamera !== undefined) {
+      uniforms.set(rteViewProj, S.rteViewProj);
+      // Outside this camera's RTE envelope: the cap and its outline, the only
+      // draws below, are not rasterisable this frame (#6128).
+      if (!tryPackRteDrawableDelta(capAnchor, rteCamera, uniforms, S.originDeltaHigh)) return;
+      uniforms[S.originDeltaHigh + 3] = 1;
+    }
     uniforms.set(this.overlayLineColor, S.lineColor); // section-cut outline colour
     uniforms[S.planeOffset + 0] = offset[0];
     uniforms[S.planeOffset + 1] = offset[1];
@@ -663,6 +548,9 @@ export class Section2DOverlayRenderer {
       pass.setVertexBuffer(0, this.fillVertexBuffer);
       pass.setIndexBuffer(this.fillIndexBuffer, 'uint32');
       pass.drawIndexed(this.fillIndexCount);
+      // Then its depth, colour-masked, for the post passes (section-cap-pipelines.ts).
+      pass.setPipeline(this.fillDepthPipeline);
+      pass.drawIndexed(this.fillIndexCount);
     }
 
     // Outline lines on top of the fill. Gated by `showOutlines` so the
@@ -684,20 +572,31 @@ export class Section2DOverlayRenderer {
    * Dispose of GPU resources.
    *
    * Every family's buffer must be released here. The clash box (#1277) was the
-   * sixth family added and was missing from this list, leaking its vertex
+   * sixth line family added and was missing from this list, leaking its vertex
    * buffer on every teardown — `section-2d-overlay-lifecycle.test.ts` now counts
-   * destroys against uploads so a seventh family cannot repeat it.
+   * destroys against uploads so another family cannot repeat it. The named
+   * `LINE_OVERLAY_CHANNELS` are released by iterating the channel list, so a
+   * sixth channel is covered here the moment it joins that list; the clash box
+   * is named separately because it is not a channel.
    */
   dispose(): void {
     this.clearGeometry();
-    this.clearAnnotationLines3D();
-    this.clearAlignmentLines3D();
-    this.clearGridLines3D();
-    this.clearDxfLines3D();
+    for (const channel of LINE_OVERLAY_CHANNELS) this.lineOverlays[channel].clear();
     this.clearClashBoxLines3D();
     if (this.uniformBuffer) {
       this.uniformBuffer.destroy();
       this.uniformBuffer = null;
     }
+    // Pipeline and bind-group objects belong to this initialization epoch.
+    // A later upload on the same instance must rebuild all of them together.
+    this.fillPipeline = null;
+    this.fillDepthPipeline = null;
+    this.linePipeline = null;
+    this.centrelinePipeline = null;
+    this.linePipelineDescriptor = null;
+    this.bindGroupLayout = null;
+    this.bindGroup = null;
+    this.uniformStride = 0;
+    this.initialized = false;
   }
 }

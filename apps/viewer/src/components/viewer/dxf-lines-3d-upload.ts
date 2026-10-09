@@ -3,11 +3,11 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import { runGpuUpload } from './gpu-upload-guard.js';
+import type { AnchoredRendererLineVertices } from '@/lib/renderer/line-overlay-rte';
 
 /** The slice of `Renderer` the DXF 3D upload effect needs. */
 export interface DxfLines3DUploadTarget {
-  uploadDxfLines3D(vertices: Float32Array): void;
-  clearDxfLines3D(): void;
+  setLineOverlay(channel: 'dxf', vertices: Float32Array | AnchoredRendererLineVertices | readonly AnchoredRendererLineVertices[] | null): void;
 }
 
 /**
@@ -18,8 +18,8 @@ export interface DxfLines3DUploadTarget {
  *
  * Extracted from the `Viewport.tsx` effect so the drop-on-failure branch is
  * unit-testable with a mock renderer: this function has no GPU dependency,
- * only `renderer.uploadDxfLines3D`/`clearDxfLines3D`. The actual buffer
- * upload itself is not covered here — that requires a real GPUDevice.
+ * only `renderer.setLineOverlay('dxf', …)`. The actual buffer upload itself is
+ * not covered here — that requires a real GPUDevice.
  *
  * An empty `vertices` array clears the overlay (nothing to upload). A
  * failed upload also clears it — drawing from a half-written buffer would
@@ -27,17 +27,29 @@ export interface DxfLines3DUploadTarget {
  */
 export function uploadDxfLines3DGuarded(
   renderer: DxfLines3DUploadTarget,
-  vertices: Float32Array,
+  vertices: Float32Array | AnchoredRendererLineVertices | readonly AnchoredRendererLineVertices[],
 ): void {
-  if (vertices.length === 0) {
-    renderer.clearDxfLines3D();
+  const vertexCount = vertices instanceof Float32Array
+    ? vertices.length
+    : 'localVertices' in vertices
+      ? vertices.localVertices.length
+      : vertices.reduce((count, partition) => count + partition.localVertices.length, 0);
+  if (vertexCount === 0) {
+    renderer.setLineOverlay('dxf', null);
     return;
   }
-  const uploaded = runGpuUpload('uploadDxfLines3D', () => {
-    renderer.uploadDxfLines3D(vertices);
+  // RENAMED from 'uploadDxfLines3D' when that method was removed. This string
+  // is not local: `gpu-upload-guard.ts` sends it to PostHog as
+  // `gpu_upload_site` on `captureException`, so any saved insight or alert
+  // filtering the old value stops matching and DXF upload failures read as
+  // having STOPPED rather than moved. The new value follows the convention the
+  // other sites use (`flushPending:raf`, `appendToBatches:non-streaming`), so
+  // the rename is the right call; updating those queries is the follow-up.
+  const uploaded = runGpuUpload('setLineOverlay:dxf', () => {
+    renderer.setLineOverlay('dxf', vertices);
     return true;
   });
   if (!uploaded) {
-    renderer.clearDxfLines3D();
+    renderer.setLineOverlay('dxf', null);
   }
 }

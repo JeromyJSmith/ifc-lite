@@ -46,6 +46,73 @@ describe('normalizeValue', () => {
     expect(normalizeValue(true)).toBe(true);
     expect(normalizeValue({ a: 1 })).toBe('{"a":1}');
   });
+
+  it('stringifies a non-finite number instead of letting it collapse to null', () => {
+    // RED on the unfixed code: normalizeValue returned NaN/Infinity/-Infinity
+    // as-is, and JSON.stringify (in buildDataFingerprint) silently maps every
+    // one of them to `null` (RFC 8259 has no non-finite literal) — the same
+    // token an absent property serializes to. GREEN requires each non-finite
+    // value to survive as a distinct, non-null token.
+    expect(normalizeValue(NaN)).toBe('NaN');
+    expect(normalizeValue(Infinity)).toBe('Infinity');
+    expect(normalizeValue(-Infinity)).toBe('-Infinity');
+    expect(normalizeValue(NaN)).not.toBeNull();
+  });
+});
+
+describe('buildDataFingerprint — non-finite property value', () => {
+  const base: DataFingerprintInput = {
+    ifcType: 'IfcWall',
+    name: 'W1',
+    propertySets: [{ name: 'Pset_A', properties: [{ name: 'x', value: null }] }],
+  };
+
+  it('does not hash the same as a genuinely absent (null) property value', () => {
+    // A property whose value is Infinity (reachable from a STEP IfcReal with
+    // an extreme exponent, e.g. "1.0E400") must not fingerprint identically
+    // to the same entity with that property entirely null — collapsing the
+    // two lets matchUnpairedByContent retire a real added/deleted pair as
+    // "unchanged" on an unrelated dataHash coincidence.
+    const withNull = base;
+    const withInfinity: DataFingerprintInput = {
+      ...base,
+      propertySets: [{ name: 'Pset_A', properties: [{ name: 'x', value: Infinity }] }],
+    };
+    const withNaN: DataFingerprintInput = {
+      ...base,
+      propertySets: [{ name: 'Pset_A', properties: [{ name: 'x', value: NaN }] }],
+    };
+
+    const hashNull = buildDataFingerprint(withNull);
+    const hashInfinity = buildDataFingerprint(withInfinity);
+    const hashNaN = buildDataFingerprint(withNaN);
+
+    expect(hashInfinity).not.toBe(hashNull);
+    expect(hashNaN).not.toBe(hashNull);
+    expect(hashInfinity).not.toBe(hashNaN);
+  });
+
+  it('control: a finite value fingerprints as before (unaffected by the guard)', () => {
+    const withFinite: DataFingerprintInput = {
+      ...base,
+      propertySets: [{ name: 'Pset_A', properties: [{ name: 'x', value: 42 }] }],
+    };
+    expect(buildDataFingerprint(withFinite)).toBe(
+      stableHash(
+        JSON.stringify({
+          Type: 'IfcWall',
+          Name: 'W1',
+          Description: '',
+          ObjectType: '',
+          PredefinedType: '',
+          Tag: '',
+          TypeAssignments: [],
+          PropertySets: [{ name: 'Pset_A', properties: [{ name: 'x', value: 42 }] }],
+          QuantitySets: [],
+        }),
+      ),
+    );
+  });
 });
 
 describe('buildDataFingerprint', () => {
@@ -464,6 +531,69 @@ describe('buildComponentFingerprints — the material component', () => {
     const a = buildComponentFingerprints(proxy(['Soil1']));
     const b = buildComponentFingerprints(proxy(['topsoil']));
     expect(a['material']).not.toBe(b['material']);
+    expect(a['attr:core']).toBe(b['attr:core']);
+    expect(a['pset:Pset_Common']).toBe(b['pset:Pset_Common']);
+  });
+});
+
+describe('buildDataFingerprint — resolved classification references', () => {
+  // Classifications were not in the fingerprint at all, so a re-coded element —
+  // e.g. a proxy moved from one Uniclass group to another, geometry and every
+  // property untouched — read as unchanged in every channel.
+  const proxy = (classifications?: string[]): DataFingerprintInput => ({
+    ifcType: 'IfcBuildingElementProxy',
+    name: 'road - roadside verge - soil',
+    ...(classifications ? { classifications } : {}),
+  });
+
+  it('moves the hash when the resolved classification reference changes', () => {
+    expect(buildDataFingerprint(proxy(['Uniclass2015:Ss_25_10_30']))).not.toBe(
+      buildDataFingerprint(proxy(['Uniclass2015:Ss_25_10_90'])),
+    );
+  });
+
+  it('separates gaining a classification from having none', () => {
+    expect(buildDataFingerprint(proxy())).not.toBe(
+      buildDataFingerprint(proxy(['Uniclass2015:Ss_25_10_30'])),
+    );
+  });
+
+  it('leaves an element with no classifications hashing exactly as an empty list', () => {
+    expect(buildDataFingerprint(proxy())).toBe(buildDataFingerprint(proxy([])));
+  });
+
+  it('is order-independent, so a re-export that walks associations differently still matches', () => {
+    expect(buildDataFingerprint(proxy(['SysA:CodeA', 'SysB:CodeB']))).toBe(
+      buildDataFingerprint(proxy(['SysB:CodeB', 'SysA:CodeA'])),
+    );
+  });
+
+  it('does not confuse a classification reference with an equally-spelled material', () => {
+    const asClassification = buildDataFingerprint(proxy(['Uniclass2015:Ss_25_10_30']));
+    const asMaterial = buildDataFingerprint({ ...proxy(), materials: ['Uniclass2015:Ss_25_10_30'] });
+    expect(asClassification).not.toBe(asMaterial);
+  });
+});
+
+describe('buildComponentFingerprints — the classification component', () => {
+  const proxy = (classifications?: string[]): DataFingerprintInput => ({
+    ifcType: 'IfcBuildingElementProxy',
+    name: 'road - roadside verge - soil',
+    propertySets: [{ name: 'Pset_Common', properties: [{ name: 'Status', value: 'New' }] }],
+    ...(classifications ? { classifications } : {}),
+  });
+
+  it('emits a `classification` key only for an element that carries one', () => {
+    expect(buildComponentFingerprints(proxy(['Uniclass2015:Ss_25_10_30']))).toHaveProperty(
+      'classification',
+    );
+    expect(buildComponentFingerprints(proxy())).not.toHaveProperty('classification');
+  });
+
+  it('moves `classification` and nothing else when the reference changes', () => {
+    const a = buildComponentFingerprints(proxy(['Uniclass2015:Ss_25_10_30']));
+    const b = buildComponentFingerprints(proxy(['Uniclass2015:Ss_25_10_90']));
+    expect(a['classification']).not.toBe(b['classification']);
     expect(a['attr:core']).toBe(b['attr:core']);
     expect(a['pset:Pset_Common']).toBe(b['pset:Pset_Common']);
   });

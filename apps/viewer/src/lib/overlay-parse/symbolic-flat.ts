@@ -37,6 +37,7 @@
  */
 
 import type { SymbolicRepresentationCollection } from '@ifc-lite/wasm';
+import { isOverlayOwnerType } from './overlay-channels.js';
 
 /**
  * Which owner types survive the flatten.
@@ -50,99 +51,8 @@ import type { SymbolicRepresentationCollection } from '@ifc-lite/wasm';
  */
 export type SymbolicFilterMode = 'overlay' | 'all';
 
-/**
- * The whole symbolic collection as transferable arrays.
- *
- * Variable-length data (curve points, fill rings, fill holes) is concatenated
- * into one buffer per kind with a companion `*Start` offset array of length
- * `N + 1`: item `i` spans `[start[i], start[i + 1])`. Fixed-width per-item data
- * is one entry per item, or a fixed stride where noted.
- *
- * Every array is backed by its own `ArrayBuffer`, so the whole struct can be
- * handed to `postMessage` as a transfer list.
- */
-export interface FlatSymbolic {
-  /**
-   * IFC type names, deduplicated. The per-primitive `*Type` arrays index into
-   * this. Under `'overlay'` it holds at most `IfcAnnotation` and `IfcGridAxis`;
-   * under `'all'` it holds every product type the model authored a symbolic
-   * representation for, which is why the index arrays are 16-bit — an 8-bit
-   * index would wrap silently past 256 distinct types and hand a primitive
-   * somebody else's `ifcType`.
-   */
-  typeNames: string[];
-
-  // ── Polylines ────────────────────────────────────────────────────────────
-  /** Flat `[x, y, x, y, …]` for every polyline, back to back. */
-  polyPoints: Float32Array;
-  /** `N + 1` **point**-index offsets into `polyPoints` (float index = 2×). */
-  polyStart: Uint32Array;
-  /** Express id of the owning entity, one per polyline. */
-  polyOwner: Uint32Array;
-  /** `worldY` placement elevation, one per polyline. */
-  polyWorldY: Float32Array;
-  /** Bit 0 = `isClosed`. One per polyline. */
-  polyFlags: Uint8Array;
-  /** Index into {@link FlatSymbolic.typeNames}, one per polyline. */
-  polyType: Uint16Array;
-
-  // ── Circles / arcs ───────────────────────────────────────────────────────
-  circleCenterX: Float32Array;
-  circleCenterY: Float32Array;
-  circleRadius: Float32Array;
-  circleStartAngle: Float32Array;
-  circleEndAngle: Float32Array;
-  circleOwner: Uint32Array;
-  circleWorldY: Float32Array;
-  /** Bit 0 = `isFullCircle`. One per circle. */
-  circleFlags: Uint8Array;
-  circleType: Uint16Array;
-
-  // ── Texts ────────────────────────────────────────────────────────────────
-  /** Raw IFC literal, still STEP-escaped — decoded on the main thread. */
-  textContent: string[];
-  /** Raw IFC `BoxAlignment` string, one per text. */
-  textAlignment: string[];
-  textX: Float32Array;
-  textY: Float32Array;
-  textDirX: Float32Array;
-  textDirY: Float32Array;
-  textHeight: Float32Array;
-  textTargetPx: Float32Array;
-  /** Stride 4: `[r, g, b, a]` per text. `a <= 0` means "no authored colour". */
-  textColor: Float32Array;
-  textOwner: Uint32Array;
-  textWorldY: Float32Array;
-  textType: Uint16Array;
-
-  // ── Fills ────────────────────────────────────────────────────────────────
-  /** Flat ring vertices for every fill, back to back. */
-  fillPoints: Float32Array;
-  /**
-   * `N + 1` **float**-index offsets into `fillPoints`. Float indices rather
-   * than vertex indices because the main-side `points.length < 6` guard reads
-   * the raw array length WASM produced; deriving the span from `pointCount`
-   * would silently drop a trailing odd float and move that boundary.
-   */
-  fillPointStart: Uint32Array;
-  /** Hole start vertex indices, relative to each fill's own ring buffer. */
-  fillHoles: Uint32Array;
-  /** `N + 1` offsets into `fillHoles`. */
-  fillHoleStart: Uint32Array;
-  /** Stride 4: `[r, g, b, a]` per fill. */
-  fillColor: Float32Array;
-  /**
-   * Stride 4: `[spacing, angle, angleSecondary, lineWidth]` per fill. Only
-   * meaningful when bit 0 of {@link FlatSymbolic.fillFlags} is set;
-   * `angleSecondary` carries `NaN` when the style had no secondary angle.
-   */
-  fillHatch: Float32Array;
-  fillOwner: Uint32Array;
-  fillWorldY: Float32Array;
-  /** Bit 0 = `hasHatching`. One per fill. */
-  fillFlags: Uint8Array;
-  fillType: Uint16Array;
-}
+import type { FlatSymbolic } from './symbolic-flat-types.js';
+export type { FlatSymbolic } from './symbolic-flat-types.js';
 
 /** An empty flatten — the shape a skipped or empty parse produces. */
 export function createEmptyFlatSymbolic(): FlatSymbolic {
@@ -182,20 +92,17 @@ export function createEmptyFlatSymbolic(): FlatSymbolic {
     fillColor: new Float32Array(0),
     fillHatch: new Float32Array(0),
     fillOwner: new Uint32Array(0),
+    fillGeometryItem: new Uint32Array(0),
     fillWorldY: new Float32Array(0),
     fillFlags: new Uint8Array(0),
     fillType: new Uint16Array(0),
   };
 }
 
-/** The only two owner types the annotation overlay renders (issue #862). */
-function isOverlayType(ifcType: string): boolean {
-  return ifcType === 'IfcAnnotation' || ifcType === 'IfcGridAxis';
-}
-
-/** Keep-predicate for a {@link SymbolicFilterMode}. */
+/** Keep-predicate for a {@link SymbolicFilterMode}. The owner types the
+ *  overlay renders are defined once, in `overlay-channels.ts`. */
 function keepPredicate(mode: SymbolicFilterMode): (ifcType: string) => boolean {
-  return mode === 'all' ? () => true : isOverlayType;
+  return mode === 'all' ? () => true : isOverlayOwnerType;
 }
 
 /** Intern an IFC type name into the shared table, returning its index. */
@@ -332,6 +239,7 @@ export function collectFlatSymbolic(
   const fillColor: number[] = [];
   const fillHatch: number[] = [];
   const fillOwner: number[] = [];
+  const fillGeometryItem: number[] = [];
   const fillWorldY: number[] = [];
   const fillFlags: number[] = [];
   const fillType: number[] = [];
@@ -355,6 +263,7 @@ export function collectFlatSymbolic(
       // side is what turns it into `null`.
       fillHatch.push(fill.hatchSpacing, fill.hatchAngle, fill.hatchAngleSecondary, fill.hatchLineWidth);
       fillOwner.push(fill.expressId);
+      fillGeometryItem.push(fill.geometryItemId ?? 0);
       fillWorldY.push(fill.worldY);
       fillFlags.push(fill.hasHatching ? 1 : 0);
       fillType.push(intern(typeNames, typeIndex, ifcType));
@@ -399,6 +308,7 @@ export function collectFlatSymbolic(
     fillColor: Float32Array.from(fillColor),
     fillHatch: Float32Array.from(fillHatch),
     fillOwner: Uint32Array.from(fillOwner),
+    fillGeometryItem: Uint32Array.from(fillGeometryItem),
     fillWorldY: Float32Array.from(fillWorldY),
     fillFlags: Uint8Array.from(fillFlags),
     fillType: Uint16Array.from(fillType),

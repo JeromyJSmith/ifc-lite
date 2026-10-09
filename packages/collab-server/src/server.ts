@@ -2,25 +2,19 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-/**
- * Websocket sync server entry point.
- */
+/** Websocket sync server entry point. */
 
 import * as http from 'node:http';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { WebSocketServer, type WebSocket } from 'ws';
-import { RoomManager, type PeerConnection } from './room-manager.js';
+import { RoomManager, type PeerConnection, type VerifyMessageFn } from './room-manager.js';
+import { startExpirySweep } from './principal-expiry.js';
 import { FilePersistence, MemoryPersistence, type Persistence } from './persistence.js';
 import { allowAnonymousEditor, canWrite, type AuthenticateFn, type Principal } from './auth.js';
 import { type AuditSink } from './audit-log.js';
 import { type RateLimitOptions } from './rate-limit.js';
-import { type VerifyMessageFn } from './room-manager.js';
-import {
-  handleBlobRequest,
-  InMemoryBlobStorage,
-  type BlobAuthorizeFn,
-  type ServerBlobStorage,
-} from './blob-route.js';
+import { handleBlobRequest, type BlobAuthorizeFn } from './blob-route.js';
+import { InMemoryBlobStorage, type ServerBlobStorage } from './blob-storage.js';
 import {
   handleTokenMintRequest,
   handleRevokeRequest,
@@ -280,6 +274,7 @@ export async function startCollabServer(
     idleUnloadMs: opts.idleUnloadMs,
     verifyMessage: opts.verifyMessage,
   });
+  const expirySweep = startExpirySweep(roomManager); // #3441; see principal-expiry.ts
 
   const blobStorage = opts.blobStorage ?? new InMemoryBlobStorage();
   // Default the blob authorizer to one that reuses the WS `authenticate`
@@ -358,10 +353,10 @@ export async function startCollabServer(
             res.end(JSON.stringify({ error: 'unauthorized' }));
             return;
           }
-          // Refresh derived gauges before rendering so the snapshot
-          // reflects live state, not state-at-last-event.
           const stats = await roomManager.stats();
           roomsGauge.set(stats.length);
+          // Reset first — keyed by peer-chosen roomId, an unloaded room would otherwise report a stale peer count forever.
+          peersGauge.reset();
           for (const s of stats) peersGauge.set(s.peerCount, { room: s.roomId });
           res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4' });
           res.end(metrics.render());
@@ -495,6 +490,7 @@ export async function startCollabServer(
     wss,
     roomManager,
     async stop() {
+      expirySweep.stop();
       await new Promise<void>((resolve) => wss.close(() => resolve()));
       if (!opts.server) {
         await new Promise<void>((resolve) => httpServer.close(() => resolve()));

@@ -7,7 +7,6 @@ import { findDuplicates } from './duplicates.js';
 import { groupClashes } from './grouping.js';
 import { groupDuplicateSets } from './duplicate-sets.js';
 import { makeExclusionSet, qualifiedKey } from './exclude.js';
-import { fromPositions } from './math/aabb.js';
 import type { ClashElement, Vec3 } from './types.js';
 
 let nextRef = 1;
@@ -585,14 +584,17 @@ describe('findDuplicates', () => {
     });
     expect(findDuplicates(withNaN).clashes).toHaveLength(pairs);
 
-    // The `fromPositions` guard does not make this unreachable. When no vertex
-    // is finite on an axis it returns the box INVERTED (min `+Infinity`, max
-    // `-Infinity`) so `boxesTouch` rejects it — a sound bound, but still a
-    // non-finite minimum, and `Infinity - Infinity` is NaN too. Two such
-    // elements are enough, and they come through the adapters, not the SDK.
+    // `fromPositions` itself can no longer produce this: an axis with no
+    // finite vertex now throws `NonFiniteAxisError` (#4254), and both
+    // adapters catch it and drop the element before it ever reaches here. An
+    // inverted (min `+Infinity`, max `-Infinity`) bound is still reachable
+    // the same way plain NaN bounds are above — an SDK caller building
+    // `ClashElement.bounds` by hand — so the sweep still has to tolerate it:
+    // still a non-finite minimum, and `Infinity - Infinity` is NaN too. Two
+    // such elements are enough.
     const inverted = (key: string): ClashElement => ({
       key, ref: nextRef++, model: 'm', tag: 'IfcWall',
-      bounds: fromPositions(new Float32Array([NaN, NaN, NaN, NaN, NaN, NaN])),
+      bounds: { min: [Infinity, Infinity, Infinity], max: [-Infinity, -Infinity, -Infinity] },
       positions: new Float32Array(0), indices: new Uint32Array(0),
     });
     expect(Number.isFinite(inverted('probe').bounds.min[0])).toBe(false);
@@ -1001,7 +1003,29 @@ describe('groupDuplicateSets', () => {
     expect(groups).toHaveLength(1);
     expect(groups[0].members).toHaveLength(3);
     expect(groups[0].title).toContain('3 coincident');
+    // Exact title, not just a `toContain` on the count: a mutation that drops
+    // the tag word entirely (e.g. always uses '' instead of `${tag} `) would
+    // still pass a `toContain('3 coincident')` check, since that substring
+    // survives either way. Pin the full string so the tag word is actually
+    // observed.
+    expect(groups[0].title).toBe('3 coincident IfcWall objects');
     expect(groups[0].id).toMatch(/^grp-[0-9a-f]{8}$/);
+  });
+
+  it('drops the type word when a set mixes IFC types (single-tag branch is not the only branch)', () => {
+    // Two IfcWall boxes plus one IfcColumn box, all coincident: the set spans
+    // more than one IFC type, so the title must read "N objects", not claim a
+    // single type. Every other title test in this suite uses same-tag
+    // fixtures (all IfcWall), so the `comp.tags.size === 1 ? tag : ''` branch
+    // that actually produces '' was previously never exercised.
+    const res = findDuplicates([
+      box('a', [0, 0, 0], 0.5, 12, 'IfcWall'),
+      box('b', [0, 0, 0], 0.5, 12, 'IfcWall'),
+      box('c', [0, 0, 0], 0.5, 12, 'IfcColumn'),
+    ]);
+    const groups = groupDuplicateSets(res);
+    expect(groups).toHaveLength(1);
+    expect(groups[0].title).toBe('3 coincident objects');
   });
 
   it('keeps two duplicate sets that stand close together as TWO findings', () => {

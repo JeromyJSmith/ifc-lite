@@ -26,9 +26,11 @@ console.log(`${result.meshes.length} meshes, ${result.totalTriangles} triangles`
 ## Stream geometry (recommended for large models)
 
 ```typescript
+const buffer = new Uint8Array(await file.arrayBuffer());
+
 for await (const event of processor.processStreaming(buffer)) {
   if (event.type === 'batch') {
-    renderer.appendMeshes(event.meshes);
+    renderer.addMeshes(event.meshes, true);
     console.log(`Loaded ${event.totalSoFar} meshes so far`);
   } else if (event.type === 'complete') {
     console.log(`Done: ${event.totalMeshes} meshes`);
@@ -54,8 +56,7 @@ Unset / `'medium'` reproduces the engine's historical densities byte-for-byte. L
 ## Coordinate handling
 
 ```typescript
-import { CoordinateHandler } from '@ifc-lite/geometry';
-
+const buffer = new Uint8Array(await file.arrayBuffer());
 const result = await processor.process(buffer);
 
 // Models with large world coordinates (geo-referenced) get auto-shifted
@@ -65,6 +66,36 @@ if (result.coordinateInfo?.hasLargeCoordinates) {
   console.log(`Origin shifted by [${x}, ${y}, ${z}] for renderer precision`);
 }
 ```
+
+The mesh pre-pass also publishes its exact IFC Z-up, metre-based `RtcFrame` as
+`coordinateInfo.wasmRtcFrame`. Pass that frame to auxiliary parsers for the
+same loaded model so grids, alignments, and symbolic geometry use the mesh
+origin exactly:
+
+```typescript
+const bytes = new Uint8Array(await file.arrayBuffer());
+const loaded = await processor.process(bytes);
+const frame = loaded.coordinateInfo.wasmRtcFrame;
+const gridLines = processor.parseGridLines(bytes, frame);
+const alignmentLines = processor.parseAlignmentLines(bytes, frame);
+const symbols = processor.parseSymbolicRepresentations(bytes, frame);
+try {
+  console.log(gridLines?.length, alignmentLines?.length, symbols?.totalCount);
+} finally {
+  symbols?.free(); // WASM-owned collection; typed arrays need no cleanup
+}
+```
+
+`needsShift: false` is an authoritative decision to subtract nothing, even if
+the frame's inactive `x`/`y`/`z` values are non-zero. It disables only RTC
+subtraction; the parser's documented unit scaling and IFC Z-up to renderer
+Y-up output conversion are unchanged. An absent
+`wasmRtcFrame` means the producer did not publish frame provenance (for example,
+the native bridge); it does not mean `needsShift: false`. Omitting the parser
+argument retains standalone whole-source detection. That is useful for an
+independent IFC source, but it can differ from a streaming pre-pass's sampled
+frame or a federation-wide shared frame, so loaded-model overlays should use
+the published frame when present.
 
 ## Vite setup
 
@@ -92,6 +123,8 @@ If your bundler can't transform
 wasm URLs through the `processAdaptive` / `processParallel` `wasmUrls`
 option:
 
+<!-- Reason: Vite-only `?url` import specifier, unresolvable by tsc. -->
+<!-- docs-check: skip -->
 ```ts
 // Vite's `?url` suffix yields a fully-resolved URL string at build time.
 // `@ifc-lite/wasm` exposes the binary at the `./ifc-lite_bg.wasm` subpath
@@ -120,6 +153,16 @@ works.
 ## API
 
 See the [Geometry Guide](https://ifclite.dev/docs/guide/geometry/) and [API Reference](https://ifclite.dev/docs/api/typescript/#ifc-litegeometry).
+
+`GeometryProcessor.planMapConversionNormalization(content)` returns a JSON
+entity-patch plan for opt-in STEP coordinate compatibility export. Initialize
+the processor first and dispose it in `finally`. Canonical Rust validates units,
+placements and representation ownership; unsupported coordinate consumers return
+warnings with no patches. `StepExporter.exportAsync({ normalizeMapGeometry:
+true })` applies this plan after edits using its existing modification ledger.
+See the [exporting guide](https://ifclite.dev/docs/guide/exporting/) for the
+supported subset and warning handling. Third-party platform bridges may expose
+the optional planner capability; the bundled native bridge explicitly refuses it.
 
 ## License
 

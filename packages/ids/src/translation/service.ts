@@ -17,6 +17,10 @@ import type {
   RequirementOptionality,
 } from '../types.js';
 
+import {
+  describeConstraint as renderConstraint,
+  interpolate as interpolateTemplate,
+} from './describe-constraint.js';
 import { en } from './locales/en.js';
 import { de } from './locales/de.js';
 import { fr } from './locales/fr.js';
@@ -83,12 +87,14 @@ class IDSTranslationServiceImpl implements TranslationService {
     template: string,
     params: Record<string, string | number>
   ): string {
-    return template.replace(/\{(\w+)\}/g, (match, key) => {
-      if (key in params) {
-        return String(params[key]);
-      }
-      return match;
-    });
+    return interpolateTemplate(template, params);
+  }
+
+  /**
+   * Describe a constraint value in human-readable form
+   */
+  describeConstraint(constraint: IDSConstraint): string {
+    return renderConstraint(constraint, this.translations);
   }
 
   /**
@@ -360,73 +366,6 @@ class IDSTranslationServiceImpl implements TranslationService {
   }
 
   /**
-   * Describe a constraint value in human-readable form
-   */
-  describeConstraint(constraint: IDSConstraint): string {
-    const t = this.translations;
-
-    switch (constraint.type) {
-      case 'simpleValue':
-        return this.interpolate(t.constraints.simpleValue, {
-          value: constraint.value,
-        });
-
-      case 'pattern':
-        return this.interpolate(t.constraints.pattern, {
-          pattern: constraint.pattern,
-        });
-
-      case 'enumeration':
-        if (constraint.values.length === 1) {
-          return this.interpolate(t.constraints.enumeration.single, {
-            value: constraint.values[0],
-          });
-        }
-        return this.interpolate(t.constraints.enumeration.multiple, {
-          values: constraint.values.map((v) => `"${v}"`).join(', '),
-        });
-
-      case 'bounds':
-        return this.describeBounds(constraint);
-
-      default:
-        return 'unknown constraint';
-    }
-  }
-
-  private describeBounds(constraint: IDSConstraint & { type: 'bounds' }): string {
-    const t = this.translations.constraints.bounds;
-
-    if (
-      constraint.minInclusive !== undefined &&
-      constraint.maxInclusive !== undefined
-    ) {
-      return this.interpolate(t.between, {
-        min: constraint.minInclusive,
-        max: constraint.maxInclusive,
-      });
-    }
-
-    if (constraint.minInclusive !== undefined) {
-      return this.interpolate(t.atLeast, { min: constraint.minInclusive });
-    }
-
-    if (constraint.maxInclusive !== undefined) {
-      return this.interpolate(t.atMost, { max: constraint.maxInclusive });
-    }
-
-    if (constraint.minExclusive !== undefined) {
-      return this.interpolate(t.greaterThan, { min: constraint.minExclusive });
-    }
-
-    if (constraint.maxExclusive !== undefined) {
-      return this.interpolate(t.lessThan, { max: constraint.maxExclusive });
-    }
-
-    return 'any value';
-  }
-
-  /**
    * Describe a failure in human-readable form
    */
   describeFailure(result: IDSRequirementResult): string {
@@ -488,9 +427,7 @@ class IDSTranslationServiceImpl implements TranslationService {
             available: context.availablePsets,
           });
         }
-        return this.interpolate(t.psetMissing, {
-          pset: field || expected || '?',
-        });
+        return this.interpolate(t.psetMissing, { pset: field || expected || '?' });
 
       case 'PROPERTY_MISSING':
         if (context?.availableProperties) {
@@ -505,6 +442,8 @@ class IDSTranslationServiceImpl implements TranslationService {
           pset: context?.propertySet || '?',
         });
 
+      case 'PROPERTY_EMPTY':
+        return this.interpolate(t.propertyEmpty, { pset: this.extractPsetFromField(field), property: this.extractPropertyFromField(field) });
       case 'PROPERTY_VALUE_MISMATCH':
         return this.interpolate(t.propertyValueMismatch, {
           pset: this.extractPsetFromField(field),
@@ -513,6 +452,8 @@ class IDSTranslationServiceImpl implements TranslationService {
           expected: expected || '?',
         });
 
+      case 'PROPERTY_DATATYPE_UNKNOWN':
+        return this.interpolate(t.propertyDatatypeUnknown, { pset: this.extractPsetFromField(field), property: this.extractPropertyFromField(field), expected: expected || '?' });
       case 'PROPERTY_DATATYPE_MISMATCH':
         return this.interpolate(t.propertyDatatypeMismatch, {
           pset: this.extractPsetFromField(field),
@@ -557,9 +498,14 @@ class IDSTranslationServiceImpl implements TranslationService {
           expected: expected || '?',
         });
 
+      case 'CLASSIFICATION_UNRESOLVED':
+        return field === 'presence' ? t.classificationPresenceUnresolved : t.classificationUnresolved;
+
       // Material failures
       case 'MATERIAL_MISSING':
         return t.materialMissing;
+      case 'MATERIAL_UNRESOLVED':
+        return t.materialUnresolved;
 
       case 'MATERIAL_VALUE_MISMATCH':
         if (context?.availableMaterials) {
@@ -656,9 +602,7 @@ class IDSTranslationServiceImpl implements TranslationService {
       .replace(/^Doit/i, 'Devrait');
   }
 
-  /**
-   * Get status text
-   */
+  /** Get status text */
   getStatusText(status: 'pass' | 'fail' | 'not_applicable'): string {
     return this.translations.status[status];
   }

@@ -67,12 +67,16 @@ pub use utils::stash_location_parts;
 pub use wasm_bindgen_rayon::init_thread_pool;
 
 mod api;
+#[cfg(feature = "opening-perf-trace")]
+mod opening_perf_trace;
 #[cfg(feature = "console-tracing")]
 mod tracing_console;
 mod utils;
 mod zero_copy;
 
 pub use api::IfcAPI;
+mod alignment_axis;
+pub use alignment_axis::AlignmentAxisJs;
 pub use utils::set_panic_hook as init_panic_hook;
 pub use zero_copy::{
     get_memory, MeshCollection, MeshDataJs, SymbolicCircle, SymbolicFillArea, SymbolicPolyline,
@@ -82,10 +86,19 @@ pub use zero_copy::{
 /// Initialize the WASM module.
 ///
 /// This function is called automatically when the WASM module is loaded.
-/// It sets up panic hooks for better error messages in the browser console.
+/// It sets up panic hooks for better error messages in the browser console,
+/// and points core's scan diagnostics at that console too.
 #[wasm_bindgen(start)]
 pub fn init() {
     utils::set_panic_hook();
+    // `ifc_lite_core::report_oversized_ids` (#3395) writes to stderr by
+    // default, and wasm32 has none — leaving every core and processing scan
+    // this module drives silently unable to say it refused a record, which is
+    // the absence-reads-as-success shape the issue is about. Set-once, and
+    // this runs before any `IfcAPI` is constructed.
+    ifc_lite_core::set_report_sink(|message| {
+        web_sys::console::warn_1(&JsValue::from_str(message));
+    });
 }
 
 /// Get the version of IFC-Lite.

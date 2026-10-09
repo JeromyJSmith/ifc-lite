@@ -11,10 +11,12 @@
  * Render conditions:
  *   - `editEnabled` is on
  *   - `activeTool === 'select'` (so the gizmo doesn't fight measure /
- *     section / addElement)
+ *     section)
  *   - exactly one entity is selected
  *   - the selection has a placement chain that can be translated
  *     (`resolvePlacementChain` returns non-null)
+ *   - the Model workspace is NOT open: there, Move and Rotate are commands
+ *     (`TransformHandles`, #6232 C2) and replace this free drag
  *
  * Coordinate spaces:
  *   The renderer is Y-up. IFC is Z-up. We project two world points
@@ -25,28 +27,38 @@
  *   delta. No camera matrix inversion required; we lean entirely on
  *   the existing `projectToScreen` callback.
  *
- * The drag commits a single `translateEntity` call per frame (no
- * batching). Each call lands as one mutation on the undo stack,
- * which is intentionally coarse — fine for v1; if it gets noisy we
- * can collapse runs in a later pass.
+ * The drag commits one `translateEntity` call per frame (delta in
+ * metres), every call tagged with the drag's `batchId`, so the whole
+ * drag undoes as ONE step. `WallEndpointOverlay` batches its resize
+ * drag the same way.
+ *
+ * Re-render wake (#5510): re-projecting the arrows on every camera move
+ * used to run its own `requestAnimationFrame` polling loop
+ * (`useCameraTickSubscription`) — one more per-component timer doing the
+ * same camera-pose diff the scene kernel's shared `SceneProjector` already
+ * does once per viewport (#5486). `useProjectorTick` subscribes to that
+ * one loop instead; the actual projection math below is unchanged (still
+ * `cameraCallbacks.projectToScreen` in the render body, not the
+ * projector's own anchor system — this component's drag math needs the
+ * raw screen-space "pixels per metre" basis per axis, which the
+ * projector's fire-and-forget anchors don't expose).
  */
 
 import { useMemo, useRef } from 'react';
 import { useViewerStore } from '@/store';
+import { canMutate } from '@/store/mutation-permission';
 import { useIfc } from '@/hooks/useIfc';
-import { useCameraTickSubscription } from '@/hooks/useCameraTickSubscription';
+import { useProjectorTick } from '@/components/viewport-ui/scene';
 import { getEntityCenter } from '@/utils/viewportUtils';
+import { dragTranslation } from '@/lib/model-placement/drag';
+import { capturePointer, releasePointer } from '@/lib/pointer-capture';
+import { IFC_AXIS_COLORS } from '@/lib/viewport-ui/overlay-theme';
 
 type Vec2 = { x: number; y: number };
 type Vec3 = { x: number; y: number; z: number };
 type Project = (worldPos: Vec3) => Vec2 | null;
 type Axis = 'x' | 'y' | 'z';
 
-const AXIS_COLORS: Record<Axis, string> = {
-  x: '#ef4444', // red — IFC X
-  y: '#10b981', // green — IFC Y
-  z: '#3b82f6', // blue — IFC Z (up)
-};
 
 /** Renderer-frame unit vector for each IFC axis. */
 const AXIS_RENDERER_OFFSET: Record<Axis, Vec3> = {
@@ -64,11 +76,12 @@ function pickViewerOrigin(meshes: import('@ifc-lite/geometry').MeshData[] | null
 
 export function GizmoOverlay() {
   const editEnabled = useViewerStore((s) => s.editEnabled);
+  const collabRole = useViewerStore((s) => s.collabRole);
   const activeTool = useViewerStore((s) => s.activeTool);
+  const inModelWorkspace = useViewerStore((s) => s.workspaceMode === 'model');
   const selectedEntity = useViewerStore((s) => s.selectedEntity);
   const selectedEntityId = useViewerStore((s) => s.selectedEntityId);
   const projectToScreen = useViewerStore((s) => s.cameraCallbacks.projectToScreen);
-  const getViewpoint = useViewerStore((s) => s.cameraCallbacks.getViewpoint);
   const translateEntity = useViewerStore((s) => s.translateEntity);
   const readEntityPosition = useViewerStore((s) => s.readEntityPosition);
   const mutationVersion = useViewerStore((s) => s.mutationVersion);
@@ -90,9 +103,9 @@ export function GizmoOverlay() {
   // user's first selection — no need to wait for an unrelated
   // mutation to prime the editor cache.
   const ready = useMemo(() => {
-    if (!editEnabled) return null;
-    if (activeTool !== 'select') return null;
-    if (!selectedEntity || selectedEntityId === null) return null;
+    if (!selectedEntity || !canMutate(useViewerStore.getState(), selectedEntity.modelId)) return null;
+    if (activeTool !== 'select' || inModelWorkspace) return null;
+    if (selectedEntityId === null) return null;
     if (!projectToScreen) return null;
 
     const model = models.get(selectedEntity.modelId);
@@ -110,7 +123,9 @@ export function GizmoOverlay() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     editEnabled,
+    collabRole,
     activeTool,
+    inModelWorkspace,
     selectedEntity,
     selectedEntityId,
     models,
@@ -120,11 +135,11 @@ export function GizmoOverlay() {
     mutationVersion,
   ]);
 
-  // Camera-tick subscription — wakes the gizmo on real viewport
+  // Shared-projector wake (#5510) — re-renders the gizmo on real viewport
   // motion (camera tick bypasses React renders for perf, see
-  // `Viewport.tsx` `updateCameraRotationRealtime`). Skipped when
-  // the gizmo isn't visible.
-  void useCameraTickSubscription(getViewpoint, ready !== null);
+  // `Viewport.tsx` `updateCameraRotationRealtime`). Skipped when the gizmo
+  // isn't visible.
+  void useProjectorTick(ready !== null);
 
   if (!ready) return null;
 
@@ -192,7 +207,7 @@ export function GizmoOverlay() {
     e.preventDefault();
     const perMetre = axisPerMeter[axis];
     if (!perMetre) return;
-    (e.target as SVGElement).setPointerCapture(e.pointerId);
+    capturePointer(e.target as SVGElement, e.pointerId);
     dragRef.current = {
       axis,
       originScreen,
@@ -210,18 +225,13 @@ export function GizmoOverlay() {
       x: e.clientX - drag.cursorStart.x,
       y: e.clientY - drag.cursorStart.y,
     };
-    // Scalar projection of the cursor delta onto the on-screen axis
-    // direction. |axisScreenPerMeter|^2 is the squared pixel length
-    // of a 1m world segment along this axis — dividing by it converts
-    // pixels back into metres.
-    const ax = drag.axisScreenPerMeter;
-    const denom = ax.x * ax.x + ax.y * ax.y;
-    if (denom < 1e-6) return;
-    const metres = (cursorDelta.x * ax.x + cursorDelta.y * ax.y) / denom;
+    const idx = drag.axis === 'x' ? 0 : drag.axis === 'y' ? 1 : 2;
+    const movement = dragTranslation([{ axis: idx, screen: drag.axisScreenPerMeter }], cursorDelta);
+    if (!movement) return;
+    const metres = movement[idx];
     // Delta since the LAST frame of this drag.
     const previous = drag.accumulatedDelta;
     const delta: [number, number, number] = [0, 0, 0];
-    const idx = drag.axis === 'x' ? 0 : drag.axis === 'y' ? 1 : 2;
     delta[idx] = metres - (drag.axis === 'x' ? previous.x : drag.axis === 'y' ? previous.y : previous.z);
     if (Math.abs(delta[idx]) < 1e-6) return;
     // Only advance the per-axis accumulator if the mutation actually
@@ -239,11 +249,7 @@ export function GizmoOverlay() {
 
   const onDragEnd = (e: React.PointerEvent<SVGElement>) => {
     if (!dragRef.current) return;
-    try {
-      (e.target as SVGElement).releasePointerCapture(e.pointerId);
-    } catch {
-      /* pointer already released — safe to ignore */
-    }
+    releasePointer(e.currentTarget, e.pointerId);
     dragRef.current = null;
   };
 
@@ -264,7 +270,7 @@ export function GizmoOverlay() {
             markerHeight="6"
             orient="auto"
           >
-            <path d="M 0 0 L 10 5 L 0 10 z" fill={AXIS_COLORS[axis]} />
+            <path d="M 0 0 L 10 5 L 0 10 z" fill={IFC_AXIS_COLORS[axis]} />
           </marker>
         ))}
       </defs>
@@ -276,7 +282,7 @@ export function GizmoOverlay() {
       {(['x', 'y', 'z'] as const).map((axis) => {
         const tip = axisTips[axis];
         if (!tip) return null;
-        const colour = AXIS_COLORS[axis];
+        const colour = IFC_AXIS_COLORS[axis];
         return (
           <g key={axis} style={{ pointerEvents: 'auto' }}>
             <line
@@ -312,8 +318,7 @@ export function GizmoOverlay() {
         cx={originScreen.x}
         cy={originScreen.y}
         r={4}
-        fill="#fff"
-        stroke="#71717a"
+        className="fill-overlay-halo stroke-overlay-ink-muted"
         strokeWidth={1.5}
         pointerEvents="none"
       />

@@ -2,18 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-/// Longest `IfcMappedItem -> IfcRepresentationMap -> MappedRepresentation`
-/// chain the colour chase will follow.
-///
-/// This is the THIRD copy of this constant. `ifc_lite_geometry`'s
-/// `router::processing` and `ifc_lite_processing`'s `element` both define
-/// `MAX_MAPPED_ITEM_DEPTH = 32` for the same traversal; all three must agree,
-/// or a chain longer than the smallest cap renders its geometry through the
-/// router while silently losing the authored style on its leaf. They are not
-/// deduplicated because the router's is private and the three crates do not
-/// share a home for it — collapsing them is worth doing and is a bigger change
-/// than this fix (#2866).
-const MAX_MAPPED_ITEM_DEPTH: u32 = 32;
+use ifc_lite_core::MAX_MAPPED_ITEM_DEPTH;
 
 /// Find color for a geometry item, following MappedItem references if needed.
 /// This handles the case where IfcStyledItem points to geometry inside a MappedRepresentation,
@@ -100,22 +89,17 @@ fn find_color_for_geometry_at(
 
         // IfcShapeRepresentation: ContextOfItems, RepresentationIdentifier, RepresentationType, Items
         // Attribute 3: Items (list of geometry items)
-        let items_attr = mapped_repr.get(3)?;
-        let items_list = items_attr.as_list()?;
-
         // Check each underlying geometry item for a color
-        for item in items_list {
-            if let Some(underlying_geom_id) = item.as_entity_ref() {
-                // Recursively find color (handles nested MappedItems)
-                if let Some(color) = find_color_for_geometry_at(
-                    underlying_geom_id,
-                    geometry_styles,
-                    decoder,
-                    depth + 1,
-                    visited,
-                ) {
-                    return Some(color);
-                }
+        for underlying_geom_id in mapped_repr.get_refs(3)? {
+            // Recursively find color (handles nested MappedItems)
+            if let Some(color) = find_color_for_geometry_at(
+                underlying_geom_id,
+                geometry_styles,
+                decoder,
+                depth + 1,
+                visited,
+            ) {
+                return Some(color);
             }
         }
     }
@@ -174,23 +158,17 @@ fn walk_representation_for_direct_color(
 ) -> Option<[f32; 4]> {
     let repr_id = entity.get_ref(6)?;
     let product_shape = decoder.decode_by_id(repr_id).ok()?;
-    let reprs_list = product_shape.get(2)?.as_list()?;
+    let reprs = product_shape.get_refs(2)?;
 
-    for repr_item in reprs_list {
-        let Some(shape_repr_id) = repr_item.as_entity_ref() else {
-            continue;
-        };
+    for shape_repr_id in reprs {
         let Ok(shape_repr) = decoder.decode_by_id(shape_repr_id) else {
             continue;
         };
-        let Some(items_list) = shape_repr.get(3).and_then(|a| a.as_list()) else {
+        let Some(items) = shape_repr.get_refs(3) else {
             continue;
         };
 
-        for geom_item in items_list {
-            let Some(geom_id) = geom_item.as_entity_ref() else {
-                continue;
-            };
+        for geom_id in items {
             if let Some(color) = find_color_for_geometry(geom_id, geometry_styles, decoder) {
                 return Some(color);
             }
@@ -251,6 +229,14 @@ END-ISO-10303-21;
         (decoder, wall)
     }
 
+    fn decode_wall_from(source: String) -> (EntityDecoder<'static>, ifc_lite_core::DecodedEntity) {
+        let content: &'static str = Box::leak(source.into_boxed_str());
+        let idx = build_entity_index(content);
+        let mut decoder = EntityDecoder::with_index(content, idx);
+        let wall = decoder.decode_by_id(1).expect("decode wall #1");
+        (decoder, wall)
+    }
+
     #[test]
     fn empty_geometry_styles_returns_none() {
         let (mut decoder, wall) = decode_wall();
@@ -264,6 +250,44 @@ END-ISO-10303-21;
         let mut styles: FxHashMap<u32, [f32; 4]> = FxHashMap::default();
         // Colour keyed on the extrusion #5 — direct IfcStyledItem path.
         styles.insert(5, [0.1, 0.8, 0.2, 1.0]);
+        assert_eq!(
+            resolve_element_color(&wall, &styles, &mut decoder),
+            Some([0.1, 0.8, 0.2, 1.0]),
+        );
+    }
+
+    #[test]
+    fn direct_color_walk_accepts_bare_representation_and_item_refs_4694() {
+        let variants = [
+            WALL_IFC.replace(
+                "#2=IFCPRODUCTDEFINITIONSHAPE($,$,(#3));",
+                "#2=IFCPRODUCTDEFINITIONSHAPE($,$,#3);",
+            ),
+            WALL_IFC.replace(
+                "#3=IFCSHAPEREPRESENTATION(#4,'Body','SweptSolid',(#5));",
+                "#3=IFCSHAPEREPRESENTATION(#4,'Body','SweptSolid',#5);",
+            ),
+        ];
+        for source in variants {
+            let (mut decoder, wall) = decode_wall_from(source);
+            let styles = FxHashMap::from_iter([(5, [0.1, 0.8, 0.2, 1.0])]);
+            assert_eq!(
+                resolve_element_color(&wall, &styles, &mut decoder),
+                Some([0.1, 0.8, 0.2, 1.0]),
+            );
+        }
+    }
+
+    #[test]
+    fn mapped_color_walk_accepts_a_bare_items_ref_4694() {
+        let source = WALL_IFC
+            .replace("(#5));", "(#10));")
+            .replace(
+                "#5=IFCEXTRUDEDAREASOLID",
+                "#10=IFCMAPPEDITEM(#11,#12);\n#11=IFCREPRESENTATIONMAP(#6,#13);\n#12=IFCCARTESIANTRANSFORMATIONOPERATOR3D($,$,#9,1.,$);\n#13=IFCSHAPEREPRESENTATION(#4,'Body','SweptSolid',#5);\n#5=IFCEXTRUDEDAREASOLID",
+            );
+        let (mut decoder, wall) = decode_wall_from(source);
+        let styles = FxHashMap::from_iter([(5, [0.1, 0.8, 0.2, 1.0])]);
         assert_eq!(
             resolve_element_color(&wall, &styles, &mut decoder),
             Some([0.1, 0.8, 0.2, 1.0]),
@@ -314,3 +338,30 @@ END-ISO-10303-21;
 #[cfg(test)]
 #[path = "color_cycle_tests.rs"]
 mod find_color_for_geometry_cycle_tests;
+
+#[cfg(test)]
+mod shared_cap_tests {
+    /// `MAX_MAPPED_ITEM_DEPTH` must be the one in `ifc_lite_core::limits`, not
+    /// a private copy that happens to hold the same number today.
+    ///
+    /// This is not redundant with the constant being shared. Sharing removes
+    /// the drift that EXISTS; it does not stop anyone reintroducing a local
+    /// `const MAX_MAPPED_ITEM_DEPTH` that shadows the import. Verified by
+    /// mutation: with the import replaced by a private `= 16`, 800 tests stayed
+    /// green until this test existed. A mid-review revision of #2864 held
+    /// exactly that value against the router's 32, so the shadow is not a
+    /// hypothetical shape.
+    ///
+    /// The assertion is on the VALUE, not on identity, so a private copy
+    /// holding the same 32 still passes. That is the honest ceiling: Rust has
+    /// no cheap const-identity check, and a same-value shadow is harmless until
+    /// the shared value is next tuned, at which point this fires.
+    #[test]
+    fn mapped_item_depth_is_the_shared_constant() {
+        assert_eq!(
+            super::MAX_MAPPED_ITEM_DEPTH,
+            ifc_lite_core::MAX_MAPPED_ITEM_DEPTH,
+            "use the shared cap from ifc_lite_core::limits, not a private copy"
+        );
+    }
+}

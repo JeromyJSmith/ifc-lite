@@ -9,10 +9,12 @@
  * Focus on structural invariants, not exact values.
  */
 
+import { runColdLoadContracts } from './lib/wasm-cold-load-contracts.mjs';
 import { readFileSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import assert from 'node:assert/strict';
+import gltfValidator from 'gltf-validator';
 import {
   initSync,
   IfcAPI,
@@ -26,7 +28,12 @@ import {
 } from '../packages/wasm/pkg/ifc-lite.js';
 import { parseMeshesViaPrePass } from './lib/mesh-via-prepass.mjs';
 import { runPrepassClassBoundaryTests } from './lib/prepass-class-boundary.mjs';
-
+import { runShardRefusalBoundaryTests } from './lib/shard-refusal-boundary.mjs';
+import { runClassToggleShardContract } from './lib/class-toggle-shard-contract.mjs';
+import { runOverlayFrameContracts } from './lib/wasm-overlay-frame-contracts.mjs';
+import { runRtcPrecisionContracts } from './lib/wasm-rtc-precision-contracts.mjs';
+import { finishContractRun } from './lib/wasm-landxml-contracts.mjs';
+import { runEarlyContracts } from './lib/wasm-early-contracts.mjs';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = join(__dirname, '..');
 const FIXTURES_DIR = join(ROOT_DIR, 'tests/models');
@@ -36,6 +43,14 @@ const COLUMN_IFC = join(FIXTURES_DIR, 'buildingsmart/column-straight-rectangle-t
 const GEOREF_IFC = join(FIXTURES_DIR, 'ifc5/Georeferencing_georeferenced-bridge-deck.ifc');
 // Carries IfcSpace volumes, so the energy-model exporters have something to emit.
 const SPACES_IFC = join(FIXTURES_DIR, 'buildingsmart/Building-Architecture.ifc');
+// Carries IfcMaterialLayerSetUsage on its walls, so the layer-slice branch of
+// `produce_element_geometry` actually runs and tags meshes GEOM_CLASS_LAYER_SLICE.
+// None of the fixtures above has a multi-layer wall: the two Building-* models
+// have no IFCMATERIALLAYERSET at all, and wall-with-opening-and-window.ifc has a
+// single-layer set, which Rust classifies NotSliceable on purpose.
+const LAYERED_IFC = join(FIXTURES_DIR, 'ara3d/duplex.ifc');
+/** Spelled once: every skip below points at the command that undoes it. */
+const FIXTURES_HINT = 'run `pnpm fixtures`';
 
 console.log('🧪 WASM API Contract Tests\n');
 
@@ -46,33 +61,46 @@ if (!existsSync(WASM_BIN)) {
   console.log('⚠️  wasm runtime missing — run `bash scripts/build-wasm.sh`. Skipping.');
   process.exit(0);
 }
-if (!existsSync(COLUMN_IFC)) {
-  console.log('⚠️  column fixture missing — run `pnpm fixtures`. Skipping.');
-  process.exit(0);
+/** Whether a fixture is present, warning once (naming what is skipped) when it is not. */
+function fixtureAvailable(path, what, skipped) {
+  if (existsSync(path)) return true;
+  console.log(`⚠️  ${what} fixture missing — run \`pnpm fixtures\`. ${skipped} will be skipped.`);
+  return false;
 }
-const GEOREF_AVAILABLE = existsSync(GEOREF_IFC);
-if (!GEOREF_AVAILABLE) {
-  console.log('⚠️  georef fixture missing — run `pnpm fixtures`. Georef tests will be skipped.');
-}
-const SPACES_AVAILABLE = existsSync(SPACES_IFC);
-if (!SPACES_AVAILABLE) {
-  console.log('⚠️  spaces fixture missing — run `pnpm fixtures`. Energy-model tests will be skipped.');
-}
+const COLUMN_AVAILABLE = existsSync(COLUMN_IFC);
+const GEOREF_AVAILABLE = fixtureAvailable(GEOREF_IFC, 'georef', 'Georef tests');
+const LAYERED_AVAILABLE = fixtureAvailable(LAYERED_IFC, 'layered-wall', 'geometryClass pin');
+const SPACES_AVAILABLE = fixtureAvailable(SPACES_IFC, 'spaces', 'Energy-model tests');
 
 // Initialize WASM
 console.log('📦 Loading WASM...');
 const wasmBuffer = readFileSync(WASM_BIN);
-initSync(wasmBuffer);
+const ownershipWasmExports = initSync(wasmBuffer);
 console.log('✅ WASM initialized\n');
 
-// Load fixture files
-const columnContent = readFileSync(COLUMN_IFC, 'utf-8');
+const columnContent = COLUMN_AVAILABLE ? readFileSync(COLUMN_IFC, 'utf-8') : '';
 
 // Create API
 const api = new IfcAPI();
 
 let passed = 0;
 let failed = 0;
+let skipped = 0;
+
+/**
+ * A test (or a whole fixture-gated block of them) that did NOT run.
+ *
+ * Registering nothing used to be indistinguishable from passing: a missing
+ * fixture simply took the assertions out of the run and the summary reported a
+ * silently smaller `passed`, which reads as success. Every skip is now named on
+ * stdout AND carried into the tally, so "78 passed, 0 failed, 3 skipped" says
+ * out loud that less was tested than the run claims to cover.
+ */
+function skip(name, reason) {
+  console.log(`  \u23ed\ufe0f  SKIP ${name}`);
+  console.log(`     ${reason}`);
+  skipped++;
+}
 
 function test(name, fn) {
   try {
@@ -85,7 +113,13 @@ function test(name, fn) {
     failed++;
   }
 }
-
+runEarlyContracts({ IfcAPI, api, test, skip, root: ROOT_DIR });
+await (await import('./lib/wasm-extrusion-bridge-contracts.mjs')).runExtrusionBridgeContracts(test, ROOT_DIR); // #6306
+if (!COLUMN_AVAILABLE) {
+  skip('IFC-backed WASM contracts', `column fixture missing — ${FIXTURES_HINT}`);
+  finishContractRun(api, passed, failed, skipped);
+  process.exit(failed > 0 ? 1 : 0);
+}
 // ===== IfcAPI initialization =====
 console.log('📋 IfcAPI initialization');
 
@@ -97,6 +131,8 @@ test('should have a version string', () => {
   assert.equal(typeof api.version, 'string');
   assert.ok(api.version.length > 0);
 });
+
+runOverlayFrameContracts(api, test);
 
 // ===== parseMeshes =====
 console.log('\n📋 parseMeshes');
@@ -196,8 +232,8 @@ test('issue #1023: raw byte geometry and scans accept non-UTF-8 string bytes', (
   const refs = api.scanEntitiesFastBytes(bytes);
   assert.ok(refs.length > 0, 'byte scan must still find entities');
 
-  const pre = api.buildPrePassOnce(bytes);
   try {
+    const pre = api.buildPrePassOnce(bytes);
     assert.ok(pre.totalJobs > 0, 'pre-pass must still produce geometry jobs');
     const collection = api.processGeometryBatch(
       bytes, pre.jobs, pre.unitScale,
@@ -255,9 +291,9 @@ test('processGeometryBatchFromSource is byte-identical to processGeometryBatch',
   const bytes = new TextEncoder().encode(columnContent);
 
   // Reference: the legacy per-call `data`-taking path.
-  const preRef = api.buildPrePassOnce(bytes);
   let ref;
   try {
+    const preRef = api.buildPrePassOnce(bytes);
     const col = api.processGeometryBatch(
       bytes, preRef.jobs, preRef.unitScale,
       preRef.rtcOffset[0], preRef.rtcOffset[1], preRef.rtcOffset[2], preRef.needsShift,
@@ -271,9 +307,9 @@ test('processGeometryBatchFromSource is byte-identical to processGeometryBatch',
   assert.ok(ref.length > 0, 'reference batch must produce meshes');
 
   // Candidate: hold the source ONCE, run the no-`data` variant.
-  const pre = api.buildPrePassOnce(bytes);
   let got;
   try {
+    const pre = api.buildPrePassOnce(bytes);
     api.setSourceBytes(bytes);
     const col = api.processGeometryBatchFromSource(
       pre.jobs, pre.unitScale,
@@ -290,6 +326,26 @@ test('processGeometryBatchFromSource is byte-identical to processGeometryBatch',
     'processGeometryBatchFromSource must be byte-for-byte identical to processGeometryBatch');
 });
 
+/** The 15-argument pre-pass tail both partitioned exports take, spelled ONCE.
+ *  Three call sites carried a literal copy each, so a pre-pass field added or
+ *  reordered had to be threaded through all three by hand and a miss would read
+ *  as a geometry bug rather than a call-site bug. `pre` is a `buildPrePassOnce`
+ *  result. The two exports stay separate calls on purpose — the test below
+ *  exists to compare them. */
+function partitionedArgs(pre) {
+  return [
+    pre.jobs, pre.unitScale,
+    pre.rtcOffset[0], pre.rtcOffset[1], pre.rtcOffset[2], pre.needsShift,
+    pre.voidKeys, pre.voidCounts, pre.voidValues, pre.styleIds, pre.styleColors,
+    pre.planeAngleToRadians, pre.materialElementIds, pre.materialColorCounts, pre.materialColors,
+  ];
+}
+
+/** `processGeometryBatchPartitioned` over a per-call `data` buffer. */
+function callPartitioned(data, pre) {
+  return api.processGeometryBatchPartitioned(data, ...partitionedArgs(pre));
+}
+
 test('processGeometryBatchPartitionedFromSource matches processGeometryBatchPartitioned', () => {
   if (typeof api.processGeometryBatchPartitioned !== 'function'
     || typeof api.processGeometryBatchPartitionedFromSource !== 'function') {
@@ -298,15 +354,10 @@ test('processGeometryBatchPartitionedFromSource matches processGeometryBatchPart
   const bytes = new TextEncoder().encode(columnContent);
 
   // Reference partitioned (legacy per-call data).
-  const preRef = api.buildPrePassOnce(bytes);
   let refFlat, refShard, refOcc;
   try {
-    const p = api.processGeometryBatchPartitioned(
-      bytes, preRef.jobs, preRef.unitScale,
-      preRef.rtcOffset[0], preRef.rtcOffset[1], preRef.rtcOffset[2], preRef.needsShift,
-      preRef.voidKeys, preRef.voidCounts, preRef.voidValues, preRef.styleIds, preRef.styleColors,
-      preRef.planeAngleToRadians, preRef.materialElementIds, preRef.materialColorCounts, preRef.materialColors,
-    );
+    const preRef = api.buildPrePassOnce(bytes);
+    const p = callPartitioned(bytes, preRef);
     try {
       refOcc = p.instancedOccurrences;
       refShard = Array.from(p.takeShard());
@@ -321,16 +372,11 @@ test('processGeometryBatchPartitionedFromSource matches processGeometryBatchPart
   }
 
   // Candidate partitioned FromSource (source held once).
-  const pre = api.buildPrePassOnce(bytes);
   let gotFlat, gotShard, gotOcc;
   try {
+    const pre = api.buildPrePassOnce(bytes);
     api.setSourceBytes(bytes);
-    const p = api.processGeometryBatchPartitionedFromSource(
-      pre.jobs, pre.unitScale,
-      pre.rtcOffset[0], pre.rtcOffset[1], pre.rtcOffset[2], pre.needsShift,
-      pre.voidKeys, pre.voidCounts, pre.voidValues, pre.styleIds, pre.styleColors,
-      pre.planeAngleToRadians, pre.materialElementIds, pre.materialColorCounts, pre.materialColors,
-    );
+    const p = api.processGeometryBatchPartitionedFromSource(...partitionedArgs(pre));
     try {
       gotOcc = p.instancedOccurrences;
       gotShard = Array.from(p.takeShard());
@@ -349,29 +395,87 @@ test('processGeometryBatchPartitionedFromSource matches processGeometryBatchPart
   assert.deepEqual(gotFlat, refFlat, 'flat MeshCollection must be byte-identical');
 });
 
-test('processGeometryBatchFromSource returns empty when no source is installed (defensive)', () => {
-  const freshApi = new IfcAPI();
-  const bytes = new TextEncoder().encode(columnContent);
-  const pre = freshApi.buildPrePassOnce(bytes);
-  try {
-    // No setSourceBytes: the held bytes are empty → zero meshes, and crucially
-    // NO panic (the decoder validates every byte span). The JS worker gates the
-    // *FromSource path on a successful setSourceBytes, so this is unreachable in
-    // production, but it must degrade gracefully rather than corrupt/crash.
-    const col = freshApi.processGeometryBatchFromSource(
-      pre.jobs, pre.unitScale,
-      pre.rtcOffset[0], pre.rtcOffset[1], pre.rtcOffset[2], pre.needsShift,
-      pre.voidKeys, pre.voidCounts, pre.voidValues, pre.styleIds, pre.styleColors,
-    );
+// #2985: the item id at the REAL wasm boundary.
+//
+// The Rust-side coverage builds its `InstanceMeshRef`s by MIRRORING what
+// `process_geometry_batch_partitioned` does, because that export is
+// wasm_bindgen-only and cannot run natively — so a mirror can stay green while
+// the production wiring one file over is wrong. This runs the real export
+// against a real model and reads the ids straight out of the shard bytes, which
+// is the only place the two can be compared without a mirror.
+//
+// Duplex is chosen because it HAS repeated mapped geometry: eight identical
+// windows, each a multi-item source, so several templates share one product set
+// and each template's item id is the thing that tells them apart. The
+// instance-count assertion is what stops this going vacuous if a routing change
+// empties the shard — zero instances would otherwise satisfy every `for` below.
+if (LAYERED_AVAILABLE) {
+  console.log('\n📋 #2985 instanced item id (wasm → wire)');
+
+  test('the partitioned shard carries each occurrence\'s representation item', () => {
+    const bytes = readFileSync(LAYERED_IFC);
+    let shard;
     try {
-      assert.equal(col.length, 0, 'FromSource without setSourceBytes must produce no meshes');
+      const pre = api.buildPrePassOnce(bytes);
+      const p = callPartitioned(bytes, pre);
+      try {
+        shard = p.takeShard();
+        const flat = p.takeMeshes();
+        if (flat) flat.free();
+      } finally {
+        p.free?.();
+      }
     } finally {
-      col.free();
+      api.clearPrePassCache();
     }
-  } finally {
-    freshApi.clearPrePassCache();
-    freshApi.free();
-  }
+
+    assert.ok(shard.length >= 32, 'the shard must at least carry a header');
+    const dv = new DataView(shard.buffer, shard.byteOffset, shard.byteLength);
+    assert.equal(dv.getUint32(4, true), 2, 'the shipped encoder writes wire version 2');
+    // Header word 7 is the instance record STRIDE IN BYTES: 88 for the base
+    // record (templateIndex, entityId, colour, transform) plus 4 for trailing
+    // field 1, the item id. The encoder writes 88 when no occurrence in the
+    // batch names an item, so 92 here IS the claim that duplex's do.
+    const stride = dv.getUint32(28, true);
+    assert.equal(stride, 92, 'header word 7 must declare the 92-byte item-id stride');
+
+    const templateCount = dv.getUint32(8, true);
+    const instanceCount = dv.getUint32(12, true);
+    assert.ok(instanceCount > 0, 'duplex must still produce instanced occurrences');
+    const instanceTable = 32 + templateCount * 48;
+
+    const perTemplate = new Map();
+    for (let i = 0; i < instanceCount; i++) {
+      const base = instanceTable + i * stride;
+      const templateIndex = dv.getUint32(base, true);
+      const entityId = dv.getUint32(base + 4, true);
+      const itemId = dv.getUint32(base + 88, true);
+      assert.notEqual(itemId, 0, `occurrence ${i} (#${entityId}) reports no item id`);
+      // The two are different questions; equal means one is wired to the other.
+      assert.notEqual(itemId, entityId, `occurrence ${i}'s item id is its own express id`);
+      const seen = perTemplate.get(templateIndex);
+      if (seen === undefined) perTemplate.set(templateIndex, itemId);
+      else assert.equal(seen, itemId,
+        `template ${templateIndex} reports two different item ids (${seen} vs ${itemId})`);
+    }
+    // Distinct templates come from distinct source items — that is what makes
+    // the id worth carrying rather than derivable from the product.
+    //
+    // The equality below is VACUOUS on a one-template shard: a single entry is
+    // trivially distinct from itself. Duplex's eight windows are multi-item, so
+    // a collapse to one template is a regression, not a fixture quirk.
+    assert.ok(perTemplate.size > 1,
+      `need >1 template to prove ids differ ACROSS templates, got ${perTemplate.size}`);
+    assert.equal(new Set(perTemplate.values()).size, perTemplate.size,
+      'two templates share an item id; the id is not per representation item');
+  });
+} else {
+  skip('#2985 instanced item id (wasm \u2192 wire)',
+    `${LAYERED_IFC} missing \u2014 ${FIXTURES_HINT}`);
+}
+
+await runColdLoadContracts({
+  IfcAPI, ownershipWasmExports, columnContent, FIXTURES_DIR, FIXTURES_HINT, SPACES_AVAILABLE, SPACES_IFC, test, skip
 });
 
 // ===== Pre-pass contract (viewer boundary) =====
@@ -383,8 +487,8 @@ console.log('\n📋 buildPrePassOnce contract');
 
 test('pre-pass exposes every field the viewer consumes', () => {
   const bytes = new TextEncoder().encode(columnContent);
-  const pre = api.buildPrePassOnce(bytes);
   try {
+    const pre = api.buildPrePassOnce(bytes);
     assert.equal(typeof pre.totalJobs, 'number');
     assert.ok(pre.jobs, 'jobs must exist');
     assert.equal(typeof pre.unitScale, 'number');
@@ -409,8 +513,8 @@ test('unit scale resolves conversion-based units (inch fixture → 0.0254)', () 
   // unit but overrides length with IFCCONVERSIONBASEDUNIT 'inch'. The
   // recurring unit-bug class is exactly this chain resolving wrong.
   const bytes = new TextEncoder().encode(columnContent);
-  const pre = api.buildPrePassOnce(bytes);
   try {
+    const pre = api.buildPrePassOnce(bytes);
     assert.ok(Math.abs(pre.unitScale - 0.0254) < 1e-9,
       `inch model must yield unitScale 0.0254, got ${pre.unitScale}`);
   } finally {
@@ -423,8 +527,8 @@ test('prepass resolves planeAngleToRadians on the wire', () => {
   // scales once and ships the plane-angle scale to workers so batch decoders
   // are seeded instead of re-paying an O(file) IFCPROJECT hunt per call.
   const bytes = new TextEncoder().encode(columnContent);
-  const pre = api.buildPrePassOnce(bytes);
   try {
+    const pre = api.buildPrePassOnce(bytes);
     assert.equal(typeof pre.planeAngleToRadians, 'number',
       'buildPrePassOnce must carry planeAngleToRadians');
     assert.ok(pre.planeAngleToRadians > 0,
@@ -478,15 +582,13 @@ test('streaming meta resolves units with IFCPROJECT moved to the END of DATA', (
   assert.ok(complete && complete.totalJobs > 0, 'streaming must complete with jobs');
 });
 
-test('unit scale resolves plain SI metres (georef fixture → 1.0)', () => {
-  if (!GEOREF_AVAILABLE) {
-    console.log('     (skipped — georef fixture missing, run `pnpm fixtures`)');
-    return;
-  }
+const GEOREF_METRE_TEST = 'unit scale resolves plain SI metres (georef fixture → 1.0)';
+if (!GEOREF_AVAILABLE) skip(GEOREF_METRE_TEST, `${GEOREF_IFC} missing — ${FIXTURES_HINT}`);
+else test(GEOREF_METRE_TEST, () => {
   const georefContent = readFileSync(GEOREF_IFC, 'utf-8');
   const bytes = new TextEncoder().encode(georefContent);
-  const pre = api.buildPrePassOnce(bytes);
   try {
+    const pre = api.buildPrePassOnce(bytes);
     assert.equal(pre.unitScale, 1, `metre model must yield unitScale 1, got ${pre.unitScale}`);
     assert.equal(pre.needsShift, false, 'local-coordinate model must not trigger RTC shift');
   } finally {
@@ -514,17 +616,14 @@ test('mesh output is metre-normalized (column fits a sane bbox)', () => {
   collection.free();
 });
 
-// ===== RTC rebase (>10km national-grid coordinates) =====
-console.log('\n📋 RTC rebase (>10km)');
+// ===== RTC rebase (>1km national-grid coordinates) =====
+console.log('\n📋 RTC rebase (>1km)');
 
 // The wasm pre-pass flags `needsShift` when the detected RTC offset exceeds
-// 10 km on any axis. The threshold constant is `10000.0` (metres, after
-// unit-scaling) in:
-//   - rust/wasm-bindings/src/api/gpu_meshes.rs (`needs_shift = rtc_offset.N.abs() > 10000.0`)
-//   - rust/geometry/src/router/processing.rs (`rtc_offset_from_translations`,
-//     `const THRESHOLD: f64 = 10000.0` — median element translation gate)
-//   - rust/core/src/model_bounds.rs (`has_large_coordinates`, `THRESHOLD = 10000.0`)
-const RTC_THRESHOLD_M = 10000.0;
+// the gate on any axis. Single Rust home (#4934, was 10 km): `rust/core/src/
+// limits.rs` `LARGE_COORD_THRESHOLD_METERS = 1000.0`, read by every consumer
+// (the median sampler `rtc_offset.rs`, the bounds fallback `model_bounds.rs`).
+const RTC_THRESHOLD_M = 1000.0;
 
 // The column fixture is authored in INCHES (IFCCONVERSIONBASEDUNIT 0.0254 m);
 // the RTC offset is detected in unit-scaled METRES, so planted coordinates
@@ -593,18 +692,18 @@ test('national-grid coordinates (Swiss LV95) should trigger the RTC rebase', () 
   collection.free();
 });
 
-test('coordinates just under the 10km threshold should NOT trigger the shift', () => {
-  // needs_shift uses a strict `> 10000.0` comparison on the unit-scaled
-  // median element translation. Plant the site so the COMPOSED column
-  // translation (site + ~10.97m local) lands just under 10_000 m.
-  const NEAR_X_M = 9_950; // composed ≈ 9_960.97 m < 10_000 m
-  const NEAR_Y_M = 9_950; // composed ≈ 9_957.32 m < 10_000 m
+test('coordinates just under the 1km threshold should NOT trigger the shift', () => {
+  // needs_shift uses a strict `> 1000.0` comparison on the unit-scaled median
+  // element translation. Site + ~10.97m local lands just under 1_000 m —
+  // #4934 lowered the gate from 10 km, pinning the NEW just-under edge.
+  const NEAR_X_M = 900; // composed ≈ 910.97 m < 1_000 m
+  const NEAR_Y_M = 900; // composed ≈ 907.32 m < 1_000 m
   const moved = withSiteOriginMetres(NEAR_X_M, NEAR_Y_M);
   assert.notEqual(moved, columnContent, 'Placement transplant must change the content');
 
   const collection = parseMeshesViaPrePass(api, moved);
 
-  assert.equal(collection.hasRtcOffset(), false, 'needsShift must stay false under 10km');
+  assert.equal(collection.hasRtcOffset(), false, 'needsShift must stay false under 1km');
   assert.equal(collection.rtcOffsetX, 0, 'rtcOffset must stay [0,0,0] under threshold');
   assert.equal(collection.rtcOffsetY, 0, 'rtcOffset must stay [0,0,0] under threshold');
   assert.equal(collection.rtcOffsetZ, 0, 'rtcOffset must stay [0,0,0] under threshold');
@@ -625,8 +724,8 @@ test('coordinates just under the 10km threshold should NOT trigger the shift', (
     mesh.free();
   }
   assert.ok(
-    maxAbs > 9000,
-    `Unshifted geometry should stay near its 9.95km placement, got max |world| = ${maxAbs}`,
+    maxAbs > 900,
+    `Unshifted geometry should stay near its 900m placement, got max |world| = ${maxAbs}`,
   );
 
   collection.free();
@@ -640,6 +739,8 @@ test('unmodified small-coordinate model keeps needsShift=false', () => {
   assert.equal(collection.rtcOffsetZ, 0);
   collection.free();
 });
+
+runRtcPrecisionContracts(api, test, columnContent, withSiteOriginMetres, COLUMN_LOCAL_X_M, COLUMN_LOCAL_Y_M);
 
 // ===== scanEntitiesFast =====
 console.log('\n📋 scanEntitiesFast');
@@ -678,10 +779,12 @@ test('should handle truncated IFC content gracefully', () => {
 });
 
 // ===== export boundary (Rust ifc-lite-export) =====
-console.log('\n📋 export (exportGlb / exportKmz)');
+console.log('\n📋 export (exportGlb)');
 
-// A real GLB from the column fixture — also the input the KMZ packer consumes.
-const glbBytes = api.exportGlb(new TextEncoder().encode(columnContent), false, new Uint32Array(), new Uint32Array(), '');
+// A real GLB from the column fixture (also the KMZ packer's input). `isolated` undefined = no filter (#4328).
+const glbBytes = api.exportGlb(new TextEncoder().encode(columnContent), false, new Uint32Array(), undefined, '');
+test('exportGlb: an empty isolation array is an ACTIVE filter and fails closed (NO_RENDER_GEOMETRY), not "no filter"', () =>
+  assert.throws(() => api.exportGlb(new TextEncoder().encode(columnContent), false, new Uint32Array(), new Uint32Array(), ''), /NO_RENDER_GEOMETRY/));
 
 test('exportGlb returns a binary glTF (GLB magic "glTF") with real meshes', () => {
   assert.ok(glbBytes instanceof Uint8Array, 'GLB should be a Uint8Array');
@@ -700,18 +803,18 @@ test('exportGlb returns a binary glTF (GLB magic "glTF") with real meshes', () =
 // exportGlbFromMeshes assembles a GLB straight from flattened mesh arrays (the viewer's
 // GPU meshes) and fails closed on malformed counts — exercised HERE through the real wasm
 // boundary, since the Rust-level tests can't prove the JS throw contract.
+const fromMeshesGlb = api.exportGlbFromMeshes(
+  new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]),
+  new Float32Array([0, 0, 1, 0, 0, 1, 0, 0, 1]),
+  new Uint32Array([0, 1, 2]),
+  new Uint32Array([3]), new Uint32Array([3]),
+  new Float32Array([0.5, 0.5, 0.5, 1]), new Float64Array([0, 0, 0]), new Uint32Array([1]),
+  false, true, false,
+);
+
 test('exportGlbFromMeshes returns a GLB for valid flattened meshes', () => {
-  const positions = new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]);
-  const normals = new Float32Array([0, 0, 1, 0, 0, 1, 0, 0, 1]);
-  const indices = new Uint32Array([0, 1, 2]);
-  const glb = api.exportGlbFromMeshes(
-    positions, normals, indices,
-    new Uint32Array([3]), new Uint32Array([3]),
-    new Float32Array([0.5, 0.5, 0.5, 1]), new Float64Array([0, 0, 0]), new Uint32Array([1]),
-    false, true, false,
-  );
-  assert.ok(glb instanceof Uint8Array && glb.length > 20, 'valid meshes produce a GLB');
-  assert.deepEqual(Array.from(glb.slice(0, 4)), [0x67, 0x6c, 0x54, 0x46]); // "glTF"
+  assert.ok(fromMeshesGlb instanceof Uint8Array && fromMeshesGlb.length > 20, 'valid meshes produce a GLB');
+  assert.deepEqual(Array.from(fromMeshesGlb.slice(0, 4)), [0x67, 0x6c, 0x54, 0x46]); // "glTF"
 });
 
 test('exportGlbFromMeshes fails closed on malformed inputs (MALFORMED_MESH_INPUT)', () => {
@@ -744,6 +847,512 @@ test('exportGlbFromMeshes fails closed on malformed inputs (MALFORMED_MESH_INPUT
     'missing index_counts must throw MALFORMED_MESH_INPUT',
   );
 });
+
+// ===== glTF spec conformance (Khronos glTF-Validator) =====
+//
+// Until this block existed, nothing anywhere in the repo checked our glTF
+// against the *format*: the only reader of a GLB we write is our own
+// `parseGLB` (`packages/export/src/glb.ts`), and a writer and a reader that
+// agree with each other prove nothing about the spec — the same self-round-trip
+// shape that hid live defects in other formats. `rust/export/src/gltf_tests.rs`
+// even NAMES glTF-Validator in a comment describing what it would report,
+// without ever invoking it.
+//
+// `gltf-validator` is the Khronos reference implementation, shipped as a
+// self-contained Dart-to-JS bundle (~400 KB, no native deps, no network at
+// runtime), so it runs right here on the bytes the REAL wasm exporter just
+// produced. It is deliberately pinned to an exact version: the validator's
+// output IS the assertion, and a floating range would let a new rule turn this
+// lane red on unchanged output — or silently stop enforcing one.
+console.log('\n📋 glTF conformance (Khronos glTF-Validator)');
+
+async function validateGlb(bytes, uri) {
+  return gltfValidator.validateBytes(new Uint8Array(bytes), {
+    uri,
+    maxIssues: 100,
+    // Every buffer we emit is GLB-embedded. A request for an external resource
+    // would itself be the defect (a URI the artifact cannot satisfy), so reject
+    // rather than resolve one and let it surface as an unresolved-reference issue.
+    externalResourceFunction: (u) =>
+      Promise.reject(new Error(`unexpected external resource request: ${u}`)),
+  });
+}
+
+/** Fail on ERROR (severity 0) *and* WARNING (severity 1), quoting the validator verbatim. */
+function assertClean(report, label) {
+  const { numErrors, numWarnings, messages } = report.issues;
+  const detail = messages
+    .filter((m) => m.severity <= 1)
+    .map((m) => `\n       [${m.severity === 0 ? 'ERROR' : 'WARNING'}] ${m.code} ${m.pointer} :: ${m.message}`)
+    .join('');
+  assert.equal(
+    numErrors + numWarnings,
+    0,
+    `${label}: glTF-Validator reported ${numErrors} error(s), ${numWarnings} warning(s):${detail}`,
+  );
+}
+
+const glbReport = await validateGlb(glbBytes, 'exportGlb.glb');
+const fromMeshesReport = await validateGlb(fromMeshesGlb, 'exportGlbFromMeshes.glb');
+
+test('exportGlb output is spec-conformant glTF 2.0 (0 errors, 0 warnings)', () => {
+  assertClean(glbReport, 'exportGlb');
+});
+
+// A clean report over an EMPTY artifact is the "check that cannot fail" trap:
+// the validator is perfectly happy with a GLB that declares no geometry, so a
+// silently-empty export would read as a pass above. Pin what it actually saw.
+test('the validator saw real geometry, not a vacuously clean empty GLB', () => {
+  assert.equal(glbReport.info.version, '2.0', 'asset.version');
+  assert.ok(glbReport.info.drawCallCount > 0, `drawCallCount was ${glbReport.info.drawCallCount}`);
+  assert.ok(
+    glbReport.info.totalTriangleCount > 0,
+    `totalTriangleCount was ${glbReport.info.totalTriangleCount}`,
+  );
+  assert.ok(
+    glbReport.info.totalVertexCount >= 3,
+    `totalVertexCount was ${glbReport.info.totalVertexCount}`,
+  );
+});
+
+// The from-meshes entry point is a SEPARATE assembler (rust/export/src/gltf/from_meshes.rs)
+// reachable from the viewer's `exportGlbFromMeshes`; validating only the
+// from-bytes path would leave it as unvalidated as before.
+test('exportGlbFromMeshes output is spec-conformant glTF 2.0 (0 errors, 0 warnings)', () => {
+  assertClean(fromMeshesReport, 'exportGlbFromMeshes');
+  assert.equal(fromMeshesReport.info.totalTriangleCount, 1, 'the one triangle handed in');
+});
+
+// ===== schema-local keywords keep their exact type across WASM (#4203) =====
+//
+// The generated schema registry now owns entity recognition. The jobs wire
+// carries only (id, start, end), so this boundary must retain the exact
+// schema-local keyword rather than collapsing it through a legacy base-type
+// table or losing it as Unknown.
+//
+// It is silent in the same way a wrong geometryClass is: the mesh renders, it
+// is simply mislabelled, and type-exact visibility rules and styling quietly
+// skip it. Nothing throws.
+//
+// This has to be checked HERE rather than in a Rust unit test, because the
+// defect lived in the wasm binding specifically -- the native path was correct
+// the whole time, so any test that did not cross the boundary agreed with the
+// half that already worked.
+console.log('\n📋 schema-local keyword labelling (Rust → JS, #4203)');
+
+test('a schema-local keyword crosses as its exact type, not "Unknown" (#4203)', () => {
+  // Respelling the fixture's columns changes ONE keyword and nothing else, so
+  // the label is the only variable.
+  const modern = columnContent;
+  assert.ok(modern.includes('IFCCOLUMN('), 'fixture lost its columns — the respelling would test nothing');
+  const legacy = modern.replace(/IFCCOLUMN\(/g, 'IFCBEAMSTANDARDCASE(');
+
+  const collect = (content) => {
+    const collection = parseMeshesViaPrePass(api, content);
+    const types = [];
+    for (let i = 0; i < collection.length; i++) {
+      const m = collection.get(i);
+      if (!m) continue;
+      types.push(m.ifcType);
+      m.free();
+    }
+    collection.free();
+    return types;
+  };
+
+  const before = collect(modern);
+  const after = collect(legacy);
+
+  assert.ok(before.length > 0, 'the fixture must produce meshes, or this pins nothing');
+  assert.equal(after.length, before.length, 'the respelling changed how many meshes are produced');
+  // The exact schema-local type specifically, not merely "not Unknown", which
+  // any other label would also satisfy.
+  assert.ok(
+    after.every((t) => t === 'IfcBeamStandardCase'),
+    `expected every mesh to label as IfcBeamStandardCase, saw ${JSON.stringify([...new Set(after)])}`,
+  );
+});
+
+// ===== geometryClass ordinals, pinned at the real boundary =====
+//
+// `packages/geometry/src/geometry-class.ts` names these ordinals for the
+// TypeScript side, and its own test asserts them against literals. That test
+// cannot fail if Rust starts emitting different numbers — both halves would
+// simply agree with themselves, which is the self-round-trip trap.
+//
+// This is the other half: it reads what Rust ACTUALLY emits across the wasm
+// boundary and pins the literal. `meshFingerprint` above also reads
+// `geometryClass`, but only to compare two code paths against each other, so
+// it is satisfied by any value as long as both paths produce the same one.
+//
+// A wrong ordinal is silent: geometry is reclassified rather than rejected, so
+// a layered wall drops out of Model view, or a type-library duplicate renders
+// as real building geometry, with nothing thrown anywhere.
+if (LAYERED_AVAILABLE) {
+  console.log('\n📋 geometryClass ordinals (Rust → TS contract)');
+  const layeredContent = readFileSync(LAYERED_IFC, 'utf-8');
+
+  test('a layered wall emits GEOM_CLASS_LAYER_SLICE === 3', () => {
+    const collection = parseMeshesViaPrePass(api, layeredContent);
+    const classes = new Set();
+    for (let i = 0; i < collection.length; i++) {
+      const m = collection.get(i);
+      if (!m) continue;
+      classes.add(m.geometryClass);
+      m.free();
+    }
+    collection.free();
+
+    // The literal 3 is the point. Deriving it from the TS constant would make
+    // this agree with the thing it is supposed to be checking.
+    assert.ok(
+      classes.has(3),
+      `expected a material-layer slice tagged 3; saw classes ${[...classes].sort().join(', ')}`,
+    );
+    // Placed occurrences must still be class 0 alongside them — if everything
+    // came back 3, the assertion above would pass while the tagging was broken.
+    assert.ok(
+      classes.has(0),
+      `expected placed occurrences tagged 0; saw classes ${[...classes].sort().join(', ')}`,
+    );
+  });
+} else {
+  skip('geometryClass ordinals (Rust \u2192 TS contract)',
+    `${LAYERED_IFC} missing \u2014 ${FIXTURES_HINT}`);
+}
+
+// ===== source ids: representation item vs material layer (#3199) =====
+//
+// A mesh carries EITHER the `IfcRepresentationItem` it was tessellated from
+// (`geometryItemId`) OR the `IfcMaterial` whose layer it slices
+// (`materialId`), never both. Before #3199 both arrived in one field, so
+// following it to source landed on an IfcMaterial for layered walls with
+// nothing to warn the caller.
+//
+// These read the RAW `MeshCollection` rather than `parseMeshesViaPrePass`,
+// because only the raw handle can be read both ways.
+//
+// The facade is pinned too, separately and deliberately: it mirrors
+// `convertMeshCollectionToBatch` field by field, and it DID silently drop both
+// ids when they were added — my first probe read zeros through it and reported
+// the boundary broken when the boundary was fine. A field the real converter
+// carries and that facade drops is invisible to every script that reads through
+// it, so one test below reads through the facade on purpose.
+//
+// Wrong ids here are silent in the usual way: geometry renders identically and
+// only a host that follows the id to source sees it land on the wrong entity.
+if (LAYERED_AVAILABLE) {
+  console.log('\n📋 source ids: representation item vs material layer (#3199)');
+  const layeredContent = readFileSync(LAYERED_IFC, 'utf-8');
+
+  // The real `MeshCollection`, handles and all. Callers must free.
+  const rawCollection = (content) => {
+    const bytes = new TextEncoder().encode(content);
+    try {
+      const pre = api.buildPrePassOnce(bytes);
+      const rtc = (pre && pre.rtcOffset) || [0, 0, 0];
+      return api.processGeometryBatch(
+        bytes, pre.jobs, pre.unitScale, rtc[0] || 0, rtc[1] || 0, rtc[2] || 0, pre.needsShift,
+        pre.voidKeys, pre.voidCounts, pre.voidValues, pre.styleIds, pre.styleColors,
+      );
+    } finally {
+      if (api.clearPrePassCache) api.clearPrePassCache();
+    }
+  };
+
+  /** Read every mesh's ids out of a fresh collection, freeing as we go. */
+  const readIds = (content) => {
+    const col = rawCollection(content);
+    const rows = [];
+    try {
+      for (let i = 0; i < col.length; i++) {
+        const m = col.get(i);
+        if (!m) continue;
+        try {
+          rows.push({
+            expressId: m.expressId,
+            geometryClass: m.geometryClass,
+            geometryItemId: m.geometryItemId,
+            materialId: m.materialId,
+          });
+        } finally {
+          m.free();
+        }
+      }
+    } finally {
+      col.free();
+    }
+    return rows;
+  };
+
+  // The unedited fixture is read ONCE and shared: `readIds` is deterministic
+  // and every test below that passes `layeredContent` was re-running the whole
+  // pre-pass + geometry batch over a 2.4 MB file to get the same rows back.
+  // Tests that MUTATE the fixture still take their own run, since that is the
+  // variable they are measuring.
+  let layeredRowsMemo = null;
+  const layeredRows = () => (layeredRowsMemo ??= readIds(layeredContent));
+
+  test('every mesh carries exactly one source id, never both and never neither', () => {
+    const rows = layeredRows();
+    assert.ok(rows.length > 0, 'the fixture produced no meshes, so nothing below is pinned');
+    const both = rows.filter((r) => r.geometryItemId !== undefined && r.materialId !== undefined);
+    const neither = rows.filter((r) => r.geometryItemId === undefined && r.materialId === undefined);
+    assert.equal(both.length, 0, `${both.length} mesh(es) carry BOTH ids, e.g. #${both[0]?.expressId}`);
+    // "Neither" is a legitimate state elsewhere (the single-mesh fallback, the
+    // cached mapped-item path). It must not happen on THIS fixture, whose
+    // elements all go through the submesh channel — if it starts happening,
+    // the ids stopped crossing the boundary and the checks below go vacuous.
+    assert.equal(neither.length, 0, `${neither.length} mesh(es) carry NO id, e.g. #${neither[0]?.expressId}`);
+  });
+
+  test('a two-item element carries a distinct geometryItemId per piece, and no material id', () => {
+    const rows = layeredRows();
+    const byElement = new Map();
+    for (const r of rows) {
+      if (r.geometryItemId === undefined) continue;
+      let ids = byElement.get(r.expressId);
+      if (!ids) byElement.set(r.expressId, (ids = new Set()));
+      ids.add(r.geometryItemId);
+    }
+    const multi = [...byElement.entries()].filter(([, ids]) => ids.size >= 2);
+    assert.ok(
+      multi.length > 0,
+      'no element produced two distinct geometryItemIds — either the fixture stopped ' +
+        'producing multi-item elements, or every piece is being stamped with the same id',
+    );
+    // An express id, not a slot index: 0 is never a valid STEP instance name.
+    for (const [, ids] of byElement) {
+      for (const id of ids) {
+        assert.ok(Number.isInteger(id) && id > 0, `geometryItemId ${id} is not a plausible express id`);
+      }
+    }
+    // The pieces of a multi-item element are representation items, so none of
+    // them may also claim to be a material layer.
+    const multiIds = new Set(multi.map(([expressId]) => expressId));
+    const stray = rows.filter((r) => multiIds.has(r.expressId) && r.materialId !== undefined);
+    assert.equal(stray.length, 0, `a multi-item element also reported a materialId: #${stray[0]?.expressId}`);
+  });
+
+  test('a material-layered wall reports materialId, and geometryItemId undefined', () => {
+    const rows = layeredRows();
+    const sliced = rows.filter((r) => r.materialId !== undefined);
+    assert.ok(sliced.length > 0, 'no mesh carried a materialId — the layer slicer did not run');
+    for (const r of sliced) {
+      assert.equal(
+        r.geometryItemId, undefined,
+        `#${r.expressId} carries a materialId AND a geometryItemId`,
+      );
+      // A slice is layer geometry, so it must also be tagged class 3.
+      assert.equal(r.geometryClass, 3, `#${r.expressId} carries a materialId at class ${r.geometryClass}`);
+    }
+  });
+
+  test('geometryClass 3 does NOT imply a material id: a bailed slice keeps its item id', () => {
+    // The contract clause most likely to be "simplified" away later, so it gets
+    // its own executable pin.
+    //
+    // geometryClass is stamped from `is_material_layer_sliceable`, a STATIC
+    // check on the material index made before any geometry runs.
+    // `try_layered_sub_meshes` can still bail at runtime (the cut produced
+    // fewer than two slabs, a void CSG errored) and fall through to the
+    // representation-item path — under class 3. Deriving which id a mesh
+    // carries from geometryClass would therefore hand back an IfcMaterial id
+    // for meshes whose id is an IfcRepresentationItem: the exact confusion
+    // #3199 removed, reintroduced one refactor later.
+    const rows = layeredRows();
+    const classThree = rows.filter((r) => r.geometryClass === 3);
+    assert.ok(classThree.length > 0, 'no class-3 meshes at all — this pins nothing');
+    const bailed = classThree.filter((r) => r.geometryItemId !== undefined);
+    assert.ok(
+      bailed.length > 0,
+      'every class-3 mesh carried a materialId, so this fixture can no longer ' +
+        'distinguish "the flag comes from the collection" from "the flag is derived ' +
+        'from geometryClass" — find a fixture whose layer slicing bails at runtime',
+    );
+    for (const r of bailed) {
+      assert.equal(r.materialId, undefined, `#${r.expressId} carries both ids`);
+    }
+  });
+
+  test('an air-gap layer reports NO material, not IfcMaterial #0', () => {
+    // `IfcMaterialLayer.Material` is OPTIONAL, and `material_layer_index.rs`
+    // decodes an absent one as `get_ref(0).unwrap_or(0)` -- so 0 is that
+    // function's "no reference" SENTINEL, not an entity. STEP instance names
+    // start at #1, so `#0` is not navigable, and following it is the one thing
+    // this field exists for.
+    //
+    // Dropping the Material ref from one layer of the real fixture changes ONE
+    // token and nothing else, so the id is the only variable.
+    //
+    // The first version of #3199 shipped this as `materialId: 0` on the theory
+    // that 0 was a real value which must round trip. It is not; preserving a
+    // producer's absence sentinel as data is the same defect the change exists
+    // to remove, one field over.
+    const withMaterial = /IFCMATERIALLAYER\(#3876,/g;
+    assert.ok(
+      withMaterial.test(layeredContent),
+      'the fixture no longer has the layer this test edits — pick another IFCMATERIALLAYER',
+    );
+    const airGap = layeredContent.replace(withMaterial, 'IFCMATERIALLAYER($,');
+
+    const before = layeredRows().filter((r) => r.materialId === 3876);
+    assert.ok(before.length > 0, 'material #3876 sliced no layers, so the edit below proves nothing');
+
+    const after = readIds(airGap).filter((r) => r.geometryClass === 3);
+
+    // 1. The removed material is gone.
+    assert.ok(
+      !after.some((r) => r.materialId === 3876),
+      'a slice still reports the material id that was removed from the file',
+    );
+
+    // 2. It did not come back as 0. This is the assertion the fix is about, and
+    //    it fails loudly against the pre-fix build: those same slices carried
+    //    `materialId: 0` there.
+    const zeros = after.filter((r) => r.materialId === 0);
+    assert.equal(
+      zeros.length, 0,
+      `${zeros.length} air-gap slice(s) reported IfcMaterial #0, which is not an entity ` +
+        `(e.g. #${zeros[0]?.expressId})`,
+    );
+
+    // 3. And the slices still EXIST, unattributed rather than dropped —
+    //    otherwise 1 and 2 are satisfied by the geometry disappearing, which
+    //    would be a far worse bug wearing this test as cover.
+    const unattributed = after.filter(
+      (r) => r.materialId === undefined && r.geometryItemId === undefined,
+    );
+    assert.ok(
+      unattributed.length >= before.length,
+      `dropping the material ref should leave ${before.length} slice(s) present but ` +
+        `unattributed, saw ${unattributed.length}`,
+    );
+
+    // 4. And nothing silently migrated to the other field.
+    for (const r of unattributed) {
+      assert.equal(
+        r.geometryItemId, undefined,
+        `air-gap slice #${r.expressId} adopted a geometryItemId instead of reporting nothing`,
+      );
+    }
+  });
+
+  test('the prepass FACADE carries both ids, not just the raw collection', () => {
+    // This is the test the block header promises, and it exists because the
+    // facade is where this actually went wrong: `scripts/lib/mesh-via-prepass.mjs`
+    // mirrors `convertMeshCollectionToBatch` field by field, it did NOT copy the
+    // new ids, and my first probe read zeros through it and reported the wasm
+    // boundary broken when the boundary was fine.
+    //
+    // Every other test in this block reads the raw `MeshCollection`, which is
+    // UPSTREAM of the facade — so without this one the facade edit ships with no
+    // coverage at all, and a future field dropped there is invisible to every
+    // script that reads through it.
+    const meshes = parseMeshesViaPrePass(api, layeredContent);
+    let items = 0, materials = 0, both = 0;
+    for (let i = 0; i < meshes.length; i++) {
+      const m = meshes.get(i);
+      if (!m) continue;
+      const hasItem = m.geometryItemId !== undefined && m.geometryItemId !== null;
+      const hasMaterial = m.materialId !== undefined && m.materialId !== null;
+      if (hasItem && hasMaterial) both++;
+      else if (hasItem) items++;
+      else if (hasMaterial) materials++;
+      if (m.free) m.free();
+    }
+    if (meshes.free) meshes.free();
+
+    // Cross-check against the raw collection rather than against a fixed number:
+    // this asserts the facade agrees with the boundary, which is the actual
+    // contract, and it cannot go vacuous if the fixture changes.
+    const raw = layeredRows();
+    assert.equal(
+      items, raw.filter((r) => r.geometryItemId !== undefined).length,
+      'the facade dropped or invented geometryItemId relative to the raw collection',
+    );
+    assert.equal(
+      materials, raw.filter((r) => r.materialId !== undefined).length,
+      'the facade dropped or invented materialId relative to the raw collection',
+    );
+    assert.equal(both, 0, `${both} mesh(es) carried BOTH ids through the facade`);
+    assert.ok(items > 0 && materials > 0, `non-vacuity: items=${items} materials=${materials}`);
+  });
+
+  test('takeMesh reports the same ids as get, and stays read-once', () => {
+    // The worker reads meshes with takeMesh and the main thread with get. Both
+    // now go through the derived Clone, so they can no longer disagree by
+    // construction -- what this still pins is that `from_mesh_data` wires the
+    // ids onto the struct at all, which no amount of deriving guarantees.
+    const viaGet = layeredRows();
+
+    const col = rawCollection(layeredContent);
+    const viaTake = [];
+    try {
+      for (let i = 0; i < col.length; i++) {
+        const m = col.takeMesh(i);
+        if (!m) continue;
+        try {
+          viaTake.push({
+            expressId: m.expressId,
+            geometryItemId: m.geometryItemId,
+            materialId: m.materialId,
+            vertexCount: m.vertexCount,
+          });
+        } finally {
+          m.free();
+        }
+      }
+
+      assert.equal(viaTake.length, viaGet.length, 'takeMesh and get disagree on how many meshes there are');
+      for (let i = 0; i < viaTake.length; i++) {
+        assert.equal(viaTake[i].expressId, viaGet[i].expressId, `mesh ${i}: express ids diverged`);
+        assert.equal(
+          viaTake[i].geometryItemId, viaGet[i].geometryItemId,
+          `mesh ${i} (#${viaGet[i].expressId}): takeMesh geometryItemId disagrees with get`,
+        );
+        assert.equal(
+          viaTake[i].materialId, viaGet[i].materialId,
+          `mesh ${i} (#${viaGet[i].expressId}): takeMesh materialId disagrees with get`,
+        );
+      }
+      assert.ok(viaTake.some((r) => r.vertexCount > 0), 'the first take returned no geometry at all');
+
+      // Read-once: takeMesh MOVES the whole struct out, so a second call for the
+      // same index yields a DEFAULT mesh -- expressId 0, no ids, no geometry.
+      //
+      // This assertion used to permit either that or the old metadata-bearing
+      // husk, because the ids were Copy and rode along by field assignment. Its
+      // comment said a switch to `mem::take` on the whole struct would change
+      // what a second call reports and that this suite should be the thing that
+      // notices. That switch has now happened, so the permissive form is spent
+      // and the exact behaviour is pinned instead: a test that accepts both
+      // answers cannot report which one it got.
+      // Non-vacuity: `expressId === 0` below only means anything while mesh 0
+      // has a non-zero id to lose. A fixture swap could make it trivially true.
+      assert.notEqual(viaTake[0].expressId, 0, 'fixture mesh 0 has no express id to lose');
+      const again = col.takeMesh(0);
+      assert.ok(again, 'a second takeMesh returned nothing at all');
+      try {
+        assert.equal(again.vertexCount, 0, 'a second takeMesh still returned vertex data');
+        assert.equal(again.expressId, 0, 'a second takeMesh should report a default expressId');
+        for (const field of ['geometryItemId', 'materialId']) {
+          assert.equal(
+            again[field], undefined,
+            `a second takeMesh should report no ${field}, got ${again[field]}`,
+          );
+        }
+      } finally {
+        again.free();
+      }
+    } finally {
+      col.free();
+    }
+  });
+} else {
+  skip('source ids: representation item vs material layer (#3199)',
+    `${LAYERED_IFC} missing — ${FIXTURES_HINT}`);
+}
 
 // ===== energy-model boundary (exportHbjson / exportDfjson) =====
 //
@@ -792,25 +1401,10 @@ if (SPACES_AVAILABLE) {
     const model = JSON.parse(new TextDecoder().decode(out));
     assert.ok(Array.isArray(model.rooms), 'Honeybee model must declare a rooms array');
   });
+} else {
+  skip('energy model (exportHbjson / exportDfjson)',
+    `${SPACES_IFC} missing — ${FIXTURES_HINT}`);
 }
-
-test('exportKmz packs a stored-zip KMZ (PK header, doc.kml + model.glb, axis-derived heading)', () => {
-  const kmz = api.exportKmz(glbBytes, 47.5, 8.5, 412, 1, 0, 'Contract Bldg');
-  assert.ok(kmz instanceof Uint8Array, 'KMZ should be a Uint8Array');
-  assert.deepEqual(Array.from(kmz.slice(0, 4)), [0x50, 0x4b, 0x03, 0x04]); // "PK\x03\x04"
-  const text = Buffer.from(kmz).toString('latin1');
-  assert.ok(text.includes('doc.kml'), 'archive names doc.kml');
-  assert.ok(text.includes('model.glb'), 'archive names model.glb');
-  assert.ok(text.includes('<heading>0</heading>'), 'heading derived from grid axis (1,0) → 0');
-  assert.ok(text.includes('Contract Bldg'), 'placemark name present');
-});
-
-test('exportKmz accepts undefined optional grid axes at the JS boundary (heading 0)', () => {
-  // Exercises the Rust Option<f64> params as `undefined` (the shim detail Codex flagged).
-  const kmz = api.exportKmz(glbBytes, 0, 0, 0, undefined, undefined, '');
-  assert.ok(kmz instanceof Uint8Array);
-  assert.ok(Buffer.from(kmz).toString('latin1').includes('<heading>0</heading>'), 'undefined axes → heading 0');
-});
 
 // ===== OpenUSD (.usda) export boundary =====
 // The vitest suites all MOCK the wasm boundary (AGENTS.md §Geometry & WASM), so
@@ -865,7 +1459,8 @@ if (existsSync(HELLO_WALL)) {
     assert.ok(!('version' in header), 'the pre-#2556 `version` key must not come back');
   });
 } else {
-  console.log('  ⚠️  apps/landing/samples/hello-wall.ifc missing — skipping exportUsd contract test');
+  skip('export contracts (USD / IFCX) over hello-wall',
+    `apps/landing/samples/hello-wall.ifc missing — ${FIXTURES_HINT}`);
 }
 
 // ===== Pipeline diagnostics channel (wasm boundary) =====
@@ -1030,8 +1625,8 @@ function withHashedBatch(content, tolerance, fn) {
   const hashApi = new IfcAPI();
   hashApi.setComputeGeometryHashes(tolerance);
   const bytes = new TextEncoder().encode(content);
-  const pre = hashApi.buildPrePassOnce(bytes);
   try {
+    const pre = hashApi.buildPrePassOnce(bytes);
     assert.ok(pre.totalJobs > 0, 'fixture must produce geometry jobs');
     const col = hashApi.processGeometryBatch(
       bytes, pre.jobs, pre.unitScale,
@@ -1544,11 +2139,19 @@ test('splitMeshByZones cuts by a prism footprint, not by its bounding box', () =
 // the size guideline); it owns its fixture and its own IfcAPI handles.
 await runPrepassClassBoundaryTests(api, test);
 
+// ===== The #3395 refusal count across the real WASM boundary =====
+// A refused record is absent from the entity-index columns, so these two
+// wasm outputs are the only evidence of it that reaches the host — and the
+// host reads both through a `??` fallback, which turns a boundary regression
+// into "this file refused nothing". Same module split, same reason.
+await runShardRefusalBoundaryTests(api, test);
 
-// Summary
-console.log('\n' + '═'.repeat(50));
-console.log(`📊 Results: ${passed} passed, ${failed} failed`);
-console.log('═'.repeat(50));
+// ===== Class-toggled classes never ride the instanced shard (#5409) =====
+// The fixture is built from the viewer's class-toggle table, so a class added
+// there and not to the Rust partition fails here.
+await runClassToggleShardContract(IfcAPI, test);
+await (await import('./lib/wasm-remesh-contracts.mjs')).runRemeshContracts({ IfcAPI, FIXTURES_DIR, FIXTURES_HINT, test, skip }); // #6232
+finishContractRun(api, passed, failed, skipped);
 
 if (failed > 0) {
   process.exit(1);

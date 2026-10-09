@@ -17,17 +17,11 @@
  */
 
 import { generateIfcGuid } from '@ifc-lite/encoding';
+import { getSchemaRegistryForVersion } from '@ifc-lite/parser';
 import type { StoreEditor } from '@ifc-lite/mutations';
+import { assertFinitePoint3 } from '../ifc-creator-math.js';
 import { toNativeLength, type SpatialAnchor } from './anchor.js';
-import {
-  assertPositiveFinite,
-  emitBodyRepresentation,
-  emitExtrudedSolid,
-  emitLocalPlacement,
-  emitPolygonProfile,
-  emitRectangleProfile,
-  ownerHistoryRef,
-} from './_emit-helpers.js';
+import { assertPositiveFinite, emitBodyRepresentation, emitExtrudedSolid, emitLocalPlacement, emitPolygonProfile, emitRectangleProfile, ownerHistoryRef, productGuid } from './_emit-helpers.js';
 
 export type SpaceInStoreParams = SpaceRectangleParams | SpacePolygonParams;
 
@@ -50,6 +44,8 @@ export interface SpaceRectangleParams {
   Profile?: 'rectangle';
   Name?: string;
   LongName?: string;
+  /** Explicit GlobalId (22-char IFC GUID); generated when omitted. */
+  GlobalId?: string;
   Description?: string;
   ObjectType?: string;
   /**
@@ -74,6 +70,8 @@ export interface SpacePolygonParams {
   Height: number;
   Name?: string;
   LongName?: string;
+  /** Explicit GlobalId (22-char IFC GUID); generated when omitted. */
+  GlobalId?: string;
   Description?: string;
   ObjectType?: string;
   /** See SpaceRectangleParams.PredefinedType. */
@@ -81,7 +79,10 @@ export interface SpacePolygonParams {
   /** Bounding elements → one IfcRelSpaceBoundary each. */
   boundaries?: SpaceBoundaryInput[];
   /** Net (inner-face) floor area in m² for Qto_SpaceBaseQuantities; defaults
-   *  to the gross/centreline area when omitted. */
+   *  to the OuterCurve polygon's own area when omitted — pass this explicitly
+   *  whenever OuterCurve is not itself the inner (room-side) face, e.g. a
+   *  centreline or outer-face boundary, otherwise NetFloorArea can come out
+   *  larger than GrossFloorArea. */
   netFloorArea?: number;
   /** Gross (centreline) floor area in m² for GrossFloorArea + GrossVolume;
    *  defaults to the OuterCurve area when omitted. */
@@ -132,6 +133,9 @@ export function addSpaceToStore(
   params: SpaceInStoreParams,
 ): SpaceBuildResult {
   const polygon = isPolygonParams(params);
+  if (params.Position !== undefined) {
+    assertFinitePoint3({ Position: params.Position }, 'addSpaceToStore');
+  }
   const placementOrigin: [number, number, number] = polygon
     ? params.Position ?? [0, 0, 0]
     : params.Position;
@@ -142,6 +146,18 @@ export function addSpaceToStore(
       [params.Width, params.Depth],
       'addSpaceToStore: Width and Depth must be positive',
     );
+  }
+
+  const PredefinedType = params.PredefinedType ?? 'INTERNAL';
+  // IFC2X3's occurrence uses InteriorOrExteriorSpace, not IfcSpaceTypeEnum.
+  // IFCX uses the existing IFC4 positional adapter for basic spaces.
+  const registry = getSchemaRegistryForVersion(anchor.schema === 'IFC2X3' || anchor.schema === 'IFC4X3' ? anchor.schema : 'IFC4');
+  const classification = registry.entities.IfcSpace.allAttributes![9];
+  if (!registry.enums[classification.type].includes(PredefinedType)) {
+    throw new Error(`addSpaceToStore: IfcSpace.${classification.name} must be one of ${registry.enums[classification.type].join(', ')}`);
+  }
+  if (PredefinedType === 'USERDEFINED' && !params.ObjectType?.trim()) {
+    throw new Error('addSpaceToStore: IfcSpace.ObjectType is required for USERDEFINED');
   }
 
   // Geometry coordinates must land in the file's native length unit —
@@ -167,7 +183,7 @@ export function addSpaceToStore(
   //   (IFC2X3 IfcInternalOrExternalEnum), ElevationWithFlooring
   // INTERNAL is a valid value in both enums, so it makes a safe default.
   const attrs: Array<unknown> = [
-    generateIfcGuid(anchor.guidRandom),
+    productGuid(params, anchor.guidRandom),
     ownerHistoryRef(anchor.ownerHistoryId),
     params.Name ?? 'Space',
     params.Description ?? null,
@@ -176,7 +192,7 @@ export function addSpaceToStore(
     `#${productShapeId}`,
     params.LongName ?? null,
     '.ELEMENT.',
-    `.${params.PredefinedType ?? 'INTERNAL'}.`,
+    `.${PredefinedType}.`,
     null,
   ];
   const spaceId = editor.addEntity('IfcSpace', attrs as Parameters<StoreEditor['addEntity']>[1]).expressId;
@@ -195,7 +211,11 @@ export function addSpaceToStore(
   // Qto_SpaceBaseQuantities — attached via the property view (createQuantitySet)
   // rather than as raw IfcElementQuantity entities, so they surface in the
   // properties panel (getQuantitiesForEntity) AND export, from one source.
-  // `area` is the OuterCurve (net when generated from walls) footprint;
+  // `area` is the OuterCurve polygon's own footprint — the fallback used only
+  // when a caller omits `netFloorArea` / `grossFloorArea`. A caller whose
+  // OuterCurve isn't the inner (room-side) face — e.g. a centreline or
+  // outer-face boundary — must pass `netFloorArea` explicitly, else
+  // NetFloorArea comes out equal to or larger than GrossFloorArea.
   // GrossFloorArea/GrossVolume take the supplied centreline measure.
   const area = polygon ? polygonArea(params.OuterCurve) : params.Width * params.Depth;
   const perimeter = polygon
@@ -214,10 +234,10 @@ export function addSpaceToStore(
 
   // Pset_SpaceCommon — the standard IfcSpace pset, so the space carries real
   // properties (not just an empty schema template). Planned areas mirror the
-  // measured ones; interior space ⇒ not external by default.
+  // measured ones; EXTERNAL must agree with IsExternal per Pset_SpaceCommon.
   editor.addPropertySet(spaceId, 'Pset_SpaceCommon', [
     { name: 'Reference', value: params.Name ?? '', type: 'LABEL' },
-    { name: 'IsExternal', value: false, type: 'BOOLEAN' },
+    { name: 'IsExternal', value: PredefinedType === 'EXTERNAL', type: 'BOOLEAN' },
     { name: 'GrossPlannedArea', value: grossArea, type: 'REAL' },
     { name: 'NetPlannedArea', value: params.netFloorArea ?? area, type: 'REAL' },
   ]);

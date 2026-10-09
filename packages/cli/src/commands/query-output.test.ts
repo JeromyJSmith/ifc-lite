@@ -16,6 +16,7 @@ import {
   outputAggregation,
   outputGroupBy,
   outputEntities,
+  computeUniqueValues,
 } from './query-output.js';
 
 interface FakeEntity {
@@ -116,6 +117,40 @@ describe('outputSum', () => {
    * (contains "area" but not "surface") stops being flagged as a possible
    * mix-up for a `--sum Area` query, silently dropping the warning.
    */
+  // Oracle test: compare the engine's --sum output against a plain loop
+  // over the same fixture. A STEP REAL literal with an extreme exponent
+  // (e.g. 1.0E400) parses to f64::INFINITY without erroring at the parse
+  // boundary, so an Infinity quantity value is reachable from a real file.
+  // `Number(q.value) || 0` in outputSum's own accumulation loop does not
+  // catch Infinity (it is truthy), so one bad entity poisons the total for
+  // every other entity in the query — a silent wrong number, not a crash.
+  it('does not let one non-finite quantity value poison the sum for every other entity', () => {
+    const bimWithInfinity = fakeBim({
+      quantities: {
+        1: [{ name: 'Qto_WallBaseQuantities', quantities: [{ name: 'NetVolume', value: 10 }] }],
+        2: [{ name: 'Qto_WallBaseQuantities', quantities: [{ name: 'NetVolume', value: Infinity }] }],
+        3: [{ name: 'Qto_WallBaseQuantities', quantities: [{ name: 'NetVolume', value: 5 }] }],
+      },
+    });
+    const entities = [{ ref: 1 }, { ref: 2 }, { ref: 3 }] as FakeEntity[];
+
+    // Direct-loop oracle: a non-finite value should not dominate the
+    // aggregate — it is treated the same as the existing, already-tested
+    // "present but unparseable" case (substituted with 0), not skipped and
+    // not propagated.
+    const oracleTotal = entities.reduce((sum, e) => {
+      const raw = bimWithInfinity.quantities(e.ref)[0]?.quantities[0]?.value;
+      const n = Number(raw);
+      return sum + (Number.isFinite(n) ? n : 0);
+    }, 0);
+    expect(oracleTotal).toBe(15);
+
+    const out = captureStdout();
+    outputSum(entities, 'NetVolume', bimWithInfinity, false);
+    out.spy.mockRestore();
+    expect(out.chunks.join('')).toBe(`${oracleTotal}\n`);
+  });
+
   it('warns about a similarly-named quantity that was not summed', () => {
     const bimWithAmbiguity = fakeBim({
       quantities: {
@@ -244,6 +279,269 @@ describe('outputGroupBy', () => {
     json.spy.mockRestore();
     const parsed = JSON.parse(json.chunks.join(''));
     expect(Object.keys(parsed)).toHaveLength(1);
+  });
+
+  /**
+   * Regression: a present-but-blank storey Name (`IFCBUILDINGSTOREY('...','',...)`)
+   * was chained with `storey?.name ?? '(no storey)'`, which only falls
+   * through on null/undefined. A blank name short-circuited the chain and
+   * was emitted verbatim as an empty-string JSON key instead of falling
+   * through to the "(no storey)" placeholder. Kills reverting the fix back
+   * to a bare `??`.
+   */
+  it('falls a blank storey Name through to "(no storey)", not an empty-string key', () => {
+    const blankStoreyBim = fakeBim({ storeys: { 1: { name: '' }, 2: { name: '   ' } } });
+    const json = captureStdout();
+    outputGroupBy(
+      [{ ref: 1, type: 'IfcWall' }, { ref: 2, type: 'IfcWall' }] as FakeEntity[],
+      'storey',
+      undefined,
+      blankStoreyBim,
+      true,
+    );
+    json.spy.mockRestore();
+    const parsed = JSON.parse(json.chunks.join(''));
+    expect(Object.keys(parsed)).not.toContain('');
+    expect(parsed['(no storey)']?.count).toBe(2);
+  });
+
+  /** Control: a genuine storey Name is still returned unchanged. */
+  it('groups by a genuine storey Name unchanged', () => {
+    const namedStoreyBim = fakeBim({ storeys: { 1: { name: 'Level 1' } } });
+    const json = captureStdout();
+    outputGroupBy([{ ref: 1, type: 'IfcWall' }] as FakeEntity[], 'storey', undefined, namedStoreyBim, true);
+    json.spy.mockRestore();
+    const parsed = JSON.parse(json.chunks.join(''));
+    expect(Object.keys(parsed)).toEqual(['Level 1']);
+  });
+
+  /**
+   * Regression: same defect on the material chain
+   * (`mat?.materials?.[0] ?? mat?.name ?? '(no material)'`) — a blank
+   * `materials[0]` short-circuited to an empty-string key.
+   */
+  it('falls a blank material name through to "(no material)", not an empty-string key', () => {
+    const blankMatBim = fakeBim({ materials: { 1: { materials: [''] } } });
+    const json = captureStdout();
+    outputGroupBy([{ ref: 1, type: 'IfcWall' }] as FakeEntity[], 'material', undefined, blankMatBim, true);
+    json.spy.mockRestore();
+    const parsed = JSON.parse(json.chunks.join(''));
+    expect(Object.keys(parsed)).not.toContain('');
+    expect(parsed['(no material)']?.count).toBe(1);
+  });
+
+  /**
+   * Pins the ACTUAL non-finite-value behaviour of --group-by's
+   * avg/min/max aggregation (aggMode), which routes through
+   * getQuantityValue -> aggregateFinite. getQuantityValue itself already
+   * substitutes 0 for a non-finite quantity value BEFORE aggregateFinite
+   * ever sees it (query-aggregation.ts), so aggregateFinite's own
+   * `!Number.isFinite(v)) continue` guard never actually fires on this
+   * path — the group's avg/min/max is computed over the SUBSTITUTED 0,
+   * not with the poisoned entity excluded. (Compare this to what a
+   * genuinely `aggregateFinite`-protected avg/min/max would report if the
+   * poisoned entity were dropped instead of zeroed: avg 7.5, min 5,
+   * max 10 — not what this test observes.) See the corrected comments on
+   * `query-aggregation.ts`/`schedule-aggregate.ts` and the changeset for
+   * what is and is not actually guarded by aggregateFinite.
+   */
+  it('avg/min/max on a poisoned (Infinity) quantity value: getQuantityValue already zeroed it before aggregateFinite runs', () => {
+    const bimWithInfinity = fakeBim({
+      quantities: {
+        1: [{ name: 'Qto_WallBaseQuantities', quantities: [{ name: 'NetVolume', value: 10 }] }],
+        2: [{ name: 'Qto_WallBaseQuantities', quantities: [{ name: 'NetVolume', value: Infinity }] }],
+        3: [{ name: 'Qto_WallBaseQuantities', quantities: [{ name: 'NetVolume', value: 5 }] }],
+      },
+    });
+    const wallEntities = [{ ref: 1, type: 'IfcWall' }, { ref: 2, type: 'IfcWall' }, { ref: 3, type: 'IfcWall' }] as FakeEntity[];
+
+    const avgJson = captureStdout();
+    outputGroupBy(wallEntities, 'type', 'NetVolume', bimWithInfinity, true, undefined, 'avg');
+    avgJson.spy.mockRestore();
+    expect(JSON.parse(avgJson.chunks.join(''))['IfcWall'].NetVolume).toBe(5); // (10 + 0 + 5) / 3
+
+    const minJson = captureStdout();
+    outputGroupBy(wallEntities, 'type', 'NetVolume', bimWithInfinity, true, undefined, 'min');
+    minJson.spy.mockRestore();
+    expect(JSON.parse(minJson.chunks.join(''))['IfcWall'].NetVolume).toBe(0); // the substituted 0, not 5
+
+    const maxJson = captureStdout();
+    outputGroupBy(wallEntities, 'type', 'NetVolume', bimWithInfinity, true, undefined, 'max');
+    maxJson.spy.mockRestore();
+    expect(JSON.parse(maxJson.chunks.join(''))['IfcWall'].NetVolume).toBe(10);
+  });
+
+  /**
+   * #4252: a group with NO NetVolume quantity data at all must be
+   * distinguishable in --json from a group whose real aggregate genuinely
+   * computes to 0. Discriminating fixture: `noDataBim` has doors that carry
+   * no NetVolume quantity anywhere (fabricated 0, matchedEntities 0);
+   * `zeroBim` has doors whose NetVolume values are -5 and 5, so the real
+   * average/sum genuinely is 0 (matchedEntities 2, the same numeric 0 but
+   * NOT fabricated). If both rendered identically on matchedEntities, this
+   * test would be vacuous — it asserts they diverge on that field despite
+   * an identical `NetVolume: 0`.
+   *
+   * Kills reverting `entry.matchedEntities = groupMatched.get(key) ?? 0`
+   * (or dropping it): with it gone, both cases collapse back to
+   * `{count, NetVolume: 0}` and cannot be told apart, which is #4252 itself.
+   */
+  it('distinguishes a group with no quantity data from a group whose real value is 0 (avg, json)', () => {
+    const noDataBim = fakeBim({ quantities: {} });
+    const doors = [{ ref: 1, type: 'IfcDoor' }, { ref: 2, type: 'IfcDoor' }] as FakeEntity[];
+
+    const noData = captureStdout();
+    outputGroupBy(doors, 'type', 'NetVolume', noDataBim, true, undefined, 'avg');
+    noData.spy.mockRestore();
+    const noDataEntry = JSON.parse(noData.chunks.join(''))['IfcDoor'];
+    expect(noDataEntry.NetVolume).toBe(0);
+    expect(noDataEntry.matchedEntities).toBe(0);
+
+    const zeroBim = fakeBim({
+      quantities: {
+        1: [{ name: 'Qto_DoorBaseQuantities', quantities: [{ name: 'NetVolume', value: -5 }] }],
+        2: [{ name: 'Qto_DoorBaseQuantities', quantities: [{ name: 'NetVolume', value: 5 }] }],
+      },
+    });
+    const zero = captureStdout();
+    outputGroupBy(doors, 'type', 'NetVolume', zeroBim, true, undefined, 'avg');
+    zero.spy.mockRestore();
+    const zeroEntry = JSON.parse(zero.chunks.join(''))['IfcDoor'];
+    expect(zeroEntry.NetVolume).toBe(0);
+    expect(zeroEntry.matchedEntities).toBe(2);
+  });
+
+  /**
+   * Same discriminating pair as above, but for --sum: an empty group's
+   * fabricated 0 total must carry matchedEntities: 0, while a real sum that
+   * cancels to 0 (values -5 and 5) must carry matchedEntities: 2. Confirms
+   * the fix is not avg-only — sum shares the exact same ambiguity.
+   */
+  it('distinguishes a group with no quantity data from a real cancelling-to-0 sum (json)', () => {
+    const noDataBim = fakeBim({ quantities: {} });
+    const doors = [{ ref: 1, type: 'IfcDoor' }, { ref: 2, type: 'IfcDoor' }] as FakeEntity[];
+
+    const noData = captureStdout();
+    outputGroupBy(doors, 'type', 'NetVolume', noDataBim, true, undefined, 'sum');
+    noData.spy.mockRestore();
+    const noDataEntry = JSON.parse(noData.chunks.join(''))['IfcDoor'];
+    expect(noDataEntry.NetVolume).toBe(0);
+    expect(noDataEntry.matchedEntities).toBe(0);
+
+    const zeroBim = fakeBim({
+      quantities: {
+        1: [{ name: 'Qto_DoorBaseQuantities', quantities: [{ name: 'NetVolume', value: -5 }] }],
+        2: [{ name: 'Qto_DoorBaseQuantities', quantities: [{ name: 'NetVolume', value: 5 }] }],
+      },
+    });
+    const zero = captureStdout();
+    outputGroupBy(doors, 'type', 'NetVolume', zeroBim, true, undefined, 'sum');
+    zero.spy.mockRestore();
+    const zeroEntry = JSON.parse(zero.chunks.join(''))['IfcDoor'];
+    expect(zeroEntry.NetVolume).toBe(0);
+    expect(zeroEntry.matchedEntities).toBe(2);
+  });
+
+  /**
+   * min/max share the same ambiguity: an empty group fabricates 0 (there is
+   * no real min/max), while a group with actual values of 0 (e.g. [0, 0])
+   * is a genuine min/max of 0. matchedEntities must tell them apart.
+   */
+  it('distinguishes a group with no quantity data from a real min/max of 0 (json)', () => {
+    const noDataBim = fakeBim({ quantities: {} });
+    const doors = [{ ref: 1, type: 'IfcDoor' }, { ref: 2, type: 'IfcDoor' }] as FakeEntity[];
+
+    const noDataMin = captureStdout();
+    outputGroupBy(doors, 'type', 'NetVolume', noDataBim, true, undefined, 'min');
+    noDataMin.spy.mockRestore();
+    const noDataEntry = JSON.parse(noDataMin.chunks.join(''))['IfcDoor'];
+    expect(noDataEntry.NetVolume).toBe(0);
+    expect(noDataEntry.matchedEntities).toBe(0);
+
+    const realZeroBim = fakeBim({
+      quantities: {
+        1: [{ name: 'Qto_DoorBaseQuantities', quantities: [{ name: 'NetVolume', value: 0 }] }],
+        2: [{ name: 'Qto_DoorBaseQuantities', quantities: [{ name: 'NetVolume', value: 0 }] }],
+      },
+    });
+    const realZeroMin = captureStdout();
+    outputGroupBy(doors, 'type', 'NetVolume', realZeroBim, true, undefined, 'min');
+    realZeroMin.spy.mockRestore();
+    const realZeroEntry = JSON.parse(realZeroMin.chunks.join(''))['IfcDoor'];
+    expect(realZeroEntry.NetVolume).toBe(0);
+    expect(realZeroEntry.matchedEntities).toBe(2);
+  });
+
+  /**
+   * Text-mode counterpart: a no-data group's line is annotated "(no data)"
+   * while a group whose real average genuinely is 0 prints the plain
+   * number with no annotation — the two paths (json / text) must agree
+   * on the same underlying signal (#4252 noted they previously diverged:
+   * text already had a signal, json had none).
+   */
+  it('annotates only the no-data group with "(no data)" in text mode, not a real-zero group', () => {
+    const doors = [{ ref: 1, type: 'IfcDoor' }, { ref: 2, type: 'IfcDoor' }] as FakeEntity[];
+    const noDataBim = fakeBim({ quantities: {} });
+
+    const noData = captureStdout();
+    outputGroupBy(doors, 'type', 'NetVolume', noDataBim, false, undefined, 'avg');
+    noData.spy.mockRestore();
+    expect(noData.chunks.join('')).toContain('(no data)');
+
+    const zeroBim = fakeBim({
+      quantities: {
+        1: [{ name: 'Qto_DoorBaseQuantities', quantities: [{ name: 'NetVolume', value: -5 }] }],
+        2: [{ name: 'Qto_DoorBaseQuantities', quantities: [{ name: 'NetVolume', value: 5 }] }],
+      },
+    });
+    const zero = captureStdout();
+    outputGroupBy(doors, 'type', 'NetVolume', zeroBim, false, undefined, 'avg');
+    zero.spy.mockRestore();
+    expect(zero.chunks.join('')).not.toContain('(no data)');
+  });
+});
+
+describe('computeUniqueValues', () => {
+  /**
+   * Regression: `--unique storey` chained `storey?.name ?? '(no storey)'`,
+   * only falling through on null/undefined. A blank/whitespace-only storey
+   * Name short-circuited the chain and produced a blank-label distinct
+   * value instead of the "(no storey)" placeholder.
+   */
+  it('falls a blank/whitespace storey Name through to "(no storey)"', () => {
+    const bim = fakeBim({ storeys: { 1: { name: '' }, 2: { name: '   ' } } });
+    const counts = computeUniqueValues([{ ref: 1 }, { ref: 2 }] as FakeEntity[], 'storey', bim);
+    expect(counts.has('')).toBe(false);
+    expect(counts.has('   ')).toBe(false);
+    expect(counts.get('(no storey)')).toBe(2);
+  });
+
+  it('a genuine storey Name is returned unchanged', () => {
+    const bim = fakeBim({ storeys: { 1: { name: 'Level 1' } } });
+    const counts = computeUniqueValues([{ ref: 1 }] as FakeEntity[], 'storey', bim);
+    expect(counts.get('Level 1')).toBe(1);
+  });
+
+  /** Same defect on the material chain. */
+  it('falls a blank/whitespace material name through to "(no material)"', () => {
+    const bim = fakeBim({ materials: { 1: { materials: [''] }, 2: { name: '   ' } } });
+    const counts = computeUniqueValues([{ ref: 1 }, { ref: 2 }] as FakeEntity[], 'material', bim);
+    expect(counts.has('')).toBe(false);
+    expect(counts.has('   ')).toBe(false);
+    expect(counts.get('(no material)')).toBe(2);
+  });
+
+  it('a genuine material name is returned unchanged', () => {
+    const bim = fakeBim({ materials: { 1: { materials: ['Concrete'] } } });
+    const counts = computeUniqueValues([{ ref: 1 }] as FakeEntity[], 'material', bim);
+    expect(counts.get('Concrete')).toBe(1);
+  });
+
+  /** Control: a truly absent storey/material still gets the placeholder. */
+  it('a truly absent storey still yields "(no storey)" (control)', () => {
+    const bim = fakeBim();
+    const counts = computeUniqueValues([{ ref: 1 }] as FakeEntity[], 'storey', bim);
+    expect(counts.get('(no storey)')).toBe(1);
   });
 });
 

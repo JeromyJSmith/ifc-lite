@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 /**
- * footprint.ts (Bet B1.4): the crux ancestor-exclusion rule (structural
+ * footprint.ts (footprint validation): the crux ancestor-exclusion rule (structural
  * conflicts), the spatial epsilon rule, and the soundness invariant
  * (writtenNodes intersection must ALWAYS report a conflict, regardless of
  * region state — see footprint.ts's module docstring for the full rationale).
@@ -208,7 +208,7 @@ describe('conflictPredicate: structural conflicts', () => {
     // would pull the host into the opening's writtenNodes, and every edit
     // anywhere below the voids relationship would then structurally conflict
     // with every edit on the host: exactly the false-conflict blowup the crux
-    // rule exists to prevent (the M4 kill criterion).
+    // rule exists to prevent (the soundness criterion).
     const dag = new ProvenanceDag();
     const specs: AnyNodeSpec[] = [
       { id: 'openMesh', kind: 'geometry-mesh', payload: mesh(400) },
@@ -314,6 +314,23 @@ describe('conflictPredicate: spatial conflicts', () => {
     expect(withZeroEpsilon.conflict).toBe(false);
   });
 
+  // Every other spatial fixture sits on one side of the boundary (a real gap,
+  // or an overlap of a whole metre) — never exactly on it. That left each
+  // axis's `<=`/`>=` free to narrow to `<`/`>` without failing a single test:
+  // confirmed live by mutating `a.min[0] <= b.max[0]` to `a.min[0] <
+  // b.max[0]` in footprint.ts and re-running this file — all 30 tests still
+  // passed. Two boxes that share a face exactly (B's min face == A's max
+  // face, epsilon 0) must still count as touching/intersecting.
+  it('boxes that share a face exactly (epsilon 0) conflict spatially', async () => {
+    const dag = buildFixedDag();
+    await dag.build();
+    const fpA = computeFootprint(dag, geometryEdit('opA', ['meshA'], { min: [0, 0, 0], max: [1, 1, 1] }));
+    const fpB = computeFootprint(dag, geometryEdit('opB', ['meshC'], { min: [1, 0, 0], max: [2, 1, 1] }));
+    const result = conflictPredicate(fpA, fpB, { epsilonMm: 0 });
+    expect(result.spatial).toBe(true);
+    expect(result.conflict).toBe(true);
+  });
+
   it('DEFAULT_EPSILON_MM is 50 (the M1 clearance-to-structure tolerance)', () => {
     expect(DEFAULT_EPSILON_MM).toBe(50);
   });
@@ -330,10 +347,10 @@ describe('conflictPredicate: spatial conflicts', () => {
 });
 
 /* ------------------------------------------------------------------ */
-/* The ablation knob (G4 review item 6)                                  */
+/* The spatial-rule ablation                                         */
 /* ------------------------------------------------------------------ */
 
-describe("conflictPredicate: spatialRule: 'disabled' (the B4.2 ablation)", () => {
+describe("conflictPredicate: spatialRule: 'disabled' (the spatial-rule ablation)", () => {
   it('drops the spatial half: overlapping regions on structurally disjoint ops no longer conflict', async () => {
     const dag = buildFixedDag();
     await dag.build();

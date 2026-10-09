@@ -26,16 +26,23 @@ export function candidatePairs(
   const pairs: Array<[number, number]> = [];
 
   if (groupB) {
-    const seen = new Set<string>();
+    // No entity-identity dedup here. Deduping candidate PAIRS by
+    // (a.model, a.key, b.model, b.key) before the narrow phase ran used to
+    // collapse every sub-prim of a split entity onto whichever one the BVH
+    // reached first — so a broad-phase false positive submesh could claim
+    // the (A, B) slot and hide a sibling submesh that genuinely clashes
+    // (#5194). Every candidate the broad phase finds is now tested; entity
+    // identity is deduped once, downstream, AFTER the narrow phase has
+    // decided each submesh's verdict, keeping the more severe one — see
+    // `mostSevere` in `orchestrator.ts`, which already deduped by the same
+    // (model, key) identity via `clashId` for an unrelated reason and is the
+    // single place both kernels' records converge.
     for (let j = 0; j < groupB.length; j += 1) {
       const b = groupB[j];
       const hits = bvh.queryAABB(inflate(b.bounds, margin));
       for (const i of hits) {
         const a = groupA[i];
-        if (a.key === b.key && a.model === b.model) continue;
-        const dedup = orderKey(a.model, a.key, b.model, b.key);
-        if (seen.has(dedup)) continue;
-        seen.add(dedup);
+        if (isSameEntity(a, b)) continue;
         pairs.push([i, j]);
       }
     }
@@ -49,7 +56,7 @@ export function candidatePairs(
         // Skip same-entity pairs: an element split across several geometry
         // sub-prims (common in IFC5/USD) produces multiple elements with the
         // same durable key — that is one entity, not a self-clash.
-        if (a.key === other.key && a.model === other.model) continue;
+        if (isSameEntity(a, other)) continue;
         pairs.push([i, j]);
       }
     }
@@ -58,8 +65,20 @@ export function candidatePairs(
   return pairs;
 }
 
-function orderKey(modelA: string, keyA: string, modelB: string, keyB: string): string {
-  const a = `${modelA} ${keyA}`;
-  const b = `${modelB} ${keyB}`;
-  return a < b ? `${a} ${b}` : `${b} ${a}`;
+/**
+ * Two `ClashElement`s are the same physical entity — not a self-clash — if
+ * they share EITHER identity within the same model:
+ *
+ * - the durable `key` (element split across several geometry sub-prims,
+ *   common in IFC5/USD: same key, same `ref`).
+ * - the runtime `ref` (expressId/globalId): a GPU-instanced entity now mints
+ *   one `ClashElement` per `MeshData` (`elementsFromStep`), and an entity
+ *   with a mix of a flat submesh and an instanced occurrence gets DIFFERENT
+ *   `key`s (the instanced one has `occurrenceKey` folded in) but the SAME
+ *   `ref` — the key-only check let that pair through as a false-positive
+ *   self-clash.
+ */
+function isSameEntity(a: Pick<ClashElement, 'key' | 'ref' | 'model'>, b: Pick<ClashElement, 'key' | 'ref' | 'model'>): boolean {
+  if (a.model !== b.model) return false;
+  return a.key === b.key || a.ref === b.ref;
 }

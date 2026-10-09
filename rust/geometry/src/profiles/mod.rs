@@ -14,6 +14,7 @@ use std::cell::Cell;
 
 mod curves_2d;
 mod curves_3d;
+mod directrix;
 mod outline;
 mod placement;
 mod shapes;
@@ -22,12 +23,34 @@ mod simplify;
 #[cfg(test)]
 mod tests;
 
-use outline::trim_polyline;
 use simplify::{mirror_profile_about_y_axis, simplify_smooth_curve_polyline};
 
 /// Maximum recursion depth for nested curve processing.
 /// Prevents stack overflow from deeply nested CompositeCurve → TrimmedCurve → CompositeCurve chains.
+/// Longest nested-curve chain the profile samplers will follow.
+///
+/// This bounds ONE PATH's length and says nothing about the NUMBER of paths,
+/// which is why it is not sufficient on its own. A composite curve with two
+/// segments per level, each resolving successfully, doubles the work per level:
+/// measured at 2^levels points (levels=20 gave 1,048,577 points in 473ms), so
+/// at this cap alone a file reaches 2^50. Nothing errors on that input, so the
+/// `?` propagation in the loops below never fires. [`MAX_CURVE_NODES`] is what
+/// actually bounds the traversal.
 const MAX_CURVE_DEPTH: u32 = 50;
+
+/// Total nested curve visits allowed per entry call.
+///
+/// `MAX_CURVE_DEPTH` bounds depth; this bounds BREADTH, and a file-driven
+/// traversal needs both. An acyclic composite-curve DAG -- every branch valid,
+/// nothing cyclic, nothing failing -- costs `O(2^depth)` under a depth cap
+/// alone, in time and in the `Vec<Point3>` it materialises.
+///
+/// 100k visits is far above any real profile (a detailed composite curve runs
+/// to hundreds of segments) and far below the point where the work is
+/// noticeable. Exhausting it is reported as an error rather than truncating
+/// silently: a short polyline returned as if complete is a wrong profile, and
+/// the router dropping the element is the honest outcome.
+const MAX_CURVE_NODES: u32 = 100_000;
 
 /// One bound of an `IfcTrimmingSelect` on a trimmed conic. A `Parameter` is an
 /// angle in the project's PLANEANGLEUNIT; a `Cartesian` point is resolved to an
@@ -51,6 +74,10 @@ pub struct ProfileProcessor {
     /// router instance is single-threaded (the router holds `RefCell` caches),
     /// so a `Cell` is sufficient. Defaults to [`TessellationQuality::Medium`].
     active_quality: Cell<TessellationQuality>,
+    /// Remaining curve visits for the in-flight entry call. Reset wherever
+    /// `active_quality` is, and decremented on every nested curve. See
+    /// [`MAX_CURVE_NODES`].
+    curve_budget: Cell<u32>,
 }
 
 impl ProfileProcessor {
@@ -59,6 +86,7 @@ impl ProfileProcessor {
         Self {
             schema,
             active_quality: Cell::new(TessellationQuality::Medium),
+            curve_budget: Cell::new(MAX_CURVE_NODES),
         }
     }
 
@@ -66,6 +94,24 @@ impl ProfileProcessor {
     #[inline]
     fn quality(&self) -> TessellationQuality {
         self.active_quality.get()
+    }
+
+    /// Charge one nested-curve visit against the entry call's budget.
+    ///
+    /// `MAX_CURVE_DEPTH` bounds one path; this bounds the whole traversal. An
+    /// acyclic composite-curve DAG fans out `2^depth` with nothing cyclic and
+    /// nothing failing, so neither a cycle guard nor the `?` propagation in the
+    /// segment loops can see it.
+    fn spend_curve_node(&self) -> Result<()> {
+        match self.curve_budget.get().checked_sub(1) {
+            Some(left) => {
+                self.curve_budget.set(left);
+                Ok(())
+            }
+            None => Err(Error::geometry(format!(
+                "Curve traversal exceeded {MAX_CURVE_NODES} nested curves"
+            ))),
+        }
     }
 
     /// Set the tessellation detail for subsequent curve sampling.
@@ -77,6 +123,7 @@ impl ProfileProcessor {
     #[inline]
     pub fn set_tessellation_quality(&self, quality: TessellationQuality) {
         self.active_quality.set(quality);
+        self.curve_budget.set(MAX_CURVE_NODES);
     }
 
     /// Process any IFC profile definition at the given tessellation `quality`.
@@ -100,6 +147,7 @@ impl ProfileProcessor {
         quality: TessellationQuality,
     ) -> Result<Profile2D> {
         self.active_quality.set(quality);
+        self.curve_budget.set(MAX_CURVE_NODES);
         self.process_with_depth(profile, decoder, 0)
     }
 
@@ -159,12 +207,12 @@ impl ProfileProcessor {
             ))),
         }?;
 
-        // Parameterised profiles are defined centred on their bounding box, and the
-        // Position placement below is applied relative to that centred origin.
-        // Several asymmetric builders (L/U/T/C) emit their points from a corner, so
-        // centre every parametric profile here in one place. Already-centred shapes
-        // (rectangle, circle, I, Z, …) are unaffected.
+        // Parameterised profiles are defined centred on their bounding box (the
+        // Position placement below is relative to that origin), yet several
+        // builders (L/U/T/C) emit from a corner, and T/Z listed their points
+        // clockwise: centre and pin the outer loop's CCW contract here, once.
         base_profile.center_on_bbox();
+        base_profile.make_outer_ccw();
 
         // Apply Profile Position transform (attribute 2: IfcAxis2Placement2D)
         if let Some(pos_attr) = profile.get(2) {
@@ -296,6 +344,7 @@ impl ProfileProcessor {
                 depth, MAX_CURVE_DEPTH
             )));
         }
+        self.spend_curve_node()?;
         match curve.ifc_type {
             IfcType::IfcPolyline => self.process_polyline(curve, decoder),
             IfcType::IfcIndexedPolyCurve => self.process_indexed_polycurve(curve, decoder),
@@ -331,6 +380,7 @@ impl ProfileProcessor {
         quality: TessellationQuality,
     ) -> Result<Vec<Point3<f64>>> {
         self.active_quality.set(quality);
+        self.curve_budget.set(MAX_CURVE_NODES);
         self.get_curve_points_with_depth(curve, decoder, 0)
     }
 
@@ -347,6 +397,7 @@ impl ProfileProcessor {
                 depth, MAX_CURVE_DEPTH
             )));
         }
+        self.spend_curve_node()?;
         match curve.ifc_type {
             IfcType::IfcPolyline => self.process_polyline_3d(curve, decoder),
             IfcType::IfcCompositeCurve => {
@@ -354,15 +405,10 @@ impl ProfileProcessor {
             }
             // IFC4x3 IfcGradientCurve = IfcCompositeCurve subtype that adds a
             // 2D BaseCurve (attr 2) supplying the horizontal layout + own
-            // segments supplying the vertical (z) profile. The minimum-viable
-            // sampler for #859's IfcLinearPlacement use case returns the
-            // horizontal track of points by recursing into BaseCurve and
-            // dropping Z to 0 — every signal lands at the correct (x, y)
-            // station, just at the alignment's reference elevation instead
-            // of the true grade-corrected z. Full grade evaluation is a
-            // follow-up; "every signal pinned to its alignment station" is
-            // already a vast improvement over the pre-fix "all signals at
-            // world origin" state.
+            // segments supplying the vertical (z) profile. Points here are the
+            // horizontal track (BaseCurve, z = 0); consumers that need the
+            // elevation evaluate the profile themselves (`gradient.rs`:
+            // IfcLinearPlacement, `AlignmentCurve::from_gradient_curve`).
             IfcType::IfcGradientCurve => {
                 if let Some(base_attr) = curve.get(2) {
                     if !base_attr.is_null() {
@@ -445,37 +491,29 @@ impl ProfileProcessor {
 
         let segments = decoder.resolve_ref_list(segments_attr)?;
         let mut result = Vec::new();
-        // Track the last IfcCurveSegment we sampled so we can extrapolate its
-        // terminal point after the loop. Each segment in the loop body emits
-        // only its START placement; without the terminal, every product whose
-        // `DistanceAlong` falls inside the FINAL segment after its start
-        // station gets clamped by `sample_polyline_at_distance` to that
-        // segment's start (i.e. authored station 800 instead of 900 on a
-        // 932-m alignment with the last segment spanning 800..932). See the
-        // post-loop block below.
+        // Terminal of the last sparsely sampled IfcCurveSegment (fallback path
+        // below), appended after the loop so a `DistanceAlong` inside the
+        // final segment doesn't clamp to that segment's start (#859).
         let mut last_curve_segment_terminal: Option<Point3<f64>> = None;
 
         for segment in segments {
-            // IFC4x3 IfcCurveSegment (alignment fixtures) has a different
-            // attribute layout from the IFC2x3/IFC4 IfcCompositeCurveSegment
-            // the original walker was written for:
-            //   IfcCurveSegment: 0 Transition, 1 Placement (IfcAxis2Placement2D/3D),
-            //                    2 SegmentStart (length measure), 3 SegmentLength,
-            //                    4 ParentCurve
-            // Without recognising it, every alignment-authored composite
-            // curve errored out at "Failed to resolve ParentCurve" (the old
-            // walker reading attr 2 hit the SegmentStart length measure),
-            // which broke #859's IfcLinearPlacement resolver — every
-            // linearly-placed signal/referent fell back to identity.
-            //
-            // Minimum-viable handling: emit the segment's Placement.Location
-            // as ONE sample point and let the linear-placement sampler
-            // interpolate linearly between segment starts. Sparse but
-            // already a vast improvement over "all at origin". A full
-            // alignment evaluator (sampling the ParentCurve inside each
-            // segment's authored start..start+length range) is follow-up
-            // scope.
+            // IFC4x3 IfcCurveSegment (0 Transition, 1 Placement, 2 SegmentStart,
+            // 3 SegmentLength, 4 ParentCurve) differs from IFC2x3/IFC4
+            // IfcCompositeCurveSegment. Line / circle / clothoid parents are
+            // sampled densely (`curve_segment.rs`, #5327) so arcs stay arcs;
+            // other parents fall back to one point per segment (its
+            // Placement.Location), which the linear-placement sampler
+            // interpolates between (#859).
             if segment.ifc_type == IfcType::IfcCurveSegment {
+                if let Some(points) = crate::curve_segment::sample_curve_segment(&segment, decoder) {
+                    for p in points {
+                        if result.last().is_none_or(|last: &Point3<f64>| (last - p).norm() > 1e-9) {
+                            result.push(p);
+                        }
+                    }
+                    last_curve_segment_terminal = None;
+                    continue;
+                }
                 if let Some(placement_attr) = segment.get(1) {
                     if !placement_attr.is_null() {
                         if let Some(placement) = decoder.resolve_ref(placement_attr)? {
@@ -550,124 +588,13 @@ impl ProfileProcessor {
             }
         }
 
-        // Append the last IfcCurveSegment's terminal sample (exact for
-        // straight segments, tangent approximation for curves). Pre-fix the
-        // missing terminal made `sample_polyline_at_distance` clamp any
-        // product in the final segment to the segment's start station; this
-        // surfaces visibly as railway signals authored at station 900 m
-        // snapping onto the segment-start marker around station 800 m.
+        // Terminal of a sparsely sampled last segment (exact for straight
+        // segments, tangent approximation for curves) — see above.
         if let Some(terminal) = last_curve_segment_terminal {
             if result.last().is_none_or(|last: &Point3<f64>| {
                 (last - terminal).norm() > 1e-9
             }) {
                 result.push(terminal);
-            }
-        }
-
-        Ok(result)
-    }
-
-    /// Process composite curve into 3D points, honoring `IfcSweptDiskSolid`'s
-    /// `StartParam`/`EndParam`. Per IFC, a composite curve is parameterised so
-    /// segment `i` covers `[i, i+1]`. Segments fully outside `[start, end]` are
-    /// dropped; boundary segments are truncated by linearly interpolating along
-    /// their sampled point list (a per-segment normalised parameter).
-    ///
-    /// Non-conformant out-of-range `EndParam` values (notably Revit, which
-    /// emits a cumulative-per-segment parameter that can exceed `num_segments`)
-    /// are clamped to the upper bound of the spec domain — this matches the
-    /// authoring tool's effective intent (render the whole curve) without
-    /// guessing at a length-unit interpretation that proved wrong on real
-    /// files (see #631 follow-up notes).
-    pub fn get_composite_curve_points_trimmed(
-        &self,
-        curve: &DecodedEntity,
-        decoder: &mut EntityDecoder,
-        start_param: Option<f64>,
-        end_param: Option<f64>,
-    ) -> Result<Vec<Point3<f64>>> {
-        let segments_attr = curve
-            .get(0)
-            .ok_or_else(|| Error::geometry("CompositeCurve missing Segments".to_string()))?;
-        let segments = decoder.resolve_ref_list(segments_attr)?;
-        let num_segments = segments.len();
-        if num_segments == 0 {
-            return Ok(Vec::new());
-        }
-
-        let start = start_param.unwrap_or(0.0).max(0.0);
-        let end = end_param.unwrap_or(num_segments as f64).min(num_segments as f64);
-        if end <= start {
-            return Ok(Vec::new());
-        }
-
-        let mut result: Vec<Point3<f64>> = Vec::new();
-        for (idx, segment) in segments.into_iter().enumerate() {
-            let seg_start = idx as f64;
-            let seg_end = seg_start + 1.0;
-            // Skip segments fully outside the trim window
-            if seg_end <= start || seg_start >= end {
-                continue;
-            }
-
-            let parent_curve_attr = segment.get(2).ok_or_else(|| {
-                Error::geometry("CompositeCurveSegment missing ParentCurve".to_string())
-            })?;
-            let parent_curve = decoder
-                .resolve_ref(parent_curve_attr)?
-                .ok_or_else(|| Error::geometry("Failed to resolve ParentCurve".to_string()))?;
-            let same_sense = segment
-                .get(1)
-                .and_then(|v| match v {
-                    ifc_lite_core::AttributeValue::Enum(e) => Some(e.as_str()),
-                    _ => None,
-                })
-                .map(|e| e == "T" || e == "TRUE")
-                .unwrap_or(true);
-
-            let mut seg_points = self.get_curve_points_with_depth(&parent_curve, decoder, 1)?;
-            if !same_sense {
-                seg_points.reverse();
-            }
-            if seg_points.len() < 2 {
-                continue;
-            }
-
-            // Map global trim window to this segment's local [0,1] domain
-            let local_start = (start - seg_start).clamp(0.0, 1.0);
-            let local_end = (end - seg_start).clamp(0.0, 1.0);
-            if local_end <= local_start {
-                continue;
-            }
-
-            let trimmed = if local_start == 0.0 && local_end == 1.0 {
-                seg_points
-            } else {
-                trim_polyline(&seg_points, local_start, local_end)
-            };
-
-            if trimmed.is_empty() {
-                continue;
-            }
-            // Drop the first point of the next segment ONLY when it coincides with
-            // the last point already in `result` — i.e. the segments share their
-            // junction vertex and concatenating verbatim would duplicate it.
-            // Composite curves whose adjacent segments are not coordinate-identical
-            // at the boundary (e.g. floating-point drift, or segments stitched
-            // together at deliberately distinct points) must keep the first vertex
-            // or the directrix gets distorted.
-            const JUNCTION_EPS: f64 = 1e-6;
-            let mut iter = trimmed.into_iter();
-            if let Some(first) = iter.next() {
-                let coincident = result.last().is_some_and(|last| {
-                    (first.x - last.x).abs() < JUNCTION_EPS
-                        && (first.y - last.y).abs() < JUNCTION_EPS
-                        && (first.z - last.z).abs() < JUNCTION_EPS
-                });
-                if !coincident {
-                    result.push(first);
-                }
-                result.extend(iter);
             }
         }
 
@@ -897,3 +824,7 @@ fn axis2_placement_location_and_x_axis_3d(
     }
     Some((origin, x_axis))
 }
+
+#[cfg(test)]
+#[path = "curve_fanout_tests.rs"]
+mod curve_fanout_tests;

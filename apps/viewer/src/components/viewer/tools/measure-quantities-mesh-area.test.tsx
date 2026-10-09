@@ -32,7 +32,7 @@ import { act, type ReactNode } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { useViewerStore } from '@/store/index.js';
-import { ToolOverlays } from '../ToolOverlays.js';
+import { renderPanelBody } from '@/lib/panels/renderPanelBody.js';
 
 const mounted: Array<{ root: Root; container: HTMLElement }> = [];
 
@@ -47,15 +47,19 @@ function renderNode(node: ReactNode): HTMLElement {
   return container;
 }
 
-const render = (): HTMLElement => renderNode(<ToolOverlays />);
+/**
+ * The QTY readout lives in the `measurements` side panel since #5502, reached
+ * through `renderPanelBody` — the one id → body map every sidebar host uses.
+ */
+const render = (): HTMLElement => renderNode(renderPanelBody('measurements', () => {}));
 
 function openSection(container: HTMLElement, label: string): void {
-  const button = [...container.querySelectorAll('button')].find(
+  const button = [...container.querySelectorAll('[role="tab"]')].find(
     (b) => b.textContent?.trim() === label,
   );
-  assert.ok(button, `no section button labelled "${label}" on the measure panel`);
+  assert.ok(button, `no tab labelled "${label}" on the Measurements panel`);
   act(() => {
-    button.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    button.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, button: 0 }));
   });
 }
 
@@ -217,7 +221,7 @@ describe('selection changes do not re-sum the corpus (mesh area is selection-ind
   });
 });
 
-describe('a present-but-empty mesh record reads as no mesh, not measured-zero (CodeRabbit)', () => {
+describe('a present-but-empty mesh record reads as no mesh, not measured-zero (#6452)', () => {
   it('does not count toward "Area mesh" and is reported as no triangulated mesh', () => {
     useViewerStore.setState({
       selectedEntitiesSet: new Set(['legacy:42']),
@@ -231,7 +235,7 @@ describe('a present-but-empty mesh record reads as no mesh, not measured-zero (C
     const text = container.textContent ?? '';
     assert.match(
       text,
-      /no triangulated mesh area could be measured/,
+      /1 element had no triangulated mesh to measure/,
       `an empty mesh record must not read as a measured zero: ${text}`,
     );
     assert.doesNotMatch(text, /Area mesh/, text);

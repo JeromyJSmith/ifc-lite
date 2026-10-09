@@ -2,6 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+use super::output_cap_types::SymbolicTruncation;
 use serde::{Deserialize, Serialize};
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -32,9 +33,10 @@ use serde::{Deserialize, Serialize};
 /// "unresolved" sentinel to and from JSON `null`.
 ///
 /// Read back, any `null` becomes `f32::NAN`. `serde_json` also writes `±inf`
-/// as `null`, so an infinity would return as NaN — no producer in this crate
-/// emits one, and NaN is the correct reading of "not a usable elevation"
-/// either way. Consumers must test `is_nan()`, not `!is_finite()`.
+/// as `null`, so an infinity round-trips as NaN — `operator.rs`'s unchecked
+/// `as_float().unwrap_or(0.0)` on a placement's Z can make `tz`, and so
+/// `world_y`, infinite, and NaN is the correct reading of "not a usable
+/// elevation" either way. Consumers must test `is_nan()`, not `!is_finite()`.
 pub(crate) mod nan_as_null {
     use serde::{Deserialize, Deserializer, Serializer};
 
@@ -222,9 +224,28 @@ pub struct SymbolicData {
     pub texts: Vec<SymbolicText>,
     /// All filled regions (`IfcAnnotationFillArea`).
     pub fills: Vec<SymbolicFillArea>,
+    /// Set when extraction stopped at [`MAX_SYMBOLIC_ELEMENTS`]; `None` when the
+    /// file was emitted in full.
+    ///
+    /// `#[serde(default)]` so a `SymbolicData` cached before this field existed
+    /// still deserializes (`apps/server/src/routes/parse/cache_keys.rs` reads
+    /// cached JSON), and `skip_serializing_if` so an untruncated response is
+    /// byte-identical to what it was before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<SymbolicTruncation>,
 }
 
+
 impl SymbolicData {
+    /// Total primitives across every collection.
+    pub(super) fn len(&self) -> usize {
+        self.grid_axes.len()
+            + self.polylines.len()
+            + self.circles.len()
+            + self.texts.len()
+            + self.fills.len()
+    }
+
     /// Returns true if no symbolic primitives were extracted — the server
     /// can omit the field from its response instead of emitting an empty
     /// object.
@@ -234,5 +255,12 @@ impl SymbolicData {
             && self.circles.is_empty()
             && self.texts.is_empty()
             && self.fills.is_empty()
+            // A truncated result is never "empty", even when it carries no
+            // primitives. `apps/server/src/types/response.rs` uses this for
+            // `skip_serializing_if`, so returning true here would drop the
+            // diagnostic on exactly the response that needs it most. Not
+            // reachable from extraction under the shipped bounds, but it
+            // round-trips in from cached JSON.
+            && self.truncated.is_none()
     }
 }

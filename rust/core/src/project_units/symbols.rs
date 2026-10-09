@@ -148,8 +148,7 @@ pub fn compose_derived(elements: &[(String, i32)]) -> String {
         if *exp == 0 || sym.is_empty() {
             continue;
         }
-        let mag = exp.unsigned_abs();
-        let piece = format!("{sym}{}", superscript(mag as i32));
+        let piece = format!("{sym}{}", superscript(exp.unsigned_abs()));
         if *exp > 0 {
             num.push(piece);
         } else {
@@ -169,8 +168,14 @@ pub fn compose_derived(elements: &[(String, i32)]) -> String {
     }
 }
 
-/// Unicode superscript for a small magnitude exponent (1 renders as empty).
-fn superscript(mag: i32) -> String {
+/// Unicode superscript for an exponent MAGNITUDE (1 renders as empty).
+///
+/// Takes the magnitude as `u32`, which is what the caller already has from
+/// `unsigned_abs()`. Narrowing it back to `i32` made exactly `i32::MIN`
+/// negative again, and the digit map below then computed `'-' - '0'` in
+/// `u32`: an overflow panic under `cargo test` and debug builds, a garbage
+/// symbol in release.
+fn superscript(mag: u32) -> String {
     match mag {
         1 => String::new(),
         0 => "\u{2070}".to_string(),
@@ -178,10 +183,12 @@ fn superscript(mag: i32) -> String {
         3 => "\u{00B3}".to_string(),
         n if (4..=9).contains(&n) => {
             // superscript 4-9 live at U+2074..U+2079
-            char::from_u32(0x2070 + n as u32).map(String::from).unwrap_or_default()
+            char::from_u32(0x2070 + n).map(String::from).unwrap_or_default()
         }
         n => {
-            // Multi-digit: build from digit superscripts.
+            // Multi-digit: build from digit superscripts. Every char of a
+            // `u32`'s decimal form is an ASCII digit, so the arithmetic arm
+            // cannot underflow.
             n.to_string()
                 .chars()
                 .map(|c| match c {
@@ -222,6 +229,17 @@ mod tests {
     }
 
     #[test]
+    fn prefixed_volume_uses_cubed_power() {
+        // A milli cubic-metre must scale by (1e-3)^3, not (1e-3)^1 or (1e-3)^2:
+        // `prefix_power` for CUBIC_METRE is untested at any non-default value
+        // without this, so a regression collapsing the cube to a square (or to
+        // no power at all) would pass every other test in this file.
+        let (sym, scale) = si_unit_symbol_and_scale("CUBIC_METRE", Some("MILLI")).unwrap();
+        assert_eq!(sym, "mm\u{00B3}");
+        assert!((scale - 1e-9).abs() < 1e-24, "expected 1e-9 (cubed), got {scale}");
+    }
+
+    #[test]
     fn bare_square_metre() {
         let (sym, scale) = si_unit_symbol_and_scale("SQUARE_METRE", None).unwrap();
         assert_eq!(sym, "m\u{00B2}");
@@ -247,6 +265,24 @@ mod tests {
     #[test]
     fn derived_pure_inverse() {
         assert_eq!(compose_derived(&[("s".into(), -1)]), "1/s");
+    }
+
+    /// `i32::MIN` is the one exponent whose magnitude does not fit `i32`:
+    /// narrowing `unsigned_abs()` back to `i32` re-signed it and the digit
+    /// map hit `'-' - '0'`, an arithmetic overflow panic. The composed
+    /// symbol must be the superscript of 2147483648 in a denominator.
+    #[test]
+    fn derived_exponent_i32_min_does_not_overflow() {
+        let composed = compose_derived(&[("m".into(), i32::MIN)]);
+        assert_eq!(
+            composed,
+            "1/m\u{00B2}\u{00B9}\u{2074}\u{2077}\u{2074}\u{2078}\u{00B3}\u{2076}\u{2074}\u{2078}"
+        );
+        // And the positive twin, so the magnitude path is pinned both ways.
+        assert_eq!(
+            compose_derived(&[("m".into(), i32::MAX)]),
+            "m\u{00B2}\u{00B9}\u{2074}\u{2077}\u{2074}\u{2078}\u{00B3}\u{2076}\u{2074}\u{2077}"
+        );
     }
 
     #[test]

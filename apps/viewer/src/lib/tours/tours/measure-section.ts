@@ -10,7 +10,14 @@
 
 import { TOUR_ANCHORS, toolAnchor } from '../anchors';
 import { EVENT_CAMERA_INTERACTED } from '../events';
-import type { TourDefinition } from '../types';
+import type { TourDefinition, ViewerStoreApi } from '../types';
+
+function prepareHomeTools(store: ViewerStoreApi): void {
+  // Tool anchors live in the Home band. Preview it without persisting over
+  // the user's collapsed preference; the tour snapshot restores both fields.
+  store.setState({ ribbonCollapsed: false });
+  store.getState().setRibbonTab('home');
+}
 
 export const MEASURE_SECTION_TOUR: TourDefinition = {
   id: 'measure-section',
@@ -42,6 +49,7 @@ export const MEASURE_SECTION_TOUR: TourDefinition = {
       anchor: toolAnchor('measure'),
       title: 'Open the Measure tool',
       body: 'Click the ruler in the toolbar, or press M.',
+      prepare: prepareHomeTools,
       gate: { predicate: (s) => s.activeTool === 'measure' },
     },
     {
@@ -60,14 +68,15 @@ export const MEASURE_SECTION_TOUR: TourDefinition = {
       anchor: toolAnchor('section'),
       title: 'Open the Section tool',
       body: 'Click the scissors in the toolbar, or press X.',
+      prepare: prepareHomeTools,
       gate: { predicate: (s) => s.activeTool === 'section' },
     },
     {
       id: 'cut-face',
       kind: 'canvas',
       title: 'Cut through a face',
-      body: 'Hover a wall or slab to preview the cut, then click to slice through it. If nothing previews, click Pick face in the Section panel.',
-      // The Section panel auto-restores the last mode on mount: a returning
+      body: 'Hover a wall or slab to preview the cut, then click to slice through it. If nothing previews, choose Face on the Section bar.',
+      // The Section tool auto-restores the last mode on open: a returning
       // "cardinal" user can land here with `enabled` already true. Baseline
       // it so the fallback only fires on a genuine change, not a restore.
       arm: (state, ctx) => {
@@ -84,7 +93,7 @@ export const MEASURE_SECTION_TOUR: TourDefinition = {
       kind: 'action',
       anchor: TOUR_ANCHORS.sectionPanel,
       title: 'Slide the cut',
-      body: 'Expand the panel and drag the position slider, or type an exact distance. Flip swaps which side stays visible.',
+      body: 'Drag the distance on the Section bar to scrub the cut, or click it to type an exact value. Flip swaps which side stays visible.',
       arm: (state, ctx) => {
         ctx.baseline.sectionPosition = state.sectionPlane.position;
         ctx.baseline.sectionCustomDistance = state.sectionPlane.custom?.distance ?? 0;

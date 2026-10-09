@@ -31,6 +31,12 @@ import {
  */
 export interface SymbolicOverlayHost {
     expandModelBoundsWithFlatVertices(positions: Float32Array, stride: number): void;
+    /** Fold f32-local symbolic data through its f64 RTE anchor. */
+    expandModelBoundsWithAnchoredLineVertices(
+        positions: Float32Array,
+        origin: readonly [number, number, number],
+        stride: number,
+    ): void;
     syncCameraSceneBounds(): void;
     requestRender(): void;
 }
@@ -40,6 +46,10 @@ export class SymbolicOverlays {
     private textPipeline: SymbolicTextPipeline | null = null;
 
     constructor(private readonly host: SymbolicOverlayHost) {}
+
+    hasGeometry(): boolean {
+        return (this.fillPipeline?.hasGeometry() ?? false) || (this.textPipeline?.hasGeometry() ?? false);
+    }
 
     /**
      * Share the device + presentation format AND the MSAA sample count +
@@ -65,9 +75,9 @@ export class SymbolicOverlays {
     }
 
     /** Background layer: painted before the 3D line overlays. */
-    drawFills(pass: GPURenderPassEncoder, viewProj: Float32Array): void {
+    drawFills(pass: GPURenderPassEncoder, viewProj: Float32Array, rteViewProj?: Float32Array, rteCamera?: readonly [number, number, number]): void {
         if (this.fillPipeline?.hasGeometry()) {
-            this.fillPipeline.render(pass, viewProj);
+            this.fillPipeline.render(pass, viewProj, rteViewProj, rteCamera);
         }
     }
 
@@ -78,6 +88,8 @@ export class SymbolicOverlays {
         canvasWidth: number,
         canvasHeight: number,
         camera: Camera,
+        rteViewProj?: Float32Array,
+        rteCamera?: readonly [number, number, number],
     ): void {
         if (!this.textPipeline?.hasGeometry()) return;
         // Pass viewport pixel dimensions so the shader can scale glyphs
@@ -112,17 +124,44 @@ export class SymbolicOverlays {
             canvasHeight,
             [basis.right.x, basis.right.y, basis.right.z],
             [basis.up.x, basis.up.y, basis.up.z],
+            undefined,
+            rteViewProj,
+            rteCamera,
         );
     }
 
-    /** See `Renderer.uploadAnnotationFills3D` for the published contract. */
+    /**
+     * See `Renderer.uploadAnnotationFills3D` for the published contract.
+     *
+     * `definesExtent: false` draws the fill without letting it grow the scene
+     * AABB (#3359). This is the fill half of the policy `setLineOverlay` keys
+     * by channel: `grid` lines are excluded from the bounds because a grid is a
+     * reference layer that routinely reaches past the model envelope, and
+     * framing the camera on it is what #967 removed. Grid BUBBLES are fills and
+     * texts, not lines, so they never passed through that table at all — with
+     * annotations off and the grid on, a perfect line routing still reframed
+     * the camera on the bubbles, which sit a fixed offset beyond each axis
+     * endpoint (BUBBLE_OFFSET_M in rust/processing/src/symbolic/grid.rs) and
+     * are therefore the outermost grid content there is.
+     *
+     * Per ITEM rather than per call because `upload` REPLACES the whole array
+     * TODAY: these two pipelines each own one buffer, so one annotation call
+     * plus one grid call is not something a caller can currently do and the
+     * declaration has to travel with the item. That is a property of the
+     * present pipeline, not of the problem. The shape that removes this flag
+     * is a channel-keyed upload matching `setLineOverlay(channel, ...)`, which
+     * would answer from `CHANNEL_EXPANDS_MODEL_BOUNDS` alone; it needs
+     * per-channel buffers and a draw per channel, so it is deliberately not
+     * this change. Default true, so every caller that says nothing keeps the
+     * old behaviour exactly.
+     */
     uploadFills(fills: readonly SymbolicFillInput[]): void {
         if (!this.fillPipeline) return;
         this.fillPipeline.upload(fills);
-        // Contribute fill extents to modelBounds — see uploadAnnotationLines3D.
+        let expanded = false;
         for (const fill of fills) {
             const pts = fill.points;
-            if (pts.length === 0) continue;
+            if (pts.length === 0 || fill.definesExtent === false) continue;
             // points are flat [x,z,x,z,...]; lift to (x, fill.worldY, z) per
             // vertex so we expand bounds in the same world space the renderer draws in.
             const lifted = new Float32Array((pts.length / 2) * 3);
@@ -131,27 +170,64 @@ export class SymbolicOverlays {
                 lifted[j + 1] = fill.worldY;
                 lifted[j + 2] = pts[i + 1];
             }
-            this.host.expandModelBoundsWithFlatVertices(lifted, 3);
+            if (fill.origin) {
+                // Keep the f64 anchor separate from the local f32 ring. In
+                // particular, `origin + point` must not be rounded back into
+                // an absolute Float32Array just for camera bounds.
+                this.host.expandModelBoundsWithAnchoredLineVertices(lifted, fill.origin, 3);
+            } else {
+                this.host.expandModelBoundsWithFlatVertices(lifted, 3);
+            }
+            expanded = true;
         }
-        this.host.syncCameraSceneBounds();
+        // Only re-fit the camera when something actually moved the bounds. The
+        // old code synced on every call including a clear, which pushed an
+        // unchanged AABB back at the camera; `setLineOverlay` has always been
+        // conditional this way.
+        if (expanded) this.host.syncCameraSceneBounds();
         this.host.requestRender();
     }
 
-    /** See `Renderer.uploadAnnotationTexts3D` for the published contract. */
+    /**
+     * See `Renderer.uploadAnnotationTexts3D` for the published contract, and
+     * `uploadFills` above for what `definesExtent: false` is for (#3359).
+     */
     uploadTexts(texts: readonly SymbolicTextInput[]): void {
         if (!this.textPipeline) return;
         this.textPipeline.upload(texts);
-        // Text origins are single points; pack them into a flat buffer and
-        // expand bounds. Glyph extents are small enough that origin-only
-        // suffices for framing.
-        if (texts.length > 0) {
-            const buf = new Float32Array(texts.length * 3);
-            for (let i = 0; i < texts.length; i++) {
-                buf[i * 3 + 0] = texts[i].worldPos[0];
-                buf[i * 3 + 1] = texts[i].worldPos[1];
-                buf[i * 3 + 2] = texts[i].worldPos[2];
+        // A clear allocates nothing. Main guarded this behind `texts.length > 0`
+        // and the rewrite lost it, which matters here: "every text waived" is
+        // this change's own scenario (annotations off, grid on).
+        if (texts.length === 0) { this.host.requestRender(); return; }
+        // Text anchors are single points. Written straight into a worst-case
+        // buffer and passed on as a subarray: filtering first would allocate a
+        // second array holding every framing text just to read its length, and
+        // annotation-heavy models push thousands.
+        const buf = new Float32Array(texts.length * 3);
+        let legacyCount = 0;
+        let expanded = false;
+        for (const t of texts) {
+            if (t.definesExtent === false) continue;
+            if (t.origin) {
+                // `worldPos` is explicitly local to `origin`. Preserve that
+                // f64 reconstruction for bounds instead of narrowing the sum.
+                this.host.expandModelBoundsWithAnchoredLineVertices(
+                    new Float32Array(t.worldPos), t.origin, 3,
+                );
+                expanded = true;
+                continue;
             }
-            this.host.expandModelBoundsWithFlatVertices(buf, 3);
+            const [x, y, z] = t.worldPos;
+            buf[legacyCount * 3 + 0] = x;
+            buf[legacyCount * 3 + 1] = y;
+            buf[legacyCount * 3 + 2] = z;
+            legacyCount++;
+        }
+        if (legacyCount > 0) {
+            this.host.expandModelBoundsWithFlatVertices(buf.subarray(0, legacyCount * 3), 3);
+            expanded = true;
+        }
+        if (expanded) {
             this.host.syncCameraSceneBounds();
         }
         this.host.requestRender();

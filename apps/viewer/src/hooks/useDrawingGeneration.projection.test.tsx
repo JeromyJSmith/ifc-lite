@@ -35,7 +35,7 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import type { Drawing2D } from '@ifc-lite/drawing-2d';
+import { exportToDXF, parseDxf, type Drawing2D } from '@ifc-lite/drawing-2d';
 import type { GeometryResult, MeshData } from '@ifc-lite/geometry';
 import { IfcTypeEnum, type SpatialHierarchy, type SpatialNode } from '@ifc-lite/data';
 import type { TypeVisibilityGate } from '@/store/typeVisibilityFilter';
@@ -154,22 +154,31 @@ const ALL_VISIBLE: TypeVisibilityGate = {
 const SPACES_HIDDEN: TypeVisibilityGate = { ...ALL_VISIBLE, spaces: false };
 
 interface HarnessOptions {
+  depth?: number | null;
   geometryResult: GeometryResult;
   typeVisibility: TypeVisibilityGate;
+  flipped?: boolean;
   ifcDataStore: { source: IfcSourceBytes; spatialHierarchy?: SpatialHierarchy } | null;
 }
 
 /** Drive the real hook once, with construction projection ON, and return the
  *  drawing it publishes. */
 async function generate(options: HarnessOptions): Promise<Drawing2D | null> {
+  return (await generateSequence([options]))[0];
+}
+
+/** Keep the hook mounted so regeneration exercises its caches. */
+async function generateSequence(sequence: HarnessOptions[]): Promise<Array<Drawing2D | null>> {
+  let options = sequence[0];
   let drawing: Drawing2D | null = null;
   let run: (() => Promise<void>) | null = null;
 
   function Harness(): null {
     const { generateDrawing } = useDrawingGeneration({
+      activeTool: 'select',
       geometryResult: options.geometryResult,
       ifcDataStore: options.ifcDataStore,
-      sectionPlane: { axis: 'down', position: 50, flipped: false },
+      sectionPlane: { axis: 'down', position: 50, flipped: options.flipped ?? false },
       displayOptions: {
         showHiddenLines: false,
         useSymbolicRepresentations: false,
@@ -178,6 +187,7 @@ async function generate(options: HarnessOptions): Promise<Drawing2D | null> {
         // The whole point of this file: the sibling suites leave this false,
         // which makes every `projectionOn` branch dead in the suite.
         showConstructionProjection: true,
+        constructionProjectionDepth: options.depth,
       },
       typeVisibility: options.typeVisibility,
       combinedHiddenIds: new Set<number>(),
@@ -201,10 +211,15 @@ async function generate(options: HarnessOptions): Promise<Drawing2D | null> {
   document.body.appendChild(container);
   let root: Root | null = null;
   try {
-    await act(async () => { root = createRoot(container); root.render(<Harness />); });
-    assert.ok(run, 'harness never rendered — the hook was not called');
-    await act(async () => { await run!(); });
-    return drawing;
+    root = createRoot(container);
+    const drawings: Array<Drawing2D | null> = [];
+    for (options of sequence) {
+      await act(async () => { root!.render(<Harness />); });
+      assert.ok(run, 'harness never rendered — the hook was not called');
+      await act(async () => { await run!(); });
+      drawings.push(drawing);
+    }
+    return drawings;
   } finally {
     if (root) await act(async () => { root!.unmount(); });
     container.remove();
@@ -502,5 +517,97 @@ describe('useDrawingGeneration construction projection: profile route mirrors th
       `a mesh-less entity's profile must be unaffected by the class-gate ` +
       `mirror; got ${[...ids]}`,
     );
+  });
+});
+
+
+for (const flipped of [false, true]) it(`keeps construction bands and lines when the model and cut move together (flipped: ${flipped}, #4332)`, async () => {
+  const source = {
+    source: contiguousSourceBytes(new TextEncoder().encode(NO_PROFILE_IFC)),
+    spatialHierarchy: spatialHierarchy(new Map([
+      [BASEMENT_SLAB, STOREY_LOWER], [CUT_WALL, STOREY_LOWER], [UPPER_SLAB, STOREY_UPPER],
+    ])),
+  };
+  // Same model/source/hierarchy for every generation. Only the displayed
+  // origins and cut bounds move; the source buffers stay in their local frame.
+  const drawings = await generateSequence([0, 100, -100, 0].map((y) => ({
+    geometryResult: geometry(STOREY_MESHES.map((mesh) => ({ ...mesh, origin: [0, y, 0] })), [0, -3 + y, 0], [4, 6 + y, 4]),
+    typeVisibility: ALL_VISIBLE, ifcDataStore: source, flipped,
+  })));
+  const first = drawings[0];
+  assert.ok(first);
+  assert.ok(first.lines.some((line) => line.category === 'projection'), 'real mesh projection must produce lines');
+  for (const next of drawings.slice(1)) {
+    assert.ok(next);
+    assert.equal(next.config.projectionBelowDepth, first.config.projectionBelowDepth, 'floor band follows the placed model');
+    assert.equal(next.config.projectionAboveDepth, first.config.projectionAboveDepth, 'ceiling band follows the placed model');
+    assert.equal(next.lines.length, first.lines.length);
+    for (let i = 0; i < first.lines.length; i++) {
+      const expected: Drawing2D['lines'][number] = first.lines[i];
+      const actual: Drawing2D['lines'][number] = next.lines[i];
+      assert.deepEqual({ ...actual, depth: expected.depth }, expected, 'moving along the cut normal preserves every projected endpoint and style');
+      assert.ok(Math.abs(actual.depth - expected.depth) < 1e-5, 'projection depth is stable within float32 rounding at 100 m');
+    }
+  }
+});
+
+it('recomputes projection bands when storey membership changes on the same geometry (#4332)', async () => {
+  const geometryResult = geometry(STOREY_MESHES, [0, -3, 0], [4, 6, 4]);
+  const source = contiguousSourceBytes(new TextEncoder().encode(NO_PROFILE_IFC));
+  const drawings = await generateSequence([STOREY_UPPER, STOREY_LOWER].map((upperSlabStorey) => ({
+    geometryResult, typeVisibility: ALL_VISIBLE,
+    ifcDataStore: { source, spatialHierarchy: spatialHierarchy(new Map([
+      [BASEMENT_SLAB, STOREY_LOWER], [CUT_WALL, STOREY_LOWER], [UPPER_SLAB, upperSlabStorey],
+    ])) },
+  })));
+  const [twoStoreys, oneStorey] = drawings;
+  assert.ok(twoStoreys); assert.ok(oneStorey);
+  assert.equal(twoStoreys.config.projectionBelowDepth, 4.5);
+  assert.equal(twoStoreys.config.projectionAboveDepth, 1.5);
+  assert.equal(oneStorey.config.projectionBelowDepth, 9, 'a single storey uses the full model extent');
+  assert.equal(oneStorey.config.projectionAboveDepth, 9, 'old membership must not retain a phantom ceiling');
+});
+
+
+// #6615: exercise the actual hook -> cutter -> projection -> published drawing.
+describe('manual construction depth through generation (#6615)', () => {
+  it('classifies the wall behind an opaque occluder when Hidden Lines is OFF, and excludes it from visible-only export', async () => {
+    // Physical invariant: an opaque slab covering the complete far footprint
+    // hides every far edge, regardless of whether dashed edges are displayed.
+    // Harness mounts the actual hook with showHiddenLines:false throughout.
+    const scene = geometry([
+      box(66154, 'IfcSlab', 0, [-4,-2,-4], [4,-1,4]),
+      box(66155, 'IfcWall', 0, [-1,-5,-1], [1,-4,1]),
+    ], [-10,-10,-10], [10,10,10]);
+    const drawing = await generate({geometryResult:scene,typeVisibility:ALL_VISIBLE,ifcDataStore:null,depth:7});
+    assert.ok(drawing);
+    const far = drawing.lines.filter(line=>line.entityId===66155 && line.category!=='cut');
+    const near = drawing.lines.filter(line=>line.entityId===66154 && line.category!=='cut');
+    assert.ok(far.length>0 && near.length>0,'both real footprints must reach occlusion classification');
+    assert.ok(far.every(line=>line.visibility==='hidden'),'opaque near slab hides the complete far wall');
+    assert.ok(near.some(line=>line.visibility==='visible'),'near slab remains visible');
+    const hasFarLandmark = (hidden:boolean) => parseDxf(exportToDXF(drawing,{showHiddenLines:hidden})).entities.some(entity=>
+      entity.kind==='line' && Math.abs(entity.x1)<=1.001 && Math.abs(entity.y1)<=1.001
+      && Math.abs(entity.x2)<=1.001 && Math.abs(entity.y2)<=1.001);
+    assert.equal(hasFarLandmark(true),true,'the hidden-edge export control includes the far footprint');
+    assert.equal(hasFarLandmark(false),false,'visible-only DXF must exclude fully occluded far edges');
+  });
+
+  it('retains cut geometry while admitting near/far references only within the requested metric depth', async () => {
+    const scene = geometry([
+      box(66151, 'IfcWall', 0, [-1, -3, -1], [1, -2.5, 1]),
+      box(66152, 'IfcWall', 0, [-4, -6, -1], [-2, -5.5, 1]),
+      box(66153, 'IfcWall', 0, [3, -1, -1], [4, 1, 1]),
+    ], [-10, -10, -10], [10, 10, 10]);
+    const drawings = await generateSequence([0, 2, 3, 7].map(depth => ({
+      geometryResult: scene, typeVisibility: ALL_VISIBLE, ifcDataStore: null, depth,
+    })));
+    const ids = drawings.map(projectedIds);
+    assert.ok(drawings.every(d => d && d.cutPolygons.some(p => p.entityId === 66153)), 'cut wall remains at every depth');
+    assert.equal(ids[0].size, 0, 'zero depth disables every projection band');
+    assert.ok(!ids[1].has(66151) && !ids[1].has(66152), '2m excludes the 2.5m and 5.5m walls');
+    assert.ok(ids[2].has(66151) && !ids[2].has(66152), '3m includes the near wall only');
+    assert.ok(ids[3].has(66151) && ids[3].has(66152), '7m includes both walls');
+    assert.equal(drawings[2]?.config.projectionBelowDepth, 3);
   });
 });

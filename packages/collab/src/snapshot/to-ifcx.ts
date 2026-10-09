@@ -14,11 +14,13 @@
  * `structured-attrs.ts` for the representation contract (#1031).
  */
 
-import type { IfcxFile, IfcxHeader, IfcxNode, ImportNode } from '@ifc-lite/ifcx';
+import type { IfcxFile, IfcxHeader, IfcxNode } from '@ifc-lite/ifcx';
 import * as Y from 'yjs';
 import { entityToJSON, iterEntities } from '../doc/entity.js';
 import { metaMap } from '../doc/schema.js';
 import { flattenStructuredBranches, geometryRecordLookup } from './structured-attrs.js';
+import { pathInSlot, type ModelSlotRef } from '../doc/model-slot.js';
+import { readIfcxFileMeta } from './slot-ifcx.js';
 import { IFCX_VERSION } from '@ifc-lite/ifcx';
 
 export interface SnapshotOptions {
@@ -33,14 +35,21 @@ export interface SnapshotOptions {
   ifcxVersion?: string;
   /** Stable child-key ordering (defaults to insertion order from the Y.Map). */
   sortChildren?: boolean;
+  /**
+   * Emit only the entities of one model slot (#4444), paths kept as stored
+   * (slot-qualified), with THAT slot's file header / imports / schemas. A
+   * recipient reconstructs one viewer model per slot from one snapshot per
+   * slot. Omitted: every entity in the room, file metadata merged across
+   * slots (see slot-ifcx.ts).
+   */
+  slot?: ModelSlotRef;
 }
 
 export function snapshotToIfcx(doc: Y.Doc, options: SnapshotOptions = {}): IfcxFile {
-  const meta = metaMap(doc);
-  const seededHeader = (meta.get('header') as IfcxHeader | undefined) ?? undefined;
-  const seededImports = (meta.get('imports') as ImportNode[] | undefined) ?? [];
-  const seededSchemas =
-    (meta.get('schemas') as Record<string, unknown> | undefined) ?? {};
+  const fileMeta = readIfcxFileMeta(metaMap(doc), options.slot);
+  const seededHeader = fileMeta.header;
+  const seededImports = fileMeta.imports ?? [];
+  const seededSchemas = fileMeta.schemas ?? {};
 
   const header: IfcxHeader = {
     id: options.id ?? seededHeader?.id ?? 'ifc-lite/collab/snapshot',
@@ -53,6 +62,7 @@ export function snapshotToIfcx(doc: Y.Doc, options: SnapshotOptions = {}): IfcxF
   const data: IfcxNode[] = [];
   const geometryRecordFor = geometryRecordLookup(doc);
   for (const [path, entity] of iterEntities(doc)) {
+    if (options.slot && !pathInSlot(options.slot, path)) continue;
     const json = entityToJSON(entity);
     const node: IfcxNode = { path };
 
@@ -72,7 +82,19 @@ export function snapshotToIfcx(doc: Y.Doc, options: SnapshotOptions = {}): IfcxF
       for (const k of inheritsKeys) node.inherits[k] = json.inherits[k];
     }
 
-    const attributes = flattenStructuredBranches(json, { geometryRecordFor });
+    // `seedFromIfcx` treats a literal `null` attribute value as an IFCX
+    // removal opinion and never stores it (see from-ifcx.ts) — so a
+    // doc attribute holding `null` (e.g. a root attribute the user
+    // cleared, mirrored via mutation-bridge.ts's `toScalar`) must not
+    // be emitted as-is: the very next seed would silently drop it,
+    // disagreeing with what this writer just produced. Match the
+    // reader's contract on the way out instead of losing the key on
+    // the next round-trip.
+    const flattened = flattenStructuredBranches(json, { geometryRecordFor });
+    const attributes: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(flattened)) {
+      if (value !== null) attributes[key] = value;
+    }
     if (Object.keys(attributes).length > 0) {
       node.attributes = attributes;
     }

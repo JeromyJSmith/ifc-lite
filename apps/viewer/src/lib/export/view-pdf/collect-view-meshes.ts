@@ -14,7 +14,7 @@
  * looking like a successful export. So this function does not accept "the
  * meshes" as one list it might quietly under-fill: `instancedMeshes` is a
  * REQUIRED field, materialized by the caller through
- * `withInstancedMeshes(geometryResult, isPrimary)`, and it is appended before
+ * `withInstancedMeshes(geometryResult, instancedModelRange)`, and it is appended before
  * any filtering so the instanced half answers every visibility channel the
  * flat half does.
  *
@@ -53,7 +53,7 @@ export interface ViewMeshInput {
   meshes: readonly MeshData[];
   /**
    * GPU-instanced occurrences, materialized by the caller from the live
-   * renderer scene via `withInstancedMeshes(geometryResult, isPrimary)`.
+   * renderer scene via `withInstancedMeshes(geometryResult, instancedModelRange)`.
    *
    * Required, not optional, and not defaulted: an omitted-by-accident
    * instanced half is precisely the #2558 defect, and a required field turns
@@ -84,9 +84,9 @@ export interface ViewMeshInput {
  * filters, so hiding an instanced occurrence hides it in the PDF too.
  *
  * Instanced shard meshes carry no `ifcType` (the renderer's scene does not keep
- * one), so the class toggles cannot gate them — the same limitation the
- * viewport has, where `Scene.setInstancedVisibility` takes only the hide and
- * isolate sets. `isTypeVisible` treats a missing type as visible, matching it.
+ * one), and `isTypeVisible` treats a missing type as visible. That is safe
+ * because no class-toggled class ever reaches the shard: the wasm partition
+ * keeps them flat, where they carry their type (#5409).
  */
 export function collectViewMeshes(input: ViewMeshInput): MeshData[] {
   const isolatedIds = effectiveIsolatedIds(input.computedIsolatedIds, input.isolatedEntities);

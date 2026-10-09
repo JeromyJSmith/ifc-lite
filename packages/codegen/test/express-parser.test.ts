@@ -326,6 +326,39 @@ describe('EXPRESS Parser', () => {
 
       expect(chain).toEqual(['IfcRoot', 'IfcObject', 'IfcProduct']);
     });
+
+    it('terminates on a cyclic SUBTYPE OF chain instead of looping forever', () => {
+      // Nothing in the real schemas is cyclic, so removing the `seen` guard
+      // in getAllAttributes/getInheritanceChain never fails an existing test
+      // — it only fails on a malformed schema, which no fixture provides.
+      // Without the guard this hangs (and eventually throws
+      // `RangeError: Invalid array length` once the unbounded levels array
+      // overflows) instead of returning.
+      const schema = parseExpressSchema(`
+        SCHEMA TEST;
+
+        ENTITY IfcA
+          SUBTYPE OF (IfcB);
+          Foo : IfcLabel;
+        END_ENTITY;
+
+        ENTITY IfcB
+          SUBTYPE OF (IfcA);
+          Bar : IfcLabel;
+        END_ENTITY;
+
+        END_SCHEMA;
+      `);
+
+      const a = schema.entities.find(e => e.name === 'IfcA')!;
+
+      expect(getAllAttributes(a, schema).map(x => x.name).sort()).toEqual(['Bar', 'Foo']);
+      // Length alone would pass on a traversal that returned ['IfcA','IfcA']
+      // or otherwise dropped IfcB, so pin the membership as well as the count.
+      const chain = getInheritanceChain(a, schema);
+      expect(chain).toHaveLength(2);
+      expect([...chain].sort()).toEqual(['IfcA', 'IfcB']);
+    });
   });
 
   describe('Attribute section boundary', () => {
@@ -359,6 +392,151 @@ describe('EXPRESS Parser', () => {
       // Both directions: the derived and inverse names must not leak in.
       expect(test.attributes.map(a => a.name)).not.toContain('DerivedAttr');
       expect(test.attributes.map(a => a.name)).not.toContain('InverseAttr');
+    });
+  });
+
+  describe('UNIQUE constraint inside a collection element type', () => {
+    /**
+     * EXPRESS allows a UNIQUE constraint directly in front of the element
+     * type of a LIST/ARRAY/SET, e.g. "LIST [1:?] OF UNIQUE IfcGridAxis"
+     * (real syntax from IfcGrid.UAxes in IFC4_ADD2_TC1.exp) — UNIQUE
+     * constrains the collection's elements, it is not part of the element
+     * type name. Before this fix, UNIQUE leaked into attr.type verbatim,
+     * producing the invalid TypeScript type `UNIQUE IfcGridAxis[]` in the
+     * generated entities.ts and schema-registry.ts (caught only by a
+     * hand-edit to entities.ts in one downstream package that never fixed
+     * the generator itself, so schema-registry.ts kept the bug).
+     */
+    it('strips UNIQUE from a simple collection element type', () => {
+      const schema = parseExpressSchema(`
+        SCHEMA TEST;
+
+        ENTITY IfcGrid
+          SUBTYPE OF (IfcRoot);
+          UAxes : LIST [1:?] OF UNIQUE IfcGridAxis;
+        END_ENTITY;
+
+        END_SCHEMA;
+      `);
+
+      const attrs = getAllAttributes(schema.entities.find(e => e.name === 'IfcGrid')!, schema);
+      const uAxes = attrs.find(a => a.name === 'UAxes')!;
+      expect(uAxes.type).toBe('IfcGridAxis');
+      expect(uAxes.type).not.toContain('UNIQUE');
+    });
+
+    it('strips UNIQUE from the innermost type of a nested collection', () => {
+      const schema = parseExpressSchema(`
+        SCHEMA TEST;
+
+        ENTITY IfcIndexedPolygonalFaceWithVoids
+          SUBTYPE OF (IfcRoot);
+          InnerCoordIndices : LIST [1:?] OF LIST [3:?] OF UNIQUE IfcPositiveInteger;
+        END_ENTITY;
+
+        END_SCHEMA;
+      `);
+
+      const attrs = getAllAttributes(
+        schema.entities.find(e => e.name === 'IfcIndexedPolygonalFaceWithVoids')!,
+        schema
+      );
+      const inner = attrs.find(a => a.name === 'InnerCoordIndices')!;
+      expect(inner.type).toBe('IfcPositiveInteger[]');
+      expect(inner.type).not.toContain('UNIQUE');
+    });
+
+    it('strips UNIQUE when it applies to a nested collection rather than a bare type', () => {
+      const schema = parseExpressSchema(`
+        SCHEMA TEST;
+
+        ENTITY IfcStructuralLoadConfiguration
+          SUBTYPE OF (IfcRoot);
+          Locations : OPTIONAL LIST [1:?] OF UNIQUE LIST [1:2] OF IfcLengthMeasure;
+        END_ENTITY;
+
+        END_SCHEMA;
+      `);
+
+      const attrs = getAllAttributes(
+        schema.entities.find(e => e.name === 'IfcStructuralLoadConfiguration')!,
+        schema
+      );
+      const locations = attrs.find(a => a.name === 'Locations')!;
+      expect(locations.type).toBe('IfcLengthMeasure[]');
+      expect(locations.type).not.toContain('UNIQUE');
+    });
+
+    /**
+     * The three cases above all carry numeric aggregate bounds, which is the
+     * only shape the committed IFC4/IFC4X3 schemas use. EXPRESS (ISO 10303-11)
+     * also allows a symbolic bound, no bound at all, and an OPTIONAL qualifier
+     * in front of UNIQUE. Those forms miss the numeric bounds pattern, so the
+     * element type never reached the code that strips UNIQUE and the qualifier
+     * was carried into attr.type verbatim.
+     */
+    it('strips UNIQUE when the aggregate bound is symbolic', () => {
+      const schema = parseExpressSchema(`
+        SCHEMA TEST;
+
+        ENTITY EntSymbolicBound
+          SUBTYPE OF (IfcRoot);
+          Axes : LIST [1:Dim] OF UNIQUE IfcGridAxis;
+        END_ENTITY;
+
+        END_SCHEMA;
+      `);
+
+      const attrs = getAllAttributes(
+        schema.entities.find(e => e.name === 'EntSymbolicBound')!,
+        schema
+      );
+      const axes = attrs.find(a => a.name === 'Axes')!;
+      expect(axes.type).toBe('IfcGridAxis');
+      expect(axes.type).not.toContain('UNIQUE');
+    });
+
+    it('strips UNIQUE when the aggregate has no bounds', () => {
+      const schema = parseExpressSchema(`
+        SCHEMA TEST;
+
+        ENTITY EntUnbounded
+          SUBTYPE OF (IfcRoot);
+          Axes : LIST OF UNIQUE IfcGridAxis;
+        END_ENTITY;
+
+        END_SCHEMA;
+      `);
+
+      const attrs = getAllAttributes(
+        schema.entities.find(e => e.name === 'EntUnbounded')!,
+        schema
+      );
+      const axes = attrs.find(a => a.name === 'Axes')!;
+      expect(axes.type).toBe('IfcGridAxis');
+      expect(axes.type).not.toContain('UNIQUE');
+    });
+
+    it('strips an OPTIONAL UNIQUE element qualifier from an ARRAY', () => {
+      const schema = parseExpressSchema(`
+        SCHEMA TEST;
+
+        ENTITY EntOptionalUnique
+          SUBTYPE OF (IfcRoot);
+          Axes : ARRAY [1:3] OF OPTIONAL UNIQUE IfcGridAxis;
+        END_ENTITY;
+
+        END_SCHEMA;
+      `);
+
+      const attrs = getAllAttributes(
+        schema.entities.find(e => e.name === 'EntOptionalUnique')!,
+        schema
+      );
+      const axes = attrs.find(a => a.name === 'Axes')!;
+      expect(axes.type).toBe('IfcGridAxis');
+      expect(axes.type).not.toContain('UNIQUE');
+      expect(axes.type).not.toContain('OPTIONAL');
     });
   });
 

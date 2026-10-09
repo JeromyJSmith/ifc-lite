@@ -2,10 +2,9 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-/**
- * IDS (Information Delivery Specification) types
- * Based on buildingSMART IDS 1.0 specification
- */
+/** IDS (Information Delivery Specification) types, per buildingSMART IDS 1.0. */
+
+import type { IDSConstraint } from './constraint-types.js';
 
 // ============================================================================
 // IDS Document Structure
@@ -211,101 +210,69 @@ export type PartOfRelation =
 // Constraint Types
 // ============================================================================
 
-/** Union of all constraint types */
-export type IDSConstraint =
-  | IDSSimpleValue
-  | IDSPatternConstraint
-  | IDSEnumerationConstraint
-  | IDSBoundsConstraint;
-
-/** Simple value - exact match */
-export interface IDSSimpleValue {
-  type: 'simpleValue';
-  /** The exact value to match */
-  value: string;
-}
-
-/** Pattern constraint - regex match */
-export interface IDSPatternConstraint {
-  type: 'pattern';
-  /** XSD regex pattern */
-  pattern: string;
-  /**
-   * The originating `xs:restriction @base` (e.g. `xs:string`, `xs:integer`).
-   * Set when the constraint came from an `<xs:restriction>` element; the
-   * auditor uses it to determine compatibility with an IFC dataType
-   * without inferring the base from the constraint shape.
-   */
-  base?: string;
-}
-
-/** Enumeration constraint - one of a list of values */
-export interface IDSEnumerationConstraint {
-  type: 'enumeration';
-  /** List of allowed values */
-  values: string[];
-  /**
-   * The originating `xs:restriction @base` (e.g. `xs:string`,
-   * `xs:integer`). Set when the constraint came from an
-   * `<xs:restriction>`; numeric/boolean enumerations carry their base
-   * here so the auditor doesn't false-positive a string-base mismatch.
-   */
-  base?: string;
-}
-
-/** Bounds constraint - numeric range or string length */
-export interface IDSBoundsConstraint {
-  type: 'bounds';
-  /** Minimum inclusive value */
-  minInclusive?: number;
-  /** Maximum inclusive value */
-  maxInclusive?: number;
-  /** Minimum exclusive value */
-  minExclusive?: number;
-  /** Maximum exclusive value */
-  maxExclusive?: number;
-  /** xs:length — exact string length */
-  length?: number;
-  /** xs:minLength — minimum string length */
-  minLength?: number;
-  /** xs:maxLength — maximum string length */
-  maxLength?: number;
-  /**
-   * The originating `xs:restriction @base` (e.g. `xs:double`,
-   * `xs:integer`). Set when the constraint came from an
-   * `<xs:restriction>` so the auditor can compare against the IFC
-   * dataType's backing type directly.
-   */
-  base?: string;
-}
+export type {
+  IDSConstraint,
+  IDSSimpleValue,
+  IDSPatternConstraint,
+  IDSEnumerationConstraint,
+  IDSBoundsConstraint,
+} from './constraint-types.js';
 
 // ============================================================================
-// Validation Result Types
+// Validation Result Types (generalised — issue #5138)
+//
+// The general report shapes live in `./report-types.js` (kept separate so
+// this file stays under its module-size budget) and are re-exported below.
+// `IDSSpecification` already structurally satisfies `SpecificationSummary`,
+// so IDS specifications flow into a `SpecificationResult` unchanged.
+// `IDSRequirement` does NOT satisfy `RequirementSummary` — it has no
+// `label` — so `IDSRequirementResult.requirement` carries the real
+// `IDSRequirement` enriched with a `label` derived from the
+// already-computed `checkedDescription` (see `validator.ts`), rather than
+// a fabricated object. That enrichment is what lets the IDS-specific
+// result types below be zero-duplication NARROWINGS of the general ones.
 // ============================================================================
+// Only the names actually referenced below need a local binding; the rest
+// are re-exported (next statement) without one.
+import type {
+  RequirementSummary,
+  RequirementResult,
+  EntityResult,
+  SpecificationResult,
+  ValidationReport,
+  ValidationModelInfo,
+} from './report-types.js';
+export type {
+  ValidationSource,
+  SpecificationSummary,
+  RequirementSummary,
+  CheckKind,
+  FailureReasonCode,
+  SetResult,
+  RequirementResult,
+  EntityResult,
+  SpecificationResult,
+  ValidationReport,
+  ValidationModelInfo,
+} from './report-types.js';
 
-/** Complete validation report */
-export interface IDSValidationReport {
-  /** The IDS document that was validated */
-  document: IDSDocument;
-  /** Model information */
-  modelInfo: IDSModelInfo;
-  /** When validation was performed */
-  timestamp: Date;
-  /** Summary statistics */
-  summary: IDSValidationSummary;
-  /** Results per specification */
+/**
+ * Complete IDS validation report — the `source.kind === 'ids'` narrowing of
+ * {@link ValidationReport}. `specificationResults` is narrowed too (not just
+ * `source`): every IDS consumer below needs `requirement.facet` and
+ * `specification.applicability`, which the general `SpecificationResult`
+ * shape doesn't carry. `IDSSpecificationResult` is itself a narrowing of
+ * `SpecificationResult` (see above), so this stays a proper subtype of
+ * `ValidationReport` — assignable wherever the general shape is expected
+ * (e.g. `idsSlice`'s `idsValidationReport: ValidationReport | null`).
+ */
+export type IDSValidationReport = Omit<ValidationReport, 'source' | 'specificationResults'> & {
+  source: { kind: 'ids'; document: IDSDocument };
   specificationResults: IDSSpecificationResult[];
-}
+};
 
-/** Information about the validated model */
-export interface IDSModelInfo {
-  /** Model identifier/filename */
-  modelId: string;
-  /** IFC schema version */
-  schemaVersion: string;
-  /** Total entity count */
-  entityCount: number;
-}
+/** @deprecated Use {@link ValidationModelInfo}. Kept as an alias — identical shape. */
+export type IDSModelInfo = ValidationModelInfo;
 
 /** Summary statistics for the entire validation */
 export interface IDSValidationSummary {
@@ -325,26 +292,6 @@ export interface IDSValidationSummary {
   overallPassRate: number;
 }
 
-/** Result for a single specification */
-export interface IDSSpecificationResult {
-  /** Reference to the specification */
-  specification: IDSSpecification;
-  /** Overall pass/fail status */
-  status: 'pass' | 'fail' | 'not_applicable';
-  /** Number of entities that matched applicability */
-  applicableCount: number;
-  /** Number of applicable entities that passed */
-  passedCount: number;
-  /** Number of applicable entities that failed */
-  failedCount: number;
-  /** Pass rate (0-100) */
-  passRate: number;
-  /** Per-entity results */
-  entityResults: IDSEntityResult[];
-  /** Cardinality result (if minOccurs/maxOccurs specified) */
-  cardinalityResult?: IDSCardinalityResult;
-}
-
 /** Cardinality check result */
 export interface IDSCardinalityResult {
   /** Whether cardinality constraint was satisfied */
@@ -359,43 +306,28 @@ export interface IDSCardinalityResult {
   message: string;
 }
 
-/** Result for a single entity */
-export interface IDSEntityResult {
-  /** Express ID of the entity */
-  expressId: number;
-  /** Model ID (for multi-model support) */
-  modelId: string;
-  /** Entity type (e.g., "IfcWall") */
-  entityType: string;
-  /** Entity name (if available) */
-  entityName?: string;
-  /** IFC GlobalId (if available) */
-  globalId?: string;
-  /** Overall pass/fail status */
-  passed: boolean;
-  /** Results for each requirement */
-  requirementResults: IDSRequirementResult[];
-}
-
-/** Result for a single requirement check */
-export interface IDSRequirementResult {
-  /** Reference to the requirement */
-  requirement: IDSRequirement;
-  /** Pass/fail status */
-  status: 'pass' | 'fail' | 'not_applicable';
-  /** The facet type that was checked */
+/**
+ * Result for a single requirement check against an IDS specification — the
+ * `IDSRequirement`-typed narrowing of {@link RequirementResult}. `requirement`
+ * carries the real parsed requirement (facet, cardinalityRaw, …), enriched
+ * with the `label` the general shape requires (see the note above
+ * {@link ValidationSource}).
+ */
+export type IDSRequirementResult = Omit<RequirementResult, 'requirement' | 'facetType'> & {
+  requirement: IDSRequirement & Pick<RequirementSummary, 'label'>;
   facetType: FacetType;
-  /** Human-readable description of what was checked (translated) */
-  checkedDescription: string;
-  /** Human-readable failure reason (translated, if failed) */
-  failureReason?: string;
-  /** Actual value found */
-  actualValue?: string;
-  /** Expected value/constraint description */
-  expectedValue?: string;
-  /** Detailed failure information */
-  failure?: IDSFailureDetail;
-}
+};
+
+/** Result for a single entity against an IDS specification. */
+export type IDSEntityResult = Omit<EntityResult, 'requirementResults'> & {
+  requirementResults: IDSRequirementResult[];
+};
+
+/** Result for a single specification against an IDS document. */
+export type IDSSpecificationResult = Omit<SpecificationResult, 'specification' | 'entityResults'> & {
+  specification: IDSSpecification;
+  entityResults: IDSEntityResult[];
+};
 
 /** Detailed failure information */
 export interface IDSFailureDetail {
@@ -423,17 +355,20 @@ export type FailureType =
   | 'ATTRIBUTE_PATTERN_MISMATCH'
   // Property failures
   | 'PSET_MISSING'
-  | 'PROPERTY_MISSING'
+  | 'PROPERTY_MISSING' | 'PROPERTY_EMPTY' // empty: null/''/UNKNOWN, not "wrong" (#6117)
   | 'PROPERTY_VALUE_MISMATCH'
   | 'PROPERTY_DATATYPE_MISMATCH'
+  | 'PROPERTY_DATATYPE_UNKNOWN' // property found, its dataType is not known here (#5224)
   | 'PROPERTY_OUT_OF_BOUNDS'
   // Classification failures
   | 'CLASSIFICATION_MISSING'
   | 'CLASSIFICATION_SYSTEM_MISMATCH'
   | 'CLASSIFICATION_VALUE_MISMATCH'
+  | 'CLASSIFICATION_UNRESOLVED' // classified, but attributes unreadable here (#3948)
   // Material failures
   | 'MATERIAL_MISSING'
   | 'MATERIAL_VALUE_MISMATCH'
+  | 'MATERIAL_UNRESOLVED' // materially associated, but attributes unreadable here (#5227)
   // PartOf failures
   | 'PARTOF_RELATION_MISSING'
   | 'PARTOF_ENTITY_MISMATCH'
@@ -494,6 +429,22 @@ export interface IFCDataAccessor {
    * type is unknown so callers fall back to permissive comparison.
    */
   getAttributeXsdTypes?(expressId: number, attrName: string): readonly string[] | undefined;
+  /**
+   * The model's raw IFC schema version string (e.g. `IFC2X3`, `IFC4`),
+   * when the accessor's backing store carries one. Used only for
+   * schema-scoped facet semantics — currently the IFC2X3
+   * occurrence/type mapping table (`facets/ifc2x3-type-mapping.ts`).
+   */
+  getSchemaVersion?(): string | undefined;
+  /**
+   * The IFC entity class of the type object (`IfcXxxType`) this
+   * instance is related to via `IfcRelDefinesByType`, if any. Distinct
+   * from `getPredefinedTypeRaw`, which reads the type's
+   * `PredefinedType` *value*, not the type object's own entity class
+   * name — needed to resolve the IFC2X3 occurrence/type mapping table,
+   * where the alias is picked out by the TYPE's class, not its value.
+   */
+  getTypeEntityType?(expressId: number): string | undefined;
   /** Get all entity IDs of a specific type */
   getEntitiesByType(typeName: string): number[];
   /** Get all entity IDs */
@@ -533,8 +484,8 @@ export interface IFCDataAccessor {
 export interface PropertyValueResult {
   /** The value */
   value: string | number | boolean | null;
-  /** The data type (e.g., "IFCLABEL", "IFCREAL") */
-  dataType: string;
+  /** The data type (e.g., "IFCLABEL", "IFCREAL"); `undefined` when unknown (#5224) */
+  dataType: string | undefined;
   /** The property set name */
   propertySetName: string;
   /** The property name */
@@ -549,7 +500,10 @@ export interface PropertySetInfo {
   properties: Array<{
     name: string;
     value: string | number | boolean | null;
-    dataType: string;
+    /** IFC dataType (e.g. `"IFCLABEL"`); `undefined` is UNKNOWN and fails a dataType facet (#5224). */
+    dataType: string | undefined;
+    /** `IfcPropertyTableValue`: columns differ in type by design; a dataType check defers to the value (#5224). */
+    dataTypeMixed?: true;
     /**
      * Optional list of individual values for multi-valued IFC properties
      * (`IfcPropertyEnumeratedValue`, `IfcPropertyListValue`). When set,
@@ -562,20 +516,21 @@ export interface PropertySetInfo {
 
 /** Classification information */
 export interface ClassificationInfo {
-  /** Classification system name */
-  system: string;
-  /** Classification value/code */
-  value: string;
-  /** Optional classification name */
-  name?: string;
+  system: string; // Classification system name
+  value: string; // Classification value/code
+  name?: string; // Optional classification name
+  unresolved?: boolean; // classified, but system/value/name ('') unreadable (#3948)
+  presenceUnknown?: boolean; // unlike `unresolved`, does NOT prove presence (#3954); paired with `unresolved: true`
 }
 
 /** Material information */
 export interface MaterialInfo {
-  /** Material name */
+  /** Material name ('' on an `unresolved` entry, like ClassificationInfo) */
   name: string;
   /** Material category (if available) */
   category?: string;
+  /** A proven material association this data source cannot read (#5227). */
+  unresolved?: boolean;
 }
 
 /** Parent entity information */

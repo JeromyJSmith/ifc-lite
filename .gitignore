@@ -1,4 +1,4 @@
-node_modules/
+node_modules
 package-lock.json
 dist/
 build/
@@ -84,7 +84,7 @@ nul
 # Local test models (private, never committed)
 tests/models/local
 
-# IFC test fixtures are fetched on demand via `pnpm fixtures` and listed in
+# Model test fixtures are fetched on demand via `pnpm fixtures` and listed in
 # tests/models/manifest.json. They must NOT be committed to the repo. The
 # fixture directories themselves are ignored too: in a worktree they may be
 # machine-local symlinks into the primary checkout.
@@ -95,6 +95,11 @@ tests/models/**/*.ifc
 tests/models/**/*.IFC
 tests/models/**/*.ifcx
 tests/models/**/*.ifczip
+tests/models/**/*.xml
+tests/models/**/*.XML
+tests/models/landxml/**/*.json
+tests/models/landxml/**/*.xyz
+tests/models/landxml/**/*.tif
 # Partial downloads from the fetcher.
 tests/models/**/*.part
 
@@ -127,3 +132,27 @@ tests/benchmark/benchmark-results/viewer-*.console.log
 # are rebuilt on every run rather than committed. See tsconfig.tests.base.json.
 packages/*/tsconfig.tests.json
 apps/*/tsconfig.tests.json
+# The ROOT path is here for a different reason: `audit()` only writes for
+# `packages/*` (typecheck-tests.mjs, `rel.startsWith('packages/')`), so
+# `pnpm typecheck` never produces this one. It appears from the bare-cwd mode
+# the script's own header calls a misuse (#2664). Untracked it is harmless;
+# tracked, every branch that adds or removes a test file carries a spurious
+# diff of a ~1.5k-line generated file, and those conflict between branches.
+/tsconfig.tests.json
+
+# Cursor's local tool output. `.cursorrules` is TRACKED and must stay so: it is the
+# pointer that sends Cursor at AGENTS.md. Only the log directory is ignored, and it
+# is ignored because this repository is public and nothing here reviews a 1.6 MB
+# debug log before `git add -A` publishes it.
+# Do NOT add a `!.cursorrules` negation here: `.cursor/` never matched that file, so
+# the negation is a no-op, and scripts/check-ci-path-coverage.mjs throws on any
+# negated pattern in this file.
+.cursor/
+
+# scripts/perf/browser-cold-ab.mts (#3978): raw per-sample JSON/console-log/
+# screenshot evidence and any private local-corpus manifest. The corpus
+# manifest points at local file paths outside the repo (private, sometimes
+# multi-GB models) and must never be committed; see browser-corpus.example.json
+# for the shape.
+scripts/perf/.browser-cold-ab-results/
+scripts/perf/browser-corpus.local.json

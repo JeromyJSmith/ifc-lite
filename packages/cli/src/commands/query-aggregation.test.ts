@@ -18,7 +18,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { getQuantityValue, sortEntities, STANDARD_QTO_MAP } from './query-aggregation.js';
+import { aggregateFinite, getQuantityValue, sortEntities, STANDARD_QTO_MAP } from './query-aggregation.js';
 
 interface FakeEntity {
   ref: number;
@@ -70,6 +70,26 @@ describe('getQuantityValue', () => {
     const value = getQuantityValue(bim, 2, 'Length');
     expect(value).toBe(0);
     expect(Number.isNaN(value)).toBe(false);
+  });
+
+  // A STEP REAL literal with an extreme exponent (e.g. 1.0E400) parses to
+  // f64::INFINITY without erroring in the decoder (see
+  // rust/export/src/json.rs's finite_json_number and its test), so a
+  // present-but-infinite quantity value is reachable from real files, not
+  // just from a computed/synthetic one. `Number(Infinity) || 0` evaluates
+  // to `Infinity` (Infinity is truthy), so the existing `|| 0` guard — built
+  // to turn an unparseable string into a safe 0 — does not catch it.
+  it('answers 0, not Infinity, for a present-but-non-finite value', () => {
+    const infBim = fakeBim({
+      3: [{ name: 'Qto_WallBaseQuantities', quantities: [{ name: 'Length', value: Infinity }] }],
+      4: [{ name: 'Qto_WallBaseQuantities', quantities: [{ name: 'Length', value: -Infinity }] }],
+    });
+    const pos = getQuantityValue(infBim, 3, 'Length');
+    const neg = getQuantityValue(infBim, 4, 'Length');
+    expect(pos).toBe(0);
+    expect(neg).toBe(0);
+    expect(Number.isFinite(pos)).toBe(true);
+    expect(Number.isFinite(neg)).toBe(true);
   });
 });
 
@@ -211,6 +231,24 @@ describe('sortEntities — dotted Pset.Prop sort', () => {
         (e) => e.ref,
       ),
     ).toEqual([2, 3, 1]);
+  });
+});
+
+describe('aggregateFinite empty group', () => {
+  it('returns null, not NaN or Infinity, when no finite value was seen', () => {
+    expect(aggregateFinite([], 'avg')).toBe(null);
+    expect(aggregateFinite([], 'min')).toBe(null);
+    expect(aggregateFinite([], 'max')).toBe(null);
+    expect(aggregateFinite([], 'sum')).toBe(null);
+    // An empty list, and one that is entirely non-finite, both count as
+    // "no finite value was seen" per the function's own doc comment.
+    expect(aggregateFinite([Number.NaN, Infinity, -Infinity], 'avg')).toBe(null);
+  });
+
+  it('still reduces normally once at least one finite value is present', () => {
+    expect(aggregateFinite([2, 4], 'avg')).toBe(3);
+    expect(aggregateFinite([2, 4], 'min')).toBe(2);
+    expect(aggregateFinite([2, 4], 'max')).toBe(4);
   });
 });
 

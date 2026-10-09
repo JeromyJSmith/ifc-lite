@@ -4,6 +4,11 @@
 
 //! Opening classification, merge/extend, and cutter-mesh synthesis.
 
+mod exit_cap;
+mod exit_cap_far_field;
+mod membrane;
+
+use super::super::processing::SourceHygiene;
 use super::geom::*;
 use super::{GeometryRouter, OpeningType, NORMALIZE_EPSILON};
 use crate::{Mesh, Point3, Vector3};
@@ -92,12 +97,28 @@ impl GeometryRouter {
             // detail stays precise even far from the global origin and the AABB-overlap
             // guard sees the cutter at the host (#1297, refined per #1310 review). The
             // bounds derived below are folded to WORLD so the same relativization applies.
-            let opening_mesh = match self.process_element(&opening_entity, decoder) {
-                Ok(m) if !m.is_empty() => m,
-                _ => continue,
+            // #6349: an opening whose items lie in frames >= 1 km apart comes back as
+            // several frame parts; each stays its own cutter instead of being rounded
+            // into one f32 mesh. An ordinary opening has exactly one part.
+            let opening_parts: Vec<Mesh> = match self.process_element_parts_with_hygiene(&opening_entity, decoder, SourceHygiene::IndexOnly) {
+                Ok(parts) => parts.into_iter().filter(|m| !m.is_empty()).collect(),
+                Err(_) => continue,
             };
+            if opening_parts.is_empty() {
+                continue;
+            }
 
-            let vertex_count = opening_mesh.positions.len() / 3;
+            // Triangle count, not raw position-buffer length: the buffer's
+            // element count also includes per-`IfcFace` vertex duplication the
+            // faceted-brep mesher emits, and welding (#4103) merges duplicate
+            // vertex slots without touching `indices`. Gating on the buffer
+            // length let two byte-identical cutters — one authored/welded with
+            // shared corners, one with duplicated ones — land on opposite sides
+            // of the threshold below for the same geometry (issue #4119: 7 of
+            // 618 fixture openings moved branch purely from welding, with no
+            // triangle changed). Triangle count is invariant to that.
+            let triangle_count: usize = opening_parts.iter().map(Mesh::triangle_count).sum();
+            let vertex_count: usize = opening_parts.iter().map(Mesh::vertex_count).sum();
 
             // Local helper: bump the aggregate counter and push a per-host
             // diagnostic line together. QUIET mode (`record_diag == false`) is a
@@ -107,7 +128,11 @@ impl GeometryRouter {
             let mut bump = |router: &Self, ck: ClassificationKind, kind: OpeningKindDiag| {
                 if record_diag {
                     router.bump_classification(ck);
-                    host_diag.push(OpeningDiagnostic { opening_id, kind, vertex_count });
+                    host_diag.push(OpeningDiagnostic {
+                        opening_id,
+                        kind,
+                        vertex_count,
+                    });
                 }
             };
 
@@ -134,24 +159,29 @@ impl GeometryRouter {
             let separable_bodies =
                 item_bounds_with_dir.len() > 1 && spatial_cluster_count(&item_bounds_with_dir) > 1;
 
-            if vertex_count > 100 && !separable_bodies {
-                // High-vertex-count single-body openings (circular / arched /
+            if triangle_count > 100 && !separable_bodies {
+                // High-triangle-count single-body openings (circular / arched /
                 // faceted sweeps) won't fit through the CSG safety thresholds,
                 // so always carry the per-item AABB + extrusion direction
-                // as a fallback (issue #635).
-                let (fallback_min, fallback_max, fallback_dir) =
-                    self.fallback_aabb_for_opening(&opening_entity, &opening_mesh, decoder);
-                bump(
-                    self,
-                    ClassificationKind::NonRectangular,
-                    OpeningKindDiag::NonRectangular,
-                );
-                openings.push(OpeningType::NonRectangular(
-                    opening_mesh,
-                    fallback_min,
-                    fallback_max,
-                    fallback_dir,
-                ));
+                // as a fallback (issue #635). Gated on triangle count, not the
+                // position-buffer length, so authoring/weld-time vertex
+                // duplication can't move an opening across the threshold for
+                // unchanged geometry (issue #4119).
+                for opening_mesh in opening_parts {
+                    let (fallback_min, fallback_max, fallback_dir) =
+                        self.fallback_aabb_for_opening(&opening_entity, &opening_mesh, decoder);
+                    bump(
+                        self,
+                        ClassificationKind::NonRectangular,
+                        OpeningKindDiag::NonRectangular,
+                    );
+                    openings.push(OpeningType::NonRectangular(
+                        opening_mesh,
+                        fallback_min,
+                        fallback_max,
+                        fallback_dir,
+                    ));
+                }
             } else if !item_bounds_with_dir.is_empty() {
                     // Per-item geometry-driven classification (origin/main).
                     // The earlier "is_floor_opening" host-aware heuristic
@@ -249,27 +279,29 @@ impl GeometryRouter {
                         }
                     }
                 } else {
-                    // WORLD bounds (fold the opening's per-element origin); see
-                    // `fallback_aabb_for_opening` (#1310 review).
-                    let o = opening_mesh.origin;
-                    let (open_min, open_max) = opening_mesh.bounds();
-                    let min_f64 = Point3::new(
-                        open_min.x as f64 + o[0],
-                        open_min.y as f64 + o[1],
-                        open_min.z as f64 + o[2],
-                    );
-                    let max_f64 = Point3::new(
-                        open_max.x as f64 + o[0],
-                        open_max.y as f64 + o[1],
-                        open_max.z as f64 + o[2],
-                    );
+                    for opening_mesh in &opening_parts {
+                        // WORLD bounds (fold the opening's per-element origin); see
+                        // `fallback_aabb_for_opening` (#1310 review).
+                        let o = opening_mesh.origin;
+                        let (open_min, open_max) = opening_mesh.bounds();
+                        let min_f64 = Point3::new(
+                            open_min.x as f64 + o[0],
+                            open_min.y as f64 + o[1],
+                            open_min.z as f64 + o[2],
+                        );
+                        let max_f64 = Point3::new(
+                            open_max.x as f64 + o[0],
+                            open_max.y as f64 + o[1],
+                            open_max.z as f64 + o[2],
+                        );
 
-                    bump(
-                        self,
-                        ClassificationKind::Rectangular,
-                        OpeningKindDiag::Rectangular,
-                    );
-                    openings.push(OpeningType::Rectangular(min_f64, max_f64, None));
+                        bump(
+                            self,
+                            ClassificationKind::Rectangular,
+                            OpeningKindDiag::Rectangular,
+                        );
+                        openings.push(OpeningType::Rectangular(min_f64, max_f64, None));
+                    }
                 }
         }
 
@@ -576,13 +608,22 @@ impl GeometryRouter {
         let extend_backward = extend_backward + coplanarity_pad;
         let extend_forward = extend_forward + coplanarity_pad;
 
-        // Extend opening bounds along the extrusion direction
-        let extended_min = open_min - extrusion_direction * extend_backward;
-        let extended_max = open_max + extrusion_direction * extend_forward;
-
-        // Create new AABB that encompasses both original opening and extended points
-        // This ensures we don't shrink the opening in other dimensions
-        let all_points = [open_min, open_max, extended_min, extended_max];
+        // Translate the whole opening AABB toward both projection extremes.
+        // Using only `open_min - direction` and `open_max + direction` assumes
+        // every direction component is positive: an antiparallel local-frame
+        // cutter would move those two corners inward and never extend. The
+        // translated min/max pairs make this invariant under `direction ->
+        // -direction`, including mixed-sign diagonal axes.
+        let backward = -extrusion_direction * extend_backward;
+        let forward = extrusion_direction * extend_forward;
+        let all_points = [
+            open_min,
+            open_max,
+            open_min + backward,
+            open_max + backward,
+            open_min + forward,
+            open_max + forward,
+        ];
 
         let new_min = Point3::new(
             all_points.iter().map(|p| p.x).fold(f64::INFINITY, f64::min),
@@ -649,189 +690,6 @@ impl GeometryRouter {
         m
     }
 
-    /// Remove the INTERNAL MEMBRANE left when an opening is authored as two (or
-    /// more) extrusions glued cap-to-cap — the AC20 round windows store two
-    /// `IfcExtrudedAreaSolid` with the SAME circle profile and the SAME start
-    /// point extruding in OPPOSITE directions, so the combined cutter mesh
-    /// carries a back-to-back pair of cap disks where the two solids meet (e.g. 28
-    /// tris on a shared plane mid-wall). The exact CSG subtract treats that double
-    /// cap as a real boundary and leaves a solid plug at the seam — the window
-    /// never cuts through.
-    ///
-    /// We delete the WHOLE interior cap plane (every cap-facing triangle in an
-    /// interior bucket that carries faces pointing both along and against the
-    /// axis), not just vertex-coincident pairs: the two disks are often
-    /// triangulated DIFFERENTLY, so pair-matching leaves a central plug (a square
-    /// patch inside the round hole). Removing the full membrane welds the two
-    /// solids into one continuous tube whose only caps are the true outer ends, so
-    /// the subtract carves a clean through-hole. A no-op for ordinary single-solid
-    /// openings (no interior back-to-back cap plane exists).
-    pub(super) fn remove_internal_membrane(opening_mesh: &Mesh, axis_dir: Vector3<f64>) -> Mesh {
-        let tri_count = opening_mesh.indices.len() / 3;
-        if tri_count < 4 {
-            return opening_mesh.clone();
-        }
-        let p = |i: usize| -> [f64; 3] {
-            [
-                opening_mesh.positions[i * 3] as f64,
-                opening_mesh.positions[i * 3 + 1] as f64,
-                opening_mesh.positions[i * 3 + 2] as f64,
-            ]
-        };
-        // Penetration axis: the cutter's cylinder/extrusion axis, along which the
-        // two glued solids stack and their shared seam caps lie. Prefer the
-        // supplied depth direction; fall back to the cutter's longest bbox axis.
-        let mut d = axis_dir;
-        if d.norm() < NORMALIZE_EPSILON {
-            let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
-            for c in opening_mesh.positions.chunks_exact(3) {
-                for a in 0..3 {
-                    lo[a] = lo[a].min(c[a] as f64);
-                    hi[a] = hi[a].max(c[a] as f64);
-                }
-            }
-            let ext = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
-            // Use a total order: non-finite file coords (e.g. `1.E999` → +inf,
-            // whose `inf - inf` extent is NaN) would make `partial_cmp` return
-            // `None` and panic the `.unwrap()`. `f64::total_cmp` (the idiom used
-            // for the sorts in voids/mod.rs) is NaN-safe and deterministic.
-            let la = (0..3).max_by(|&i, &j| ext[i].total_cmp(&ext[j])).unwrap();
-            d = Vector3::new(
-                if la == 0 { 1.0 } else { 0.0 },
-                if la == 1 { 1.0 } else { 0.0 },
-                if la == 2 { 1.0 } else { 0.0 },
-            );
-        }
-        d /= d.norm();
-
-        // Cutter span along the axis — its extreme ends are the TRUE outer caps,
-        // which must be kept.
-        let (mut smin, mut smax) = (f64::INFINITY, f64::NEG_INFINITY);
-        for c in opening_mesh.positions.chunks_exact(3) {
-            let s = c[0] as f64 * d.x + c[1] as f64 * d.y + c[2] as f64 * d.z;
-            smin = smin.min(s);
-            smax = smax.max(s);
-        }
-        let span = (smax - smin).abs();
-        if span < NORMALIZE_EPSILON {
-            return opening_mesh.clone();
-        }
-        // Bucket cap triangles by their plane offset along the axis (0.5 mm grid,
-        // so a flat cap's triangles cluster into one bucket). A bucket touching
-        // either extreme is an outer cap and is never removed.
-        let cell = (span * 0.005).max(5.0e-4);
-        let bucket = |s: f64| (s / cell).round() as i64;
-        let (min_b, max_b) = (bucket(smin), bucket(smax));
-
-        // Lateral basis (u, v) ⊥ axis, for the spatial-overlap test below.
-        let helper = if d.x.abs() < 0.9 {
-            Vector3::new(1.0, 0.0, 0.0)
-        } else {
-            Vector3::new(0.0, 1.0, 0.0)
-        };
-        let u = d.cross(&helper).normalize();
-        let v = d.cross(&u);
-
-        // Per interior cap-plane bucket, track the LATERAL (⊥ axis) bounding box of
-        // the +axis-facing and −axis-facing cap faces SEPARATELY. Two solids glued
-        // cap-to-cap leave an outward cap of one and an inward cap of the other on
-        // the same plane — but, crucially, with the SAME lateral footprint (the
-        // shared disk). Tracking direction alone is not enough: two laterally
-        // SEPARATE caps (e.g. side-by-side cutters abutting at one offset) would
-        // also carry both directions in the bucket, and welding them would punch
-        // through solid material between the holes. So a bucket is a membrane only
-        // where the two footprints actually OVERLAP, and only that overlap region
-        // is removed — a lone cap or a disjoint neighbour sharing the offset is
-        // kept. A genuine two-hole opening is therefore not merged into one.
-        let bbox_union = |bb: &mut Option<[f64; 4]>, lu: f64, lv: f64| match bb {
-            None => *bb = Some([lu, lu, lv, lv]),
-            Some(b) => {
-                b[0] = b[0].min(lu);
-                b[1] = b[1].max(lu);
-                b[2] = b[2].min(lv);
-                b[3] = b[3].max(lv);
-            }
-        };
-        let mut buckets: std::collections::HashMap<i64, [Option<[f64; 4]>; 2]> =
-            std::collections::HashMap::new();
-        // Per cap triangle: (bucket, lateral_u, lateral_v); non-caps use i64::MIN.
-        let mut cap_tris: Vec<(i64, f64, f64)> = Vec::with_capacity(tri_count);
-        for t in 0..tri_count {
-            let (i0, i1, i2) = (
-                opening_mesh.indices[t * 3] as usize,
-                opening_mesh.indices[t * 3 + 1] as usize,
-                opening_mesh.indices[t * 3 + 2] as usize,
-            );
-            let (a, b, c) = (p(i0), p(i1), p(i2));
-            let e1 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-            let e2 = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
-            let n = [
-                e1[1] * e2[2] - e1[2] * e2[1],
-                e1[2] * e2[0] - e1[0] * e2[2],
-                e1[0] * e2[1] - e1[1] * e2[0],
-            ];
-            let nl = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
-            if nl < 1e-12 {
-                cap_tris.push((i64::MIN, 0.0, 0.0));
-                continue;
-            }
-            let align = (n[0] * d.x + n[1] * d.y + n[2] * d.z) / nl;
-            if align.abs() <= 0.9 {
-                cap_tris.push((i64::MIN, 0.0, 0.0)); // not a cap (tube wall)
-                continue;
-            }
-            let cx = (a[0] + b[0] + c[0]) / 3.0;
-            let cy = (a[1] + b[1] + c[1]) / 3.0;
-            let cz = (a[2] + b[2] + c[2]) / 3.0;
-            let cs = cx * d.x + cy * d.y + cz * d.z;
-            let lu = cx * u.x + cy * u.y + cz * u.z;
-            let lv = cx * v.x + cy * v.y + cz * v.z;
-            let bk = bucket(cs);
-            cap_tris.push((bk, lu, lv));
-            if bk != min_b && bk != max_b {
-                let e = buckets.entry(bk).or_insert([None, None]);
-                bbox_union(&mut e[(align > 0.0) as usize], lu, lv);
-            }
-        }
-        // A bucket is a glued membrane where its +face and −face footprints overlap
-        // laterally; the membrane region is that lateral intersection.
-        let mut membrane_region: std::collections::HashMap<i64, [f64; 4]> =
-            std::collections::HashMap::new();
-        for (&bk, dirs) in &buckets {
-            if let (Some(neg), Some(pos)) = (dirs[0], dirs[1]) {
-                let iu0 = neg[0].max(pos[0]);
-                let iu1 = neg[1].min(pos[1]);
-                let iv0 = neg[2].max(pos[2]);
-                let iv1 = neg[3].min(pos[3]);
-                // Require a non-degenerate overlap so caps merely touching at an
-                // edge/corner (a real internal partition, not a coincident disk)
-                // are not welded.
-                if iu1 - iu0 > 1.0e-3 && iv1 - iv0 > 1.0e-3 {
-                    membrane_region.insert(bk, [iu0, iu1, iv0, iv1]);
-                }
-            }
-        }
-        if membrane_region.is_empty() {
-            return opening_mesh.clone();
-        }
-        let pad = 1.0e-4;
-        let mut out = opening_mesh.clone();
-        out.indices.clear();
-        for t in 0..tri_count {
-            let (bk, lu, lv) = cap_tris[t];
-            if let Some(r) = membrane_region.get(&bk) {
-                if lu >= r[0] - pad && lu <= r[1] + pad && lv >= r[2] - pad && lv <= r[3] + pad
-                {
-                    continue; // inside the overlapping membrane footprint
-                }
-            }
-            out.indices.push(opening_mesh.indices[t * 3]);
-            out.indices.push(opening_mesh.indices[t * 3 + 1]);
-            out.indices.push(opening_mesh.indices[t * 3 + 2]);
-        }
-        out
-    }
-
     /// Push the opening MESH's caps a hair PAST the host along `dir` so a FLUSH
     /// cap interface becomes a clean TRANSVERSAL crossing before the exact-kernel
     /// subtract. Returns the mesh UNCHANGED unless a real flush-cap condition is
@@ -877,78 +735,27 @@ impl GeometryRouter {
         }
         let d = dir / len;
 
-        // Opening span along `d`.
-        let (mut omn, mut omx) = (f64::INFINITY, f64::NEG_INFINITY);
-        for c in opening_mesh.positions.chunks_exact(3) {
-            let s = c[0] as f64 * d.x + c[1] as f64 * d.y + c[2] as f64 * d.z;
-            omn = omn.min(s);
-            omx = omx.max(s);
-        }
-        let open_span = (omx - omn).abs();
+        // Cutter extents in the penetration frame, and which caps the opening
+        // actually EXITS through. Growing a cap the opening does not exit
+        // through removes host material no authored opening occupied (#3219),
+        // so the decision lives behind one call in `exit_cap`.
+        let Some(frame) = exit_cap::CutterFrame::new(opening_mesh, d) else {
+            return opening_mesh.clone();
+        };
+        let open_span = frame.span();
         if open_span < NORMALIZE_EPSILON {
             return opening_mesh.clone();
         }
-
-        // FLUSH-CAP DETECTION against the host SURFACE (not its AABB): is there a
-        // host triangle whose plane is ~parallel to a cap (normal·d ≈ ±1) and whose
-        // plane the cap's projection `omn`/`omx` sits ON (within `flush_band`)? Only
-        // then is that cap a real flush interface to extend. This is what tells a
-        // #1112 roof-opening cap (flush with a roof facet that is INTERIOR to the
-        // host's projected extent) apart from a wall #552611 horizontal slot whose
-        // caps float inside the wall (no host facet there) — extending the latter
-        // along its authored +Z extrusion would cut the wall in half.
-        let flush_band = open_span.max(1.0) * 1e-3; // 0.1% of opening depth, scale-rel
-        let (mut cap_min_flush, mut cap_max_flush) = (false, false);
-        // Farthest host surface coincident with each cap, along `d` (for the push).
-        let (mut host_at_min, mut host_at_max) = (omn, omx);
-        let vat = |i: u32| {
-            let b = i as usize * 3;
-            [
-                host_mesh.positions[b] as f64,
-                host_mesh.positions[b + 1] as f64,
-                host_mesh.positions[b + 2] as f64,
-            ]
-        };
-        let vc = host_mesh.positions.len() / 3;
-        for t in host_mesh.indices.chunks_exact(3) {
-            if (t[0] as usize) >= vc || (t[1] as usize) >= vc || (t[2] as usize) >= vc {
-                continue;
-            }
-            let (a, b, c) = (vat(t[0]), vat(t[1]), vat(t[2]));
-            let e1 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-            let e2 = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
-            let n = [
-                e1[1] * e2[2] - e1[2] * e2[1],
-                e1[2] * e2[0] - e1[0] * e2[2],
-                e1[0] * e2[1] - e1[1] * e2[0],
-            ];
-            let nl = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
-            if nl < 1e-12 {
-                continue;
-            }
-            // |n·d| ≈ 1 ⇒ host facet parallel to the caps (normal along the
-            // penetration axis). 0.985 ≈ 10° — absorbs the ~0.1° facet scatter and
-            // a tilted roof's facet wobble without admitting a perpendicular wall.
-            let nd = (n[0] * d.x + n[1] * d.y + n[2] * d.z) / nl;
-            if nd.abs() < 0.985 {
-                continue;
-            }
-            // the facet's offset along d (any vertex; it's ~constant on the facet)
-            let s = a[0] * d.x + a[1] * d.y + a[2] * d.z;
-            if (s - omn).abs() <= flush_band {
-                cap_min_flush = true;
-                host_at_min = host_at_min.min(s);
-            }
-            if (s - omx).abs() <= flush_band {
-                cap_max_flush = true;
-                host_at_max = host_at_max.max(s);
-            }
-        }
-        if !cap_min_flush && !cap_max_flush {
-            return opening_mesh.clone(); // no flush cap ⇒ a clean transversal cut
+        let (omn, omx) = frame.caps();
+        // `pad` is needed by the gate: the veto probes the interval the push
+        // would sweep, which is pad-sized.
+        let pad = (open_span * 0.30).max(0.01);
+        let caps = exit_cap::detect(host_mesh, &frame, pad);
+        if !caps.any_moves() {
+            return opening_mesh.clone(); // no coincident cap => already transversal
         }
 
-        // Push each FLUSH cap a clearance margin PAST its coincident host facet, so
+        // Push each EXIT cap a clearance margin PAST its coincident host facet, so
         // the interface becomes a transversal crossing. The margin is NOT a hairline
         // pad: a near-grazing exit (cap a few µm past a TILTED faceted surface)
         // re-creates a coarse T-junction at the facet seam — two rim vertices a few
@@ -965,24 +772,26 @@ impl GeometryRouter {
         // chamfer), 15 % → a near-grazing 1250:1 resonance, 30–40 % → ~25:1 clean.
         // 30 % is the conservative floor of that clean band; it is still small in
         // absolute terms (a few cm on a ~1 m-deep opening, ~9 cm on a 0.3 m window),
-        // fires ONLY on a detected flush cap (a floating wall-slot cap is untouched),
+        // fires ONLY on a detected exit cap (a floating wall-slot cap is untouched),
         // pushes INTO the host away from neighbouring elements, and stays well short
         // of the engulf guard. Verified: the whole rect-opening + #1007 + #960 suite
         // stays green and `issue_1007_real_opening_no_bridge`'s footprint coverage
         // stays 0 (no bridge).
-        let pad = (open_span * 0.30).max(0.01);
-        let push_back = if cap_min_flush { (omn - host_at_min).max(0.0) + pad } else { 0.0 };
-        let push_fwd = if cap_max_flush { (host_at_max - omx).max(0.0) + pad } else { 0.0 };
-        // Only the flush cap ring(s) move; interior loops are untouched (band = a
-        // quarter of the opening's own depth).
-        let band = (open_span * 0.25).max(1e-6);
+        // A jamb is pulled off its plane by one coincidence band, or a quarter
+        // of the cutter where that is smaller. See `CutterFrame::shrink`.
+        let shrink = frame.shrink();
+        let push_back = caps.push_back(omn, pad, shrink);
+        let push_fwd = caps.push_fwd(omx, pad, shrink);
+        // Only cap rings move, exit and jamb alike; interior loops stay put.
+        // Named for contrast with `CutterFrame::cap_band`, a different quantity.
+        let ring_band = (open_span * exit_cap::RING_BAND_FRACTION).max(1e-6);
         let mut out = opening_mesh.clone();
         for c in out.positions.chunks_exact_mut(3) {
             let p = Point3::new(c[0] as f64, c[1] as f64, c[2] as f64);
             let s = p.x * d.x + p.y * d.y + p.z * d.z;
-            let shift = if cap_min_flush && s <= omn + band {
+            let shift = if caps.min_moves() && s <= omn + ring_band {
                 -push_back
-            } else if cap_max_flush && s >= omx - band {
+            } else if caps.max_moves() && s >= omx - ring_band {
                 push_fwd
             } else {
                 0.0

@@ -2,34 +2,100 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
-import type { ConnectionTestResult, SourceFile as PluginSourceFile } from '@ifc-lite/plugin-api';
+import { useState, useCallback, useEffect, useMemo } from 'react';
+import type { ConnectionTestResult } from '@ifc-lite/plugin-api';
 import { useSourceHost } from '@/services/sources/SourceHostProvider';
-import { dispatchSourceDownload } from '@/services/sources/source-host';
 import { SourceSettingsDialog } from './SourceSettingsDialog';
 import { SourceBrowser } from './SourceBrowser';
 import { SourceProviderRow } from './SourceProviderRow';
 import { SourceFavouritesList } from './SourceFavouritesList';
+import { useSourceDownloadBatch } from './useSourceDownloadBatch';
 import type { SourceFavourite } from '@/lib/sources/favourites';
 import { Button } from '@/components/ui/button';
 import { toast } from '@/components/ui/toast';
 import { AlertCircle, Cloud, X } from 'lucide-react';
+import { useTranslation } from '@/i18n';
+import { formatLocaleNumber } from '@/i18n/intlFormat';
+import type { TranslationKey } from '@/i18n';
+import { getLocale, hasActiveTranslation, resolveEnglish, selectPluralCategory } from '@/i18n/registry';
 import { useViewerStore } from '@/store';
 import { loadResolvedSourcePrefs, saveSourcePrefs } from '@/lib/sources/preferences';
-import { sanitizeFilename } from '@/lib/export/download';
 import { clearAllSourceData } from '@/lib/sources/persistence';
-import { claimRevisionWatchSlot, watchSourceRevisions } from '@/lib/sources/revisionWatch';
+import {
+  claimRevisionWatchSlot,
+  watchSourceRevisions,
+  type SourceRevisionUpdate,
+} from '@/lib/sources/revisionWatch';
 
 interface SourcesPanelProps {
   onClose: () => void;
 }
 
-interface SourceDownloadSelection {
-  readonly projectId: string;
-  readonly files: readonly PluginSourceFile[];
+type Translate = ReturnType<typeof useTranslation>['t'];
+
+/** Build one complete, locale-orderable source revision notice. */
+const REVISION_BOTH_KEYS: Record<Intl.LDMLPluralRule, TranslationKey> = {
+  zero: 'sources.sourcesPanel.revisionChangedZeroDeleted',
+  one: 'sources.sourcesPanel.revisionChangedOneDeleted',
+  two: 'sources.sourcesPanel.revisionChangedTwoDeleted',
+  few: 'sources.sourcesPanel.revisionChangedFewDeleted',
+  many: 'sources.sourcesPanel.revisionChangedManyDeleted',
+  other: 'sources.sourcesPanel.revisionChangedOtherDeleted',
+};
+
+export function revisionSyncMessage(t: Translate, locale: string, changed: number, deleted: number): string {
+  if (changed > 0 && deleted > 0) {
+    const localeKey = REVISION_BOTH_KEYS[selectPluralCategory(locale, changed)];
+    const params = {
+      count: deleted,
+      changed: formatLocaleNumber(locale, changed),
+      deleted: formatLocaleNumber(locale, deleted),
+    };
+    // Locale catalogues are partial (#4785): falling back to English text
+    // under the *active locale's* plural category (e.g. Russian "one" for
+    // 21) can pick an English form that count doesn't have (English's
+    // "one" is only for exactly 1) — reselect with English plural rules
+    // first so the fallback text and its count agree grammatically.
+    return hasActiveTranslation(localeKey)
+      ? t(localeKey, params)
+      : resolveEnglish(REVISION_BOTH_KEYS[selectPluralCategory('en', changed)], params);
+  }
+  if (changed > 0) {
+    return t('sources.sourcesPanel.revisionChangedOnly', { count: changed });
+  }
+  if (deleted > 0) {
+    return t('sources.sourcesPanel.revisionDeletedOnly', { count: deleted });
+  }
+  return '';
+}
+
+/**
+ * Builds and shows the background revision-sync toast. Reads the active
+ * locale live via `getLocale()` rather than accepting it as a parameter:
+ * the one-shot, slot-gated effect below can still be pending when the
+ * app's async startup locale activates, so a closed-over value could be
+ * stale by the time this resolves (#5000 review).
+ */
+export function notifyRevisionSync(t: Translate, updates: readonly SourceRevisionUpdate[]): void {
+  const deleted = updates.filter((u) => u.event.deleted).length;
+  const changed = updates.length - deleted;
+  toast.info(revisionSyncMessage(t, getLocale(), changed, deleted));
+}
+
+export function RegistrationFailureMessage({ provider, reason }: { provider: string; reason: string }) {
+  const { t } = useTranslation();
+  let marker = '\uE000provider\uE001';
+  while (reason.includes(marker)) marker += '\uE002';
+  const message = t('sources.sourcesPanel.failedToRegister', { provider: marker, reason });
+  const segments = message.split(marker);
+  if (segments.length === 1) return message;
+  return segments.flatMap((segment, index) => index === segments.length - 1
+    ? [segment]
+    : [segment, <span key={index} className="font-medium">{provider}</span>]);
 }
 
 export function SourcesPanel({ onClose }: SourcesPanelProps) {
+  const { t } = useTranslation();
   const sourceHost = useSourceHost();
   const providers = useMemo(() => sourceHost.list(), [sourceHost]);
   const registrationFailures = useMemo(
@@ -38,7 +104,6 @@ export function SourcesPanel({ onClose }: SourcesPanelProps) {
   );
   const [browsing, setBrowsing] = useState<string | null>(null);
   const [settingsFor, setSettingsFor] = useState<string | null>(null);
-  const [downloading, setDownloading] = useState(false);
   // Bumped when saved prefs change so rows/contexts re-derive configured state.
   const [prefsVersion, setPrefsVersion] = useState(0);
   // Same counter pattern for the favourites the list reads from storage. Its
@@ -72,10 +137,6 @@ export function SourcesPanel({ onClose }: SourcesPanelProps) {
     setBrowseTarget(null);
   }, []);
 
-  // Cancels in-flight downloads when the panel unmounts (close / navigate away).
-  const downloadAbortRef = useRef<AbortController | null>(null);
-  useEffect(() => () => downloadAbortRef.current?.abort(), []);
-
   const activeProvider = browsing ? sourceHost.get(browsing) : undefined;
   const settingsProvider = settingsFor ? sourceHost.get(settingsFor) : undefined;
 
@@ -89,19 +150,21 @@ export function SourcesPanel({ onClose }: SourcesPanelProps) {
     void watchSourceRevisions(sourceHost, tags, controller.signal)
       .then((updates) => {
         if (controller.signal.aborted || updates.length === 0) return;
-        const deleted = updates.filter((u) => u.event.deleted).length;
-        const changed = updates.length - deleted;
-        const parts: string[] = [];
-        if (changed > 0) parts.push(`${changed} loaded model${changed === 1 ? ' has' : 's have'} a newer revision`);
-        if (deleted > 0) parts.push(`${deleted} source file${deleted === 1 ? ' is' : 's are'} gone upstream`);
-        toast.info(`${parts.join('; ')} — use Sync to update.`);
+        // `notifyRevisionSync` reads the locale live (`getLocale()`) rather
+        // than a value closed over here: this is a one-shot, slot-gated
+        // check that can still be pending when the startup locale finishes
+        // loading and activates, so a render-time snapshot could be stale
+        // by the time this resolves (#5000 review). `locale` is
+        // deliberately not a dependency of this effect — adding it would
+        // abort and restart the one-shot check on every switch.
+        notifyRevisionSync(t, updates);
       })
       .catch((err: unknown) => {
         if (controller.signal.aborted) return;
         console.warn('[sources] Background revision check failed', err);
       });
     return () => controller.abort();
-  }, [sourceHost]);
+  }, [sourceHost, t]);
 
   const handleSavePrefs = useCallback(
     (values: Record<string, string>) => {
@@ -129,78 +192,25 @@ export function SourcesPanel({ onClose }: SourcesPanelProps) {
 
   const handleTestConnection = useCallback(
     async (values: Record<string, string>): Promise<ConnectionTestResult> => {
-      if (!settingsProvider) return { ok: false, message: 'No provider' };
+      if (!settingsProvider) {
+        return { ok: false, message: t('sources.sourcesPanel.noProviderMessage') };
+      }
       const ctx = sourceHost.createContext(settingsProvider.manifest, values);
       if (settingsProvider.testConnection) {
         return settingsProvider.testConnection(ctx);
       }
-      return { ok: false, message: 'Provider does not support connection testing' };
+      return { ok: false, message: t('sources.sourcesPanel.connectionTestUnsupported') };
     },
-    [settingsProvider, sourceHost],
+    [settingsProvider, sourceHost, t],
   );
 
-  // Downloads run one file at a time and each finished file is dispatched
-  // (and its buffer reference dropped) before the next download starts, so
-  // whole batches of large IFCs are never held in memory simultaneously.
-  // The viewport listener serializes the resulting loads.
-  const handleDownload = useCallback(
-    async ({ projectId, files }: SourceDownloadSelection) => {
-      if (!activeProvider || !browsing) return;
-      const prefs = loadResolvedSourcePrefs(activeProvider.manifest);
-      const ctx = sourceHost.createContext(activeProvider.manifest, prefs);
-      const providerId = browsing;
-      const providerTitle = activeProvider.manifest.title;
-
-      downloadAbortRef.current?.abort();
-      const controller = new AbortController();
-      downloadAbortRef.current = controller;
-
-      setDownloading(true);
-      try {
-        let queued = 0;
-        for (const f of files) {
-          if (controller.signal.aborted) break;
-          try {
-            const buffer = await activeProvider.download(
-              ctx,
-              { projectId, containerId: f.containerId, fileId: f.id },
-              { signal: controller.signal },
-            );
-            dispatchSourceDownload([
-              {
-                // `f.name` is provider-supplied and reaches `new File(...)` and
-                // `addModel`, so it is untrusted input to a filename position.
-                // Sanitize at the boundary rather than trusting every provider
-                // to have done it — the same contract the export paths use.
-                name: sanitizeFilename(f.name, { fallback: 'model.ifc' }),
-                buffer,
-                sourceFile: f,
-                tag: sourceHost.createSourceTag(
-                  providerId,
-                  projectId,
-                  f.containerId,
-                  f.id,
-                  f.currentRevisionId,
-                ),
-              },
-            ]);
-            queued += 1;
-          } catch (err) {
-            if (controller.signal.aborted) break;
-            toast.error(
-              err instanceof Error
-                ? `${f.name}: ${err.message}`
-                : `Failed to download ${f.name} from ${providerTitle}`,
-            );
-          }
-        }
-        if (queued > 0) closeBrowser();
-      } finally {
-        setDownloading(false);
-      }
-    },
-    [activeProvider, browsing, closeBrowser, sourceHost],
-  );
+  // Downloads are aborted when the panel unmounts (close / navigate away).
+  const { downloading, downloadStates, handleDownload, clearFinishedDownloadStates } = useSourceDownloadBatch({
+    provider: activeProvider,
+    providerId: browsing,
+    sourceHost,
+    onBatchSucceeded: closeBrowser,
+  });
 
   const browsingCtx = useMemo(() => {
     if (!activeProvider || !browsing) return null;
@@ -226,8 +236,12 @@ export function SourcesPanel({ onClose }: SourcesPanelProps) {
         provider={activeProvider}
         ctx={browsingCtx}
         onDownload={(selection) => void handleDownload(selection)}
-        onBack={closeBrowser}
+        onBack={() => {
+          closeBrowser();
+          clearFinishedDownloadStates();
+        }}
         busy={downloading}
+        downloadStates={downloadStates}
         openTarget={browseTarget}
         onFavouritesChanged={bumpFavourites}
       />
@@ -237,12 +251,12 @@ export function SourcesPanel({ onClose }: SourcesPanelProps) {
   return (
     <div className="flex h-full flex-col">
       <div className="flex items-center justify-between border-b px-3 py-2">
-        <span className="text-sm font-medium">Cloud Sources</span>
+        <span className="text-sm font-medium">{t('sources.sourcesPanel.title')}</span>
         <Button
           variant="ghost"
           size="sm"
           className="h-7 w-7 p-0 rounded-sm"
-          aria-label="Close"
+          aria-label={t('sources.sourcesPanel.closeAria')}
           onClick={onClose}
         >
           <X className="h-4 w-4" aria-hidden />
@@ -253,7 +267,7 @@ export function SourcesPanel({ onClose }: SourcesPanelProps) {
         {providers.length === 0 && registrationFailures.length === 0 && (
           <div className="flex flex-col items-center gap-2 px-4 py-8 text-center text-sm text-muted-foreground">
             <Cloud className="h-8 w-8" aria-hidden />
-            <span>No source providers configured</span>
+            <span>{t('sources.sourcesPanel.noProviders')}</span>
           </div>
         )}
 
@@ -281,8 +295,8 @@ export function SourcesPanel({ onClose }: SourcesPanelProps) {
 
         {registrationFailures.length > 0 && (
           <div className="border-t px-3 py-2">
-            <div className="mb-1 text-[11px] uppercase tracking-wide text-muted-foreground">
-              Unavailable providers
+            <div className="mb-1 text-xs uppercase tracking-wide text-muted-foreground">
+              {t('sources.sourcesPanel.unavailableProviders')}
             </div>
             <ul className="flex flex-col gap-1.5">
               {registrationFailures.map((failure) => (
@@ -292,8 +306,7 @@ export function SourcesPanel({ onClose }: SourcesPanelProps) {
                 >
                   <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden />
                   <span>
-                    <span className="font-medium">{failure.provider}</span> failed to register:{' '}
-                    {failure.reason}
+                    <RegistrationFailureMessage provider={failure.provider} reason={failure.reason} />
                   </span>
                 </li>
               ))}

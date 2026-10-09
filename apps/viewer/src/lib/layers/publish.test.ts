@@ -119,6 +119,41 @@ describe('publishViewerDraft (#1717 V2)', () => {
     assert.deepStrictEqual(result.unresolved, [42]);
   });
 
+  it('a second publish to the same ref appends its layer id after the first, not before', async () => {
+    // `stackFiles`/`layers` are documented "weakest first" (see the
+    // `PublishDraftInit.stackFiles` doc comment and this file's header):
+    // downstream composition reads a ref's `layers` in that order, so a
+    // later publish landing before an earlier one would silently flip
+    // which edit wins on any overlapping attribute. The prior
+    // "deterministic" test republishes the SAME edits, so both an append
+    // and a prepend land on `[layerId, layerId]` — indistinguishable. Two
+    // DIFFERENT edits are required to see the ordering at all.
+    const store = await BrowserLayerStore.open();
+    const base = makeBase();
+    const first = publishViewerDraft({
+      store,
+      stackFiles: [base],
+      mutations: [mutation({ id: 'm1', psetName: 'Pset_FireSafety', propName: 'FireRating', newValue: 'REI30' })],
+      pathOf: () => 'wall-guid-1',
+      intent: 'First edit',
+      authorPrincipal: 'louis',
+      refName: 'local',
+      created: '2026-07-11T12:00:00Z',
+    });
+    const second = publishViewerDraft({
+      store,
+      stackFiles: [base],
+      mutations: [mutation({ id: 'm2', psetName: 'Pset_FireSafety', propName: 'FireRating', newValue: 'REI60' })],
+      pathOf: () => 'wall-guid-1',
+      intent: 'Second edit',
+      authorPrincipal: 'louis',
+      refName: 'local',
+      created: '2026-07-11T13:00:00Z',
+    });
+    assert.notStrictEqual(first.layerId, second.layerId);
+    assert.deepStrictEqual(store.getRef('local')?.layers, [first.layerId, second.layerId]);
+  });
+
   it('is deterministic: same edits, same created stamp, same content address', async () => {
     const store = await BrowserLayerStore.open();
     const init = {
@@ -323,6 +358,29 @@ describe('publishViewerDraft (#1717 V2)', () => {
     assert.deepStrictEqual(node?.attributes, { 'bsi::ifc::class': { code: 'IfcColumn' } });
   });
 
+  it('a set-component op whose values are non-empty but every member fails wire translation is still reported unrepresented, not silently marked written', () => {
+    // Distinct from the `values: {}` empty-pset case (the loop there never
+    // runs at all, so `wrote` trivially stays false): here the loop DOES
+    // run — once, for `uri` — but `wireEntry` returns null for it (nothing
+    // under `attr:class` matches a non-"code" member), so `node.attributes`
+    // is never touched. `wrote` must reflect "did anything actually land
+    // on the wire", not "did we iterate at least one member" — a `wrote =
+    // true` set unconditionally inside the loop (rather than only when
+    // `entry` is truthy) would pass every existing fixture, since every
+    // other test's non-empty `values` has at least one representable
+    // member.
+    const unrepresentedOps: ChangeSetOp[] = [];
+    const op: ChangeSetOp = {
+      op: 'set-component',
+      entity: 'wall-guid-1',
+      componentKey: 'attr:class',
+      values: { uri: 'https://example.invalid/schema' },
+    };
+    const nodes = buildDeltaNodes([op], [], unrepresentedOps);
+    assert.deepStrictEqual(unrepresentedOps, [op]);
+    assert.strictEqual(nodes.find((n) => n.path === 'wall-guid-1'), undefined);
+  });
+
   it('an entity deletion publishes an explicit `true` tombstone opinion (not merely a truthy value)', async () => {
     const store = await BrowserLayerStore.open();
     const result = publishViewerDraft({
@@ -439,6 +497,48 @@ describe('publishViewerDraft retype + skipped reporting (#1717 geometry pass)', 
     // The unrelated real edit on the other entity must still publish.
     const realNode = result.file.data.find((n) => n.path === 'wall-guid-1');
     assert.deepStrictEqual(realNode?.attributes?.[FIRE], { type: 'IfcLabel', value: 'REI90' });
+  });
+});
+
+describe('publishViewerDraft — graph provenance (#5167 Phase 2)', () => {
+  it('records author kind/tool/session when the caller (Flow Publish) supplies them, defaulting to a human author otherwise', async () => {
+    const store = await BrowserLayerStore.open();
+    const base = makeBase();
+    const result = publishViewerDraft({
+      store,
+      stackFiles: [base],
+      mutations: [mutation({ psetName: 'Pset_FireSafety', propName: 'FireRating', newValue: 'REI90' })],
+      pathOf: (id) => (id === 7 ? 'wall-guid-1' : undefined),
+      intent: 'Published from flow "Audit rooms" — wrote: graph/rooms',
+      authorPrincipal: 'viewer-user',
+      refName: 'local',
+      authorKind: 'hybrid',
+      authorTool: 'flow:graph-123',
+      authorSession: 'graph-123',
+    });
+    const manifest = getProvenance(store.loadLayer(result.layerId));
+    assert.strictEqual(manifest?.author.kind, 'hybrid');
+    assert.strictEqual(manifest?.author.tool, 'flow:graph-123');
+    assert.strictEqual(manifest?.author.session, 'graph-123');
+    assert.match(manifest?.intent ?? '', /graph\/rooms/);
+  });
+
+  it('the existing Draft-section call path (no overrides) still stamps a human author with no tool/session', async () => {
+    const store = await BrowserLayerStore.open();
+    const base = makeBase();
+    const result = publishViewerDraft({
+      store,
+      stackFiles: [base],
+      mutations: [mutation({ psetName: 'Pset_FireSafety', propName: 'FireRating', newValue: 'REI90' })],
+      pathOf: (id) => (id === 7 ? 'wall-guid-1' : undefined),
+      intent: 'Manual edit',
+      authorPrincipal: 'louis',
+      refName: 'local',
+    });
+    const manifest = getProvenance(store.loadLayer(result.layerId));
+    assert.strictEqual(manifest?.author.kind, 'human');
+    assert.strictEqual(manifest?.author.tool, undefined);
+    assert.strictEqual(manifest?.author.session, undefined);
   });
 });
 

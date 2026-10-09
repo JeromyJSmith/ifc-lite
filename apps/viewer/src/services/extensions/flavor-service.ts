@@ -14,6 +14,8 @@
  */
 
 import {
+  activeFlavorPointer,
+  activeFlavorPointerAlreadyStored,
   DEFAULT_FLAVOR_ID,
   flavorImportedId,
   packFlavor,
@@ -28,6 +30,10 @@ import {
   type UnpackedFlavor,
 } from '@ifc-lite/extensions';
 import { IdbFlavorStorage } from './idb-flavor-storage.js';
+import {
+  DEFAULT_FLAVOR_DESCRIPTION,
+  DEFAULT_FLAVOR_NAME,
+} from './default-flavor-metadata.js';
 
 export interface FlavorServiceOptions {
   storage?: FlavorStorage;
@@ -57,6 +63,16 @@ export class FlavorService {
   async getActive(): Promise<Flavor | undefined> {
     const id = await this.storage.getActiveId();
     return id ? this.storage.getFlavor(id) : undefined;
+  }
+
+  /**
+   * The persisted active-flavor pointer, without loading the flavor behind it.
+   * `getActive` answers `undefined` both for "no pointer" and for "the pointer
+   * names a flavor that is gone"; a caller comparing against the value a
+   * pointer write would store needs the pointer itself.
+   */
+  async activeId(): Promise<string | undefined> {
+    return this.storage.getActiveId();
   }
 
   async put(flavor: Flavor, reason?: string): Promise<void> {
@@ -152,8 +168,8 @@ export class FlavorService {
     const flavor: Flavor = {
       schemaVersion: 1,
       id,
-      name: 'Default',
-      description: 'Baseline flavor — no extensions, no overrides.',
+      name: DEFAULT_FLAVOR_NAME,
+      description: DEFAULT_FLAVOR_DESCRIPTION,
       createdAt: now,
       updatedAt: now,
       extensions: [],
@@ -164,7 +180,27 @@ export class FlavorService {
       settings: {},
     };
     await this.storage.putFlavor(flavor, 'reset to defaults');
-    await this.storage.setActiveId(id);
+    // A refused pointer write that would have stored exactly what is stored
+    // already changed nothing, so it must not fail the reset. Resetting when
+    // the default flavor is already active — the common case, since the reset
+    // button is the way back from anything — writes the pointer it already
+    // holds: the baseline flavor above landed and the pointer names it, so
+    // storage is exactly what a successful reset leaves behind.
+    //
+    // `activeFlavorPointer` builds the value handed to `setActiveId`, and
+    // `activeFlavorPointerAlreadyStored` — the one comparison, shared with the
+    // switcher — compares through that same value, so what is compared is what
+    // would have been written.
+    const activeId = activeFlavorPointer(flavor);
+    try {
+      await this.storage.setActiveId(activeId);
+    } catch (err) {
+      const stored = await activeFlavorPointerAlreadyStored(
+        () => this.storage.getActiveId(),
+        activeId,
+      );
+      if (!stored) throw err;
+    }
     this.emit();
     return flavor;
   }

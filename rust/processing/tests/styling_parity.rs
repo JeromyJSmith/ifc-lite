@@ -19,6 +19,20 @@
 //!
 //! When Phase 1 deletes the old table bodies, this file is the proof that
 //! the only behavioral change is the four documented entries.
+//!
+//! ANTI-VACUITY (#3200): the two source-grep guards at the bottom conclude from
+//! an ABSENCE - no second table, no second extractor - so a scan that examined
+//! nothing used to pass them, silently, over an empty directory and over a
+//! directory that does not exist alike. Four guards now stand in the way: a
+//! missing or unreadable scan root is a hard error rather than an empty result
+//! (and the two are told apart), a file that cannot be read is a hard error
+//! rather than a skip, the walk must reach `SCANNED_FLOOR` files, and the
+//! detectors themselves are exercised against known-positive inputs - a file
+//! count shows the walk is alive, not that the detector still detects. A fifth
+//! now closes the way around all four: under CI the no-repo-root skip at the
+//! top of each guard is refused outright (`common::refuse_to_skip_in_ci`).
+
+mod common;
 
 use ifc_lite_core::IfcType;
 use ifc_lite_processing::default_color_for_type;
@@ -28,7 +42,7 @@ const NEUTRAL_GRAY: [f32; 4] = [0.8, 0.8, 0.8, 1.0];
 /// Snapshot of the historical `wasm-bindings` table
 /// (`rust/wasm-bindings/src/api/styling.rs:970`, 2026-06).
 /// `None` => the type fell through to the neutral-gray default.
-fn wasm_default(t: IfcType) -> [f32; 4] {
+fn wasm_default(t: &IfcType) -> [f32; 4] {
     match t {
         IfcType::IfcWall | IfcType::IfcWallStandardCase => [0.85, 0.85, 0.85, 1.0],
         IfcType::IfcSlab => [0.7, 0.7, 0.7, 1.0],
@@ -51,7 +65,7 @@ fn wasm_default(t: IfcType) -> [f32; 4] {
 
 /// Snapshot of the historical `processing` table
 /// (`rust/processing/src/processor.rs:2140`, 2026-06).
-fn processing_default(t: IfcType) -> [f32; 4] {
+fn processing_default(t: &IfcType) -> [f32; 4] {
     match t {
         IfcType::IfcWall | IfcType::IfcWallStandardCase => [0.85, 0.85, 0.85, 1.0],
         IfcType::IfcSlab => [0.7, 0.7, 0.7, 1.0],
@@ -104,17 +118,17 @@ const CONTESTED: &[IfcType] = &[
     IfcType::IfcBuildingElementProxy,
 ];
 
-fn is_contested(t: IfcType) -> bool {
-    CONTESTED.contains(&t)
+fn is_contested(t: &IfcType) -> bool {
+    CONTESTED.contains(t)
 }
 
 #[test]
 fn union_agrees_with_both_tables_on_uncontested_types() {
-    for &t in MAPPED_TYPES {
+    for t in MAPPED_TYPES {
         if is_contested(t) {
             continue;
         }
-        let canonical = default_color_for_type(t).to_array();
+        let canonical = default_color_for_type(t.clone()).to_array();
         assert_eq!(
             canonical,
             wasm_default(t),
@@ -140,13 +154,13 @@ fn union_picks_the_documented_winner_for_contested_types() {
     ];
 
     for (t, expected, from_wasm) in cases {
-        let canonical = default_color_for_type(t).to_array();
+        let canonical = default_color_for_type(t.clone()).to_array();
         assert_eq!(canonical, expected, "{t:?}: unexpected canonical value");
 
         let winner = if from_wasm {
-            wasm_default(t)
+            wasm_default(&t)
         } else {
-            processing_default(t)
+            processing_default(&t)
         };
         assert_eq!(canonical, winner, "{t:?}: canonical must equal the chosen source table");
     }
@@ -154,7 +168,7 @@ fn union_picks_the_documented_winner_for_contested_types() {
     // FurnishingElement specifically must NOT keep processing's darker brown.
     assert_ne!(
         default_color_for_type(IfcType::IfcFurnishingElement).to_array(),
-        processing_default(IfcType::IfcFurnishingElement),
+        processing_default(&IfcType::IfcFurnishingElement),
         "furnishing must change away from processing's [0.5,0.35,0.2,1]"
     );
 }
@@ -164,13 +178,13 @@ fn exactly_four_types_change_per_table() {
     // Guard rail: the migration must touch ONLY the four contested types.
     let wasm_deltas: Vec<IfcType> = MAPPED_TYPES
         .iter()
-        .copied()
-        .filter(|&t| default_color_for_type(t).to_array() != wasm_default(t))
+        .filter(|&t| default_color_for_type(t.clone()).to_array() != wasm_default(t))
+        .cloned()
         .collect();
     let processing_deltas: Vec<IfcType> = MAPPED_TYPES
         .iter()
-        .copied()
-        .filter(|&t| default_color_for_type(t).to_array() != processing_default(t))
+        .filter(|&t| default_color_for_type(t.clone()).to_array() != processing_default(t))
+        .cloned()
         .collect();
 
     // vs wasm: StairFlight + BuildingElementProxy gain a non-default value.
@@ -211,11 +225,83 @@ fn repo_root() -> Option<std::path::PathBuf> {
     }
 }
 
+/// Lower bound on how many `.rs` files the two source-grep guards below must
+/// reach before an empty offender list means anything.
+///
+/// Both guards conclude from an ABSENCE, so a walk that reaches nothing proves
+/// nothing and passes anyway - which is what they did before #3200, over an
+/// empty directory and over a directory that does not exist alike.
+///
+/// MEASURED, not guessed: set at roughly two thirds of what the walk over
+/// `rust/` + `apps/` reached when it was last raised (about 1280 files in late
+/// September 2026, when the #5941 stack pushed the walk past twice the old
+/// floor of 640; about 970 earlier that month; 659 at #3200). A wrong scan root or a failing `read_dir`
+/// takes the count to zero or a handful. Losing a large subtree takes it to a
+/// fraction, and the floor catches a loss of about a third of the tree. It
+/// does not catch losing `apps/` alone (under a tenth of the files).
+///
+/// The number AGES: the tree grows and the floor does not. At 440 against a
+/// tree of about 960 files the guard would have passed with more than half of
+/// `rust/` + `apps/` gone. [`assert_walk_is_live`] therefore also refuses a
+/// walk that reaches more than TWICE the floor: that failure is not a defect
+/// in the code under test, it is the signal to re-measure and raise this
+/// constant.
+const SCANNED_FLOOR: usize = 855;
+
+/// Anti-vacuity (#3200) in BOTH directions: `scanned` must reach
+/// [`SCANNED_FLOOR`] (the walk is alive), and [`SCANNED_FLOOR`] must still be
+/// at least half of `scanned` (the floor is alive). Each guard below concludes
+/// from an empty offender list, so the walk having reached a real tree is
+/// part of its evidence, not a precondition someone else checks.
+fn assert_walk_is_live(scanned: usize, concludes: &str) {
+    assert!(
+        scanned >= SCANNED_FLOOR,
+        "styling parity walked rust/ and apps/ and reached only {scanned} .rs file(s); \
+         the floor is {SCANNED_FLOOR}. Refusing a vacuous pass: this guard \
+         concludes that {concludes}, and a scan that examined this little has \
+         established no such thing."
+    );
+    assert!(
+        scanned <= SCANNED_FLOOR * 2,
+        "styling parity walked rust/ and apps/ and reached {scanned} .rs files, more \
+         than twice the floor of {SCANNED_FLOOR}. The floor has gone stale: raise \
+         SCANNED_FLOOR to about two thirds of {scanned} and update its comment, so \
+         that the guard which concludes that {concludes} cannot pass again after \
+         losing half the tree."
+    );
+}
+
+/// Walk `dir`, collecting every `.rs` file underneath it.
+///
+/// A directory this cannot list is a hard error, and the two reasons are told
+/// apart. The previous `let Ok(entries) = read_dir(dir) else { return; };` made
+/// "the scan root is not there" and "the scan root cannot be opened" produce
+/// the same result as "this directory holds no Rust files", which for an
+/// absence guard reads as a clean bill of health (#3200). A missing directory
+/// means the walk roots are wrong; an unreadable one means the environment is.
 fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => panic!(
+            "styling parity: {} does not exist. Refusing to treat a missing \
+             directory as one holding no .rs files - these guards conclude from \
+             an absence, so a scan root that is not there would read as clean.",
+            dir.display()
+        ),
+        Err(err) => panic!(
+            "styling parity: {} could not be read ({err}). Refusing to treat an \
+             unreadable directory as one holding no .rs files.",
+            dir.display()
+        ),
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry.unwrap_or_else(|err| {
+            panic!(
+                "styling parity: an entry of {} could not be read ({err}). \
+                 Refusing to walk past a file these guards could not classify.",
+                dir.display()
+            )
+        });
         let path = entry.path();
         if path.is_dir() {
             let skip = matches!(
@@ -231,9 +317,92 @@ fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
     }
 }
 
+/// Read one walked file. Unreadable is a hard error, not a skip: `continue`
+/// removed the file from an absence guard's evidence without removing it from
+/// the tree, so a copy of the forbidden table sitting in a file these guards
+/// could not open would have read as "not found".
+fn read_walked(path: &std::path::Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_else(|err| {
+        panic!(
+            "styling parity: {} could not be read ({err}). Refusing to skip a \
+             file this guard could not examine - these guards prove an absence, \
+             and an unread file is not an absence.",
+            path.display()
+        )
+    })
+}
+
+/// Does `src` declare a per-consumer default-color table?
+///
+/// Matches actual function declarations only, not prose or strings that happen
+/// to mention the name (e.g. this file's own doc comments). Split out from the
+/// guard so it can be exercised against a known-positive input - a file count
+/// alone shows the walk is alive, not that the detector still detects.
+fn declares_default_color_table(src: &str) -> bool {
+    src.lines().any(|line| {
+        let line = line.trim_start();
+        line.starts_with("fn get_default_color")
+            || line.starts_with("pub fn get_default_color")
+            || line.starts_with("pub(crate) fn get_default_color")
+    })
+}
+
+/// Does `src` declare a second surface-style colour extractor? Same reasoning
+/// as `declares_default_color_table`.
+fn declares_surface_style_extractor(src: &str) -> bool {
+    src.lines().any(|line| {
+        let line = line.trim_start();
+        ["fn ", "pub fn ", "pub(crate) fn "].iter().any(|p| {
+            line.starts_with(&format!("{p}extract_color_from_rendering"))
+                || line.starts_with(&format!("{p}extract_color_rgb"))
+        })
+    })
+}
+
+/// Positive control for both detectors: a file count proves the walk reaches
+/// files, and nothing more. If the detectors themselves stopped matching - a
+/// rename, an edited prefix list, a `trim_start` that went away - the offender
+/// lists would empty out and both guards would go green over a tree full of
+/// violations. These synthetic inputs fail the moment that happens.
+#[test]
+fn the_detectors_still_fire_on_a_known_violation() {
+    assert!(
+        declares_default_color_table("    pub fn get_default_color(t: IfcType) -> Color {\n"),
+        "the default-color-table detector stopped matching a declaration it must catch"
+    );
+    assert!(
+        declares_default_color_table("fn get_default_color_for_type(t: IfcType) -> Color {\n"),
+        "the default-color-table detector must match the wasm-side name too"
+    );
+    assert!(
+        declares_surface_style_extractor(
+            "    fn extract_color_from_rendering(id: u32) -> Color {\n"
+        ),
+        "the surface-style detector stopped matching a declaration it must catch"
+    );
+    assert!(
+        declares_surface_style_extractor("pub(crate) fn extract_color_rgb(id: u32) -> Color {\n"),
+        "the surface-style detector stopped matching `extract_color_rgb`"
+    );
+
+    // And it must stay a DECLARATION detector: prose and call sites are not
+    // second tables, and a detector that fired on them would be turned off.
+    assert!(
+        !declares_default_color_table(
+            "// the historical copies were named `fn get_default_color`\n"
+        ),
+        "the default-color-table detector must not fire on prose"
+    );
+    assert!(
+        !declares_surface_style_extractor("        let c = extract_color_rgb(id, decoder)?;\n"),
+        "the surface-style detector must not fire on a call site"
+    );
+}
+
 #[test]
 fn no_duplicate_default_color_tables() {
     let Some(root) = repo_root() else {
+        common::refuse_to_skip_in_ci("styling parity guard");
         eprintln!("repo root not found (packaged context) — skipping guard");
         return;
     };
@@ -246,6 +415,8 @@ fn no_duplicate_default_color_tables() {
     collect_rs_files(&root.join("rust"), &mut files);
     collect_rs_files(&root.join("apps"), &mut files);
 
+    assert_walk_is_live(files.len(), "no second default-color table exists");
+
     let mut offenders = Vec::new();
     for path in files {
         let rel = path
@@ -256,18 +427,7 @@ fn no_duplicate_default_color_tables() {
         if allow(&rel) {
             continue;
         }
-        let Ok(src) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        // Match actual function declarations only, not prose/strings that
-        // happen to mention the name (e.g. this guard's own doc comment).
-        let declares_color_table = src.lines().any(|line| {
-            let line = line.trim_start();
-            line.starts_with("fn get_default_color")
-                || line.starts_with("pub fn get_default_color")
-                || line.starts_with("pub(crate) fn get_default_color")
-        });
-        if declares_color_table {
+        if declares_default_color_table(&read_walked(&path)) {
             offenders.push(rel);
         }
     }
@@ -295,6 +455,7 @@ fn no_duplicate_default_color_tables() {
 #[test]
 fn no_duplicate_surface_style_color_extraction() {
     let Some(root) = repo_root() else {
+        common::refuse_to_skip_in_ci("styling parity guard");
         eprintln!("repo root not found (packaged context) — skipping guard");
         return;
     };
@@ -312,30 +473,44 @@ fn no_duplicate_surface_style_color_extraction() {
     collect_rs_files(&root.join("rust"), &mut files);
     collect_rs_files(&root.join("apps"), &mut files);
 
+    assert_walk_is_live(files.len(), "no second surface-style colour extractor exists");
+
+    let scanned = files.len();
     let mut offenders = Vec::new();
+    // END-TO-END positive control, one step beyond the synthetic one above:
+    // count the exempt files the detector DOES match. The allowlist exists for
+    // `rust/geometry/examples/`, which really does carry its own
+    // `fn extract_color_from_rendering`, so a healthy run always finds at
+    // least one. Zero means the walk and the detector never met a real
+    // declaration, whatever the file count says.
+    let mut allowed_hits = 0usize;
     for path in files {
         let rel = path
             .strip_prefix(&root)
             .unwrap_or(&path)
             .to_string_lossy()
             .replace('\\', "/");
+        let declares = declares_surface_style_extractor(&read_walked(&path));
         if allow(&rel) {
+            if declares {
+                allowed_hits += 1;
+            }
             continue;
         }
-        let Ok(src) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let declares = src.lines().any(|line| {
-            let line = line.trim_start();
-            ["fn ", "pub fn ", "pub(crate) fn "].iter().any(|p| {
-                line.starts_with(&format!("{p}extract_color_from_rendering"))
-                    || line.starts_with(&format!("{p}extract_color_rgb"))
-            })
-        });
         if declares {
             offenders.push(rel);
         }
     }
+
+    assert!(
+        allowed_hits >= 1,
+        "the surface-style detector matched nothing at all across {scanned} walked \
+         file(s), not even the exempt `rust/geometry/examples/` copy it is \
+         allowed to find. An absence guard that cannot find a declaration it \
+         KNOWS is there has stopped detecting, so its empty offender list means \
+         nothing. If that example was deliberately removed, retire this control \
+         in the same commit."
+    );
 
     assert!(
         offenders.is_empty(),

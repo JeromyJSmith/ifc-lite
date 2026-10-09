@@ -16,6 +16,8 @@
  * not O(elements × meshes).
  */
 
+import { trackExportCompleted } from '@/lib/analytics';
+import { escapeCsvCell } from '@ifc-lite/export';
 import type { DiffEntry, DiffState } from '@ifc-lite/diff';
 import type { FederatedModel } from '../../store/types.js';
 import type { CompareResult } from '../../store/slices/compareSlice.js';
@@ -25,16 +27,17 @@ import { productTypeSplit, type ProductTypeTally } from './productTypeCounts.js'
 import {
   annotateReviewGroups,
   contentMatchReportRows,
+  exportedAuthoredKey,
   exportedGlobalId,
   type CompareReportRow,
 } from './reportRows.js';
 import {
   meshBoundsIndex,
   placementMoveSummary,
-  renderToWorldShift,
   summarizeGeometryChange,
   type WorldAabb,
 } from './geometrySummary.js';
+import { totalYupOffset } from '../geo/coordinate-frame.js';
 import { downloadBlob, sanitizeFilename } from '../export/download.js';
 
 export type { CompareReportRow } from './reportRows.js';
@@ -84,7 +87,7 @@ function boundsIndex(model: FederatedModel | undefined): Map<number, WorldAabb> 
   if (!model?.geometryResult) return new Map();
   return meshBoundsIndex(
     model.geometryResult.meshes,
-    renderToWorldShift(model.geometryResult.coordinateInfo),
+    totalYupOffset(model.geometryResult.coordinateInfo),
   );
 }
 
@@ -153,6 +156,8 @@ function classifyModified(
     }
   }
   if (entry.changeKinds.includes('data')) parts.push('Data changed');
+  // #5309: name the containment move rather than the generic 'Changed'.
+  if (entry.changeKinds.includes('container')) parts.push('Container changed');
 
   return { change: parts.join(', ') || 'Changed', movedDistance };
 }
@@ -187,6 +192,7 @@ export function buildCompareReport(
     // The fingerprint key is the GlobalId; synthetic "missing:" keys (entities
     // without a resolvable GlobalId) export blank rather than the placeholder.
     const globalId = exportedGlobalId(reportKey(entry));
+    const key = exportedAuthoredKey(reportKey(entry));
     const modelName = ref.modelId === result.headModelId ? result.headName : result.baseName;
 
     let change: string;
@@ -196,6 +202,7 @@ export function buildCompareReport(
     else ({ change, movedDistance } = classifyModified(entry, baseBounds, headBounds, baseModel, headModel));
 
     const row: CompareReportRow = { globalId, name, ifcType, state: entry.state, change, movedDistance, model: modelName };
+    if (key) row.key = key;
     rows.push(row);
     rowGlobalIds.set(row, ref.globalId);
   }
@@ -250,29 +257,27 @@ export function buildCompareReport(
  *  tab/CR is evaluated as a formula by Excel/Sheets; prefixing a single quote
  *  forces it to be read as text (model/element names are attacker-influenced). */
 function csvField(value: string | number): string {
-  let s = String(value);
-  // Strip EVERY leading invisible before the trigger test, not just the BOM.
-  // Spreadsheet importers treat a BOM as file metadata, but a zero-width space
-  // (U+200B), an LTR mark (U+200E), a non-breaking space (U+00A0) or a line /
-  // paragraph separator (U+2028/U+2029) in front of `=` likewise does not stop
-  // a spreadsheet reading the cell as a formula -- while it DOES stop the
-  // anchored test below matching, so the apostrophe never gets prepended.
-  // Fixing only the BOM leaves the guard bypassable, which for a CSV-injection
-  // guard means it still fails in the way that matters.
-  //
-  // `\p{Z}`, not `\p{Zs}`: the separator category also covers `Zl` and `Zp`
-  // (U+2028/U+2029). Same class as `lists/export/model.ts`.
-  s = s.replace(/^[\p{Cf}\p{Z}]+/u, '');
-  if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
-  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  // Delegates to `@ifc-lite/export`'s single escaper. The copy that used to
+  // live here bought its invisible-handling by DELETING the leading run of
+  // `\p{Cf}\p{Z}`; `\p{Z}` includes U+0020, so every exported cell silently
+  // lost its leading spaces, against RFC 4180 §2.4 ("Spaces are considered
+  // part of a field and should not be ignored"). The shared escaper looks
+  // *past* the run instead of removing it — same payloads guarded, data intact.
+  return escapeCsvCell(String(value), { delimiter: ',' });
 }
 
 /** Serialize the report as RFC-4180 CSV (one element per row). */
 export function reportToCsv(report: CompareReport): string {
-  // `Match` / `MatchedGlobalId` are appended, never inserted: an existing
-  // consumer reading the first six columns positionally keeps working (#1891).
+  // `Match` / `MatchedGlobalId` / `Key` are appended, never inserted: an
+  // existing consumer reading the first six columns positionally keeps working
+  // (#1891). `Key` is the authored key a row was compared on and appears ONLY
+  // when the comparison used one (issue #4955), so a GlobalId-keyed report is
+  // byte-identical to before; it is not a GlobalId and never lands in that
+  // column.
+  const withKey = report.rows.some((r) => r.key !== undefined);
   const header = [
     'GlobalId', 'Name', 'IfcType', 'Change', 'MovedDistance_m', 'Model', 'Match', 'MatchedGlobalId',
+    ...(withKey ? ['Key'] : []),
   ];
   const lines: string[] = [];
   // The row count below totals products AND type objects together (`Change`
@@ -310,6 +315,7 @@ export function reportToCsv(report: CompareReport): string {
       csvField(r.model),
       csvField(r.match ?? ''),
       csvField(r.matchedGlobalId ?? ''),
+      ...(withKey ? [csvField(r.key ?? '')] : []),
     ].join(','));
   }
   return lines.join('\r\n');
@@ -335,4 +341,5 @@ export function downloadCompareReport(
   const body = format === 'csv' ? reportToCsv(report) : reportToJson(report);
   const type = format === 'csv' ? 'text/csv;charset=utf-8;' : 'application/json;charset=utf-8;';
   downloadBlob(new Blob([body], { type }), `${name}.${format}`);
+  trackExportCompleted({ format, surface: 'compare_panel' });
 }

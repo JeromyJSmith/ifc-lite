@@ -13,18 +13,18 @@
 //! "render frame". Resolving the grid placement naively therefore lands the
 //! axes kilometres off the model.
 //!
-//! This module resolves each axis through the **same** transform pipeline the
-//! meshes use — full `IfcLocalPlacement` chain (`resolve_scaled_placement`) +
-//! `lengthUnitScale` + the same RTC offset
-//! (`detect_rtc_offset_from_first_element`, gated at 10 km and above) — and
-//! emits the endpoints in the renderer's **Y-up, RTC-subtracted, metres** world
-//! space (the exact frame `MeshDataJs::new` produces after its IFC Z-up → WebGL
-//! Y-up swap). Grids then line up with the streamed geometry by construction,
-//! mirroring `alignment_lines.rs`.
+//! This module resolves each axis through the mesh transform pipeline — full
+//! `IfcLocalPlacement` chain (`resolve_scaled_placement`) + `lengthUnitScale`
+//! and RTC — and emits renderer **Y-up, metres** endpoints. The explicit-frame
+//! bindings consume the exact browser pre-pass frame and therefore line up by
+//! construction. Legacy standalone bindings choose `MeshFrame::for_overlay`
+//! from the whole source; that best-effort choice can differ from an earlier
+//! streaming sample or a federation override. See `alignment_lines.rs`.
 
 use super::IfcAPI;
 use ifc_lite_core::{build_entity_index, DecodedEntity, EntityDecoder, EntityScanner, IfcType};
 use ifc_lite_geometry::GeometryRouter;
+use ifc_lite_processing::MeshFrame;
 use wasm_bindgen::prelude::*;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -45,25 +45,26 @@ pub(crate) struct GridAxis3D {
 /// Parse the file and resolve every `IfcGridAxis` into render-frame endpoints.
 /// Returns an empty vec when the file has no grids (or none with a resolvable
 /// axis curve), so callers can clear the overlay cheaply.
-pub(crate) fn extract_grid_axes(content: &str) -> Vec<GridAxis3D> {
+pub(crate) fn extract_grid_axes(content: &str, frame: Option<MeshFrame>) -> Vec<GridAxis3D> {
     let entity_index = build_entity_index(content);
     let mut decoder = EntityDecoder::with_index(content, entity_index);
 
     // Reuse the geometry router for both unit-scale and the placement resolver,
     // exactly like the mesh pipeline (and the symbolic builder).
+    // Not drained: meshes nothing. Pinned by rust/geometry/tests/issue_3821_auxiliary_routers_mesh_nothing.rs.
     let router = GeometryRouter::with_units(content, &mut decoder);
     let unit_scale = router.unit_scale();
 
-    // RTC offset (metres). `detect_rtc_offset_from_first_element` returns
-    // (0,0,0) for models within 10 km of the origin, so this is a no-op for
-    // local files and a true shift for georeferenced models — the same offset
-    // the mesh pipeline applies.
-    let rtc = router.detect_rtc_offset_from_first_element(content, &mut decoder);
+    // RTC offset (metres): exact when supplied by the browser mesh pre-pass;
+    // otherwise the standalone whole-source choice (#4665, #4799).
+    let rtc = frame
+        .unwrap_or_else(|| MeshFrame::for_overlay(&router, content.as_bytes(), &mut decoder))
+        .rtc_offset();
 
     let mut out: Vec<GridAxis3D> = Vec::new();
     let mut scanner = EntityScanner::new(content);
     while let Some((id, type_name, start, end)) = scanner.next_entity() {
-        if type_name != "IFCGRID" {
+        if !ifc_lite_core::keyword_eq(type_name, "IFCGRID") {
             continue;
         }
         let Ok(grid) = decoder.decode_at_with_id(id, start, end) else {
@@ -189,7 +190,16 @@ fn to_render_frame(
     let rz = wz - rtc.2;
     // IFC Z-up → WebGL Y-up: (x, z, -y). Matches MeshDataJs::new so grids land
     // on the same ground as the streamed meshes.
-    [rx as f32, rz as f32, -ry as f32]
+    //
+    // `+ 0.0` folds the -0.0 that negating a zero northing produces back to
+    // +0.0, matching the symbolic overlay's `RenderFrameRebase::plan`
+    // (`rust/processing/src/symbolic/rebase.rs`) on the sign of zero for this
+    // axis. Only that: the two are NOT bit-identical in general, because
+    // `plan` subtracts in f32 while this rounds once after subtracting in
+    // f64, so they can differ by an ulp on the same coordinate. Sign of zero
+    // is the part the symbolic side's pinned goldens record, and the part a
+    // test on each side now holds.
+    [rx as f32, rz as f32, -ry as f32 + 0.0]
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -287,13 +297,13 @@ impl IfcAPI {
     /// Parse the file and return every `IfcGridAxis` as a flat `Float32Array`
     /// of 3D line-list vertices `[x0,y0,z0, x1,y1,z1, …]` (one segment per
     /// axis) in the renderer's Y-up world space (RTC-subtracted, metres). Feed
-    /// straight to a line pipeline (e.g. `uploadAnnotationLines3D`).
+    /// straight to a line pipeline (e.g. `renderer.setLineOverlay('grid', …)`).
     ///
     /// Returns an empty array when the file has no grids, so the caller can
     /// clear the overlay cheaply.
     #[wasm_bindgen(js_name = parseGridLines)]
     pub fn parse_grid_lines(&self, content: String) -> js_sys::Float32Array {
-        let axes = extract_grid_axes(&content);
+        let axes = extract_grid_axes(&content, None);
         let mut verts: Vec<f32> = Vec::with_capacity(axes.len() * 6);
         for a in &axes {
             verts.extend_from_slice(&a.start);
@@ -302,135 +312,51 @@ impl IfcAPI {
         js_sys::Float32Array::from(&verts[..])
     }
 
+    /// Parse grid line vertices in the exact frame selected by the mesh pre-pass.
+    #[wasm_bindgen(js_name = parseGridLinesInFrame)]
+    pub fn parse_grid_lines_in_frame(
+        &self,
+        content: String,
+        #[wasm_bindgen(unchecked_param_type = "RtcFrame")] frame: JsValue,
+    ) -> Result<js_sys::Float32Array, JsValue> {
+        let axes = extract_grid_axes(
+            &content,
+            Some(super::overlay_frame::parse_overlay_frame(&frame)?),
+        );
+        let mut verts: Vec<f32> = Vec::with_capacity(axes.len() * 6);
+        for a in &axes {
+            verts.extend_from_slice(&a.start);
+            verts.extend_from_slice(&a.end);
+        }
+        Ok(js_sys::Float32Array::from(&verts[..]))
+    }
+
     /// Parse the file and return structured per-axis data (tag + endpoints) in
     /// the renderer's Y-up world space (RTC-subtracted, metres). Use this when
     /// you also need the axis tags (to render grid bubbles / labels).
     #[wasm_bindgen(js_name = parseGridAxes)]
     pub fn parse_grid_axes(&self, content: String) -> GridAxisCollection {
         GridAxisCollection {
-            axes: extract_grid_axes(&content),
+            axes: extract_grid_axes(&content, None),
         }
+    }
+
+    /// Parse structured grid axes in the exact frame selected by the mesh pre-pass.
+    #[wasm_bindgen(js_name = parseGridAxesInFrame)]
+    pub fn parse_grid_axes_in_frame(
+        &self,
+        content: String,
+        #[wasm_bindgen(unchecked_param_type = "RtcFrame")] frame: JsValue,
+    ) -> Result<GridAxisCollection, JsValue> {
+        Ok(GridAxisCollection {
+            axes: extract_grid_axes(
+                &content,
+                Some(super::overlay_frame::parse_overlay_frame(&frame)?),
+            ),
+        })
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Minimal IFC4 grid: one IfcGrid (placement at origin) with a single
-    // IfcGridAxis "A" whose AxisCurve is a 2-point IfcPolyline
-    // (0,0)->(10,0), metres.
-    const LOCAL_GRID: &str = r#"ISO-10303-21;
-HEADER;
-FILE_DESCRIPTION((''),'2;1');
-FILE_NAME('','',(''),(''),'','','');
-FILE_SCHEMA(('IFC4'));
-ENDSEC;
-DATA;
-#1=IFCCARTESIANPOINT((0.,0.,0.));
-#2=IFCDIRECTION((0.,0.,1.));
-#3=IFCDIRECTION((1.,0.,0.));
-#4=IFCAXIS2PLACEMENT3D(#1,#2,#3);
-#5=IFCLOCALPLACEMENT($,#4);
-#10=IFCCARTESIANPOINT((0.,0.));
-#11=IFCCARTESIANPOINT((10.,0.));
-#12=IFCPOLYLINE((#10,#11));
-#13=IFCGRIDAXIS('A',#12,.T.);
-#20=IFCGRID('0aBcDeFgHiJkLmNoPqRsT0',$,'Grid',$,$,#5,$,(#13),$,$);
-ENDSEC;
-END-ISO-10303-21;
-"#;
-
-    #[test]
-    fn extracts_local_grid_axis() {
-        let axes = extract_grid_axes(LOCAL_GRID);
-        assert_eq!(axes.len(), 1, "expected one grid axis");
-        let a = &axes[0];
-        assert_eq!(a.tag, "A", "axis tag preserved");
-        // Start (0,0,0) → renderer (0,0,-0).
-        assert!(a.start[0].abs() < 1e-4, "start x≈0, got {}", a.start[0]);
-        assert!(a.start[1].abs() < 1e-4, "start y≈0, got {}", a.start[1]);
-        assert!(a.start[2].abs() < 1e-4, "start z≈0, got {}", a.start[2]);
-        // End (10,0,0) IFC → renderer Y-up (10, 0, -0).
-        assert!(
-            (a.end[0] - 10.0).abs() < 1e-3,
-            "end renderer-x ≈10, got {}",
-            a.end[0]
-        );
-        assert!(a.end[1].abs() < 1e-3, "end elevation ≈0, got {}", a.end[1]);
-    }
-
-    #[test]
-    fn flat_line_list_is_even_xyz_triples() {
-        // Mirror the flat line-list `parseGridLines` builds, without invoking
-        // the wasm method (js_sys types don't link on the native test target).
-        let axes = extract_grid_axes(LOCAL_GRID);
-        let mut verts: Vec<f32> = Vec::new();
-        for a in &axes {
-            verts.extend_from_slice(&a.start);
-            verts.extend_from_slice(&a.end);
-        }
-        assert!(!verts.is_empty(), "grid must emit line vertices");
-        assert_eq!(verts.len() % 3, 0, "vertices must be xyz triples");
-        assert_eq!((verts.len() / 3) % 2, 0, "line-list = even vertex count");
-        // One axis → one segment → 2 vertices → 6 floats.
-        assert_eq!(verts.len(), 6, "one axis → 6 floats");
-    }
-
-    #[test]
-    fn empty_for_no_grid() {
-        let none = "ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\nENDSEC;\nEND-ISO-10303-21;\n";
-        assert!(extract_grid_axes(none).is_empty());
-    }
-
-    #[test]
-    fn georeferenced_grid_rebased_near_origin() {
-        // Grid placement carries a ~10.4 km survey offset (metres here for
-        // simplicity); the axis point sits 10 m further along. After RTC the
-        // axis must land near the origin, not at ~10 km.
-        let content = r#"ISO-10303-21;
-HEADER;
-FILE_DESCRIPTION((''),'2;1');
-FILE_NAME('','',(''),(''),'','','');
-FILE_SCHEMA(('IFC4'));
-ENDSEC;
-DATA;
-#1=IFCCARTESIANPOINT((0.,0.,0.));
-#2=IFCDIRECTION((0.,0.,1.));
-#3=IFCDIRECTION((1.,0.,0.));
-#4=IFCAXIS2PLACEMENT3D(#1,#2,#3);
-#5=IFCLOCALPLACEMENT($,#4);
-/* a wall far out at survey coords so RTC detection trips (>10 km) */
-#6=IFCCARTESIANPOINT((10400000.,2000000.,0.));
-#7=IFCAXIS2PLACEMENT3D(#6,#2,#3);
-#8=IFCLOCALPLACEMENT($,#7);
-#9=IFCPRODUCTDEFINITIONSHAPE($,$,(#41));
-#40=IFCCARTESIANPOINT((10400000.,2000000.,0.));
-#41=IFCSHAPEREPRESENTATION($,'Body','Curve2D',(#42));
-#42=IFCPOLYLINE((#40,#40));
-#43=IFCWALL('1WaLLWaLLWaLLWaLLWaLL00',$,'W',$,$,#8,#9,$,$);
-/* grid placed at the same survey frame */
-#50=IFCCARTESIANPOINT((10400000.,2000000.,0.));
-#51=IFCAXIS2PLACEMENT3D(#50,#2,#3);
-#52=IFCLOCALPLACEMENT($,#51);
-#10=IFCCARTESIANPOINT((0.,0.));
-#11=IFCCARTESIANPOINT((10.,0.));
-#12=IFCPOLYLINE((#10,#11));
-#13=IFCGRIDAXIS('A',#12,.T.);
-#20=IFCGRID('0aBcDeFgHiJkLmNoPqRsT0',$,'Grid',$,$,#52,$,(#13),$,$);
-ENDSEC;
-END-ISO-10303-21;
-"#;
-        let axes = extract_grid_axes(content);
-        assert_eq!(axes.len(), 1, "expected one grid axis");
-        let a = &axes[0];
-        // The grid origin maps to ~origin after RTC (within a few metres of the
-        // wall sample used to detect the offset).
-        for c in a.start.iter().chain(a.end.iter()) {
-            assert!(
-                c.abs() < 1000.0,
-                "render-frame coord must be near origin after RTC, got {c}"
-            );
-        }
-    }
-}
+#[path = "grid_lines_tests.rs"]
+mod tests;

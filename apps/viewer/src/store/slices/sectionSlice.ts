@@ -10,111 +10,22 @@ import type { StateCreator } from 'zustand';
 import type { SectionPlane, SectionPlaneAxis, SectionCapStyle, SectionCapHatchId, CustomSectionPlane } from '../types.js';
 import { SECTION_PLANE_DEFAULTS, SECTION_CAP_DEFAULTS } from '../constants.js';
 import { planeBasis, nearestCardinalAxis } from '@ifc-lite/renderer';
+import { facePickPlaneDistance } from './sectionFacePick.js';
+import { createSectionBoxSlice, type SectionBoxSlice } from './sectionBoxSlice.js';
+import { saveLastSectionMode, clearLastSectionMode } from './sectionLastMode.js';
+export { loadLastSectionMode, clearLastSectionMode, type LastSectionMode } from './sectionLastMode.js';
 
-/**
- * Project `pickedAt` onto the current cut plane and return that point as
- * the "anchor on the live plane".
- *
- * The plane equation is `dot(p, normal) = distance`. As the user drags
- * the gizmo (or moves the slider) only `distance` changes — `pickedAt`
- * stays at the original face-pick location, which sits OFF the live
- * plane. Any visual that needs a "point on the current plane" (cap
- * polygon basis origin, 3D drag gizmo position, hatch UV anchor) must
- * use the projected point instead, otherwise it freezes at the original
- * pick location while the actual cut slides along the normal.
- *
- * Derivation: the projection of `pickedAt` onto the plane is
- * `pickedAt + (distance − dot(pickedAt, normal)) · normal`, which moves
- * `pickedAt` along the unit normal by exactly the offset required to
- * satisfy `dot(out, normal) = distance`.
- *
- * Round-trip note: when `distance == dot(pickedAt, normal)` (i.e. just
- * after a fresh face-pick) the result equals `pickedAt`, so the legacy
- * code path that fed `pickedAt` directly is preserved at pick-time.
- */
-export function customPlaneCenter(plane: CustomSectionPlane): [number, number, number] {
-  const { pickedAt: p, normal: n, distance: d } = plane;
-  const dotPicked = p[0] * n[0] + p[1] * n[1] + p[2] * n[2];
-  const k = d - dotPicked;
-  return [p[0] + k * n[0], p[1] + k * n[1], p[2] + k * n[2]];
-}
+export { customPlaneCenter } from './section-plane-center';
 
 // ─── Persistence ─────────────────────────────────────────────────────────
 // Cap appearance (hatch pattern, colours, spacing, angle, whether the cap is
 // shown at all) persists across reloads via localStorage, so the user's
-// preferred cut surface survives closing and re-opening the app. Axis and
-// position are session-scoped because they only make sense relative to a
-// loaded model. See chatSlice.ts for the same direct-localStorage pattern
-// used elsewhere in the store.
+// preferred cut surface survives closing and re-opening the app — it is
+// pure display style, not tied to any model's geometry. See chatSlice.ts
+// for the same direct-localStorage pattern used elsewhere in the store.
 const CAP_STYLE_STORAGE_KEY     = 'ifc-lite:section-cap-style';
 const CAP_SHOW_STORAGE_KEY      = 'ifc-lite:section-cap-show';
 const OUTLINES_SHOW_STORAGE_KEY = 'ifc-lite:section-outlines-show';
-
-// Last-used section mode (issue #243 follow-up). When the user reopens
-// the section tool we restore whichever mode they used last:
-//   • 'pick'     — face-pick is rearmed (default for first-time users
-//                  and anyone whose last action was a face pick).
-//   • 'cardinal' — restore the previous axis + position + flipped so the
-//                  cut appears exactly where they left it.
-// Custom (face-picked) planes are NOT persisted: they're tied to the
-// loaded model's world coordinates and would land somewhere meaningless
-// on a different model. Re-arming pick mode lets the user re-cut the
-// equivalent face on the new model with one click.
-const SECTION_MODE_STORAGE_KEY  = 'ifc-lite:section-last-mode';
-
-export type LastSectionMode =
-  | { kind: 'pick' }
-  | { kind: 'cardinal'; axis: SectionPlaneAxis; position: number; flipped: boolean };
-
-const DEFAULT_LAST_MODE: LastSectionMode = { kind: 'pick' };
-
-function isSectionPlaneAxis(v: unknown): v is SectionPlaneAxis {
-  return v === 'down' || v === 'front' || v === 'side';
-}
-
-export function loadLastSectionMode(): LastSectionMode {
-  if (typeof window === 'undefined') return DEFAULT_LAST_MODE;
-  try {
-    const raw = window.localStorage.getItem(SECTION_MODE_STORAGE_KEY);
-    if (!raw) return DEFAULT_LAST_MODE;
-    const parsed = JSON.parse(raw) as Record<string, unknown>;
-    if (parsed?.kind === 'pick') return { kind: 'pick' };
-    if (
-      parsed?.kind === 'cardinal' &&
-      isSectionPlaneAxis(parsed.axis) &&
-      typeof parsed.position === 'number' && Number.isFinite(parsed.position) &&
-      typeof parsed.flipped === 'boolean'
-    ) {
-      // Clamp position to the same [0, 100] range the slice enforces so
-      // a tampered or stale value can't poison the slider on restore.
-      const position = Math.min(100, Math.max(0, parsed.position));
-      return { kind: 'cardinal', axis: parsed.axis, position, flipped: parsed.flipped };
-    }
-    return DEFAULT_LAST_MODE;
-  } catch {
-    // Corrupted JSON or storage exception — fall back to the default
-    // pick mode silently. We don't warn here because this runs on every
-    // panel mount and would spam the console for any user with bad data.
-    return DEFAULT_LAST_MODE;
-  }
-}
-
-function saveLastSectionMode(mode: LastSectionMode): void {
-  if (typeof window === 'undefined') return;
-  try {
-    window.localStorage.setItem(SECTION_MODE_STORAGE_KEY, JSON.stringify(mode));
-  } catch {
-    // Quota exceeded / private mode — best effort, the preference just
-    // doesn't survive this session.
-  }
-}
-
-function clearLastSectionMode(): void {
-  if (typeof window === 'undefined') return;
-  try {
-    window.localStorage.removeItem(SECTION_MODE_STORAGE_KEY);
-  } catch { /* best-effort */ }
-}
 
 const HATCH_IDS: readonly SectionCapHatchId[] = [
   'solid', 'diagonal', 'crossHatch', 'horizontal',
@@ -218,7 +129,7 @@ export interface SectionPickPreview {
   faceKey: string;
 }
 
-export interface SectionSlice {
+export interface SectionSlice extends SectionBoxSlice {
   // State
   sectionPlane: SectionPlane;
   /**
@@ -232,7 +143,7 @@ export interface SectionSlice {
    * Hover preview for the face-pick gesture (issue #243 follow-up).
    * Populated by the dwell handler when the cursor pauses ~200ms over a
    * surface; consumed by `SectionVisualization.tsx` to paint a
-   * translucent violet quad + a tiny normal arrow on the hovered face.
+   * translucent accent quad + a tiny normal arrow on the hovered face.
    * Cleared on cursor leaving the canvas, moving to a different face,
    * disarming pick mode, or successful commit.
    */
@@ -251,12 +162,12 @@ export interface SectionSlice {
   /**
    * Set the section plane from a face pick. `normal` is the face's world-
    * space unit normal; `point` is any point on the face (typically the
-   * raycast hit). The derived plane equation is
-   * `dot(worldPos, normal) = dot(point, normal)`.
+   * raycast hit), oriented out of the visible surface. The plane is
+   * `dot(worldPos, normal) = dot(point, normal) - inset` (#5480, `sectionFacePick.ts`).
    *
-   * Also writes the nearest cardinal `axis` + `flipped` and a percentage-
-   * along-that-axis `position` so legacy consumers (drawings, BCF,
-   * tooltips) still see a reasonable axis-aligned approximation.
+   * Resets `flipped` (relative to `normal`, as the renderer applies it) so every
+   * face orientation keeps the cut side (#5644), and writes the nearest cardinal
+   * `axis` + `position`; `cardinalSectionFlipped` maps the flip for readers of those.
    */
   setSectionPlaneFromFace: (
     normal: [number, number, number],
@@ -297,7 +208,7 @@ function isDrawablePick(
   return point.every(Number.isFinite);
 }
 
-const getDefaultSectionPlane = (): SectionPlane => ({
+export const getDefaultSectionPlane = (): SectionPlane => ({
   axis: SECTION_PLANE_DEFAULTS.AXIS,
   position: SECTION_PLANE_DEFAULTS.POSITION,
   enabled: SECTION_PLANE_DEFAULTS.ENABLED,
@@ -311,85 +222,74 @@ const getDefaultSectionPlane = (): SectionPlane => ({
   capStyle:     getDefaultCapStyle(),
 });
 
-export const createSectionSlice: StateCreator<SectionSlice, [], [], SectionSlice> = (set) => ({
+export const createSectionSlice: StateCreator<SectionSlice, [], [], SectionSlice> = (set, get, api) => {
+  // Every action below that creates/re-enables a cut goes through this one
+  // path (#5893 review): `enabled` and `sceneState.section.visible` must
+  // never diverge, or nothing renders with no feedback. `get()` is cast:
+  // this slice types `set`/`get` narrowly (`sectionSlice.test.ts` stubs it
+  // alone) — same as `uiSlice.ts`'s `setActiveTool` reaching `resetMeasureGesture`.
+  const enableSectionPlane = (planePatch: Partial<SectionPlane> = {}): void => {
+    set((state) => ({ sectionPlane: { ...state.sectionPlane, ...planePatch, enabled: true } }));
+    (get() as unknown as { setSectionVisible?: (visible: boolean) => void }).setSectionVisible?.(true);
+  };
+
+  return {
+  ...createSectionBoxSlice(set, get, api),
   // Initial state
   sectionPlane: getDefaultSectionPlane(),
   sectionPickMode: false,
   sectionPickPreview: null,
 
   // Actions
-  setSectionPlaneAxis: (axis) => set((state) => {
-    // Persist the cardinal choice so reopening the section tool restores
-    // axis + position + flipped (issue #243 follow-up). Position and
-    // flipped come from current state — picking an axis doesn't reset
-    // either, it just switches which axis the slider walks along.
-    saveLastSectionMode({
-      kind: 'cardinal',
-      axis,
-      position: state.sectionPlane.position,
-      flipped:  state.sectionPlane.flipped,
-    });
-    return {
-      // Changing the axis implicitly means "I want to cut now" — enable the clip
-      // so users don't get stuck in a confusing no-op preview. Also drop any
-      // custom (face-picked) plane so the cardinal preset takes over cleanly.
-      sectionPlane: { ...state.sectionPlane, axis, enabled: true, custom: undefined },
-    };
-  }),
+  setSectionPlaneAxis: (axis) => {
+    const state = get();
+    // Persist axis + position + flipped so reopening the tool restores it
+    // (issue #243). Position/flipped come from current state — picking an
+    // axis just switches which axis the slider walks along. Also enable
+    // the clip (picking an axis implicitly means "cut now") and drop any
+    // custom (face-picked) plane so the cardinal preset takes over cleanly.
+    saveLastSectionMode({ kind: 'cardinal', axis, position: state.sectionPlane.position, flipped: state.sectionPlane.flipped });
+    enableSectionPlane({ axis, custom: undefined, box: undefined });
+  },
 
-  setSectionPlanePosition: (position) => set((state) => {
-    // Clamp position to valid range [0, 100]
+  setSectionPlanePosition: (position) => {
+    const state = get();
     const clampedPosition = Math.min(100, Math.max(0, Number(position) || 0));
-    // Slider semantics differ between cardinal and custom modes:
-    //   • cardinal: percentage along the axis between bounds extents.
-    //   • custom: percentage along the picked normal between the bounds-
-    //     diagonal extents centred on `pickedAt`. The renderer translates
-    //     that to a signed `distance`; the action below just stores the
-    //     percentage and updates `custom.distance` to match.
-    const next: SectionPlane = { ...state.sectionPlane, position: clampedPosition, enabled: true };
-    // Persist the cardinal slider position so the user gets the same cut
-    // back on reopen (issue #243 follow-up). Custom-mode position drives
-    // a face-anchored distance which we deliberately don't persist —
-    // those coordinates are model-relative and meaningless across files.
+    // Cardinal: percentage along the axis between bounds extents, persisted
+    // (issue #243) for reopen. Custom: percentage along the picked normal
+    // between the bounds-diagonal extents centred on `pickedAt` — not
+    // persisted (model-relative). The renderer translates that to a signed
+    // `distance`; the patch below stores the percentage and updates
+    // `custom.distance` to match.
+    const planePatch: Partial<SectionPlane> = { position: clampedPosition };
     if (!state.sectionPlane.custom) {
-      saveLastSectionMode({
-        kind: 'cardinal',
-        axis:     state.sectionPlane.axis,
-        position: clampedPosition,
-        flipped:  state.sectionPlane.flipped,
-      });
-    }
-    if (state.sectionPlane.custom) {
+      saveLastSectionMode({ kind: 'cardinal', axis: state.sectionPlane.axis, position: clampedPosition, flipped: state.sectionPlane.flipped });
+    } else {
       const c = state.sectionPlane.custom;
-      // Re-anchor distance from percentage. The half-extent is derived
-      // from the renderer-supplied bounds when we have them — at this
-      // point in the slice we don't, so we use the existing distance as
-      // the anchor and shift it by the percentage delta. This keeps the
-      // slider responsive without the slice needing a bounds dependency.
-      // The renderer cap path uses `custom.distance` verbatim regardless,
-      // so the visual stays accurate.
-      const dPct = (clampedPosition - state.sectionPlane.position) / 100;
-      const dot = c.pickedAt[0] * c.normal[0] + c.pickedAt[1] * c.normal[1] + c.pickedAt[2] * c.normal[2];
-      // 100% of slider span = ~bounds-diagonal; without bounds, fall
-      // back to a generous fixed step (10 world units per 100%). The
-      // SectionPanel updates this with the real bounds via
-      // `setSectionCustomDistance` once they're known.
+      // Re-anchor from percentage: without renderer-supplied bounds here,
+      // shift the existing distance by the percentage delta over a fixed
+      // fallback span (10 world units per 100%; SectionPanel corrects it
+      // with real bounds via `setSectionCustomDistance` once known).
+      // `pickedAt` stays anchored; only `distance` changes.
       const fallbackSpan = 10;
-      next.custom = { ...c, distance: c.distance + dPct * fallbackSpan };
-      // Keep `pickedAt` so future deltas remain anchored to the original
-      // pick — only `distance` (and on flip, `normal`) ever change.
-      void dot;
+      const dPct = (clampedPosition - state.sectionPlane.position) / 100;
+      planePatch.custom = { ...c, distance: c.distance + dPct * fallbackSpan, alignment: undefined };
     }
-    return { sectionPlane: next };
-  }),
+    enableSectionPlane(planePatch);
+  },
 
-  toggleSectionPlane: () => set((state) => ({
-    sectionPlane: { ...state.sectionPlane, enabled: !state.sectionPlane.enabled },
-  })),
+  toggleSectionPlane: () => {
+    const enabling = !get().sectionPlane.enabled;
+    if (enabling) { enableSectionPlane(); return; }
+    set((state) => ({ sectionPlane: { ...state.sectionPlane, enabled: false } }));
+  },
 
-  setSectionPlaneEnabled: (enabled) => set((state) => ({
-    sectionPlane: { ...state.sectionPlane, enabled },
-  })),
+  // An explicit on/off also drops a parked cut (#4910); turning ON goes
+  // through `enableSectionPlane` so a stale hidden toggle cannot survive it.
+  setSectionPlaneEnabled: (enabled) => {
+    if (enabled) { enableSectionPlane(); return; }
+    set((state) => ({ sectionPlane: { ...state.sectionPlane, enabled: false, parked: false } }));
+  },
 
   flipSectionPlane: () => set((state) => {
     // A plane is geometrically defined by `(normal, distance)`. Which
@@ -450,21 +350,23 @@ export const createSectionSlice: StateCreator<SectionSlice, [], [], SectionSlice
     return { sectionPlane: getDefaultSectionPlane(), sectionPickMode: false, sectionPickPreview: null };
   }),
 
-  setSectionPlaneFromFace: (normal, point, bounds) => set((state) => {
+  setSectionPlaneFromFace: (normal, point, bounds) => {
+    const state = get();
     const nx = normal[0]; const ny = normal[1]; const nz = normal[2];
     const len = Math.hypot(nx, ny, nz);
     if (!isDrawablePick(normal, point)) {
       // Degenerate normal — disarm pick mode but don't poison the
       // renderer with NaNs. Also clear any in-flight hover preview so
-      // the violet quad doesn't linger after a bogus pick attempt.
+      // the accent quad doesn't linger after a bogus pick attempt.
       // `point` is screened too: it only reached `distance` and
       // `pickedAt`, so a non-finite hit point produced a NaN plane
       // offset that the normal check never saw (#2495).
       console.warn('[section] face-pick received a degenerate normal or point; ignoring');
-      return { sectionPickMode: false, sectionPickPreview: null };
+      set(() => ({ sectionPickMode: false, sectionPickPreview: null }));
+      return;
     }
     const unit: [number, number, number] = [nx / len, ny / len, nz / len];
-    const distance = point[0] * unit[0] + point[1] * unit[1] + point[2] * unit[2];
+    const distance = facePickPlaneDistance(unit, point, bounds);
     const basis = planeBasis(unit);
     const cardinal = nearestCardinalAxis(unit);
 
@@ -500,23 +402,16 @@ export const createSectionSlice: StateCreator<SectionSlice, [], [], SectionSlice
     // the custom plane itself (model-relative coords).
     saveLastSectionMode({ kind: 'pick' });
 
-    return {
-      sectionPlane: {
-        ...state.sectionPlane,
-        axis:    cardinal.axis,
-        flipped: cardinal.flipped,
-        position,
-        enabled: true,
-        custom,
-      },
+    set(() => ({
       sectionPickMode: false,
-      // Commit consumes the preview — the violet quad transitions
+      // Commit consumes the preview — the accent quad transitions
       // visually into the actual cap on the next render. Clearing here
       // (rather than waiting for the hover handler) avoids a frame of
       // double-render where both preview and cap paint the same face.
       sectionPickPreview: null,
-    };
-  }),
+    }));
+    enableSectionPlane({ axis: cardinal.axis, flipped: false, position, custom, box: undefined });
+  },
 
   setSectionCustomDistance: (distance) => set((state) => {
     if (!state.sectionPlane.custom || !Number.isFinite(distance)) {
@@ -525,22 +420,24 @@ export const createSectionSlice: StateCreator<SectionSlice, [], [], SectionSlice
     return {
       sectionPlane: {
         ...state.sectionPlane,
-        custom: { ...state.sectionPlane.custom, distance },
+        custom: { ...state.sectionPlane.custom, distance, alignment: undefined },
       },
     };
   }),
 
-  setSectionPickMode: (enabled) => set(() => (
+  setSectionPickMode: (enabled) => set((state) => (
     // Disarming pick mode also drops any hovering preview overlay so
     // it doesn't linger after the user toggles off (Esc, second toggle
     // press, tool change). Re-arming starts fresh.
     enabled
-      ? { sectionPickMode: true }
+      ? { sectionPickMode: true, ...(state.sectionPlane.custom?.alignment ? {
+        sectionPlane: { ...state.sectionPlane, custom: { ...state.sectionPlane.custom, alignment: undefined } },
+      } : {}) }
       : { sectionPickMode: false, sectionPickPreview: null }
   )),
 
   setSectionPickPreview: (preview) => set((state) => {
-    // Setting a preview while pick mode is OFF would put the violet
+    // Setting a preview while pick mode is OFF would put the accent
     // quad on screen with no way to commit it — guard against that so
     // a stale hover event firing after disarm doesn't reintroduce the
     // overlay.
@@ -559,4 +456,5 @@ export const createSectionSlice: StateCreator<SectionSlice, [], [], SectionSlice
     }
     return { sectionPickPreview: preview };
   }),
-});
+  };
+};

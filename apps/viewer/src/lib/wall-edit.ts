@@ -16,17 +16,31 @@
 
 import type { IfcDataStore } from '@ifc-lite/parser';
 import type { MutablePropertyView, StoreEditor } from '@ifc-lite/mutations';
+import { fromNativeLength, readWallJoinRels, readWallJoinTarget } from '@ifc-lite/create';
 import {
   asExpressIdRef,
   readAttributes,
   resolvePlacementChain,
   resolveRotationState,
 } from './placement-core.js';
+import { moveWallAxis } from './wall-axis-edit.js';
 
+/** Only these classes are walls; a beam or member built by the in-store
+ * builders carries the same rectangle-profile + explicit-RefDirection shape,
+ * so the representation alone cannot tell them apart. */
+const WALL_STEP_TYPES = new Set(['IFCWALL', 'IFCWALLSTANDARDCASE']);
+
+/**
+ * Every length on a {@link WallEditChain} is in METRES — the viewer's render
+ * and authoring space — whatever the file's length unit. Raw STEP reads are
+ * in native units (e.g. millimetres) and are multiplied by the model's
+ * `lengthUnitScale` on the way in; the ids are what a writer needs to divide
+ * back out (#6233).
+ */
 export interface WallEditChain {
   /** IfcLocalPlacement.RelativePlacement.Location — the wall's start point. */
   startPointId: number;
-  /** Current start coordinates (storey-local). */
+  /** Current start coordinates (storey-local, metres). */
   startCoordinates: [number, number, number];
   /** IfcAxis2Placement3D.RefDirection — wall direction (start→end). */
   refDirectionId: number;
@@ -44,6 +58,8 @@ export interface WallEditChain {
   extrudedSolidId: number;
   /** Extrusion depth ( = wall height in metres ); `NaN` when the slot wasn't a number. */
   height: number;
+  /** The native-unit → metre factor the lengths above were scaled by. */
+  lengthUnitScale: number;
 }
 
 /**
@@ -57,13 +73,19 @@ export interface WallEditChain {
  * profile / extruded-solid pair. Callers should treat null as
  * "endpoints not editable" and hide their drag handles rather than
  * crashing.
+ *
+ * `lengthUnitScale` is the model's native-unit → metre factor
+ * (`getModelLengthUnitScale`); the viewer's slice actions always pass it.
  */
 export function resolveWallEditChain(
   dataStore: IfcDataStore,
   view: MutablePropertyView,
   editor: StoreEditor,
   expressId: number,
+  lengthUnitScale = 1,
 ): WallEditChain | null {
+  const stepType = editor.getEntityType(expressId);
+  if (!stepType || !WALL_STEP_TYPES.has(stepType.toUpperCase())) return null;
   const wallAttrs = readAttributes(dataStore, view, editor, expressId);
   if (!wallAttrs) return null;
 
@@ -131,17 +153,22 @@ export function resolveWallEditChain(
   const depth = solidAttrs[3];
   const height = typeof depth === 'number' ? depth : NaN;
 
+  // In-store-authored walls are native-unit too (`addWallToStore` converts
+  // its metre params), so the scale applies to every wall alike.
+  const m = (native: number) => fromNativeLength({ lengthUnitScale }, native);
+  const [sx, sy, sz] = chain.coordinates;
   return {
     startPointId: chain.cartesianPointId,
-    startCoordinates: chain.coordinates,
+    startCoordinates: [m(sx), m(sy), m(sz)],
     refDirectionId: rot.refDirectionId,
     refDirection: rot.refDirection,
     profileId,
-    wallLength: xdim,
-    thickness: ydim,
+    wallLength: m(xdim),
+    thickness: m(ydim),
     profileOriginPointId,
     extrudedSolidId: solidId,
-    height,
+    height: m(height),
+    lengthUnitScale,
   };
 }
 
@@ -293,15 +320,21 @@ export type WallResizeResult =
 
 /**
  * Resize a rectangular-profile wall by setting new start AND end
- * points. Updates four entities atomically (from the caller's
- * perspective — the four writes still land as four mutations on
- * the undo stack today; a batched-mutation primitive is a planned
- * follow-up so a drag interaction collapses to one undo step).
+ * points, in the wall's native STEP units, straight through the
+ * editor with no history. The viewer's undoable resize is
+ * `MutationSlice.resizeWall` (`store/slices/mutation-wall-resize.ts`):
+ * it works in metres, writes the same four entities as one batched
+ * undo step, and folds an endpoint drag's frames into that step.
  *
  *   - wall placement origin (IfcCartesianPoint)
  *   - RefDirection (IfcDirection)  → new normalised (end-start)
  *   - profile XDim (IfcRectangleProfileDef)  → new length
  *   - profile origin (IfcCartesianPoint)  → [newLength/2, 0]
+ *   - the `Axis` polyline's two points, when the wall has one → [0, 0] and
+ *     [newLength, 0], so the centreline readers prefer stays with the body
+ *
+ * A wall with joins or cut ends is not a rectangle wall: it is re-shaped
+ * (and its joins recomputed) by `reshapeWallsIn` / `@ifc-lite/create`.
  */
 export function resizeRectangleWall(
   dataStore: IfcDataStore,
@@ -318,6 +351,12 @@ export function resizeRectangleWall(
       reason:
         'Wall does not have a simple IfcRectangleProfileDef → IfcExtrudedAreaSolid representation',
     };
+  }
+  // A wall with joins, cut ends or an offset body is more than these four coupled entities: overwriting
+  // them would leave its `IfcRelConnectsPathElements` and cuts describing the old place.
+  const read = readWallJoinTarget(dataStore, view, expressId, 1);
+  if (read && (!read.plain || readWallJoinRels(dataStore, view, new Set([expressId])).length > 0)) {
+    return { ok: false, reason: 'Wall has joins, cut ends or an offset body; resize it through reshapeWallsIn so its joins stay valid' };
   }
   const dx = newEnd[0] - newStart[0];
   const dy = newEnd[1] - newStart[1];
@@ -337,6 +376,7 @@ export function resizeRectangleWall(
   editor.setPositionalAttribute(chain.refDirectionId, 0, dir);
   editor.setPositionalAttribute(chain.profileId, 3, length);
   editor.setPositionalAttribute(chain.profileOriginPointId, 0, [length / 2, 0]);
+  moveWallAxis(dataStore, view, editor, expressId, length);
 
   return { ok: true, newStart, newEnd, newLength: length };
 }

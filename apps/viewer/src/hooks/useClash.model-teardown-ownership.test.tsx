@@ -15,7 +15,7 @@
  *    click) clears both channels and owns neither afterwards, but leaves
  *    `clashSelectedId` set. The next owner to install a ghost had it destroyed
  *    by an unrelated model removal — and on the `syncSourceModel` path that IS
- *    the original #2654 regression, because `purgeStaleEntityState` runs one
+ *    the original #2654 regression, because the second purge runs one
  *    line later and reads `null`.
  *  - UNDER-CLEAR: `selectElement` (the chevron expand and the per-side button)
  *    installs a NON-EMPTY clash isolation through `applyFocusMode` and never
@@ -198,14 +198,14 @@ describe('removeModel releases the visibility channel clash OWNS (#2654 third re
       'setup sanity: a clash IS selected — the fact the old gate mistook for ownership');
 
     // Now ANOTHER owner takes the channel: this is the store action the spaces
-    // X-ray, LayerDiffView and Space Sketch's ghost preview all drive.
+    // X-ray, LayerDiffView and the storey ghost all drive.
     useViewerStore.getState().setGhostExceptEntities(new Set([1]));
 
     useViewerStore.getState().removeModel('B');
 
     const s = useViewerStore.getState();
     assert.ok(s.ghostExceptEntities,
-      'clash disowned the channel in highlight mode — removing an unrelated model must not destroy the ghost the next owner installed. On the syncSourceModel path this is the original #2654 regression: purgeStaleEntityState runs one line later and reads null.');
+      'clash disowned the channel in highlight mode — removing an unrelated model must not destroy the ghost the next owner installed. On the syncSourceModel path this is the original #2654 regression: the second model-removed purge runs one line later and reads null.');
     assert.deepEqual([...s.ghostExceptEntities], [1], 'and must not filter it either — that is the resync purge\'s job');
   });
 
@@ -278,7 +278,7 @@ describe('removeModel releases the visibility channel clash OWNS (#2654 third re
     assert.equal(useViewerStore.getState().ghostExceptEntities, null,
       'setup sanity: highlight cleared the ghost channel');
 
-    // Another owner (spaces X-ray / LayerDiffView / Space Sketch) installs a
+    // Another owner (spaces X-ray / LayerDiffView) installs a
     // ghost that happens to hold EXACTLY the ids clash last installed — the two
     // clash parents are a perfectly ordinary thing for a user to X-ray.
     useViewerStore.getState().setGhostExceptEntities(new Set([1, 2]));

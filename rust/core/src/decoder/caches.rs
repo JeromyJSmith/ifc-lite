@@ -16,6 +16,35 @@ use super::EntityDecoder;
 use crate::DecodedEntity;
 
 impl EntityDecoder<'_> {
+    /// #3987: validate an indexed record fully, but materialize only a string
+    /// attribute. Discovery must not allocate discarded property/reference trees.
+    /// Honor both requested-id and parsed-id memoized values without adding any.
+    pub(crate) fn decode_string_by_id_transient(
+        &mut self, id: u32, attribute: usize,
+    ) -> crate::Result<Option<String>> {
+        if let Some(entity) = self.cache.get(&id) {
+            return Ok(entity.get_string(attribute).map(str::to_owned));
+        }
+        self.build_index();
+        let (start, end) = self.entity_index.as_ref().and_then(|index| index.lookup(id))
+            .ok_or_else(|| crate::Error::parse(0, format!("Entity #{} not found", id)))?;
+        // The SAME parser checks unused fields too. A malformed tail must fail
+        // even when Name was already readable or the parsed id is memoized.
+        let (parsed_id, _, tokens) = self.parse_at(start, end, "decode_at_uncached")?;
+        if let Some(entity) = self.cache.get(&parsed_id) {
+            return Ok(entity.get_string(attribute).map(str::to_owned));
+        }
+        Ok(match tokens.get(attribute) {
+            Some(token @ crate::parser::Token::String(_)) => {
+                match crate::AttributeValue::from_token(token) {
+                    crate::AttributeValue::String(value) => Some(value),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+    }
+
     /// Drain the populated cache out of this decoder for sharing across
     /// rayon tasks. After calling this, the decoder is empty (cache
     /// moved out); callers typically then drop the decoder.
@@ -100,10 +129,28 @@ impl EntityDecoder<'_> {
         self.placement_transform_cache.get(&id).copied()
     }
 
-    /// Memoize a resolved placement world transform under its placement id. Only
-    /// the geometry router's real computed transforms (IfcLocalPlacement /
-    /// linear / grid) are stored here; identity/depth-guard fallbacks are not, so
-    /// the memo stays a pure function of the placement id (byte-identical reuse).
+    /// Memoize a placement world transform under its placement id.
+    ///
+    /// The router also files the world frame of the `IfcGrid` owning an
+    /// IFC2X3/IFC4 grid placement under that grid's `IfcGridAxis` id; entity
+    /// ids are unique, so the two key sets never collide.
+    ///
+    /// This is an unconditional insert, and last write wins. It does not
+    /// validate `transform`, does not compare it against any entry already held
+    /// for `id`, and has no way to tell a complete world transform from a
+    /// partial one — nothing in this crate computes placement transforms, so
+    /// nothing here can.
+    ///
+    /// Whether the memo is a pure function of the placement id is therefore a
+    /// property of the CALLERS, not of this method. The geometry router is the
+    /// one that owes it: it stores only fully composed local/linear/grid
+    /// transforms, and in particular never stores one composed from a walk its
+    /// depth guard cut short, because what such a walk composed depends on the
+    /// depth it was entered at rather than on the placement id (#3012). A caller
+    /// that breaks that discipline does not fail here — it makes whichever
+    /// reader happens to query the id first decide the answer for every reader
+    /// after it, including across workers via
+    /// [`Self::take_placement_transform_cache`].
     pub fn cache_placement_transform(&mut self, id: u32, transform: [f64; 16]) {
         self.placement_transform_cache.insert(id, transform);
     }
@@ -113,3 +160,7 @@ impl EntityDecoder<'_> {
         self.cache.len()
     }
 }
+
+#[cfg(test)]
+#[path = "transient_projection_tests.rs"]
+mod transient_projection_tests;

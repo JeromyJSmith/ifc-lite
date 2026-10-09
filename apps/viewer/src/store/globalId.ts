@@ -82,3 +82,74 @@ export function toGlobalIdForRef(
 ): number {
   return toGlobalIdFromModels(models, ref.modelId, ref.expressId);
 }
+
+/** The model shape both `localIdInParseRange` and `localIdInOverlay` need. */
+export type OwnershipModel = Pick<FederatedModel, 'idOffset' | 'maxExpressId'>;
+
+/** The mutation-view shape `localIdInOverlay` needs — just enough to ask "does an overlay entity live at this local id". */
+export interface OwnershipView {
+  getNewEntity(id: number): unknown;
+}
+
+/**
+ * Parse-time ownership: a model owns `[idOffset, idOffset + maxExpressId]` from
+ * the original parse. Returns the LOCAL express id, or `null`.
+ *
+ * `model.idOffset` bare, no `?? 0`: it is a required `number` on
+ * `FederatedModel` (`store/types.ts`), and every caller of this has always
+ * read it bare. `null` is returned for a miss, so a caller must test
+ * `!== null` — local id `0` is a legitimate answer and a truthiness test
+ * would drop it.
+ *
+ * The single shared home for this rule (#3343): `modelSlice.ts`'s unscoped
+ * and scoped resolvers, and `teardown-scope.ts`'s `modelRemovedScope` survivor
+ * check, all call this instead of re-spelling the range arithmetic. Before
+ * the consolidation the three copies had already drifted once (#2697) and
+ * were independently re-merged by an unrelated teardown refactor (#3358) —
+ * nothing structurally stopped them drifting again.
+ */
+export function localIdInParseRange(model: OwnershipModel, globalId: number): number | null {
+  const localId = globalId - model.idOffset;
+  return localId >= 0 && localId <= model.maxExpressId ? localId : null;
+}
+
+/**
+ * Overlay ownership: duplicates / scripted adds through StoreEditor land ABOVE
+ * the model's parse-time `maxExpressId`, so `localIdInParseRange` cannot see
+ * them; the model's mutation view can. Returns the LOCAL express id, or `null`.
+ */
+export function localIdInOverlay(
+  model: OwnershipModel,
+  globalId: number,
+  view: OwnershipView | undefined,
+): number | null {
+  if (!view) return null;
+  const localId = globalId - model.idOffset;
+  if (localId <= model.maxExpressId) return null; // parse-range's business
+  return view.getNewEntity(localId) !== null ? localId : null;
+}
+
+/** The store fields {@link typeNameOfGlobalId} reads. */
+export interface TypeNameLookupState {
+  resolveGlobalIdFromModels: (globalId: number) => { modelId: string; expressId: number } | null;
+  models: ReadonlyMap<string, { ifcDataStore?: { entities?: { getTypeName(id: number): string } } | null }>;
+}
+
+/**
+ * The IFC class of a federated global id (e.g. a GPU-instanced occurrence,
+ * which carries no class of its own), read from the id's OWN model store.
+ * Resolves through `resolveGlobalIdFromModels`, the canonical way back from
+ * a global id (it also knows overlay-allocated ids, the registry does not).
+ * The active store is read only with no models loaded (legacy single-model
+ * mode, where global === express).
+ */
+export function typeNameOfGlobalId(
+  state: TypeNameLookupState,
+  globalId: number,
+  activeStore: { entities?: { getTypeName(id: number): string } } | null | undefined,
+): string | undefined {
+  if (state.models.size === 0) return activeStore?.entities?.getTypeName(globalId) || undefined;
+  const loc = state.resolveGlobalIdFromModels(globalId);
+  if (!loc) return undefined;
+  return state.models.get(loc.modelId)?.ifcDataStore?.entities?.getTypeName(loc.expressId) || undefined;
+}

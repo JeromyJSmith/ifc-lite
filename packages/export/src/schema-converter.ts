@@ -8,21 +8,21 @@
  * Handles entity type renaming and attribute rewriting when converting
  * between IFC schema versions (IFC2X3, IFC4, IFC4X3, IFC5).
  *
- * Key differences between schemas:
- * - IFC2X3 → IFC4: IfcWallStandardCase → IfcWall (with PredefinedType),
- *   spatial hierarchy changes, removed/renamed entity types
- * - IFC4 → IFC4X3: New facility types (bridge, road, railway, marine),
- *   IfcBuiltElement replaces IfcBuildingElement in some cases
- * - IFC5: Alpha spec — STEP-based with different attribute ordering,
- *   entity names largely aligned with IFC4X3 but schema header is 'IFC5'
- *
  * This module works at the STEP text level: it rewrites entity type names
  * and adjusts attribute counts via regex replacement on raw STEP lines.
  */
 
 import { generateIfcGuid, type RandomSource } from '@ifc-lite/encoding';
-import { deterministicGlobalId } from '@ifc-lite/parser';
-import { ENTITIES_IFC2X3, ENTITIES_IFC4, ENTITIES_IFC4X3, type IfcEntityInfo } from '@ifc-lite/data';
+import { deterministicGlobalId, getSchemaRegistryForVersion } from '@ifc-lite/parser';
+import { resolveUnrepresentedEntity } from './schema-untranslatable.js';
+import { BY_NAME_ATTR_REMAP_TYPES, remapRenamedAttributesByName } from './schema-converter-attr-remap.js';
+import { splitTopLevelStepArguments } from './step-argument-parser.js';
+import { Ifc2x3SlotFill } from './schema-converter-ifc2x3-slots.js';
+import type { Ifc4SlotCheck } from './schema-converter-ifc4-slots.js';
+import type { EnumReconciliation } from './schema-converter-enums.js';
+import { referencesAnyExpressId } from './step-ref-scan.js';
+
+export { computeWithheldRefIds } from './schema-untranslatable.js';
 
 export type IfcSchemaVersion = 'IFC2X3' | 'IFC4' | 'IFC4X3' | 'IFC5';
 
@@ -60,6 +60,35 @@ const IFC4_TO_IFC2X3: Map<string, string> = new Map([
   ['IFCCOURSE', 'IFCBUILDINGELEMENTPROXY'],
   ['IFCPAVEMENT', 'IFCSLAB'],
   ['IFCKERB', 'IFCBUILDINGELEMENTPROXY'],
+  // IFC4 renamed the IFC2X3 door/window type objects. Left unmapped,
+  // `resolveUnrepresentedEntity` treated them as having NO IFC2X3
+  // representation and replaced every one with an IFCPROXY carrying a
+  // freshly minted GlobalId — losing the source GlobalId, Name and psets —
+  // even though IfcDoorStyle/IfcWindowStyle are real targets. The attribute
+  // lists only partially overlap, so `BY_NAME_ATTR_REMAP_TYPES`
+  // (schema-converter-attr-remap.ts) also reconciles them by name.
+  ['IFCDOORTYPE', 'IFCDOORSTYLE'],
+  ['IFCWINDOWTYPE', 'IFCWINDOWSTYLE'],
+  // Structural analysis domain (#4206): IfcStructuralLoadCase, IfcStructuralCurveAction
+  // and IfcStructuralSurfaceAction are all IfcRoot subtypes with a real IFC2X3
+  // target under a DIFFERENT name. Left unmapped, `resolveUnrepresentedEntity`
+  // silently replaced every one with an IFCPROXY — losing the GlobalId, the
+  // applied load reference and the load/action classification even though
+  // IFC2X3 has a real (if differently shaped) target for each.
+  // IfcStructuralLoadCase(IFC4) has no IFC2X3 counterpart of its own name;
+  // IFC2X3 folds load cases into `IfcStructuralLoadGroup` with
+  // `PredefinedType=.LOAD_CASE.` and no `SelfWeightCoefficients` slot — a
+  // strict attribute-name prefix, so the trim path below reconciles it
+  // without help from `BY_NAME_ATTR_REMAP_TYPES`.
+  ['IFCSTRUCTURALLOADCASE', 'IFCSTRUCTURALLOADGROUP'],
+  // IfcStructuralCurveAction/SurfaceAction(IFC4) rename to
+  // IfcStructuralLinearAction/PlanarAction(IFC2X3): both carry the same
+  // attributes through `GlobalOrLocal`/`DestabilizingLoad`, but IFC2X3 then
+  // inserts an optional `CausedBy` before `ProjectedOrTrue` where IFC4
+  // appends `PredefinedType` instead, so neither list is a positional prefix
+  // of the other — `BY_NAME_ATTR_REMAP_TYPES` reconciles both by name.
+  ['IFCSTRUCTURALCURVEACTION', 'IFCSTRUCTURALLINEARACTION'],
+  ['IFCSTRUCTURALSURFACEACTION', 'IFCSTRUCTURALPLANARACTION'],
   // IFC4X3 spatial structure → IFC2X3 equivalents
   ['IFCFACILITY', 'IFCBUILDING'],
   ['IFCFACILITYPART', 'IFCBUILDINGSTOREY'],
@@ -121,61 +150,6 @@ const IFC4X3_TO_IFC4: Map<string, string> = new Map([
   ['IFCMOBILETELECOMMUNICATIONSAPPLIANCE', 'IFCCOMMUNICATIONSAPPLIANCE'],
   ['IFCDISTRIBUTIONBOARD', 'IFCELECTRICDISTRIBUTIONBOARD'],
   ['IFCELECTRICFLOWTREATMENTDEVICE', 'IFCFLOWTREATMENTDEVICE'],
-]);
-
-/**
- * IFC2X3 entities that have fewer attributes than IFC4.
- * When converting IFC4 → IFC2X3, trailing attributes must be trimmed.
- *
- * Key: entity type (UPPERCASE)
- * Value: max number of positional attributes allowed in IFC2X3
- *
- * Common differences:
- * - IfcRoot subtypes: IFC4 adds no extra root attrs, but several element
- *   subtypes gained PredefinedType in IFC4 that doesn't exist in IFC2X3.
- * - IfcProject: IFC2X3 has 9 attrs, IFC4 has 9 (same)
- * - IfcSite: IFC2X3 has 14, IFC4 has 14 (same)
- * - IfcBuilding: IFC2X3 has 12, IFC4 has 12 (same)
- * - IfcBuildingStorey: IFC2X3 has 10, IFC4 has 10 (same)
- * - IfcSpace: IFC2X3 has 11 (no LongName), IFC4 has 11 (same count, different attrs)
- * - IfcWall: IFC2X3 has 8, IFC4 has 9 (added PredefinedType)
- * - IfcSlab: IFC2X3 has 9, IFC4 has 9 (same)
- * - IfcDoor: IFC2X3 has 10, IFC4 has 13 (added PredefinedType, OperationType, UserDefinedOperationType)
- * - IfcWindow: IFC2X3 has 10, IFC4 has 13 (added PredefinedType, PartitioningType, UserDefinedPartitioningType)
- * - IfcBeam/Column: IFC2X3 has 8, IFC4 has 9 (added PredefinedType)
- * - IfcOpeningElement: IFC2X3 has 8, IFC4 has 9 (added PredefinedType)
- */
-const IFC2X3_ATTR_COUNTS: Map<string, number> = new Map([
-  ['IFCWALL', 8],
-  ['IFCBEAM', 8],
-  ['IFCCOLUMN', 8],
-  ['IFCROOF', 9],
-  ['IFCSTAIR', 9],
-  ['IFCRAMP', 9],
-  ['IFCRAILING', 9],
-  ['IFCMEMBER', 8],
-  ['IFCPLATE', 8],
-  ['IFCFOOTING', 9],
-  ['IFCPILE', 11],
-  ['IFCCOVERING', 9],
-  ['IFCOPENINGELEMENT', 8],
-  ['IFCDOOR', 10],
-  ['IFCWINDOW', 10],
-  ['IFCFURNISHINGELEMENT', 8],
-  ['IFCBUILDINGELEMENTPROXY', 9],
-  ['IFCCURTAINWALL', 8],
-  ['IFCFLOWSEGMENT', 8],
-  ['IFCFLOWTERMINAL', 8],
-  ['IFCFLOWCONTROLLER', 8],
-  ['IFCFLOWFITTING', 8],
-  ['IFCFLOWMOVINGDEVICE', 8],
-  ['IFCFLOWSTORAGEDEVICE', 8],
-  ['IFCFLOWTREATMENTDEVICE', 8],
-  ['IFCENERGYCONVERSIONDEVICE', 8],
-  ['IFCDISTRIBUTIONELEMENT', 8],
-  ['IFCDISTRIBUTIONFLOWELEMENT', 8],
-  ['IFCDISTRIBUTIONCONTROLELEMENT', 8],
-  ['IFCDISTRIBUTIONCHAMBERELEMENT', 8],
 ]);
 
 /**
@@ -258,97 +232,105 @@ function chainMaps(
 }
 
 // Lazily-built UPPERCASE entity name → ordered positional attribute NAMES, per
-// schema, from the generated buildingSMART tables. `IfcEntityInfo.attributes` is
-// the full inherited+direct positional list (verified to match STEP counts:
-// IfcWall 8→9, IfcDoor 10→13, IfcMaterial 1→3, …).
+// schema, from the EXPRESS-derived registries: present iff the schema declares
+// it. `@ifc-lite/data`'s C# tables put 24 IFC4X3-only entities (and `TagList`)
+// under IFC4, which kept both the `IFCPROXY` route and the trim from firing
+// (#5204). IFC5 has no EXPRESS registry: `null` skips count adjustment.
 const ATTR_NAME_TABLES = new Map<IfcSchemaVersion, Map<string, readonly string[]>>();
-function attrNameTable(schema: IfcSchemaVersion): Map<string, readonly string[]> | null {
+export function attrNameTable(schema: IfcSchemaVersion): Map<string, readonly string[]> | null {
   let table = ATTR_NAME_TABLES.get(schema);
   if (table) return table;
-  let entities: readonly IfcEntityInfo[] | null = null;
-  if (schema === 'IFC2X3') entities = ENTITIES_IFC2X3;
-  else if (schema === 'IFC4') entities = ENTITIES_IFC4;
-  else if (schema === 'IFC4X3') entities = ENTITIES_IFC4X3;
-  else return null; // IFC5 has no generated table — skip count adjustment
+  if (schema !== 'IFC2X3' && schema !== 'IFC4' && schema !== 'IFC4X3') return null;
   table = new Map<string, readonly string[]>();
-  for (const e of entities) table.set(e.name.toUpperCase(), e.attributes);
+  for (const [name, meta] of Object.entries(getSchemaRegistryForVersion(schema).entities)) {
+    table.set(name.toUpperCase(), (meta.allAttributes ?? meta.attributes).map((a) => a.name));
+  }
   ATTR_NAME_TABLES.set(schema, table);
   return table;
 }
 
 /**
- * True when `src` is a STRICT prefix of `tgt` by attribute name — i.e. the
- * target only *appended* attributes. Trailing-`$` padding is only safe then;
- * many entities insert/reorder attributes mid-list (e.g. IfcMaterialProperties,
- * IfcApproval, IfcTask), where padding would shift values into the wrong slots.
+ * True when `shorter` is a STRICT prefix of `longer` by attribute name — i.e.
+ * the longer form only *appended* attributes to the shorter one. Both the
+ * trailing-`$` padding (upgrade) and the tail trim (downgrade) are only safe
+ * then; many entities insert/reorder attributes mid-list (e.g.
+ * IfcMaterialProperties, IfcApproval, IfcTask), where padding or trimming would
+ * shift values into the wrong slots.
+ *
+ * Callers pass the shorter schema's list first, whichever direction they run in.
  */
-function isStrictAttrPrefix(src: readonly string[], tgt: readonly string[]): boolean {
-  if (src.length >= tgt.length) return false;
-  for (let i = 0; i < src.length; i++) {
-    if (src[i] !== tgt[i]) return false;
+export function isStrictAttrPrefix(shorter: readonly string[], longer: readonly string[]): boolean {
+  if (shorter.length >= longer.length) return false;
+  for (let i = 0; i < shorter.length; i++) {
+    if (shorter[i] !== longer[i]) return false;
   }
   return true;
 }
 
-/** Ordinal rank of a schema version (older → newer) for direction checks. */
-function schemaRank(schema: IfcSchemaVersion): number {
-  switch (schema) {
-    case 'IFC2X3': return 0;
-    case 'IFC4': return 1;
-    case 'IFC4X3': return 2;
-    case 'IFC5': return 3;
-    default: return 0;
-  }
-}
-
 /** Count top-level (comma-separated) STEP attributes, respecting nested
  *  parentheses and single-quoted strings. Empty list → 0. */
-function countTopLevelAttributes(attrsRaw: string): number {
-  if (!attrsRaw.trim()) return 0;
-  let count = 1;
-  let depth = 0;
-  let inString = false;
-  for (let i = 0; i < attrsRaw.length; i++) {
-    const ch = attrsRaw[i];
-    if (ch === "'" && !inString) inString = true;
-    else if (ch === "'" && inString) {
-      if (i + 1 < attrsRaw.length && attrsRaw[i + 1] === "'") { i++; continue; }
-      inString = false;
-    } else if (!inString) {
-      if (ch === '(') depth++;
-      else if (ch === ')') depth--;
-      else if (ch === ',' && depth === 0) count++;
-    }
-  }
-  return count;
+function requireTopLevelAttributes(attrsRaw: string): string[] {
+  const attrs = splitTopLevelStepArguments(attrsRaw);
+  if (attrs === null) throw new Error('Schema conversion refused an invalid STEP argument list.');
+  return attrs;
 }
 
 /**
  * Convert a raw STEP entity line from one schema version to another.
  *
- * Handles:
- * 1. Entity type name conversion
- * 2. Attribute count adjustment: trimming trailing attrs for older schemas, and
- *    padding trailing `$` for newer schemas that ADDED attributes (e.g. the
- *    PredefinedType IFC4 introduced on IfcWall/IfcBeam/IfcOpeningElement/…).
- * 3. Skipping entities that have no valid representation in the target schema
+ * Handles: 1. entity type names; 2. attribute counts (trim for older schemas,
+ * pad trailing `$` for attributes a newer schema APPENDED, e.g. IFC4's
+ * PredefinedType on IfcWall); 3. entities with no target representation;
+ * 4. enum members the target lacks (`enums`, #5365).
  *
  * @param line - Raw STEP entity line (e.g., "#1=IFCWALL('guid',...);")
  * @param fromSchema - Source schema version
  * @param toSchema - Target schema version
- * @param random - Optional seeded `RandomSource` for the GlobalId of any
- *   IFCPROXY placeholder minted here. Omit for the default random path; pass
- *   a seeded source when the caller needs byte-reproducible output.
- * @returns Converted line (entities without valid target representation become IFCPROXY placeholders)
+ * @param random - Optional seeded `RandomSource` for the GlobalId of any IFCPROXY
+ *   placeholder minted here; pass one when output must be byte-reproducible.
+ * @param slots - This package's exporters pass one; it carries the owner
+ *   history they reuse (#4686) and collects what they could not settle.
+ *   Omitted, a throwaway stands in, so the generated table's own defaults are
+ *   still written but the OwnerHistory reuse and both counts are lost.
+ * @param ifc4Slots - Counts IFC4-required slots left `$` (IFC4X3/IFC5 → IFC4 only, #5202).
+ * @param enums - Resolves enum members the target lacks and reports losses (#5365).
+ * @param withheldRefIds - Express ids this export is OMITTING outright
+ *   ({@link computeWithheldRefIds}, #4206) — a record whose attributes name
+ *   one is redirected to the same "no representation" resolution as its own
+ *   unmapped type would get, so it cannot ship a now-dangling `#N`.
+ * @returns Converted line (entities without valid target representation become
+ *   IFCPROXY placeholders), or `null` when this record itself is one of the
+ *   narrow set `resolveUnrepresentedEntity` can safely OMIT rather than throw
+ *   for — the caller must not write a `null` result.
  */
 export function convertStepLine(
   line: string,
   fromSchema: IfcSchemaVersion,
   toSchema: IfcSchemaVersion,
   random?: RandomSource,
-): string {
+  slots?: Ifc2x3SlotFill,
+  withheldRefIds?: ReadonlySet<number>,
+  ifc4Slots?: Ifc4SlotCheck,
+  enums?: EnumReconciliation,
+): string | null {
   if (fromSchema === toSchema) return line;
+  let converted = convertRecord(line, fromSchema, toSchema, random, withheldRefIds);
+  if (converted === null) return null;
+  if (enums && toSchema !== 'IFC5') converted = enums.apply(converted, toSchema);
+  if (toSchema === 'IFC2X3') return (slots ?? new Ifc2x3SlotFill()).apply(converted);
+  if (toSchema === 'IFC4' && (fromSchema === 'IFC4X3' || fromSchema === 'IFC5')) ifc4Slots?.apply(converted);
+  return converted;
+}
 
+/** {@link convertStepLine} before the IFC2X3 required-slot fills, between two
+ *  different schemas. */
+function convertRecord(
+  line: string,
+  fromSchema: IfcSchemaVersion,
+  toSchema: IfcSchemaVersion,
+  random?: RandomSource,
+  withheldRefIds?: ReadonlySet<number>,
+): string | null {
   // Parse: #ID=TYPE(attrs);  — tolerate whitespace around `=` and before the
   // type (some exporters, e.g. Tekla, write `#34498= IFCOPENINGELEMENT(...)`).
   // Without this those lines passed through unconverted, so neither type renames
@@ -360,8 +342,23 @@ export function convertStepLine(
   const entityType = match[2].toUpperCase();
   const attrsRaw = match[3] ?? '';
 
+  // Validate before choosing any conversion branch. A malformed slot list
+  // must not still receive a type rename, proxy replacement, trim, or padding:
+  // that would partially convert a record whose positions are untrustworthy.
+  requireTopLevelAttributes(attrsRaw);
+
   // Convert entity type
   const newType = convertEntityType(entityType, fromSchema, toSchema);
+
+  // A record whose attribute list references an id this export is OMITTING
+  // (`withheldRefIds`, #4206) cannot carry that reference forward, no matter
+  // how cleanly this record's OWN type would otherwise convert — a renamed
+  // record left pointing at a `#N` with no line is worse than an honest
+  // proxy. Checked before `shouldSkipEntity` and the attribute-table lookup
+  // below so it wins over both.
+  if (withheldRefIds && withheldRefIds.size > 0 && referencesAnyExpressId(attrsRaw, withheldRefIds)) {
+    return resolveUnrepresentedEntity(prefix, entityType, attrsRaw, toSchema, random, withheldRefIds !== undefined);
+  }
 
   // Replace entities that have no valid representation in the target schema
   // with IFCPROXY placeholders to preserve EXPRESS IDs and prevent dangling references
@@ -394,37 +391,53 @@ export function convertStepLine(
     return `${prefix}IFCPROXY('${guid}',$,'${entityType}',$,$,$,$,.NOTDEFINED.,$);`;
   }
 
-  // Adjust attribute count if downgrading to IFC2X3
-  let finalAttrs = attrsRaw;
-  if (toSchema === 'IFC2X3') {
-    const maxAttrs = IFC2X3_ATTR_COUNTS.get(newType);
-    if (maxAttrs !== undefined) {
-      finalAttrs = trimAttributes(attrsRaw, maxAttrs);
-    }
-  }
-
-  // Pad trailing optional attributes when UPGRADING to a newer schema that
-  // APPENDED attributes (e.g. IFC2X3 → IFC4 added PredefinedType to IfcWall /
-  // IfcBeam / IfcOpeningElement / …). Without this the upgraded entity is short
-  // an attribute and invalid under the new schema, which strict readers reject.
+  // Reconcile the attribute list against the target schema. WHICH WAY it moves
+  // is decided by the strict attribute-NAME prefix relation alone, never by the
+  // direction of travel — rank and shrinkage are independent. A newer schema can
+  // REMOVE attributes: 10 entities have an IFC4 list that is a strict prefix of
+  // their IFC2X3 one, and 4 more for IFC4 → IFC4X3. IFC4 dropped
+  // `ControlElementId` from IfcDistributionControlElement and both
+  // `CentreOfGravity*` from IfcLShapeProfileDef; IFC4X3 dropped IfcReferent's
+  // `PredefinedType`. Gating the trim on the rank comparison left every one of
+  // those upgrades untouched, so 6-argument `IFCRELDECOMPOSES` lines — the
+  // entity takes 4 in IFC4 — went into files whose header declares IFC4.
   //
-  // CRITICAL: only pad when the source attribute name-list is a strict PREFIX of
-  // the target's. Many entities insert/reorder attributes mid-list (e.g.
-  // IfcMaterialProperties [Material] → [Name, Description, Properties, Material],
-  // IfcApproval, IfcTask); blindly appending `$` there would shift values into the
-  // wrong (and type-invalid) slots. A prefix check distinguishes a safe append
-  // from a corrupting insertion — the headline targets are all prefix-safe. The
-  // appended attributes are optional, so `$` is valid. Scoped to upconversion so
-  // it never touches the downconversion trim path above.
-  if (schemaRank(toSchema) > schemaRank(fromSchema)) {
-    // Source attrs keyed on the ORIGINAL type; target on the (possibly renamed) type.
-    const srcAttrs = attrNameTable(fromSchema)?.get(entityType);
-    const tgtAttrs = attrNameTable(toSchema)?.get(newType);
-    if (srcAttrs && tgtAttrs && isStrictAttrPrefix(srcAttrs, tgtAttrs)) {
-      const currentCount = countTopLevelAttributes(finalAttrs);
+  // The prefix rule is what makes either adjustment safe: many entities INSERT
+  // attributes mid-list rather than appending them (IFC2X3 IfcApproval is
+  // [Description, ApprovalDateTime, …, Identifier] against IFC4's
+  // [Identifier, Name, Description, …]; IfcMaterialProperties [Material] →
+  // [Name, Description, Properties, Material]), and trimming the tail or
+  // appending `$` there would leave values in the wrong, type-invalid slots.
+  // Those types are left alone. The appended attributes are optional, so `$` is
+  // a valid pad.
+  //
+  // The two branches cannot both apply: each requires ITS OWN list to be
+  // strictly shorter than the other, which no pair of lists can satisfy at once.
+  // Source attrs keyed on the ORIGINAL type; target on the (possibly renamed) type.
+  let finalAttrs = attrsRaw;
+  const targetTable = attrNameTable(toSchema);
+  const srcAttrs = attrNameTable(fromSchema)?.get(entityType);
+  const tgtAttrs = targetTable?.get(newType);
+  // `shouldSkipEntity` above only catches its hand-listed alignment types;
+  // a type entirely unknown to `targetTable` (not merely a strict-prefix
+  // attribute mismatch, handled below) has no representation in `toSchema` at
+  // all — see `resolveUnrepresentedEntity` for why it can't just pass through.
+  if (srcAttrs && targetTable && !tgtAttrs) {
+    return resolveUnrepresentedEntity(prefix, entityType, attrsRaw, toSchema, random, withheldRefIds !== undefined);
+  }
+  if (srcAttrs && tgtAttrs) {
+    if (isStrictAttrPrefix(tgtAttrs, srcAttrs)) {
+      finalAttrs = trimAttributes(attrsRaw, tgtAttrs.length);
+    } else if (isStrictAttrPrefix(srcAttrs, tgtAttrs)) {
+      const currentCount = requireTopLevelAttributes(finalAttrs).length;
       if (currentCount > 0 && currentCount < tgtAttrs.length) {
         finalAttrs = `${finalAttrs}${',$'.repeat(tgtAttrs.length - currentCount)}`;
       }
+    } else if (entityType !== newType && BY_NAME_ATTR_REMAP_TYPES.has(entityType)) {
+      // Neither list is a prefix of the other; see `BY_NAME_ATTR_REMAP_TYPES`.
+      const remapped = remapRenamedAttributesByName(attrsRaw, srcAttrs, tgtAttrs);
+      if (remapped === null) throw new Error('Schema conversion refused an invalid STEP argument list.');
+      finalAttrs = remapped;
     }
   }
 
@@ -439,7 +452,7 @@ export function convertStepLine(
  * Alignment entities are valid in IFC4X3 and IFC5, so they are only skipped
  * when targeting older schemas (IFC2X3, IFC4).
  */
-function shouldSkipEntity(entityType: string, toSchema: IfcSchemaVersion): boolean {
+export function shouldSkipEntity(entityType: string, toSchema: IfcSchemaVersion): boolean {
   // Alignment entities are native to IFC4X3 and IFC5 — preserve them
   if (toSchema === 'IFC4X3' || toSchema === 'IFC5') {
     return false;
@@ -464,55 +477,12 @@ function shouldSkipEntity(entityType: string, toSchema: IfcSchemaVersion): boole
  */
 function trimAttributes(attrsRaw: string, maxCount: number): string {
   if (!attrsRaw.trim()) return attrsRaw;
+  // The scan below only tests its budget AFTER pushing an attribute, so a zero
+  // budget would keep the first one. An entity with no attributes in the target
+  // schema keeps none.
+  if (maxCount <= 0) return '';
 
-  const attrs: string[] = [];
-  let depth = 0;
-  let inString = false;
-  let current = '';
-
-  for (let i = 0; i < attrsRaw.length; i++) {
-    const ch = attrsRaw[i];
-
-    if (ch === "'" && !inString) {
-      inString = true;
-      current += ch;
-    } else if (ch === "'" && inString) {
-      // Check for escaped quote ''
-      if (i + 1 < attrsRaw.length && attrsRaw[i + 1] === "'") {
-        current += "''";
-        i++;
-        continue;
-      }
-      inString = false;
-      current += ch;
-    } else if (inString) {
-      current += ch;
-    } else if (ch === '(') {
-      depth++;
-      current += ch;
-    } else if (ch === ')') {
-      depth--;
-      current += ch;
-    } else if (ch === ',' && depth === 0) {
-      attrs.push(current);
-      current = '';
-      if (attrs.length >= maxCount) {
-        return attrs.join(',');
-      }
-    } else {
-      current += ch;
-    }
-  }
-
-  // Last attribute
-  attrs.push(current);
-
-  // Trim to maxCount
-  if (attrs.length > maxCount) {
-    return attrs.slice(0, maxCount).join(',');
-  }
-
-  return attrs.join(',');
+  return requireTopLevelAttributes(attrsRaw).slice(0, maxCount).join(',');
 }
 
 /**

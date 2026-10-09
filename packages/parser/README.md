@@ -107,6 +107,31 @@ if (georef?.hasGeoreference) {
 }
 ```
 
+The exported, immutable `SI_PREFIX_MULTIPLIERS` table maps the exact `IfcSIPrefix`
+enumeration names to their numeric prefix factors. IFC readers and STEP compatibility writers
+share this table; an unknown prefix must be refused rather than treated as 1.
+
+## Read cost data
+
+```typescript
+import { evaluateCostItem, extractCostOnDemand } from '@ifc-lite/parser';
+
+const cost = extractCostOnDemand(store);
+const result = evaluateCostItem(cost, cost.CostItems[0].expressId);
+console.log(result.Amount, result.Currency, result.Diagnostics);
+```
+
+The read model preserves ordered `CostValues`, direct `CostQuantities`, shared
+references, and the original `IfcRelNests`/assignment relationship endpoints.
+Rates use only `IfcCostItem.CostQuantities`; product Qto values are never used as
+an implicit fallback. Direct quantities make the item's values unit costs even
+when `UnitBasis` is absent. IFC4 and IFC4X3 support exact-decimal arithmetic,
+currencies, compatible `UnitBasis` conversion, and named or `*` nested-category
+totals. Invalid quantities or incompatible dimensions produce diagnostics and
+withhold the total instead of returning a partial result. IFC2X3 cost metadata and legacy
+relationships remain inspectable, with an explicit partial-read diagnostic;
+IFC2X3 evaluation is intentionally unsupported.
+
 ## Performance
 
 | Model size | Parse time |

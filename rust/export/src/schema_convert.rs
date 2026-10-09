@@ -2,10 +2,16 @@
 //! IFC **schema conversion** for STEP export (Phase 2 P2). Ports
 //! `packages/export/src/schema-converter.ts`: entity-type renames between
 //! IFC2X3 / IFC4 / IFC4X3 / IFC5 (with multi-step chaining), IFC2X3 attribute-count
-//! trimming on downgrade, and a proxy fallback for types with no target representation.
+//! trimming on downgrade, padding of the attributes a newer target schema appended
+//! (`schema_pad`), and a proxy fallback for types with no target representation.
+
+use crate::schema_ifc2x3_slots::Ifc2x3SlotFill;
+use crate::schema_enum::ConversionChecks;
+use crate::schema_unrepresented::{check_representation, UnrepresentedEntityError};
+use crate::step_slot::split_top_level_args;
 
 /// Canonicalize a FILE_SCHEMA label to one of the four families we convert between.
-fn canon(s: &str) -> &'static str {
+pub(crate) fn canon(s: &str) -> &'static str {
     let u = s.to_uppercase();
     if u.starts_with("IFC2X3") {
         "IFC2X3"
@@ -40,8 +46,104 @@ fn map_4_to_2x3(t: &str) -> Option<&'static str> {
         "IFCFACILITY" | "IFCBRIDGE" | "IFCROAD" | "IFCRAILWAY" | "IFCMARINEFACILITY" => "IFCBUILDING",
         "IFCFACILITYPART" | "IFCFACILITYPARTCOMMON" | "IFCBRIDGEPART" | "IFCROADPART"
         | "IFCRAILWAYPART" | "IFCMARINEPART" => "IFCBUILDINGSTOREY",
+        // IFC4 renamed the IFC2X3 door/window type objects. Left unmapped,
+        // `should_skip_entity`-adjacent proxy fallback below treated them as
+        // having no IFC2X3 representation and replaced every one with an
+        // IFCPROXY carrying a freshly minted GlobalId (mirrors TS #3653).
+        // `BY_NAME_ATTR_REMAP_TYPES` reconciles their attribute lists by
+        // name since IFC4 inserted ElementType/PredefinedType mid-list.
+        "IFCDOORTYPE" => "IFCDOORSTYLE",
+        "IFCWINDOWTYPE" => "IFCWINDOWSTYLE",
+        // #4206, door/window's bug class: unmapped, fell through to a proxy.
+        "IFCSTRUCTURALLOADCASE" => "IFCSTRUCTURALLOADGROUP",
+        "IFCSTRUCTURALCURVEACTION" => "IFCSTRUCTURALLINEARACTION",
+        "IFCSTRUCTURALSURFACEACTION" => "IFCSTRUCTURALPLANARACTION",
         _ => return None,
     })
+}
+
+/// Source (IFC4) and target (IFC2X3) EXPRESS attribute names for the two
+/// door/window-type renames above, in the order STEP encodes them. Neither
+/// list is a positional prefix of the other (IFC4 inserted `ElementType`/
+/// `PredefinedType` ahead of the attributes it kept), so
+/// `convert_step_line` reconciles them by NAME rather than trimming a
+/// positional suffix like every other IFC2X3-downgrade rename.
+fn by_name_attr_remap_names(entity_type: &str) -> Option<(&'static [&'static str], &'static [&'static str])> {
+    match entity_type {
+        "IFCDOORTYPE" => Some((
+            &[
+                "GlobalId", "OwnerHistory", "Name", "Description", "ApplicableOccurrence",
+                "HasPropertySets", "RepresentationMaps", "Tag", "ElementType", "PredefinedType",
+                "OperationType", "ParameterTakesPrecedence", "UserDefinedOperationType",
+            ],
+            &[
+                "GlobalId", "OwnerHistory", "Name", "Description", "ApplicableOccurrence",
+                "HasPropertySets", "RepresentationMaps", "Tag", "OperationType", "ConstructionType",
+                "ParameterTakesPrecedence", "Sizeable",
+            ],
+        )),
+        "IFCWINDOWTYPE" => Some((
+            &[
+                "GlobalId", "OwnerHistory", "Name", "Description", "ApplicableOccurrence",
+                "HasPropertySets", "RepresentationMaps", "Tag", "ElementType", "PredefinedType",
+                "PartitioningType", "ParameterTakesPrecedence", "UserDefinedPartitioningType",
+            ],
+            &[
+                "GlobalId", "OwnerHistory", "Name", "Description", "ApplicableOccurrence",
+                "HasPropertySets", "RepresentationMaps", "Tag", "ConstructionType", "OperationType",
+                "ParameterTakesPrecedence", "Sizeable",
+            ],
+        )),
+        // #4206: IFC4 appends PredefinedType where IFC2X3 inserts CausedBy
+        // before ProjectedOrTrue -- neither list is a positional prefix.
+        "IFCSTRUCTURALCURVEACTION" | "IFCSTRUCTURALSURFACEACTION" => Some((
+            &["GlobalId", "OwnerHistory", "Name", "Description", "ObjectType", "ObjectPlacement",
+              "Representation", "AppliedLoad", "GlobalOrLocal", "DestabilizingLoad", "ProjectedOrTrue", "PredefinedType"],
+            &["GlobalId", "OwnerHistory", "Name", "Description", "ObjectType", "ObjectPlacement",
+              "Representation", "AppliedLoad", "GlobalOrLocal", "DestabilizingLoad", "CausedBy", "ProjectedOrTrue"],
+        )),
+        _ => None,
+    }
+}
+
+/// Reconcile a renamed entity's attribute list by matching attribute NAMES
+/// between the source and target schema tables, rather than by position.
+/// A target attribute with no same-named source attribute becomes `$`
+/// (unknown); a source attribute with no same-named target slot is dropped.
+///
+/// The `$` is not the last word on a slot IFC2X3 requires a value in.
+/// `IfcDoorStyle`/`IfcWindowStyle` declare `OperationType`,
+/// `ConstructionType`, `ParameterTakesPrecedence` and `Sizeable` mandatory,
+/// and `IfcDoorType`/`IfcWindowType` have no `ConstructionType` or `Sizeable`
+/// at all; [`Ifc2x3SlotFill`] settles all four from the generated
+/// required-slot table straight after this runs, because the remap's output
+/// carries exactly the target's attribute count. Same policy and same shape as
+/// the TypeScript twin's `remapRenamedAttributesByName`, which reaches it
+/// through its own fill: `convertStepLine` applies one on every IFC2X3 target,
+/// substituting a throwaway when the caller passes none.
+///
+/// The `trim` below has no twin, and that is a real divergence rather than a
+/// compensation: NEITHER splitter trims its tokens (measured:
+/// `splitTopLevelStepArguments("'a' ,  $  , #3 ")` returns
+/// `["'a' ", "  $  ", " #3 "]`). So a source slot written `  $  ` is
+/// normalised to `$` here and passed through verbatim there. It predates
+/// #4714, it is whitespace-only, and the four mandatory slots this doc is
+/// about are overwritten by the fill either way; left as found rather than
+/// changed on the way past.
+fn remap_attrs_by_name(attrs: &str, src_names: &[&str], tgt_names: &[&str]) -> Option<String> {
+    let values = split_top_level_args(attrs)?;
+    let mut by_name: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for (name, value) in src_names.iter().zip(values.iter()) {
+        by_name.insert(*name, value.as_str());
+    }
+    Some(tgt_names
+        .iter()
+        .map(|name| {
+            let given = by_name.get(name).copied().filter(|v| v.trim() != "$");
+            given.unwrap_or("$")
+        })
+        .collect::<Vec<_>>()
+        .join(","))
 }
 
 fn map_4x3_to_4(t: &str) -> Option<&'static str> {
@@ -80,6 +182,7 @@ fn ifc2x3_attr_count(t: &str) -> Option<usize> {
         | "IFCBUILDINGELEMENTPROXY" => 9,
         "IFCPILE" => 11,
         "IFCDOOR" | "IFCWINDOW" => 10,
+        "IFCSTRUCTURALLOADGROUP" => 10, // #4206: drops trailing SelfWeightCoefficients
         _ => return None,
     })
 }
@@ -133,103 +236,171 @@ pub(crate) fn placeholder_guid(id: u32) -> String {
     String::from_utf8(s.to_vec()).unwrap()
 }
 
+/// Split a raw STEP attribute list into its top-level (comma-separated)
+/// value strings, respecting nested parentheses and single-quoted strings.
+/// Empty list -> `[]`. Shared by `trim_attributes` (positional truncation)
+/// and `remap_attrs_by_name` (by-name reconciliation).
 /// Trim a STEP attribute list to `max_count` top-level attributes (STEP-nesting aware).
-fn trim_attributes(attrs: &str, max_count: usize) -> String {
+fn trim_attributes(attrs: &str, max_count: usize) -> Option<String> {
     if attrs.trim().is_empty() {
-        return attrs.to_string();
+        return Some(attrs.to_string());
     }
-    let bytes = attrs.as_bytes();
-    let mut out: Vec<String> = Vec::new();
-    let mut depth = 0i32;
-    let mut in_string = false;
-    let mut current = String::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        let ch = bytes[i] as char;
-        if ch == '\'' && !in_string {
-            in_string = true;
-            current.push(ch);
-        } else if ch == '\'' && in_string {
-            if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                current.push_str("''");
-                i += 2;
-                continue;
-            }
-            in_string = false;
-            current.push(ch);
-        } else if in_string {
-            current.push(ch);
-        } else if ch == '(' {
-            depth += 1;
-            current.push(ch);
-        } else if ch == ')' {
-            depth -= 1;
-            current.push(ch);
-        } else if ch == ',' && depth == 0 {
-            out.push(std::mem::take(&mut current));
-            if out.len() >= max_count {
-                return out.join(",");
-            }
-        } else {
-            current.push(ch);
-        }
-        i += 1;
-    }
-    out.push(current);
+    let out = split_top_level_args(attrs)?;
     if out.len() > max_count {
-        out[..max_count].join(",")
+        Some(out[..max_count].join(","))
     } else {
-        out.join(",")
+        Some(out.join(","))
     }
 }
 
 /// Convert one STEP entity line `#id=TYPE(attrs);` from `from` to `to`.
 /// Returns the line unchanged when it isn't a parseable entity line.
-pub fn convert_step_line(line: &str, from: &str, to: &str, express_id: u32) -> String {
+///
+/// On a downgrade to IFC2X3, `slots` settles the slots IFC2X3 requires a value
+/// in that the converted record still holds `$` in: `OwnerHistory` by reuse
+/// (#4686) and the rest from the generated required-slot table (#4714); see
+/// [`crate::schema_ifc2x3_slots`]. Required rather than defaulted, so an
+/// exporter cannot convert without having decided which owner history it
+/// writes, and cannot lose the count of what stayed `$`.
+///
+/// `checks`: enum members the target lacks (#5365); IFC4-required `$` slots, counted (#5307).
+///
+/// Errs for a type with no representation in `to` at all (#5116, [`crate::schema_unrepresented`]).
+pub fn convert_step_line(
+    line: &str,
+    from: &str,
+    to: &str,
+    express_id: u32,
+    slots: &mut Ifc2x3SlotFill,
+    checks: Option<&mut ConversionChecks>,
+) -> Result<String, UnrepresentedEntityError> {
     let (cfrom, cto) = (canon(from), canon(to));
     if cfrom == cto {
-        return line.to_string();
+        return Ok(line.to_string());
     }
+    let mut converted = convert_record(line, cfrom, cto, express_id)?;
+    if let Some(checks) = checks {
+        converted = checks.enums.apply(converted, cto);
+        let ifc4_downgrade = cto == "IFC4" && (cfrom == "IFC4X3" || cfrom == "IFC5");
+        ifc4_downgrade.then(|| checks.ifc4_slots.count(&converted));
+    }
+    Ok(if cto == "IFC2X3" { slots.apply(converted) } else { converted })
+}
+
+/// [`convert_step_line`] before the IFC2X3 required-slot fills, between two
+/// different canonical schemas.
+fn convert_record(line: &str, cfrom: &'static str, cto: &'static str, express_id: u32) -> Result<String, UnrepresentedEntityError> {
     // Parse #ID=TYPE(attrs); (multi-line tolerant: rfind ')').
     let trimmed = line.trim_end();
     let body = trimmed.strip_suffix(';').unwrap_or(trimmed);
     let eq = match body.find('=') {
         Some(e) => e,
-        None => return line.to_string(),
+        None => return Ok(line.to_string()),
     };
     let prefix = &body[..=eq]; // "#123="
     let after = &body[eq + 1..];
     let popen = match after.find('(') {
         Some(p) => p,
-        None => return line.to_string(),
+        None => return Ok(line.to_string()),
     };
     let aclose = match after.rfind(')') {
         Some(c) if c > popen => c,
-        _ => return line.to_string(),
+        _ => return Ok(line.to_string()),
     };
     let entity_type = after[..popen].trim().to_uppercase();
     let attrs = &after[popen + 1..aclose];
 
+    // Validate before choosing any conversion branch. Otherwise a malformed
+    // slot list can still receive a type rename, proxy replacement, trim, or
+    // padding and become a partially converted record (#4200).
+    if split_top_level_args(attrs).is_none() {
+        return Ok(line.to_string());
+    }
+
     let new_type = convert_entity_type(&entity_type, cfrom, cto);
 
     if should_skip_entity(&new_type, cto) {
-        return format!(
+        // The proxy carries a MINTED GlobalId, not the source entity's, and the
+        // authored identity is therefore lost on a downgrade. That is
+        // deliberate on the TypeScript twin (`convertStepLine` in
+        // `packages/export/src/schema-converter.ts`), which documents the
+        // counter-example and pins it in `merged-exporter.test.ts`: two
+        // federated models can legitimately carry the SAME alignment GlobalId,
+        // and copying the source id would unify two distinct alignments into
+        // one. The two implementations do not agree on WHAT to mint — this one
+        // derives from the express id, the TypeScript one from the whole source
+        // line — so the same model downgraded by each yields different proxy
+        // ids. Left as found; changing either is a decision for the maintainer,
+        // not a side effect of a round-trip test.
+        return Ok(format!(
             "{prefix}IFCPROXY('{}',$,'{}',$,$,$,$,.NOTDEFINED.,$);",
             placeholder_guid(express_id),
             entity_type
-        );
+        ));
     }
 
-    let final_attrs = if cto == "IFC2X3" {
+    // #5116, see `check_representation`'s doc.
+    if let Some(result) = check_representation(prefix, &entity_type, &new_type, cto, express_id) {
+        return result;
+    }
+
+    // IFCDOORTYPE/IFCWINDOWTYPE -> IFCDOORSTYLE/IFCWINDOWSTYLE: neither
+    // attribute list is a positional prefix of the other (IFC4 inserted
+    // ElementType/PredefinedType mid-list), so reconcile by name instead of
+    // the generic positional trim below.
+    let mut final_attrs = if new_type != entity_type {
+        if let Some((src_names, tgt_names)) = by_name_attr_remap_names(&entity_type) {
+            match remap_attrs_by_name(attrs, src_names, tgt_names) {
+                Some(value) => value,
+                None => return Ok(line.to_string()),
+            }
+        } else if cto == "IFC2X3" {
+            match ifc2x3_attr_count(&new_type) {
+                Some(max) => match trim_attributes(attrs, max) {
+                    Some(value) => value,
+                    None => return Ok(line.to_string()),
+                },
+                None => attrs.to_string(),
+            }
+        } else {
+            attrs.to_string()
+        }
+    } else if cto == "IFC2X3" {
         match ifc2x3_attr_count(&new_type) {
-            Some(max) => trim_attributes(attrs, max),
+            Some(max) => match trim_attributes(attrs, max) {
+                Some(value) => value,
+                None => return Ok(line.to_string()),
+            },
             None => attrs.to_string(),
         }
     } else {
         attrs.to_string()
     };
 
-    format!("{prefix}{new_type}({final_attrs});")
+    // Pad the trailing optional attributes a newer target schema APPENDED
+    // (#1416). Keyed on the ORIGINAL type, because the source schema is what
+    // decides how many attributes the line already has; the table's target
+    // count already accounts for the rename. Only types whose source
+    // attribute NAME list is a strict prefix of the target's are in it, so
+    // this can never shift a value into a reordered slot -- see
+    // `schema_pad`. An attribute-less line is left alone rather than
+    // fabricated from nothing, matching the TypeScript twin's
+    // `currentCount > 0` guard.
+    if let Some(target_count) = crate::schema_pad::padded_attr_count(cfrom, cto, &entity_type) {
+        let current = crate::schema_pad::count_top_level_attributes(&final_attrs);
+        if current > 0 && current < target_count {
+            for _ in current..target_count {
+                final_attrs.push_str(",$");
+            }
+        }
+    }
+
+    Ok(format!("{prefix}{new_type}({final_attrs});"))
+}
+
+/// True when `to` names IFC2X3, the one target whose `OwnerHistory` is mandatory.
+pub(crate) fn targets_ifc2x3(to: &str) -> bool {
+    canon(to) == "IFC2X3"
 }
 
 /// True when converting between these schemas changes entity types/attributes.
@@ -238,52 +409,5 @@ pub fn needs_conversion(from: &str, to: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn entity_type_renames() {
-        assert_eq!(convert_entity_type("IFCBURNERTYPE", "IFC4", "IFC2X3"), "IFCGASTERMINALTYPE");
-        assert_eq!(convert_entity_type("IFCCHIMNEY", "IFC4", "IFC2X3"), "IFCBUILDINGELEMENTPROXY");
-        assert_eq!(convert_entity_type("IFCWALL", "IFC2X3", "IFC4"), "IFCWALL"); // unchanged
-        // chained 4X3 → 2X3 (via 4): IfcFacility → IfcBuilding
-        assert_eq!(convert_entity_type("IFCFACILITY", "IFC4X3", "IFC2X3"), "IFCBUILDING");
-    }
-
-    #[test]
-    fn downgrade_trims_attributes() {
-        // IfcWall in IFC4 has 9 attrs (trailing PredefinedType); IFC2X3 keeps 8.
-        let line = "#5=IFCWALL('guid',$,'W1',$,$,#6,#7,'tag',.STANDARD.);";
-        let out = convert_step_line(line, "IFC4", "IFC2X3", 5);
-        assert!(out.starts_with("#5=IFCWALL("), "type kept");
-        assert!(!out.contains(".STANDARD."), "9th attr (PredefinedType) trimmed");
-        // 8 top-level attrs remain → 7 commas.
-        let inner = &out["#5=IFCWALL(".len()..out.len() - 2];
-        assert_eq!(inner.split(',').count(), 8, "trimmed to 8 attrs");
-    }
-
-    #[test]
-    fn nested_attrs_not_split_when_trimming() {
-        // Commas inside a nested list must not count as top-level separators.
-        let line = "#9=IFCWALL('g',$,$,$,$,(#1,#2,#3),#7,'t',.STANDARD.);";
-        let out = convert_step_line(line, "IFC4", "IFC2X3", 9);
-        assert!(out.contains("(#1,#2,#3)"), "nested list preserved intact");
-        assert!(!out.contains(".STANDARD."), "trailing attr trimmed");
-    }
-
-    #[test]
-    fn alignment_becomes_proxy_on_downgrade() {
-        let line = "#3=IFCALIGNMENTHORIZONTAL('g',$,$,$,$,#4);";
-        let out = convert_step_line(line, "IFC4X3", "IFC4", 3);
-        assert!(out.starts_with("#3=IFCPROXY("), "alignment → proxy");
-        assert!(out.contains("'IFCALIGNMENTHORIZONTAL'"), "original type recorded as name");
-    }
-
-    #[test]
-    fn no_conversion_is_identity() {
-        let line = "#1=IFCWALL('g',$,$);";
-        assert_eq!(convert_step_line(line, "IFC4", "IFC4", 1), line);
-        assert!(!needs_conversion("IFC4", "IFC4"));
-        assert!(needs_conversion("IFC2X3", "IFC4"));
-    }
-}
+#[path = "schema_convert_tests.rs"]
+mod tests;

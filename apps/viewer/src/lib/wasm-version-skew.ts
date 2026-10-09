@@ -23,8 +23,10 @@
 
 import {
   isWasmAssetUnavailableError,
+  isWorkerScriptSkewMessage,
   WASM_ASSET_UNAVAILABLE_EVENT,
 } from '@ifc-lite/geometry';
+import { reportStaleDeployment } from './stale-deployment.js';
 
 /** sessionStorage key holding the epoch-ms of the last skew-triggered reload. */
 const RELOAD_TS_KEY = 'ifclite:wasm-skew-reload-ts';
@@ -63,7 +65,7 @@ function markReloaded(now: number): boolean {
     // allow-same-origin / "block all cookies"). If we cannot RECORD a reload
     // we must not PERFORM one: a permanent failure (CSP-blocked worker, proxy
     // rewriting assets) would otherwise reload on every occurrence with no
-    // debounce at all. Mirrors the vite:preloadError policy in main.tsx.
+    // debounce at all. Mirrors the vite:preloadError policy in bootstrap.tsx.
     return false;
   }
 }
@@ -133,11 +135,14 @@ export function installWasmVersionSkewRecovery(): void {
   // letting it bubble to the global handlers below.
   window.addEventListener(WASM_ASSET_UNAVAILABLE_EVENT, (event) => {
     const detail = (event as CustomEvent<{ message?: string; kind?: string }>).detail;
+    // Reload refused (already spent in this window, or storage blocked): the
+    // user reloads instead, prompted by the stale-deployment notice (#5609).
     if (detail?.kind === 'worker-script') {
-      recoverFromWorkerScriptSkew();
+      if (!recoverFromWorkerScriptSkew()) reportStaleDeployment();
       return;
     }
-    recoverFromWasmVersionSkew(detail?.message ?? '');
+    const message = detail?.message ?? '';
+    if (!recoverFromWasmVersionSkew(message) && isWasmAssetUnavailableError(message)) reportStaleDeployment();
   });
 
   // Backstop for any wasm asset error that bubbles unhandled — parser wasm,
@@ -233,7 +238,20 @@ export function shouldSuppressWasmSkewNoise(
   deps: SkewNoiseDeps = defaultNoiseDeps,
 ): boolean {
   const message = exceptionMessageOf(event);
-  if (message === undefined || !isWasmAssetUnavailableError(message)) return false;
+  if (message === undefined) return false;
+  // Two independent signatures, because the underlying recovery is
+  // classified two different ways (#3533). `isWasmAssetUnavailableError`
+  // matches the wasm-binary MIME/404 text (#1363). The worker-script variant
+  // (`geometry-parallel.ts`'s pre-pass/process-worker `onerror` synthesizing
+  // "…worker script failed to load (possibly a stale deployment)") carries
+  // none of those tokens — it was classified by KIND on the
+  // `WASM_ASSET_UNAVAILABLE_EVENT` the geometry library dispatched (trusted,
+  // not re-matched, by `recoverFromWorkerScriptSkew` — see its own doc
+  // comment). By the time the exception lands here only the message text
+  // survives, so we need `isWorkerScriptSkewMessage` to recognize that same
+  // recovered condition — without this, a worker-script skew reloads
+  // correctly but still gets captured as if it were unhandled.
+  if (!isWasmAssetUnavailableError(message) && !isWorkerScriptSkewMessage(message)) return false;
 
   const now = deps.now();
 

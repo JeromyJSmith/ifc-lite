@@ -106,6 +106,8 @@ interface ContentDiffShape {
     headTruncated: boolean;
   }>;
   truncatedMatches: number;
+  splitMerges?: Array<{ kind: string; confidence: string; whole: string; pieces: string[] }>;
+  successors?: Array<{ confidence: string; base: string; head: string; overlap: number; distance: number }>;
 }
 
 interface DiffShape {
@@ -139,6 +141,18 @@ async function diff(input: Record<string, unknown>): Promise<DiffShape> {
   return result.structuredContent as unknown as DiffShape;
 }
 
+/**
+ * A wall on a storey whose Name is blank (`IFCBUILDINGSTOREY('...','',...)`),
+ * for `quantity_diff`'s group-by-storey regression coverage. Overrides the
+ * shared PREAMBLE's storey (`#41`, Name 'L01') with a second, blank-named one
+ * (`#42`) that the wall is actually placed under.
+ */
+function blankStoreyWallBody(wallGuid: string): string {
+  return `#42= IFCBUILDINGSTOREY('${guid('BLKS')}',$,'',$,$,#40,$,$,.ELEMENT.,0.);
+#72= IFCWALL('${wallGuid}',$,'Wall',$,$,#40,$,'tag',$);
+#80= IFCRELCONTAINEDINSPATIALSTRUCTURE('${guid('RCBS')}',$,$,$,(#72),#42);`;
+}
+
 beforeAll(async () => {
   tmp = await mkdtemp(join(tmpdir(), 'ifc-lite-mcp-diff-'));
   await load('base', step(twoWallsBody(guid('OLDA'), guid('OLDB'))));
@@ -147,6 +161,8 @@ beforeAll(async () => {
   await load('twins-head', step(twinWallsBody(guid('TWC'), guid('TWD'))));
   await load('sched-base', scheduleModel(guid('OLDT'), guid('PSTA'), guid('RELA')));
   await load('sched-head', scheduleModel(guid('NEWT'), guid('PSTB'), guid('RELB')));
+  await load('blank-storey-a', step(blankStoreyWallBody(guid('BSWA'))));
+  await load('blank-storey-b', step(blankStoreyWallBody(guid('BSWB'))));
 }, 60_000);
 
 afterAll(async () => {
@@ -215,10 +231,13 @@ describe('model_diff by_content', () => {
     // pair, and the check is inert unless BOTH sides supply them.
     expect(fingerprints.every((f) => f.components?.['attr:core'] !== undefined)).toBe(true);
 
-    // The IfcTask is an IfcObjectDefinition the columnar parser does not put in
-    // its EntityTable (it is not an IfcProduct subtype), so `getGlobalId`
-    // answers ''. Reading the table alone drops it from the comparison
-    // entirely; the chain check sends it to its STEP record instead.
+    // The IfcTask is an IfcObjectDefinition that is not an IfcProduct subtype.
+    // Before #4204's IfcRoot-descendant retention, the columnar parser did not
+    // put it in its EntityTable and `getGlobalId` answered '', so reading the
+    // table alone dropped it from the comparison entirely and the chain check
+    // had to send it to its STEP record instead. Now #4204 retains every
+    // IfcRoot descendant, so the table holds it directly — this pins that it
+    // still ends up correctly in the comparison either way.
     expect(byKey.get(guid('OLDT'))).toBe('IfcTask');
     // And with a real class name, not the table's 'Unknown': ifcType is hashed
     // into the fingerprint and cross-checked on every content match, so
@@ -342,4 +361,57 @@ ${twinWallsBody(guid('MXE'), guid('MXF'))}`));
     expect(content.contentMatches[0].kind).toBe('ambiguous');
     expect(content.truncatedMatches).toBe(2);
   }, 30_000);
+
+  it('split_merge / successors are wired through but produce no claims — this server has no geometry pipeline (issue #4956)', async () => {
+    // Both stages are geometry-only. This server always compares at `scope:
+    // 'data'`, so the engine abstains on both regardless of the flags —
+    // pinning that the params are accepted and threaded to `diffModels`
+    // without throwing, and that the honest "absent, not empty" answer comes
+    // back rather than a fabricated `[]`.
+    const off = await diff({ a: 'base', b: 'head', by_content: true });
+    expect(off.contentDiff?.splitMerges).toBeUndefined();
+    expect(off.contentDiff?.successors).toBeUndefined();
+
+    const on = await diff({
+      a: 'base',
+      b: 'head',
+      by_content: true,
+      split_merge: true,
+      successors: true,
+    });
+    expect(on.contentDiff?.splitMerges).toBeUndefined();
+    expect(on.contentDiff?.successors).toBeUndefined();
+    // The rest of the comparison is unaffected by the two flags.
+    expect(on.contentDiff?.counts).toEqual(off.contentDiff?.counts);
+  }, 30_000);
+});
+
+describe('quantity_diff group_by storey — blank storey Name (regression: #3515-family)', () => {
+  interface QuantityDiffRow {
+    key: string;
+    left: number;
+    right: number;
+    delta: number;
+    deltaPct: number | null;
+  }
+
+  /**
+   * `model.bim.storey(e.ref)?.name ?? '(none)'` only falls through on
+   * null/undefined; a present-but-blank storey Name
+   * (`IFCBUILDINGSTOREY('...','',...)`) short-circuited the chain and was
+   * used verbatim as the group-by-storey key instead of falling through to
+   * the "(none)" placeholder.
+   */
+  it('falls a blank storey Name through to "(none)", not an empty-string group key', async () => {
+    const tool = diffTools.find((t) => t.name === 'quantity_diff');
+    if (!tool) throw new Error('quantity_diff not registered');
+    const result: CallToolResult = await tool.handler(
+      { a: 'blank-storey-a', b: 'blank-storey-b', type: 'IfcWall', group_by: 'storey' },
+      ctx,
+    );
+    expect(result.isError).toBeUndefined();
+    const rows = (result.structuredContent as { rows: QuantityDiffRow[] }).rows;
+    expect(rows.map(r => r.key)).not.toContain('');
+    expect(rows.map(r => r.key)).toContain('(none)');
+  });
 });

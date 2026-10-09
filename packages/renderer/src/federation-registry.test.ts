@@ -8,14 +8,15 @@ import assert from 'node:assert';
 import { FederationRegistry } from './federation-registry.js';
 
 describe('FederationRegistry - offset assignment', () => {
-  it('registers models with non-overlapping offsets and a +1 gap', () => {
+  it('registers models with non-overlapping offsets, a +1 gap, and overlay headroom', () => {
     const reg = new FederationRegistry();
     const offsetA = reg.registerModel('modelA', 100);
     const offsetB = reg.registerModel('modelB', 50);
 
     assert.equal(offsetA, 0);
-    // Next model starts after modelA's range (maxExpressId 100) + 1 gap
-    assert.equal(offsetB, 101);
+    // Next model starts after modelA's range (maxExpressId 100) + 1 gap +
+    // OVERLAY_ID_HEADROOM (1_000_000) reserved for mutation-added entities.
+    assert.equal(offsetB, 1_000_101);
   });
 
   it('re-registering the same model returns the existing offset (no duplicate range)', () => {
@@ -30,7 +31,7 @@ describe('FederationRegistry - offset assignment', () => {
   it('unregisterModel removes the model but does NOT reclaim offset space (#federation gap)', () => {
     const reg = new FederationRegistry();
     reg.registerModel('modelA', 100); // offset 0..100
-    const offsetB = reg.registerModel('modelB', 50); // offset 101
+    const offsetB = reg.registerModel('modelB', 50); // offset 1_000_101
 
     reg.unregisterModel('modelA');
     assert.equal(reg.hasModel('modelA'), false);
@@ -47,13 +48,85 @@ describe('FederationRegistry - offset assignment', () => {
     reg.registerModel('modelA', 1_999_999_990);
     assert.throws(() => reg.registerModel('modelB', 100), /exceed safe ID limit/);
   });
+
+  it('allows registration landing EXACTLY on the MAX_SAFE_OFFSET boundary, rejects one past it', () => {
+    // The guard is `nextOffset + maxExpressId > MAX_SAFE_OFFSET`: landing
+    // exactly ON the limit must be allowed (the boundary itself is safe),
+    // only crossing it must throw. Testing only far past the limit (as the
+    // test above does) cannot tell `>` apart from `>=` at the boundary.
+    const reg = new FederationRegistry();
+    reg.registerModel('modelA', 0); // offset 0, nextOffset -> 1 + OVERLAY_ID_HEADROOM = 1_000_001
+    // sum = nextOffset(1_000_001) + maxExpressId(1_998_999_999) = 2_000_000_000 exactly.
+    assert.doesNotThrow(() => reg.registerModel('modelB', 1_998_999_999));
+    // nextOffset now overflows MAX_SAFE_OFFSET; any further model throws.
+    assert.throws(() => reg.registerModel('modelC', 0), /exceed safe ID limit/);
+  });
 });
 
 describe('FederationRegistry - toGlobalId / fromGlobalId round-trip', () => {
+  it('keeps reserved but unpublished progressive IDs unpickable', () => {
+    const reg = new FederationRegistry();
+    const offset = reg.reserveModel('landxml', 12);
+    assert.equal(offset, 0);
+    assert.equal(reg.fromGlobalId(1), null, 'reservation alone never fabricates ownership');
+    assert.throws(() => reg.toGlobalId('landxml', 1), /not published/);
+
+    reg.publishRange('landxml', 1, 3);
+    assert.equal(reg.toGlobalId('landxml', 1), 1);
+    assert.deepEqual(reg.fromGlobalId(3), { modelId: 'landxml', expressId: 3 });
+    assert.equal(reg.fromGlobalId(4), null, 'the reserved hole remains unpickable');
+  });
+
+  it('packs later models after the fixed reservation and overlay headroom', () => {
+    const reg = new FederationRegistry();
+    reg.reserveModel('landxml', 12);
+    const offset = reg.registerModel('ifc', 0);
+    assert.equal(offset, 1_000_013);
+    reg.publishRange('landxml', 1, 12);
+    assert.throws(() => reg.publishRange('landxml', 13, 13), /Invalid published range/);
+  });
+
+  it('rejects late source growth and bounds explicitly owned overlay headroom', () => {
+    const reg = new FederationRegistry();
+    reg.reserveModel('landxml', 2);
+    reg.publishRange('landxml', 1, 2);
+    reg.publishOverlayRange('landxml', 3, 1_000_002);
+    assert.deepEqual(reg.fromGlobalId(1_000_002), { modelId: 'landxml', expressId: 1_000_002 });
+    assert.throws(() => reg.publishOverlayRange('landxml', 1_000_003, 1_000_003), /Invalid overlay range/);
+    assert.throws(() => reg.publishRange('landxml', 3, 3), /Invalid published range/);
+  });
+
+  it('previews only the exact next overlay range without publishing ownership', () => {
+    const reg = new FederationRegistry();
+    reg.registerModel('editable', 3);
+    const otherOffset = reg.registerModel('other', 3);
+
+    assert.equal(reg.previewOverlayGlobalId('editable', 4, 6, 6), 6);
+    assert.equal(reg.fromGlobalId(6), null, 'a GPU staging preview must not make an ID pickable');
+    assert.throws(() => reg.toGlobalId('editable', 6), /not published/);
+    assert.deepEqual(reg.fromGlobalId(otherOffset + 2), { modelId: 'other', expressId: 2 });
+    assert.throws(
+      () => reg.previewOverlayGlobalId('editable', 5, 6, 6),
+      /contiguously/,
+      'a preview may not skip a strict ownership hole',
+    );
+  });
+
+  it('removal and reload burn only the removed reservation and preserve survivors', () => {
+    const reg = new FederationRegistry();
+    reg.reserveModel('first', 4);
+    reg.publishRange('first', 1, 2);
+    const survivor = reg.registerModel('survivor', 2);
+    reg.unregisterModel('first');
+    const reloaded = reg.reserveModel('first', 4);
+    assert.ok(reloaded > survivor);
+    assert.deepEqual(reg.fromGlobalId(survivor + 2), { modelId: 'survivor', expressId: 2 });
+  });
+
   it('round-trips expressId -> globalId -> {modelId, expressId} across multiple models', () => {
     const reg = new FederationRegistry();
     reg.registerModel('modelA', 100); // offset 0
-    reg.registerModel('modelB', 200); // offset 101
+    reg.registerModel('modelB', 200); // offset 1_000_101
 
     const globalA = reg.toGlobalId('modelA', 42);
     const globalB = reg.toGlobalId('modelB', 42);
@@ -96,42 +169,72 @@ describe('FederationRegistry - fromGlobalId binary search (N=0, N=1, N=many, gap
   it('N=many: resolves the correct model at each range boundary across several models', () => {
     const reg = new FederationRegistry();
     reg.registerModel('modelA', 100); // range [0, 100]
-    reg.registerModel('modelB', 50); // offset 101, range [101, 151]
-    reg.registerModel('modelC', 30); // offset 152, range [152, 182]
+    reg.registerModel('modelB', 50); // offset 1_000_101, range [1_000_101, 1_000_151]
+    reg.registerModel('modelC', 30); // offset 2_000_152, range [2_000_152, 2_000_182]
 
     assert.deepEqual(reg.fromGlobalId(0), { modelId: 'modelA', expressId: 0 });
     assert.deepEqual(reg.fromGlobalId(100), { modelId: 'modelA', expressId: 100 });
-    assert.deepEqual(reg.fromGlobalId(101), { modelId: 'modelB', expressId: 0 });
-    assert.deepEqual(reg.fromGlobalId(151), { modelId: 'modelB', expressId: 50 });
-    assert.deepEqual(reg.fromGlobalId(152), { modelId: 'modelC', expressId: 0 });
-    assert.deepEqual(reg.fromGlobalId(182), { modelId: 'modelC', expressId: 30 });
+    assert.deepEqual(reg.fromGlobalId(1_000_101), { modelId: 'modelB', expressId: 0 });
+    assert.deepEqual(reg.fromGlobalId(1_000_151), { modelId: 'modelB', expressId: 50 });
+    assert.deepEqual(reg.fromGlobalId(2_000_152), { modelId: 'modelC', expressId: 0 });
+    assert.deepEqual(reg.fromGlobalId(2_000_182), { modelId: 'modelC', expressId: 30 });
   });
 
   it('N=many with a gap: unregistering a middle model leaves a dead zone that resolves to null', () => {
     const reg = new FederationRegistry();
     reg.registerModel('modelA', 100); // range [0, 100]
-    reg.registerModel('modelB', 50); // offset 101, range [101, 151]
-    reg.registerModel('modelC', 30); // offset 152, range [152, 182]
+    reg.registerModel('modelB', 50); // offset 1_000_101, range [1_000_101, 1_000_151]
+    reg.registerModel('modelC', 30); // offset 2_000_152, range [2_000_152, 2_000_182]
 
     reg.unregisterModel('modelB');
 
     // A globalId that used to belong to modelB now lands in the gap between
     // modelA's and modelC's ranges - this is the exact collision-prevention
     // mechanism under test: it must resolve to null, never to a wrong model.
-    assert.equal(reg.fromGlobalId(120), null);
+    assert.equal(reg.fromGlobalId(1_000_120), null);
 
     // The surrounding models are unaffected.
     assert.deepEqual(reg.fromGlobalId(50), { modelId: 'modelA', expressId: 50 });
-    assert.deepEqual(reg.fromGlobalId(160), { modelId: 'modelC', expressId: 8 });
+    assert.deepEqual(reg.fromGlobalId(2_000_160), { modelId: 'modelC', expressId: 8 });
   });
 
   it('globalId landing before the very first range resolves to null', () => {
     const reg = new FederationRegistry();
     reg.registerModel('modelA', 10); // offset 0, so nothing is "before" it here
-    reg.registerModel('modelB', 10); // offset 11
+    reg.registerModel('modelB', 10); // offset 1_000_011
 
     reg.unregisterModel('modelA');
-    // Now the only remaining range starts at offset 0 is gone; sortedRanges = [modelB @11]
+    // Now the only remaining range starts at offset 0 is gone; sortedRanges = [modelB @1_000_011]
     assert.equal(reg.fromGlobalId(5), null, 'below the first remaining range -> null, not a wrong match');
+  });
+});
+
+describe('FederationRegistry - mutation-overlay id collision with the next model', () => {
+  it('an overlay-allocated id in a non-last model must not resolve to a real entity in the next model', () => {
+    // StoreEditor.addEntity() (packages/mutations/src/store-editor.ts) allocates
+    // new entity expressIds from a per-model watermark starting at
+    // maxExistingId + 1 — it has no knowledge of the FederationRegistry's global
+    // offset scheme. If the registry packs the next model's offset directly at
+    // modelA.maxExpressId + 1 (a bare +1 gap), then adding even a SINGLE new
+    // entity to modelA (via the AddElement tool, IDS auto-fix, etc.) produces a
+    // local expressId that, once offset to a globalId, lands exactly on modelB's
+    // real entity #0 — a silent misattribution to a genuine, unrelated entity.
+    const reg = new FederationRegistry();
+    reg.registerModel('modelA', 100); // modelA real entities occupy local ids [0, 100]
+    reg.registerModel('modelB', 50);  // modelB real entities occupy local ids [0, 50]
+
+    // Simulate StoreEditor's watermark allocation: the first entity added to
+    // modelA after load gets local expressId 101 (maxExistingId + 1).
+    const overlayLocalId = 101;
+    reg.publishOverlayRange('modelA', overlayLocalId, overlayLocalId);
+    const overlayGlobalId = reg.toGlobalId('modelA', overlayLocalId);
+
+    const resolved = reg.fromGlobalId(overlayGlobalId);
+
+    // It must NEVER resolve as modelB's real, pre-existing entity #0 — that is
+    // a completely different element silently standing in for the newly added
+    // one (annotations, BCF markup, and storey inference would all target the
+    // wrong entity with no error surfaced).
+    assert.notDeepEqual(resolved, { modelId: 'modelB', expressId: 0 });
   });
 });

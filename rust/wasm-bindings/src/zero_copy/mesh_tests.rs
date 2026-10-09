@@ -122,23 +122,21 @@ fn clone_carries_every_parallel_array() {
     assert_eq!(cloned.geometry_closure_flags, vec![0b1111]);
 }
 
-/// `MeshDataJs::new` reverses winding order in place-of-3 triples to
-/// compensate for the Z-up->Y-up handedness flip. A caller-supplied index
-/// count that is not a multiple of 3 must not panic — the divisible prefix is
-/// processed and the (malformed) remainder is left untouched, rather than the
-/// bounds computation reading past the end of `indices`.
+/// #4056: a proper rotation preserves index order, including an incomplete tail.
 #[test]
-fn new_processes_divisible_prefix_without_panicking_on_non_multiple_of_3_indices() {
+fn issue_4056_rotation_preserves_indices_and_incomplete_tail() {
     let mut mesh = Mesh::new();
-    mesh.positions = vec![0.0, 0.0, 1.0, 0.0, 1.0, 2.0];
-    mesh.normals = vec![0.0, 0.0, 1.0, 0.0, 1.0, 0.0];
-    mesh.indices = vec![0, 1, 0, 1]; // 4 indices: not a multiple of 3
-
-    let md = MeshDataJs::new(1, "IfcWall".to_string(), mesh, [1.0, 1.0, 1.0, 1.0]);
-
-    // Only the first 3 (divisible prefix) are winding-reversed via swap(1, 2);
-    // the trailing 4th index rides through unchanged.
-    assert_eq!(md.indices, vec![0, 0, 1, 1]);
+    mesh.positions = vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+    mesh.normals = vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0];
+    mesh.indices = vec![0, 1, 2, 1];
+    let md = MeshDataJs::new(1, "IfcWall".to_string(), mesh, [1.0; 4]);
+    assert_eq!(md.indices, vec![0, 1, 2, 1]);
+    let p = &md.positions;
+    let u = [p[3] - p[0], p[4] - p[1], p[5] - p[2]];
+    let v = [p[6] - p[0], p[7] - p[1], p[8] - p[2]];
+    let cross = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+    let dot: f32 = cross.iter().zip(&md.normals).map(|(a, b)| a * b).sum();
+    assert!(dot > 0.0, "The rotated face must retain its outward normal");
 }
 
 /// `MeshDataJs::new` converts IFC Z-up to WebGL Y-up: new_y = old_z,
@@ -228,4 +226,64 @@ fn new_converts_origin_local_bounds_and_local_to_world_to_yup() {
          0.0, 0.0, 0.0,    1.0,
     ];
     assert_eq!(ltw, expected, "local_to_world must be conjugated as S*M*S^T, not merely translated");
+}
+
+/// `Default` and `new` must agree on every field `new` does not derive from its
+/// arguments. Pinned because the two are separate constructors and the derive
+/// would have disagreed silently: `#[derive(Default)]` gives `false` for the
+/// texture repeat flags while `new` sets them `true`, so a `default()` plus
+/// setters would clamp a texture that should tile. Review caught that; this
+/// stops it coming back as a derive.
+#[test]
+fn default_agrees_with_new_on_the_fields_new_does_not_take() {
+    let from_new = MeshDataJs::new(1, "IfcWall".to_string(), Mesh::default(), [1.0, 1.0, 1.0, 1.0]);
+    let d = MeshDataJs::default();
+
+    assert_eq!(
+        d.texture_repeat_s(), from_new.texture_repeat_s(),
+        "Default and new disagree on textureRepeatS; a default()-built mesh would clamp",
+    );
+    assert_eq!(
+        d.texture_repeat_t(), from_new.texture_repeat_t(),
+        "Default and new disagree on textureRepeatT",
+    );
+    assert_eq!(d.geometry_class(), from_new.geometry_class());
+    assert_eq!(d.geometry_item_id(), from_new.geometry_item_id());
+    assert_eq!(d.material_id(), from_new.material_id());
+    assert_eq!(d.texture_id(), from_new.texture_id());
+    assert_eq!(d.has_texture(), from_new.has_texture());
+    // The rest of the fields `new` does not take. Enumerated rather than
+    // derived because there is no reflection here, so adding a field means
+    // adding a line: an earlier version named seven getters and a divergent
+    // eighth would have passed.
+    //
+    // `uvs` and `texture_rgba` are deliberately absent: their getters build
+    // `js_sys` typed arrays, which panic outside a JS runtime, and this test
+    // runs on the NATIVE host as part of `cargo test --workspace`. Both are
+    // plain `Vec` fields that `Default` and `new` leave empty.
+    assert_eq!(d.texture_width(), from_new.texture_width());
+    assert_eq!(d.texture_height(), from_new.texture_height());
+    assert_eq!(d.texture_url(), from_new.texture_url());
+    assert_eq!(d.shading_color().is_none(), from_new.shading_color().is_none());
+    assert_eq!(d.metallic(), from_new.metallic());
+    assert_eq!(d.roughness(), from_new.roughness());
+    assert_eq!(d.local_bounds().is_none(), from_new.local_bounds().is_none());
+    assert_eq!(d.local_to_world().is_none(), from_new.local_to_world().is_none());
+}
+
+/// #4643 (threshold lowered to 1 km by #4934): the pre-pass re-bases a model
+/// whose bbox corner is past the gate on the bbox centre, which can itself be
+/// inside the gate, and `produce_batch` stores that offset on the
+/// collection. `hasRtcOffset` must report it, or JS reads a non-zero
+/// `rtcOffsetX` beside `hasRtcOffset() == false`. Restoring the
+/// gate-comparison test on the anchor's own magnitude fails the second
+/// assertion.
+#[test]
+fn has_rtc_offset_reports_any_applied_offset() {
+    let mut c = MeshCollection::new();
+    assert!(!c.has_rtc_offset(), "no offset set");
+    c.set_rtc_offset(850.0, 0.0, 0.0);
+    assert!(c.has_rtc_offset(), "a sub-gate bbox-centre anchor was applied");
+    c.set_rtc_offset(0.0, 0.0, -2_600_000.0);
+    assert!(c.has_rtc_offset());
 }

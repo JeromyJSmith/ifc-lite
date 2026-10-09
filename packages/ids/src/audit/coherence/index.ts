@@ -15,11 +15,13 @@ import type {
   IDSConstraint,
   IDSDocument,
   IDSFacet,
-  IDSRequirement,
   IDSSpecification,
 } from '../../types.js';
 import type { IDSAuditIssue } from '../types.js';
+import { XSD_NUMERIC_SPECIALS } from '../../constraints/xsd-cast.js';
+import { isValidXsdDateTimeLiteral, isXsdDateTimeBase } from '../../constraints/xsd-datetime.js';
 import { compileXsdRegex } from './regex.js';
+import { auditRequirementCardinality } from './cardinality.js';
 
 export function runCoherenceAudit(doc: IDSDocument): IDSAuditIssue[] {
   const issues: IDSAuditIssue[] = [];
@@ -99,129 +101,6 @@ function auditSpec(
       issues
     );
   });
-}
-
-/**
- * Cardinality coherence on a requirement facet (Report 202 upstream).
- *
- * Per upstream IDS-Audit-tool:
- *  - `cardinality="optional"` on a `<property>` requires `@dataType`.
- *  - `cardinality="prohibited"` on a `<property>` is incompatible with
- *    `@dataType` (the property must not exist at all).
- *  - `cardinality="optional"` on `<material>`, `<classification>` and
- *    `<partOf>` requires a value/system/entity to be specified — an
- *    `optional` facet without a constraint is meaningless.
- */
-function auditRequirementCardinality(
-  req: IDSRequirement,
-  path: string,
-  issues: IDSAuditIssue[]
-): void {
-  // The XSD `conditionalCardinality` / `simpleCardinality` enums are
-  // case-sensitive lowercase: `required`, `optional`, `prohibited`. The
-  // parser preserves the raw value when it didn't match exactly so we
-  // can flag mistakes here (`Required`, `Invalid`, empty string, …)
-  // rather than silently defaulting to `required`.
-  if (req.cardinalityRaw !== undefined) {
-    issues.push({
-      severity: 'error',
-      code: 'E_CARDINALITY_INVALID',
-      message: `@cardinality="${req.cardinalityRaw}" is not a valid value; expected one of {required, optional, prohibited}`,
-      path: `${path}.cardinality`,
-      facetType: req.facet.type,
-      detail: { value: req.cardinalityRaw },
-    });
-  }
-  switch (req.facet.type) {
-    case 'property': {
-      const hasDataType = req.facet.dataType !== undefined;
-      if (req.optionality === 'optional' && !hasDataType) {
-        issues.push({
-          severity: 'error',
-          code: 'E_CARDINALITY_INVALID',
-          message:
-            'optional <property> requirement requires @dataType to be specified',
-          path: `${path}.cardinality`,
-          facetType: 'property',
-        });
-      }
-      if (req.optionality === 'prohibited' && hasDataType) {
-        issues.push({
-          severity: 'error',
-          code: 'E_CARDINALITY_INVALID',
-          message:
-            'prohibited <property> requirement is incompatible with @dataType',
-          path: `${path}.cardinality`,
-          facetType: 'property',
-        });
-      }
-      break;
-    }
-    case 'material': {
-      if (req.optionality === 'optional') {
-        const hasValue =
-          req.facet.value !== undefined && !isEmptyConstraint(req.facet.value);
-        if (!hasValue) {
-          issues.push({
-            severity: 'error',
-            code: 'E_CARDINALITY_INVALID',
-            message:
-              'optional <material> requirement must specify a non-empty <value> constraint',
-            path: `${path}.cardinality`,
-            facetType: 'material',
-          });
-        }
-      }
-      break;
-    }
-    case 'classification': {
-      if (req.optionality === 'optional') {
-        const hasSystem =
-          req.facet.system !== undefined &&
-          !isEmptyConstraint(req.facet.system);
-        const hasValue =
-          req.facet.value !== undefined && !isEmptyConstraint(req.facet.value);
-        if (!hasSystem && !hasValue) {
-          issues.push({
-            severity: 'error',
-            code: 'E_CARDINALITY_INVALID',
-            message:
-              'optional <classification> requirement must specify <system> or <value>',
-            path: `${path}.cardinality`,
-            facetType: 'classification',
-          });
-        }
-      }
-      break;
-    }
-    case 'attribute':
-    case 'entity':
-    case 'partOf':
-      // Attribute/entity/partOf carry their own intrinsic content;
-      // cardinality on them is just required/optional/prohibited.
-      break;
-  }
-}
-
-function isEmptyConstraint(c: import('../../types.js').IDSConstraint): boolean {
-  switch (c.type) {
-    case 'simpleValue':
-      return c.value === '' || c.value == null;
-    case 'enumeration':
-      return c.values.length === 0;
-    case 'pattern':
-      return c.pattern === '';
-    case 'bounds':
-      return (
-        c.minInclusive === undefined &&
-        c.maxInclusive === undefined &&
-        c.minExclusive === undefined &&
-        c.maxExclusive === undefined &&
-        c.length === undefined &&
-        c.minLength === undefined &&
-        c.maxLength === undefined
-      );
-  }
 }
 
 function auditFacetConstraints(
@@ -369,7 +248,24 @@ function checkBounds(
       facetType,
     });
   }
+  if (c.unparseableFacets !== undefined && c.unparseableFacets.length > 0) {
+    for (const f of c.unparseableFacets) {
+      issues.push({
+        severity: 'error',
+        code: 'E_RESTRICTION_FACET_UNPARSEABLE',
+        message: `xs:${f.facet} @value="${f.rawValue}" could not be parsed as a number — this facet is dropped and, until fixed, the whole restriction rejects every value (it does not fall back to unbounded)`,
+        path,
+        facetType,
+        detail: { facet: f.facet, rawValue: f.rawValue },
+      });
+    }
+  }
+  // A facet that failed to parse already produced the more precise
+  // `E_RESTRICTION_FACET_UNPARSEABLE` above; don't also report the
+  // constraint as merely "empty" (misleading — something WAS
+  // authored, it just didn't parse).
   const empty =
+    (c.unparseableFacets === undefined || c.unparseableFacets.length === 0) &&
     c.minInclusive === undefined &&
     c.minExclusive === undefined &&
     c.maxInclusive === undefined &&
@@ -393,9 +289,9 @@ function checkBounds(
  * escape codes to JS regex equivalents (cf. upstream `XmlRegex.cs`).
  *
  * Translation handles `\i`/`\c`/`\d`/`\w` and their negations via
- * Unicode property escapes (compiled with the `u` flag). Char-class
- * subtraction (`[a-z-[aeiou]]`) is XSD-only and surfaces as
- * `W_REGEX_UNVERIFIED`. Any remaining syntactic errors are real
+ * Unicode property escapes (compiled with the `u` flag), and char-class
+ * subtraction (`[a-z-[aeiou]]`) as a negative lookahead. A construct that
+ * can only be approximated surfaces as `W_REGEX_UNVERIFIED`. Any remaining syntactic errors are real
  * authoring mistakes and surface as `E_RESTRICTION_EMPTY` (upstream
  * Report 109).
  */
@@ -433,37 +329,34 @@ function checkPattern(
 
 /**
  * Validate that `value` matches the lexical space of the supplied XSD
- * primitive base. Mirrors upstream `XsTypes.IsValid` — same regexes,
- * just expressed in JS. Used by the enumeration coherence check to
- * flag entries like `<xs:enumeration value="12,0"/>` under a
+ * primitive base. Mirrors upstream `XsTypes.IsValid` (see the table, and the
+ * date family it hands off); flags `<xs:enumeration value="12,0"/>` under
  * `<xs:restriction base="xs:double">`.
  */
 const XS_VALUE_REGEX: Record<string, RegExp> = {
-  // Lifted from upstream `XmlRegex.cs` static fields.
+  // Upstream `XmlRegex.cs`, except the mantissa: `[0-9]*(?:\.[0-9]*)?` not
+  // `[0-9]*\.?[0-9]*`, whose two adjacent digit runs make a failing lexeme
+  // retry every split (quadratic, #3113). Same language, one parse/prefix.
   'xs:integer': /^[+-]?(\d+)$/,
-  'xs:double': /^([-+]?[0-9]*\.?[0-9]*([eE][-+]?[0-9]+)?|NaN|\+INF|-INF)$/,
-  'xs:float': /^([-+]?[0-9]*\.?[0-9]*([eE][-+]?[0-9]+)?|NaN|\+INF|-INF)$/,
-  'xs:decimal': /^([-+]?[0-9]*\.?[0-9]*([eE][-+]?[0-9]+)?|NaN|\+INF|-INF)$/,
+  'xs:double': /^([-+]?[0-9]*(?:\.[0-9]*)?([eE][-+]?[0-9]+)?|NaN|\+INF|-INF)$/,
+  'xs:float': /^([-+]?[0-9]*(?:\.[0-9]*)?([eE][-+]?[0-9]+)?|NaN|\+INF|-INF)$/,
+  'xs:decimal': /^([-+]?[0-9]*(?:\.[0-9]*)?([eE][-+]?[0-9]+)?|NaN|\+INF|-INF)$/,
   'xs:boolean': /^(true|false|0|1)$/,
-  'xs:date': /^\d{4}-\d{2}-\d{2}(Z|([+-]\d{2}:\d{2}))?$/,
-  'xs:dateTime':
-    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|([+-]\d{2}:\d{2}))?$/,
-  'xs:time': /^\d{2}:\d{2}:\d{2}(\.\d+)?(Z|([+-]\d{2}:\d{2}))?$/,
+  // The date family is absent on purpose: its value space is a calendar, not a
+  // digit-run shape, so it goes through `isValidXsdDateTimeLiteral` (#3721).
   'xs:duration': /^[-+]?P(\d+Y)?(\d+M)?(\d+D)?(T(\d+H)?(\d+M)?(\d+S)?)?$/,
 };
 
-function isValidLexicalForXsType(value: string, base: string): boolean {
+export function isValidLexicalForXsType(value: string, base: string): boolean {
+  if (isXsdDateTimeBase(base)) return isValidXsdDateTimeLiteral(value, base);
   const rx = XS_VALUE_REGEX[base];
   if (!rx) return true; // base we don't recognise → don't fabricate errors
-  // For doubles/floats/decimals, an empty lexeme is technically allowed
-  // by the regex but isn't a meaningful number — reject.
-  if (
-    (base === 'xs:double' ||
-      base === 'xs:float' ||
-      base === 'xs:decimal') &&
-    !/[0-9]/.test(value)
-  ) {
-    return false;
+  if (base === 'xs:double' || base === 'xs:float' || base === 'xs:decimal') {
+    // Digit required in the MANTISSA, specials exempt (#3336). Testing the
+    // whole lexeme accepted 'e5' on the exponent's digit and rejected the
+    // digitless specials, which is how this and `literalCastsUnder` disagreed.
+    const bare = !XSD_NUMERIC_SPECIALS.has(value);
+    if (bare && !/[0-9]/.test(value.split(/[eE]/)[0])) return false;
   }
   return rx.test(value);
 }

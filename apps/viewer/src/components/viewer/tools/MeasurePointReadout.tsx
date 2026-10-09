@@ -23,22 +23,37 @@
  * - **Render** — the shifted frame the renderer works in. Shown only when the
  *   pipeline actually shifted the model, since otherwise it is the same row
  *   twice under two labels.
- * - **Reference** — offset from a user-set datum. Shown once one is set.
+ * - **Datum** — the temporary reference point itself (#2737 §3), as a position
+ *   in the SAME frame and format as the Model row above, because that is what
+ *   it is: a point somebody picked. Shown once one is set.
+ * - **Relative** — the live point's offset FROM that datum. Also shown only
+ *   once one is set, and printed as signed per-axis deltas (`ΔX +2.500`) so it
+ *   cannot be read as a position. The two rows ship together on purpose: an
+ *   offset whose origin is off-screen or forgotten is a number nobody can act
+ *   on, so the datum is never left implied by the delta row's existence.
  * - **Map** — projected E/N/H and WGS84 lat/lon. Unchanged from #1674/#1679,
  *   and still gated on the Geo XYZ toggle and a usable IfcMapConversion.
+ *
+ * Only the Relative row is a delta; every other row is a position, and no
+ * datum is ever subtracted from one. A relative reading and a georeferenced
+ * one are therefore never the same number wearing different labels.
  */
 
 import { Crosshair, Globe, MapPin, XCircle } from 'lucide-react';
-import { Button } from '@/components/ui/button';
+import { IconButton } from '@/components/ui/icon-button';
 import { useViewerStore } from '@/store';
+import { useTranslation } from '@/i18n/useTranslation';
+// Side-effect import: merges the measure catalogue into the runtime `en`
+// object so `t('measure.*')` resolves under the real 'en' locale (see that
+// module's own doc comment).
 import { useRenderFrameOffsets } from '@/hooks/useRenderFrameOffsets';
 import { useAnchorGeoreference } from '@/lib/geo/useAnchorGeoreference';
 import {
   pointCoordinates,
   relativeOffset,
-  viewerToIfcAxes,
   formatCoordinateTriple,
 } from './measure-modes/coordinates';
+import { viewerToIfcAxes } from '@/lib/geo/coordinate-frame';
 import { formatDistance, formatSignedTriple } from './formatDistance';
 import { projectedEnh, useProjectedLatLon, type Vec3Like } from './measure-modes/geo-readout';
 
@@ -46,16 +61,17 @@ import { projectedEnh, useProjectedLatLon, type Vec3Like } from './measure-modes
 function CoordRow({ label, value, hint }: { label: string; value: string; hint?: string }) {
   return (
     <div className="flex items-baseline gap-2 whitespace-nowrap">
-      <span className="w-[4.5rem] shrink-0 font-mono text-[9px] uppercase tracking-wider text-muted-foreground/70">
+      <span className="w-[4.5rem] shrink-0 font-mono text-2xs uppercase tracking-wider text-muted-foreground">
         {label}
       </span>
-      <span className="font-mono text-[11px] tabular-nums">{value}</span>
-      {hint && <span className="font-mono text-[9px] text-muted-foreground/60">{hint}</span>}
+      <span className="font-mono text-2xs tabular-nums">{value}</span>
+      {hint && <span className="font-mono text-2xs text-muted-foreground">{hint}</span>}
     </div>
   );
 }
 
 export function MeasurePointReadout() {
+  const { t } = useTranslation();
   const activeMeasurement = useViewerStore((s) => s.activeMeasurement);
   const measurements = useViewerStore((s) => s.measurements);
   const geoReadoutEnabled = useViewerStore((s) => s.geoReadoutEnabled);
@@ -77,8 +93,8 @@ export function MeasurePointReadout() {
 
   if (!livePoint) {
     return (
-      <div className="border-t px-2 py-2 text-center text-[10px] text-muted-foreground">
-        Measure a point to read its coordinates
+      <div className="px-3 py-8 text-center text-xs text-muted-foreground">
+        {t('measure.point.emptyPrompt')}
       </div>
     );
   }
@@ -90,51 +106,68 @@ export function MeasurePointReadout() {
   const offset = referencePoint
     ? relativeOffset(coords.local, viewerToIfcAxes(referencePoint))
     : null;
+  // The datum's own position, resolved through the SAME frame reconstruction
+  // as the live point so the two rows are comparable by eye. Derived on every
+  // render from the store rather than captured when the datum was set: moving
+  // or clearing the reference re-renders this component, so a displayed offset
+  // and the datum printed beside it can never disagree with each other or
+  // outlive the datum they were taken from.
+  const datum = referencePoint ? pointCoordinates(referencePoint, frame) : null;
   const enh = showGeo && anchor ? projectedEnh(livePoint, anchor) : null;
 
   return (
-    <div className="border-t px-2 py-2 space-y-1.5">
+    <div className="space-y-1.5 px-3 py-2">
       <div className="flex items-center justify-between gap-2">
-        <span className="flex items-center gap-1 font-mono text-[10px] uppercase tracking-wider text-primary">
+        <span className="flex items-center gap-1 font-mono text-2xs uppercase tracking-wider text-foreground">
           <Crosshair className="h-3 w-3" />
-          {activeMeasurement ? 'Live point' : 'Last point'}
+          {activeMeasurement ? t('measure.point.live') : t('measure.point.last')}
         </span>
         <div className="flex items-center gap-1">
-          <Button
+          <IconButton
             variant="ghost"
             size="icon-sm"
-            title="Set this point as the relative-coordinate reference"
+            label={t('measure.point.setReferenceTitle')}
             onClick={() => setReferencePoint({ x: livePoint.x, y: livePoint.y, z: livePoint.z })}
           >
             <MapPin className="h-3 w-3" />
-          </Button>
+          </IconButton>
           {referencePoint && (
-            <Button
+            <IconButton
               variant="ghost"
               size="icon-sm"
-              title="Clear the reference point"
+              label={t('measure.point.clearReferenceTitle')}
               onClick={() => setReferencePoint(null)}
             >
               <XCircle className="h-3 w-3" />
-            </Button>
+            </IconButton>
           )}
         </div>
       </div>
 
       <div className="overflow-x-auto">
         <CoordRow
-          label={frame.rebased ? 'Anchor' : 'Model'}
+          label={frame.rebased ? t('measure.point.rowAnchor') : t('measure.point.rowModel')}
           value={formatCoordinateTriple(coords.world)}
           hint="m"
         />
         {/* Only when the pipeline actually shifted the model — otherwise this
             is the Model row again under a different name. */}
         {coords.shifted && (
-          <CoordRow label="Render" value={formatCoordinateTriple(coords.local)} hint="m" />
+          <CoordRow label={t('measure.point.rowRender')} value={formatCoordinateTriple(coords.local)} hint="m" />
+        )}
+        {datum && (
+          <CoordRow
+            label={t('measure.point.rowDatum')}
+            // A position, not a delta — same frame, same formatter, same
+            // unlabelled metres as the Model row, because reading the two
+            // against each other is the point of showing it at all.
+            value={formatCoordinateTriple(datum.world)}
+            hint="m"
+          />
         )}
         {offset && (
           <CoordRow
-            label="Rel. ref"
+            label={t('measure.point.rowRelative')}
             // dx/dy/dz are a LENGTH DELTA, not a raw model coordinate — unlike
             // the Model/Render/Map rows above, this triple must honour the
             // same LENGTHUNIT override as the trailing distance hint, or the
@@ -144,26 +177,30 @@ export function MeasurePointReadout() {
           />
         )}
         {enh && (
-          <CoordRow label="Map" value={`E ${enh.e}  N ${enh.n}  H ${enh.h}`} hint="m" />
+          <CoordRow
+            label={t('measure.point.rowMap')}
+            value={`${t('measure.geo.easting')} ${enh.e}  ${t('measure.geo.northing')} ${enh.n}  ${t('measure.geo.height')} ${enh.h}`}
+            hint="m"
+          />
         )}
         {latLon && (
           <CoordRow
-            label="Lat / Lon"
+            label={t('measure.point.rowLatLon')}
             value={`${latLon.lat.toFixed(6)}  ${latLon.lon.toFixed(6)}`}
           />
         )}
       </div>
 
       {frame.rebased && (
-        <div className="font-mono text-[9px] leading-tight text-muted-foreground/70">
-          Federation alignment re-based one or more models into
-          {frame.anchorName ? ` ${frame.anchorName}` : ' the anchor model'}'s frame,
-          so these are anchor coordinates, not necessarily the picked file's own.
+        <div className="font-mono text-2xs leading-tight text-muted-foreground">
+          {t('measure.point.rebasedNote', {
+            name: frame.anchorName ? frame.anchorName : t('measure.point.anchorModelFallback'),
+          })}
         </div>
       )}
 
       {enh && anchor && (
-        <div className="flex items-center gap-1 font-mono text-[9px] text-muted-foreground/70">
+        <div className="flex items-center gap-1 font-mono text-2xs text-muted-foreground">
           <Globe className="h-2.5 w-2.5" />
           {anchor.eff.projectedCRS.name}
         </div>

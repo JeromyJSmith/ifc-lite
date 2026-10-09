@@ -9,6 +9,7 @@
 import { useMemo } from 'react';
 import { AlertCircle, CheckCircle, Clock } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
+import { useTranslation } from '@/i18n';
 
 // ============================================================================
 // Constants
@@ -23,6 +24,7 @@ export const PRIORITIES = ['High', 'Medium', 'Low'];
 // ============================================================================
 
 export function StatusBadge({ status }: { status?: string }) {
+  const { t } = useTranslation();
   const variant = useMemo(() => {
     switch (status?.toLowerCase()) {
       case 'open':
@@ -54,7 +56,7 @@ export function StatusBadge({ status }: { status?: string }) {
   return (
     <Badge variant={variant} className="text-xs gap-1">
       <Icon className="h-3 w-3" />
-      {status || 'Open'}
+      {status || t('bcf.helpers.statusOpen')}
     </Badge>
   );
 }
@@ -86,7 +88,8 @@ export function PriorityBadge({ priority }: { priority?: string }) {
 // Date Formatters
 // ============================================================================
 
-export function formatDate(isoDate: string): string {
+export function formatDate(isoDate: string | undefined): string {
+  if (!isoDate) return '';
   const date = new Date(isoDate);
   if (isNaN(date.getTime())) return isoDate;
   return date.toLocaleDateString(undefined, {
@@ -96,7 +99,8 @@ export function formatDate(isoDate: string): string {
   });
 }
 
-export function formatDateTime(isoDate: string): string {
+export function formatDateTime(isoDate: string | undefined): string {
+  if (!isoDate) return '';
   const date = new Date(isoDate);
   if (isNaN(date.getTime())) return isoDate;
   return date.toLocaleString(undefined, {

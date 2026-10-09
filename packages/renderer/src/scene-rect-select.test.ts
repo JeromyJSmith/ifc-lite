@@ -66,6 +66,28 @@ const ORTHO_NEAR_1_FAR_10 = new Float32Array([
 ]);
 
 describe('selectBoundingBoxesInRect (#1904)', () => {
+  it('retains a centimetre residual at a 5,000 km camera origin (#5049)', () => {
+    // Translation-free perspective projection: the RTE frame has already
+    // removed the eye. The two boxes are 2 cm apart at the national-grid
+    // origin; a world-f32 projection collapses them into one position.
+    const boxes = new Map([
+      [1, box(5_000_000.01, -0.01, -10, 5_000_000.02, 0.01, -9)],
+      [2, box(5_000_000.04, -0.01, -10, 5_000_000.05, 0.01, -9)],
+    ]);
+    const hits = selectBoundingBoxesInRect(
+      boxes,
+      PERSPECTIVE_NEAR_0_1,
+      // The first box projects around x=50.1; the second around x=50.5.
+      { x0: 49.9, y0: 49, x1: 50.15, y1: 51 },
+      W,
+      H,
+      undefined,
+      undefined,
+      undefined,
+      { cameraWorld: [5_000_000, 0, 0] },
+    );
+    assert.deepStrictEqual(hits, new Set([1]));
+  });
   it('selects a box whose projection lands inside the rect', () => {
     const boxes = new Map([[1, box(0, 0, 0, 0.2, 0.2, 0)]]);
     // Screen AABB is x 50..60, y 40..50.
@@ -78,6 +100,47 @@ describe('selectBoundingBoxesInRect (#1904)', () => {
     // Rect sits in the top-left corner; the box projects to the middle.
     const hits = selectBoundingBoxesInRect(boxes, IDENTITY, { x0: 0, y0: 0, x1: 10, y1: 10 }, W, H);
     assert.deepStrictEqual(hits, new Set());
+  });
+
+  // The final gate is a 4-way AABB-disjoint test (`maxX < rx0 || minX > rx1 ||
+  // maxY < ry0 || minY > ry1`). The existing "rejects a box whose projection
+  // is outside the rect" test puts the rect in the corner, so it trips BOTH
+  // the minX>rx1 and minY>ry1 clauses at once and cannot tell them apart from
+  // the other two. Each clause is isolated here, with the other axis's rect
+  // bound left wide open so it can't also reject.
+  describe('rejects a box on exactly one side of the rect, isolated per axis', () => {
+    // Box screen AABB is x 50..60, y 40..50 (per the IDENTITY comment above).
+    it('box entirely LEFT of the rect (maxX < rx0)', () => {
+      const boxes = new Map([[1, box(0, 0, 0, 0.2, 0.2, 0)]]);
+      const hits = selectBoundingBoxesInRect(
+        boxes, IDENTITY, { x0: 70, y0: 0, x1: 90, y1: 100 }, W, H,
+      );
+      assert.deepStrictEqual(hits, new Set());
+    });
+
+    it('box entirely RIGHT of the rect (minX > rx1)', () => {
+      const boxes = new Map([[1, box(0, 0, 0, 0.2, 0.2, 0)]]);
+      const hits = selectBoundingBoxesInRect(
+        boxes, IDENTITY, { x0: 0, y0: 0, x1: 10, y1: 100 }, W, H,
+      );
+      assert.deepStrictEqual(hits, new Set());
+    });
+
+    it('box entirely ABOVE the rect on screen (maxY < ry0)', () => {
+      const boxes = new Map([[1, box(0, 0, 0, 0.2, 0.2, 0)]]);
+      const hits = selectBoundingBoxesInRect(
+        boxes, IDENTITY, { x0: 0, y0: 60, x1: 100, y1: 90 }, W, H,
+      );
+      assert.deepStrictEqual(hits, new Set());
+    });
+
+    it('box entirely BELOW the rect on screen (minY > ry1)', () => {
+      const boxes = new Map([[1, box(0, 0, 0, 0.2, 0.2, 0)]]);
+      const hits = selectBoundingBoxesInRect(
+        boxes, IDENTITY, { x0: 0, y0: 0, x1: 100, y1: 10 }, W, H,
+      );
+      assert.deepStrictEqual(hits, new Set());
+    });
   });
 
   it('selects on partial overlap — the rect need not contain the whole box', () => {

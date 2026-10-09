@@ -1,5 +1,284 @@
 # @ifc-lite/lists
 
+## 3.0.1
+
+### Patch Changes
+
+- Updated dependencies [[`4a9e7ad`](https://github.com/LTplus-AG/ifc-lite/commit/4a9e7ad337bafc495aa02be9e46a6ef130b9a075), [`64c343b`](https://github.com/LTplus-AG/ifc-lite/commit/64c343bfea7de91b2a44a895f6302f3b1a7f70a7)]:
+  - @ifc-lite/rules@0.6.0
+
+## 3.0.0
+
+### Major Changes
+
+- [#6179](https://github.com/LTplus-AG/ifc-lite/pull/6179) [`bffa875`](https://github.com/LTplus-AG/ifc-lite/commit/bffa875a07ed2b4e3e61e12bc25966278f346d6a) Thanks [@louistrue](https://github.com/louistrue)! - Replace `ListDefinition.conditions` with required Rules `groups: FilterGroup[]`.
+  Viewer lists now evaluate those groups through `@ifc-lite/rules`, including
+  federated models and live property edits. Saved v1 lists and imported
+  `.list.json` files migrate on read; predicates without an equivalent Rules
+  form remain active and visible in `unreadableConditions`.
+  
+  Consumers constructing a definition should replace flat `conditions` with
+  `groups`. The synchronous provider-only `executeList` accepts already-filtered
+  snapshots through `expressIdsByModel`; it rejects nonempty groups so it cannot
+  silently return extra rows. For a v1 predicate that has no Rules equivalent,
+  pass it as `legacyConditions` to that provider-only path.
+  
+  The SDK's `bim.list.execute()` keeps its optional `conditions` contract by
+  passing an empty Rules group set and translating supplied conditions into
+  provider-only predicates for the updated Lists engine.
+
+### Minor Changes
+
+- [#6251](https://github.com/LTplus-AG/ifc-lite/pull/6251) [`e45167d`](https://github.com/LTplus-AG/ifc-lite/commit/e45167dc7c70e1f24c5386da8e7d51834e352db3) Thanks [@louistrue](https://github.com/louistrue)! - Saved list filters migrate losslessly into Rules groups ([#6190](https://github.com/LTplus-AG/ifc-lite/issues/6190)). `migrateLegacyListDefinition` and `migrateLegacyListConditions` now turn every Lists predicate without a canonical Rules form into a `listCondition` rule instead of an unreadable row. That covers zones, spatial levels, quantity and material presence, model file name, Lists attributes, inherited and regex-named properties, and world coordinates. It applies both to v1 `conditions` and to provider-only rows saved by earlier builds. Flat conditions are ANDed into every group, and an OR group is split so `(a OR b) AND c` becomes `(a AND c) OR (b AND c)`. `unreadableConditions` now holds only data that cannot be evaluated: malformed members, unknown operators or sources, and group rules this build cannot read. A saved group with such a rule no longer makes the whole list disappear. The rule shows as a removable row instead.
+  
+  The viewer removes the Lists-only compatibility editor and its provider-only filter path. Every filter is edited in the shared Rules editor. A list with an unreadable row shows it with a Remove button and will not run until it is removed. Document table lists still reject malformed embedded groups at load.
+  
+  `@ifc-lite/rules` exports `LIST_CONDITION_SOURCES` and `LIST_CONDITION_OPERATORS`, the sources and operators a `listCondition` rule may hold, which the migration validates against.
+
+- [#6250](https://github.com/LTplus-AG/ifc-lite/pull/6250) [`1ecb4a6`](https://github.com/LTplus-AG/ifc-lite/commit/1ecb4a6b010c4dd07d01f4df3a4ee0649bb3f9b0) Thanks [@louistrue](https://github.com/louistrue)! - The Lists builder's Rules editor now offers a "List value" rule ([#6190](https://github.com/LTplus-AG/ifc-lite/issues/6190)) that authors every Lists-only predicate mode: zone-set assignment and its four display modes, exact Container/Storey/Building/Site/Project levels, model file name, Lists attributes, properties and quantities (including aggregation inheritance), material, classification and world coordinates. A zone rule stores the zone set's id and shows the set's current name. If the set has been deleted, the rule keeps pointing at it and the picker shows it as missing. Suggestions come from every loaded model. Search, Lens and clash builders do not offer the rule.
+  
+  Each mode offers the operators that can match the value it reads, so a zone volume can be compared with `gt`, `lt` and the other numeric operators, and Straddles offers only equality and presence. `@ifc-lite/lists` exports `listConditionValueKind(source, propertyName)`, the kind of value the engine compares for each source and mode.
+
+- [#6249](https://github.com/LTplus-AG/ifc-lite/pull/6249) [`6ea079d`](https://github.com/LTplus-AG/ifc-lite/commit/6ea079d943f6bc95fb8316a100bef1f3eac7d472) Thanks [@louistrue](https://github.com/louistrue)! - Add a `listCondition` filter rule ([#6190](https://github.com/LTplus-AG/ifc-lite/issues/6190)). It carries a saved Lists value predicate (zone assignment and the zone volume modes, exact spatial levels, quantity and material presence, model file name, Lists attributes, inherited properties) inside a Rules `FilterGroup`, so it can combine with other rules under AND or OR. The Lists engine evaluates it. Each evaluated model supplies `EvaluatorModel.listConditions`, and `@ifc-lite/lists` exports `listConditionMatcher(provider)` to build one. A run whose rules hold a `listCondition` throws before reading any element when a model has no matcher, instead of matching nothing. Rule-set files reject the kind. The viewer's list runner attaches the matcher to every model it runs.
+
+- [#6172](https://github.com/LTplus-AG/ifc-lite/pull/6172) [`5eff834`](https://github.com/LTplus-AG/ifc-lite/commit/5eff8349cc35129549327273d938bc49e405bf53) Thanks [@louistrue](https://github.com/louistrue)! - Decode saved List conditions into canonical filter groups without dropping unsupported rows.
+
+### Patch Changes
+
+- [#6166](https://github.com/LTplus-AG/ifc-lite/pull/6166) [`36fcb46`](https://github.com/LTplus-AG/ifc-lite/commit/36fcb4614d66a4d2fc57ae0efdcb7c8edba4d3d1) Thanks [@louistrue](https://github.com/louistrue)! - Share the guarded IFC name matcher between Lists and Rules to prepare unified list filters.
+- Updated dependencies [[`8901816`](https://github.com/LTplus-AG/ifc-lite/commit/8901816fa9171b1af0a9af5036105db0fa72cb24), [`05a2221`](https://github.com/LTplus-AG/ifc-lite/commit/05a222113355eea2e89d81acab74c62a5e77aa3f), [`e45167d`](https://github.com/LTplus-AG/ifc-lite/commit/e45167dc7c70e1f24c5386da8e7d51834e352db3), [`05a2221`](https://github.com/LTplus-AG/ifc-lite/commit/05a222113355eea2e89d81acab74c62a5e77aa3f), [`6ea079d`](https://github.com/LTplus-AG/ifc-lite/commit/6ea079d943f6bc95fb8316a100bef1f3eac7d472), [`236b076`](https://github.com/LTplus-AG/ifc-lite/commit/236b076ca7ee967691380335b4637a5be3c61562), [`5eff834`](https://github.com/LTplus-AG/ifc-lite/commit/5eff8349cc35129549327273d938bc49e405bf53), [`9828849`](https://github.com/LTplus-AG/ifc-lite/commit/9828849515862f0649f31a6433a5870e77249709), [`36fcb46`](https://github.com/LTplus-AG/ifc-lite/commit/36fcb4614d66a4d2fc57ae0efdcb7c8edba4d3d1), [`0943da2`](https://github.com/LTplus-AG/ifc-lite/commit/0943da2a068efd24847cdb1282a4c55f766563e4)]:
+  - @ifc-lite/data@6.1.0
+  - @ifc-lite/rules@0.5.0
+  - @ifc-lite/encoding@2.3.0
+  - @ifc-lite/regex-guard@0.3.0
+
+## 2.3.3
+
+### Patch Changes
+
+- Updated dependencies [[`ccc491e`](https://github.com/LTplus-AG/ifc-lite/commit/ccc491efac18ce496af47c91b1ef4fc04ebecca5), [`7215c2a`](https://github.com/LTplus-AG/ifc-lite/commit/7215c2a9344ede37c90680e1eb2a6c2b70c0ee3d), [`5c02af8`](https://github.com/LTplus-AG/ifc-lite/commit/5c02af8b7fda4d2fe53f79d3f00b9d192fc664d9)]:
+  - @ifc-lite/data@6.0.0
+
+## 2.3.2
+
+### Patch Changes
+
+- Updated dependencies [[`00d6837`](https://github.com/LTplus-AG/ifc-lite/commit/00d68371ac6ab87fafa4bc5f0add2468a7e8a398)]:
+  - @ifc-lite/data@5.3.0
+
+## 2.3.1
+
+### Patch Changes
+
+- Updated dependencies [[`0f5d174`](https://github.com/LTplus-AG/ifc-lite/commit/0f5d174d2fb726536d1a3a30c7e5415603db72c0)]:
+  - @ifc-lite/data@5.2.0
+
+## 2.3.0
+
+### Minor Changes
+
+- [#5440](https://github.com/LTplus-AG/ifc-lite/pull/5440) [`79716f9`](https://github.com/LTplus-AG/ifc-lite/commit/79716f9828e4f57bedeaef66292233806b15edf7) Thanks [@louistrue](https://github.com/louistrue)! - Property and quantity rules, rule-set subjects, and list conditions take an `inherit` option. It works the same in search, applicability, validation and lists. With `'aggregation'`, an element with no value of its own, or on its type, takes the value of its nearest `IfcRelAggregates` ancestor, and its own value still wins. With `'type'`, a quantity also reads its type's quantity sets; properties already read the type. Leaving `inherit` unset keeps today's behaviour. `ListDataProvider` gains an optional `getAggregateParents`. The rule chips, the validation subject picker and list condition rows offer the option.
+
+### Patch Changes
+
+- Updated dependencies [[`83284a9`](https://github.com/LTplus-AG/ifc-lite/commit/83284a947d9adb9e1ece28f9d5ee7166722be1e5), [`52d30de`](https://github.com/LTplus-AG/ifc-lite/commit/52d30de0ae3fc8ef6322191bd1831483b93d485f), [`617da29`](https://github.com/LTplus-AG/ifc-lite/commit/617da29bc17326105dd1143385c967210e529a43), [`dabc489`](https://github.com/LTplus-AG/ifc-lite/commit/dabc48987aca1392685218dd31641f8dbadf9590), [`60f70f9`](https://github.com/LTplus-AG/ifc-lite/commit/60f70f93c9cdf9948f1a7325efb1e157a09d3a60), [`0d9cbc0`](https://github.com/LTplus-AG/ifc-lite/commit/0d9cbc0072baa634923623c6772500d57a63f412)]:
+  - @ifc-lite/data@5.1.0
+
+## 2.2.5
+
+### Patch Changes
+
+- Updated dependencies [[`d38af5a`](https://github.com/LTplus-AG/ifc-lite/commit/d38af5afd36f12329fe6f33bf905d28fca65ba43), [`e1ace4f`](https://github.com/LTplus-AG/ifc-lite/commit/e1ace4f05a45a252d502bf72a506336185d2b157), [`ab8380e`](https://github.com/LTplus-AG/ifc-lite/commit/ab8380e6b9edf1ca1f05abf343ae6040ac8aee77), [`e211790`](https://github.com/LTplus-AG/ifc-lite/commit/e211790ff4d7070d908fb519652158089652dd9c)]:
+  - @ifc-lite/data@5.0.0
+
+## 2.2.4
+
+### Patch Changes
+
+- Updated dependencies [[`37a5949`](https://github.com/LTplus-AG/ifc-lite/commit/37a5949b1ed3786b52602b62d04bf1ac451844b3), [`f24aff9`](https://github.com/LTplus-AG/ifc-lite/commit/f24aff9a7f7685af2cdf0230fe4c712d7dc37940)]:
+  - @ifc-lite/data@4.5.0
+
+## 2.2.3
+
+### Patch Changes
+
+- Updated dependencies [[`5a82260`](https://github.com/LTplus-AG/ifc-lite/commit/5a82260e3e0bf686851e724b24dbfa05d11d9c7c), [`6d8ebeb`](https://github.com/LTplus-AG/ifc-lite/commit/6d8ebebb7cd8722534ff1ad7817cf7a7d0191aaf)]:
+  - @ifc-lite/data@4.4.0
+
+## 2.2.2
+
+### Patch Changes
+
+- Updated dependencies [[`3af8c93`](https://github.com/LTplus-AG/ifc-lite/commit/3af8c938050373cf95c09502573dead0fd425467)]:
+  - @ifc-lite/data@4.3.0
+
+## 2.2.1
+
+### Patch Changes
+
+- Updated dependencies [[`1120b6a`](https://github.com/LTplus-AG/ifc-lite/commit/1120b6a3acbbbb579a4e454083b862ed1d445200)]:
+  - @ifc-lite/data@4.2.1
+
+## 2.2.0
+
+### Minor Changes
+
+- [#4543](https://github.com/LTplus-AG/ifc-lite/pull/4543) [`6f339d8`](https://github.com/LTplus-AG/ifc-lite/commit/6f339d8165104cd44f6c6c36371c205ec3cccafb) Thanks [@louistrue](https://github.com/louistrue)! - Model tags for federations ([#4215](https://github.com/LTplus-AG/ifc-lite/issues/4215), part 2): the hierarchy's Models section gains a "By tag" grouping (one group per tag plus an explicit Untagged group; a model under several tags is listed under each but stays one model — counts, visibility and selection deduplicate by model), tag chips that filter the listed rows without touching the viewport, and a separate explicit "Isolate matching models" action that shows the listed models and hides the rest in one store write. Lists gain a model tag scope (`ListDefinition.modelTagScope`, the same `has any` / `has all` / `has none` / `untagged` predicates as search and clash): the list runs only over the models in scope, and a scope naming a deleted tag — or one no loaded model satisfies — is refused with a visible reason instead of running over every model.
+
+## 2.1.2
+
+### Patch Changes
+
+- Updated dependencies [[`511e488`](https://github.com/LTplus-AG/ifc-lite/commit/511e488a8de2b90f7d5f7663911873a92b3427c7)]:
+  - @ifc-lite/data@4.2.0
+
+## 2.1.1
+
+### Patch Changes
+
+- [#4335](https://github.com/LTplus-AG/ifc-lite/pull/4335) [`8620be3`](https://github.com/LTplus-AG/ifc-lite/commit/8620be38be0162b7cbdbe23ae7bc924763b83612) Thanks [@BIMvoice](https://github.com/BIMvoice)! - `compileNameMatcher` (the `/regex/` name-pattern compiler shared by list columns, the SDK's `property`/`quantity` query methods, and the sandbox's `bim.query.property` bridge tool) now rejects a pattern with a catastrophic-backtracking shape (`(...+)+`, `(...+)*`, `(.*)+`, `(.*)*`) or over 256 characters, throwing instead of compiling a live `RegExp` that could hang on `.test()`. This closes a ReDoS reachable from an LLM/agent-authored viewer sandbox script's own tool-call arguments, where the regex compiles and runs on the host's main thread outside the QuickJS sandbox.
+  
+  The check is delegated to `@ifc-lite/regex-guard`'s `assertGuardedRegexPattern` (added for [#4259](https://github.com/LTplus-AG/ifc-lite/issues/4259)'s IDS `xs:pattern` and bulk-edit name-pattern guards) rather than a fourth hand-copied heuristic in this package.
+  
+  This is a shape heuristic, not an exhaustive defence — it catches the textbook catastrophic forms, not every pattern a determined author could construct. A complete fix (a Worker + timeout, or `re2-wasm`) is future work.
+  
+  The viewer's set-name pattern-builder preview (`pattern-preview.ts`) is updated to catch this rejection and surface it through the existing "Invalid pattern" warning instead of throwing mid-keystroke.
+- Updated dependencies [[`ced8bb4`](https://github.com/LTplus-AG/ifc-lite/commit/ced8bb46c368648bd54a1bab716d049143faa036), [`de30321`](https://github.com/LTplus-AG/ifc-lite/commit/de303215ad631d54069067682f443ef33d7d37f3), [`8620be3`](https://github.com/LTplus-AG/ifc-lite/commit/8620be38be0162b7cbdbe23ae7bc924763b83612), [`be4fdb9`](https://github.com/LTplus-AG/ifc-lite/commit/be4fdb9ffe6995c74d3629887021c98b843beadb)]:
+  - @ifc-lite/data@4.1.0
+  - @ifc-lite/regex-guard@0.2.0
+
+## 2.1.0
+
+### Minor Changes
+
+- [#3706](https://github.com/LTplus-AG/ifc-lite/pull/3706) [`a8c48ee`](https://github.com/LTplus-AG/ifc-lite/commit/a8c48eed679a31ef0c44782ee19c0889cef5a665) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Add a `geometry` column/condition source (issue [#3671](https://github.com/LTplus-AG/ifc-lite/issues/3671), "Reporting World Coordinates in Lists"): `propertyName` selects `X` | `Y` | `Z` (default `X`) of the element's World Coordinate, in the project's own coordinate system and IFC Z-up axes, project length units. This is PROJECT space, distinct from the map/WGS84 georeferenced frame.
+  
+  The value is the CENTRE of the element's world bounding box, not its `IfcLocalPlacement` origin. For an L-shaped slab or a curved wall those differ, and the centre can fall outside the element itself.
+  
+  `ListDataProvider` gains an optional `getWorldPosition(expressId)` accessor to back it; providers built before this existed simply have no World Coordinate columns, the same graceful-degrade contract as every other optional accessor.
+  
+  `geometry` columns resolve through the existing generic numeric sort/filter machinery, so sorting works and the engine supports `gt`/`lt` conditions. The list builder UI does not yet offer `geometry` as a condition source, so those conditions can currently only be authored programmatically.
+  
+  Elements whose whole mesh set went to the GPU-instanced shard report no World Coordinate: they never appear in `GeometryResult.meshes`, and `instancedGeometryAabbs` is not consulted yet. Their cells are blank rather than wrong.
+
+### Patch Changes
+
+- [#3746](https://github.com/LTplus-AG/ifc-lite/pull/3746) [`020932a`](https://github.com/LTplus-AG/ifc-lite/commit/020932aade4a506b5e6e6e27ddb706884660f995) Thanks [@louistrue](https://github.com/louistrue)! - A World Coordinate column whose axis is not `X`, `Y` or `Z` now resolves to an empty cell instead of silently reporting the X coordinate.
+  
+  `getWorldCoordinateValue` matched the axis with `case 'X': default: return pos.x;`, so the explicit `X` case and the fallback shared a body. Any other axis — a hand-edited saved list definition, a definition written by a build that knows an axis this one does not — got the X coordinate under a header saying something else. A blank cell is a visible gap; a plausible number under the wrong label is a wrong answer that reads as a right one, and nothing downstream can tell the two apart.
+  
+  Blank or whitespace-only still means `X`, which is the documented default for a column created without an axis. ("Whitespace" is JavaScript's `trim()` definition, so a zero-width space is an unknown axis rather than a blank one — a distinction with no known producer, noted rather than coded around.)
+  
+  The same resolver backs geometry **conditions**, so this narrows the filter too: a condition on an unknown axis now matches no rows, `exists` included. That is reachable only from a hand-edited or imported definition — the Lists builder constructs geometry columns and never geometry conditions — but it is a behaviour change and is now pinned by a test rather than inherited.
+  
+  No existing column changes: the Lists builder offers only `X`, `Y` and `Z` (`ListBuilder.tsx`), so no axis a user can pick today is affected. The change protects persisted definitions and forward compatibility.
+
+- [#3855](https://github.com/LTplus-AG/ifc-lite/pull/3855) [`182215a`](https://github.com/LTplus-AG/ifc-lite/commit/182215a835c4beac6a776bcb4eb1d019cab9063e) Thanks [@louistrue](https://github.com/louistrue)! - Corrected the code samples on each package's npm landing page: the README fences are now typechecked against the package's real exports, so the snippets import what they call, declare the values they read, and no longer show removed options or renamed methods. Patch-bumping every package whose README changed so the corrections actually reach npmjs.com.
+- Updated dependencies [[`142b84c`](https://github.com/LTplus-AG/ifc-lite/commit/142b84c41036b749e7b64418a882424b9c386edb), [`bcbe7b9`](https://github.com/LTplus-AG/ifc-lite/commit/bcbe7b9afa38e8dafb5900e73575c71a8fd96012), [`82343f7`](https://github.com/LTplus-AG/ifc-lite/commit/82343f75dd2e6029946cbcd0990d3f8fd38a26ad), [`1000dce`](https://github.com/LTplus-AG/ifc-lite/commit/1000dce72e9ec75c59848efefc1f709d01172e72), [`89c4cf2`](https://github.com/LTplus-AG/ifc-lite/commit/89c4cf22e83d76115035f7dcbf6e34f9c06dd091), [`a1aebc8`](https://github.com/LTplus-AG/ifc-lite/commit/a1aebc822b819221258f4759edf4c82ff0d140f7), [`f8e03d4`](https://github.com/LTplus-AG/ifc-lite/commit/f8e03d4d5bb620fc9e807d5233091d145a201165), [`a1069f8`](https://github.com/LTplus-AG/ifc-lite/commit/a1069f8f096fcfc5771200a2748466096c3463d5), [`1060a30`](https://github.com/LTplus-AG/ifc-lite/commit/1060a30187c8f6bb327f9e356056f2364568e8ff), [`80a0cd9`](https://github.com/LTplus-AG/ifc-lite/commit/80a0cd9b946a5ff1aa6ca214ddb427a5d1f5303c), [`a2488e8`](https://github.com/LTplus-AG/ifc-lite/commit/a2488e858bc7792cdcc818f7759c0a6e46e7d892), [`8368339`](https://github.com/LTplus-AG/ifc-lite/commit/83683393654d8c1b903f03b5c6e9e5ff111fdaf0)]:
+  - @ifc-lite/encoding@2.2.0
+  - @ifc-lite/data@4.0.0
+
+## 2.0.2
+
+### Patch Changes
+
+- Updated dependencies [[`111b733`](https://github.com/LTplus-AG/ifc-lite/commit/111b733b21915522cf9678fb05d4595ac4a8906e), [`758ed93`](https://github.com/LTplus-AG/ifc-lite/commit/758ed93f24d48dd0067568a1e4b62f9380e9d131)]:
+  - @ifc-lite/data@3.5.1
+
+## 2.0.1
+
+### Patch Changes
+
+- Updated dependencies [[`36350e8`](https://github.com/LTplus-AG/ifc-lite/commit/36350e8439af3c52d62d8bb3f6e2daa7bb8d4fa2), [`329008d`](https://github.com/LTplus-AG/ifc-lite/commit/329008d2324204ff39d2ac4a0423add6a60e8907), [`302121a`](https://github.com/LTplus-AG/ifc-lite/commit/302121ac7bc9312b1073738b3bbe0956ce452cf4), [`c2885ef`](https://github.com/LTplus-AG/ifc-lite/commit/c2885ef575fe57d9bc8e1960bb0ea31cb02f0665)]:
+  - @ifc-lite/data@3.5.0
+
+## 2.0.0
+
+### Major Changes
+
+- [#3115](https://github.com/LTplus-AG/ifc-lite/pull/3115) [`8ba612f`](https://github.com/LTplus-AG/ifc-lite/commit/8ba612f90d3bb0ad41f756d6fdef6b3250e8d330) Thanks [@louistrue](https://github.com/louistrue)! - CSV: numeric cells export as numbers. **The formula guard's default changed.**
+  Pass `exemptNumbers: false` to `escapeCsvCell` / `guardSpreadsheetFormula` to
+  keep the old behaviour.
+  
+  **Read this first if you consume `@ifc-lite/export`.** The CWE-1236 guard
+  prefixes a leading `=`, `+`, `-`, `@`, TAB or CR with `'` so a spreadsheet reads
+  the cell as text. It now makes one exception by default: a cell that is *wholly*
+  a signed number is left alone. Nothing in your code has to change for the
+  behaviour to change, which is why this is called out here rather than in a
+  footnote.
+  
+  The exception cannot weaken the guard. The exempted language contains only
+  `+ - . e E` and the digits `0-9`, which cannot spell a function name, a cell
+  reference or a `(`. `=`, `@`, TAB and CR are never exempted, `-0.35=cmd` is not
+  wholly a number and stays guarded, and a leading invisible character defeats the
+  exemption rather than the guard, so `<ZWSP>-1` is still prefixed.
+  
+  **What it costs.** The default has to guess from the text, because most callers
+  hand it a bare string, and guessing gets identifiers wrong: a `+`-prefixed phone
+  number is wholly numeric as text, so it is written bare and Excel renders
+  `4.1791E+10` with the `+` gone. `-007` becomes `-7`. Both were previously kept
+  exactly, as `'`-prefixed text.
+  
+  The viewer's Lists CSV does not guess, because it has the value itself: it
+  exempts a cell when the value really is a number and guards it otherwise, so a
+  phone number stays text there and a measure stays summable even in a column that
+  also holds text. So this cost applies to the writers that only ever see strings,
+  which is the CLI, the SDK, MCP, the compare report, search results, zone tables
+  and `@ifc-lite/lists`' own CSV. Pass `exemptNumbers: false` to opt any of them
+  out.
+  
+  **Why the exception exists.** `@ifc-lite/lists` had exempted numbers since [#1772](https://github.com/LTplus-AG/ifc-lite/issues/1772)
+  ("`-0.35` exported as `'-0.35` and broke Excel SUM()") while every other writer
+  guarded them, so the same list exported two ways did not match. The policy is
+  now one default rather than eleven call-site decisions that drift.
+  
+  **The viewer's Lists CSV stopped formatting numbers before writing them.** It
+  ran every value through the display formatter, which calls `toLocaleString()` on
+  integers. Under en-US that wrote `"-1,000"`, quoted because of the comma, so the
+  column stopped summing. Under a locale that groups with `.` it wrote a bare
+  `-3.000`, which a spreadsheet in a `,`-grouping locale reads back as **-3**, a
+  silent 1000x error in a quantity column. Exempting numbers fixes neither, since
+  neither string is wholly numeric in the locale that produced it. CSV is
+  machine-readable output, so it now writes the number, matching what the XLSX
+  writer always did. PDF, which a human reads, is unchanged.
+  
+  Two consequences of that, both deliberate. Unit-converted values now show their
+  full double precision (3 ft in metres is `0.9144000000000001`, not `0.9144`),
+  which is the same value the XLSX export already carried, so the two agree. And grouping a
+  list by a numeric column used to hard-code that column as non-numeric in the
+  schedule/pivot export, where the grouping value is the *only* place the value
+  appears; it wrote `"'-3,000"` and nothing else for -3000. Schedule grouping
+  columns now inherit `numeric` and carry the raw value, falling back to the group
+  label where a bucket holds values that merely format alike.
+  
+  **The numeric test no longer backtracks.** It was
+  `/^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/`, quadratic on a failing match and
+  reached only after a trigger matched, so `-` plus 60k digits took ~1.8s. IFC
+  property text is attacker-controllable, which made that a denial of service on
+  an export. It is a linear scan now, and lives in `@ifc-lite/encoding` (no
+  dependencies, already depended on by both callers) as the new `isWhollyNumeric`
+  export, so there is one copy per language rather than one per package. The
+  accepted language is unchanged, checked by sweeping every string up to four
+  characters over the alphabet it is built from against the old regex.
+
+### Patch Changes
+
+- [#3100](https://github.com/LTplus-AG/ifc-lite/pull/3100) [`56ad58c`](https://github.com/LTplus-AG/ifc-lite/commit/56ad58cc8d1d8d54fdb996606f667c0c170d74aa) Thanks [@BIMvoice](https://github.com/BIMvoice)! - Fix two defects in `listResultToCSV` found by validating its output against RFC 4180 and an independent third-party CSV parser rather than against our own reader.
+  
+  **Records were separated by LF, not CRLF.** RFC 4180 s2.1 says "each record is located on a separate line, delimited by a line break (CRLF)", and its ABNF admits no other separator (`file = [header CRLF] record *(CRLF record) [CRLF]`). Over the 364 real IFC files in this repository the writer produced 1949 bare-LF separators and not one RFC-conformant document; it now emits CRLF and all 364 are clean. No trailing terminator is written, which s2.2 explicitly permits. The viewer's own Lists CSV writer already emitted CRLF, so the two paths disagreed on the same export.
+  
+  **The CWE-1236 spreadsheet formula guard could be bypassed with a leading invisible character.** The guard anchored `/^[=+\-@\t\r]/` at offset 0, so a BOM, zero-width space, left-to-right mark, no-break space, U+2028/U+2029 or a plain space in front of `=` stopped the regex matching while doing nothing to stop Excel or Sheets evaluating the cell as a formula — `\uFEFF=HYPERLINK(...)` sailed through unguarded. IFC text properties are attacker-controllable and can carry any of them. The trigger is now looked for past any leading `\p{Cf}`/`\p{Z}` run, and the invisibles are preserved rather than stripped so no cell content is lost. This is the same fix `packages/sdk/src/namespaces/export.ts` received for [#1944](https://github.com/LTplus-AG/ifc-lite/issues/1944); this copy never got it. The deliberate exemption that keeps a plain signed number such as `-0.35` summable in Excel ([#1772](https://github.com/LTplus-AG/ifc-lite/issues/1772)) is unchanged.
+- Updated dependencies [[`8ba612f`](https://github.com/LTplus-AG/ifc-lite/commit/8ba612f90d3bb0ad41f756d6fdef6b3250e8d330), [`9359bc4`](https://github.com/LTplus-AG/ifc-lite/commit/9359bc488173585b2b90e124cc66dcf8292c4be9), [`f6febcc`](https://github.com/LTplus-AG/ifc-lite/commit/f6febcc2d4986e79b3c44d63853bb72a16475c65), [`00f6e79`](https://github.com/LTplus-AG/ifc-lite/commit/00f6e79c22641ff59bfb3327d910b04f9a164d8b), [`116a3e9`](https://github.com/LTplus-AG/ifc-lite/commit/116a3e94de753b95fa94b2d6c41a0171cd254729)]:
+  - @ifc-lite/encoding@2.1.0
+  - @ifc-lite/data@3.4.1
+
+## 1.23.2
+
+### Patch Changes
+
+- Updated dependencies [[`be6b43c`](https://github.com/LTplus-AG/ifc-lite/commit/be6b43c2b334811422c1cbfbea5d6e6d1b9a401d), [`6ce17fa`](https://github.com/LTplus-AG/ifc-lite/commit/6ce17fa903d38ab8ee3e6ebaf6da8453726d3ce2)]:
+  - @ifc-lite/data@3.4.0
+
 ## 1.23.1
 
 ### Patch Changes

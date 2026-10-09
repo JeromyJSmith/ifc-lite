@@ -119,6 +119,34 @@ function buildFormat3Records(rows: Array<{
   return new Uint8Array(buf);
 }
 
+/**
+ * Format-7 records (LAS 1.4 extended base record + RGB, 36 bytes): the
+ * format-6 30-byte layout (see `buildFormat6Records`) followed by three
+ * uint16 colour channels at bytes 30-35. `rgbOffsetForFormat` maps formats
+ * 7, 8 and 10 to offset 30 — distinct from formats 3/5's offset 28 — but
+ * nothing built a format >= 6 RGB record, so that offset was unverified.
+ */
+function buildFormat7Records(rows: Array<{
+  x: number; y: number; z: number;
+  intensity?: number; classification?: number;
+  r: number; g: number; b: number;
+}>): Uint8Array {
+  const buf = new ArrayBuffer(rows.length * 36);
+  const view = new DataView(buf);
+  for (let i = 0; i < rows.length; i++) {
+    const off = i * 36;
+    view.setInt32(off, rows[i].x, true);
+    view.setInt32(off + 4, rows[i].y, true);
+    view.setInt32(off + 8, rows[i].z, true);
+    view.setUint16(off + 12, rows[i].intensity ?? 0, true);
+    view.setUint8(off + 16, rows[i].classification ?? 0);
+    view.setUint16(off + 30, rows[i].r, true);
+    view.setUint16(off + 32, rows[i].g, true);
+    view.setUint16(off + 34, rows[i].b, true);
+  }
+  return new Uint8Array(buf);
+}
+
 describe('parseLasHeader', () => {
   it('reads format-0 LAS 1.2 header fields', () => {
     const { header } = buildHeader({
@@ -160,6 +188,25 @@ describe('parseLasHeader', () => {
   it('rejects record length smaller than format baseline', () => {
     const { header } = buildHeader({ pointDataFormatId: 3, pointRecordLength: 28 });
     expect(() => parseLasHeader(header)).toThrow();
+  });
+
+  it('rejects a zero X/Y/Z scale factor', () => {
+    // A scale of 0 on any axis collapses every point on that axis to the
+    // constant `offset` — decodeLasPoints has no way to detect this after
+    // the fact (pointCount still reports correctly), so the header must
+    // reject it up front, the same way pointCount is validated above.
+    const { header } = buildHeader({ scale: [0, 0.01, 0.01] });
+    expect(() => parseLasHeader(header)).toThrow(/LAS: invalid X scale/);
+  });
+
+  it('rejects a NaN scale factor', () => {
+    const { header } = buildHeader({ scale: [0.01, NaN, 0.01] });
+    expect(() => parseLasHeader(header)).toThrow(/LAS: invalid Y scale/);
+  });
+
+  it('rejects a non-finite offset', () => {
+    const { header } = buildHeader({ offset: [0, Infinity, 0] });
+    expect(() => parseLasHeader(header)).toThrow(/LAS: invalid Y offset/);
   });
 
   it('uses the LAS 1.4 extended 64-bit point count when the legacy field is 0', () => {
@@ -237,6 +284,63 @@ describe('decodeLasPoints', () => {
     expect(Array.from(chunk.classifications!)).toEqual([2, 6, 1]);
     expect(chunk.colors).toBeUndefined();
     expect(chunk.bbox).toEqual({ min: [9, 18, 25], max: [11, 22, 35] });
+  });
+
+  it('skips a non-finite coordinate in the bbox fold instead of poisoning it', () => {
+    // parseLasHeader now rejects a non-finite/zero scale outright, so the
+    // only way decodeLasPoints itself can still see a non-finite coordinate
+    // is legitimate-looking raw data that overflows f64 once multiplied by
+    // an (individually valid) huge scale factor. Mirrors e57-decode.ts's /
+    // ifcx-points.ts's `computeBBox`, which both skip non-finite coords
+    // rather than let a single bad point collapse the bbox to ±Infinity.
+    const { header } = buildHeader({
+      pointDataFormatId: 0,
+      pointRecordLength: 20,
+      pointCount: 2,
+      scale: [1e300, 1, 1],
+      offset: [0, 0, 0],
+    });
+    const h = parseLasHeader(header);
+    const records = buildFormat0Records([
+      { x: 2_000_000_000, y: 1, z: 1 }, // x*scale overflows to +Infinity
+      { x: 0, y: 2, z: 2 },
+    ]);
+    const chunk = decodeLasPoints(records, h, 2, 20);
+    expect(Number.isFinite(chunk.positions[0])).toBe(false);
+    // The second, fully-finite point is the only one folded into the bbox.
+    expect(chunk.bbox).toEqual({ min: [0, 2, 2], max: [0, 2, 2] });
+  });
+
+  it('leaves the bbox at its ±Infinity seed when every point in the chunk is non-finite', () => {
+    // A finite-but-huge scale passes parseLasHeader's own
+    // Number.isFinite/!==0 validation, then `raw * scale` overflows to
+    // ±Infinity for every point in the chunk. Unlike e57-decode.ts's /
+    // ifcx-points.ts's `computeBBox` (which decode a whole file in one pass
+    // with nothing above them), this chunk's bbox is unioned across chunks
+    // by streaming/host.ts's `streamPointCloud` with plain min/max
+    // comparisons — ±Infinity there is an absorbing no-op, so a wholly-bad
+    // chunk correctly drops out of the running bbox instead of contributing
+    // a finite [0,0,0] that would drag the aggregate toward the origin (see
+    // host.test.ts's mixed-chunk aggregation test). A finite sentinel here
+    // would also defeat host.ts's own `Number.isFinite(bboxMin[0]) ? ... :
+    // info.bbox` fallback to the header bbox for a wholly-bad file.
+    const { header } = buildHeader({
+      pointDataFormatId: 0,
+      pointRecordLength: 20,
+      pointCount: 2,
+      scale: [1e300, 1e300, 1e300],
+      offset: [0, 0, 0],
+    });
+    const h = parseLasHeader(header);
+    const records = buildFormat0Records([
+      { x: 2_000_000_000, y: 2_000_000_000, z: 2_000_000_000 },
+      { x: 1_000_000_000, y: 1_000_000_000, z: 1_000_000_000 },
+    ]);
+    const chunk = decodeLasPoints(records, h, 2, 20);
+    expect(chunk.bbox).toEqual({
+      min: [Infinity, Infinity, Infinity],
+      max: [-Infinity, -Infinity, -Infinity],
+    });
   });
 
   it('subtracts originOffset in f64 before narrowing to f32 (issue #1804)', () => {
@@ -340,6 +444,25 @@ describe('decodeLasPoints', () => {
     expect(chunk.classifications![0]).toBe(200);
     // 40 & 0x1f === 8, so this too separates "masked" from "not masked".
     expect(chunk.classifications![1]).toBe(40);
+  });
+
+  it('decodes format-7 RGB points from byte 30, not byte 28 (format 3/5\'s offset)', () => {
+    const { header } = buildHeader({
+      pointDataFormatId: 7,
+      pointRecordLength: 36,
+      pointCount: 2,
+      scale: [1, 1, 1],
+    });
+    const h = parseLasHeader(header);
+    expect(h.hasRgb).toBe(true);
+    const records = buildFormat7Records([
+      { x: 0, y: 0, z: 0, r: 65535, g: 0, b: 0 },          // pure red
+      { x: 1, y: 2, z: 3, r: 32768, g: 32768, b: 32768 },  // mid gray
+    ]);
+    const chunk = decodeLasPoints(records, h, 2, 36);
+    expect(chunk.colors).toBeDefined();
+    expect(chunk.colors!.slice(0, 3)).toEqual(new Float32Array([1, 0, 0]));
+    expect(chunk.colors![3]).toBeCloseTo(0.5, 2);
   });
 
   it('decodes format-3 RGB points', () => {

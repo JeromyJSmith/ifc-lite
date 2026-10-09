@@ -3,10 +3,9 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 /**
- * Inbound postMessage command handler.
- *
- * Receives commands from the parent SDK and dispatches them to the store
- * and renderer. Also handles the READY → INIT → INIT_ACK handshake.
+ * Inbound postMessage command handler: receives commands from the parent SDK,
+ * dispatches them to the store and renderer, and handles the
+ * READY → INIT → INIT_ACK handshake.
  */
 
 import {
@@ -15,6 +14,7 @@ import {
   createEvent,
   EMBED_SOURCE,
   PROTOCOL_VERSION,
+  TYPE_VISIBILITY_FLAG_KEYS,
   type EmbedMessageEnvelope,
   type InboundCommandType,
   type InboundPayloads,
@@ -22,8 +22,11 @@ import {
   type ViewPreset,
   type SectionAxis,
 } from '@ifc-lite/embed-protocol';
-import type { ViewerState } from '@/store/index.js';
-import { toGlobalIdFromModels } from '@/store/index.js';
+import { resolvePresentationColorMap, resolvePresentationIds } from '@/lib/presentation/resolvePresentationIds.js';
+import { toGlobalIdFromModels, type ViewerState } from '@/store/index.js';
+import { clearSectionCut, revealSectionCut } from '@/store/section-active.js';
+import { aroundDestructiveLoad, offerHostPose } from './cameraIntent.js';
+import { applyInitConfig } from './initConfig.js';
 
 /** Reference to the store's getState / setState for imperative access */
 interface BridgeContext {
@@ -32,12 +35,10 @@ interface BridgeContext {
   loadModelFromUrl: (url: string) => Promise<{ entities: number; triangles: number; vertices: number }>;
   /** Callback to load a model from ArrayBuffer */
   loadModelFromBuffer: (buffer: ArrayBuffer, name?: string) => Promise<{ entities: number; triangles: number; vertices: number }>;
-  /**
-   * Callback to ADD a model to the federation alongside whatever is already
-   * loaded (does not replace existing models). Returns the real, freshly
-   * minted model id so the host can later target it with REMOVE_MODEL.
-   */
-  addModelFromUrl: (url: string) => Promise<{ modelId: string; entities: number; triangles: number; vertices: number }>;
+  // Adds a model to the federation alongside what's already loaded (unlike LOAD_MODEL); resolves the real minted model id for later REMOVE_MODEL targeting.
+  addModelFromUrl: (url: string, name?: string) => Promise<{ modelId: string; entities: number; triangles: number; vertices: number }>;
+  setBackgroundColor: (bg: string | undefined) => void; // set (or clear, with undefined) the embed's custom background colour
+  setOverlays: (overlays: { hideAxis?: boolean; hideScale?: boolean; hideTypes?: string[] }) => void; // hideAxis/hideScale/hideTypes, also settable from INIT's config (initConfig.ts)
 }
 
 /** Optional security knobs for the bridge (all opt-in; defaults preserve the public-widget behaviour). */
@@ -244,8 +245,7 @@ async function handleCommand(type: InboundCommandType, data: unknown, requestId?
         }
         return;
       }
-      // Apply initial config if provided
-      if (payload?.config?.theme) state.setTheme(payload.config.theme);
+      applyInitConfig(payload?.config, { setTheme: state.setTheme, setInteractionMode: state.setInteractionMode, setBackgroundColor: ctx.setBackgroundColor, setOverlays: ctx.setOverlays }); // every config field, not just theme (initConfig.ts)
       // ACK the init
       if (requestId) {
         emitToParent(createResponse(requestId));
@@ -256,7 +256,7 @@ async function handleCommand(type: InboundCommandType, data: unknown, requestId?
 
     case 'LOAD_MODEL': {
       const payload = data as InboundPayloads['LOAD_MODEL'];
-      const stats = await ctx.loadModelFromUrl(payload.url);
+      const stats = await aroundDestructiveLoad(ctx.getState, ctx.loadModelFromUrl, payload.url);
       if (requestId) emitToParent(createResponse(requestId, stats));
       return;
     }
@@ -267,7 +267,7 @@ async function handleCommand(type: InboundCommandType, data: unknown, requestId?
       if (buffer.byteLength > MAX_BUFFER_SIZE) {
         throw new Error(`Model too large (${(buffer.byteLength / 1024 / 1024).toFixed(0)} MB). Max: 500 MB`);
       }
-      const stats = await ctx.loadModelFromBuffer(buffer);
+      const stats = await aroundDestructiveLoad(ctx.getState, ctx.loadModelFromBuffer, buffer);
       if (requestId) emitToParent(createResponse(requestId, stats));
       return;
     }
@@ -277,7 +277,7 @@ async function handleCommand(type: InboundCommandType, data: unknown, requestId?
       // Federation-aware add: does NOT replace existing models (unlike
       // LOAD_MODEL, which is destructive by design). The response carries the
       // real minted model id so REMOVE_MODEL can target it later.
-      const result = await ctx.addModelFromUrl(payload.url);
+      const result = await ctx.addModelFromUrl(payload.url, payload.name);
       if (requestId) emitToParent(createResponse(requestId, result));
       return;
     }
@@ -343,22 +343,22 @@ async function handleCommand(type: InboundCommandType, data: unknown, requestId?
     }
 
     case 'ISOLATE': {
-      const payload = data as InboundPayloads['ISOLATE'];
-      state.isolateEntities(payload.ids);
+      const payload = data as InboundPayloads['ISOLATE']; // #3338: expand assemblies, matching LensPanel/PropertiesPanel/SearchModal/SDK.
+      state.isolateEntities(resolvePresentationIds(state.cameraCallbacks.resolveHighlightIds, payload.ids));
       if (requestId) emitToParent(createResponse(requestId));
       return;
     }
 
     case 'HIDE': {
-      const payload = data as InboundPayloads['HIDE'];
-      state.hideEntities(payload.ids);
+      const payload = data as InboundPayloads['HIDE']; // #3338: hiddenEntities is matched against MESH ids, so an unexpanded assembly id hides nothing.
+      state.hideEntities(resolvePresentationIds(state.cameraCallbacks.resolveHighlightIds, payload.ids));
       if (requestId) emitToParent(createResponse(requestId));
       return;
     }
 
     case 'SHOW': {
-      const payload = data as InboundPayloads['SHOW'];
-      state.showEntities(payload.ids);
+      const payload = data as InboundPayloads['SHOW']; // #3338: expands for HIDE's reason plus its own -- HIDE put the PARTS in the set.
+      state.showEntities(resolvePresentationIds(state.cameraCallbacks.resolveHighlightIds, payload.ids));
       if (requestId) emitToParent(createResponse(requestId));
       return;
     }
@@ -371,17 +371,24 @@ async function handleCommand(type: InboundCommandType, data: unknown, requestId?
 
     case 'SET_COLORS': {
       const payload = data as InboundPayloads['SET_COLORS'];
-      const updates = new Map<number, [number, number, number, number]>();
-      for (const [key, color] of Object.entries(payload.colorMap)) {
-        updates.set(Number(key), color);
-      }
-      state.updateMeshColors(updates);
+      // #3338: same expansion as HIDE/ISOLATE, in the shape the colour channel needs -- a
+      // geometry-less assembly id keyed here paints nothing until it becomes its meshed parts.
+      const entries = Object.entries(payload.colorMap).map(([k, c]) => [Number(k), c] as const);
+      const updates = resolvePresentationColorMap(state.cameraCallbacks.resolveHighlightIds, entries);
+      // `override` so the displaced colors are captured and RESET_COLORS can
+      // put them back.
+      state.updateMeshColors(updates, { override: true });
       if (requestId) emitToParent(createResponse(requestId));
       return;
     }
 
     case 'RESET_COLORS': {
-      state.clearPendingColorUpdates();
+      // Undo SET_COLORS: restore the colors it baked into
+      // geometryResult.meshes[].color. Deliberately NOT
+      // clearPendingColorUpdates() — that is the separate lens/IDS/clash/
+      // schedule overlay channel, which SET_COLORS never writes to and this
+      // command has no claim on.
+      state.resetMeshColors();
       if (requestId) emitToParent(createResponse(requestId));
       return;
     }
@@ -400,7 +407,7 @@ async function handleCommand(type: InboundCommandType, data: unknown, requestId?
 
     case 'SET_CAMERA': {
       const payload = data as InboundPayloads['SET_CAMERA'];
-      state.setCameraRotation({ azimuth: payload.azimuth, elevation: payload.elevation });
+      await offerHostPose({ azimuth: payload.azimuth, elevation: payload.elevation }, ctx.getState);
       if (requestId) emitToParent(createResponse(requestId));
       return;
     }
@@ -416,14 +423,10 @@ async function handleCommand(type: InboundCommandType, data: unknown, requestId?
       const payload = data as InboundPayloads['SET_SECTION'];
       if (payload.axis !== undefined) state.setSectionPlaneAxis(payload.axis as SectionAxis);
       if (payload.position !== undefined) state.setSectionPlanePosition(payload.position);
-      if (payload.enabled !== undefined) {
-        const current = state.sectionPlane.enabled;
-        if (current !== payload.enabled) state.toggleSectionPlane();
-      }
-      if (payload.flipped !== undefined) {
-        const current = state.sectionPlane.flipped;
-        if (current !== payload.flipped) state.flipSectionPlane();
-      }
+      if (payload.flipped !== undefined && ctx.getState().sectionPlane.flipped !== payload.flipped) state.flipSectionPlane();
+      // The cut is drawn only by the Section tool, so "enabled" opens it (#4910).
+      if (payload.enabled === true) revealSectionCut(ctx.getState);
+      else if (payload.enabled === false) clearSectionCut(ctx.getState);
       if (requestId) emitToParent(createResponse(requestId));
       return;
     }
@@ -431,16 +434,19 @@ async function handleCommand(type: InboundCommandType, data: unknown, requestId?
     case 'SET_THEME': {
       const payload = data as InboundPayloads['SET_THEME'];
       state.setTheme(payload.theme);
+      // Only touch bg when sent, so a theme-only SET_THEME can't clear a prior background (same optional-field convention as SET_SECTION above).
+      if (payload.bg !== undefined) ctx.setBackgroundColor(payload.bg);
       if (requestId) emitToParent(createResponse(requestId));
       return;
     }
 
     case 'SET_TYPE_VISIBILITY': {
       const payload = data as InboundPayloads['SET_TYPE_VISIBILITY'];
-      const tv = state.typeVisibility;
-      if (payload.spaces !== undefined && tv.spaces !== payload.spaces) state.toggleTypeVisibility('spaces');
-      if (payload.openings !== undefined && tv.openings !== payload.openings) state.toggleTypeVisibility('openings');
-      if (payload.site !== undefined && tv.site !== payload.site) state.toggleTypeVisibility('site');
+      // Every flag the protocol declares. `toggleTypeVisibility` FLIPS rather than
+      // assigns, so a flag is only passed when the request actually changes it.
+      for (const key of TYPE_VISIBILITY_FLAG_KEYS) {
+        if (payload[key] !== undefined && state.typeVisibility[key] !== payload[key]) state.toggleTypeVisibility(key);
+      }
       if (requestId) emitToParent(createResponse(requestId));
       return;
     }

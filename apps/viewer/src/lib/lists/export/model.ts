@@ -9,9 +9,11 @@
  * grouped sections with per-group count + subtotals, plus grand totals.
  */
 
+import { guardSpreadsheetFormula } from '@ifc-lite/export';
 import { groupingColumnIds, type CellValue, type ColumnDefinition, type ListRow, type ListGrouping } from '@ifc-lite/lists';
 import type { ProjectUnits } from '@ifc-lite/parser';
-import { buildNestedGroupBuckets, type GroupSort } from '@/lib/lists/group-sort';
+import type { GroupSort, GroupOrder } from '@/lib/lists/group-sort';
+import { buildGroupedExport, sumColumnIndices } from './grouping';
 import { resolveListColumnUnits } from '@/lib/units/list-column-units';
 
 export interface ExportColumn {
@@ -101,6 +103,24 @@ export interface BuildModelInput {
   unitDisplayOverrides?: Record<string, string>;
 }
 
+/** A group header's first cell: the label indented one step per nesting level, with the member count. */
+export function groupHeaderLabel(group: Pick<ExportGroup, 'label' | 'count' | 'level'>, indent = '    '): string {
+  return `${indent.repeat(group.level)}${group.label}  (${group.count})`;
+}
+
+/**
+ * The grand-total row over `cols` as raw cells: `label` first, the schedule
+ * view's Count under `__count`, each summed column's total, `null` elsewhere.
+ * Writers format (`displayCell`) or keep the numbers (Excel) as they do rows.
+ */
+export function totalsRowCells(model: ExportModel, cols: ExportColumn[], label: string): CellValue[] {
+  return cols.map((c, i) => {
+    if (i === 0) return label;
+    if (model.schedule && c.id === '__count') return model.totals.count;
+    return c.summed ? model.totals.sums[c.id] : null;
+  });
+}
+
 /** Format a cell for text-based exports (CSV/PDF). Excel keeps raw numbers. */
 export function displayCell(value: CellValue): string {
   if (value === null || value === undefined) return '';
@@ -117,33 +137,32 @@ export function displayCell(value: CellValue): string {
  * TAB or CR makes a cell execute as a formula in Excel/LibreOffice/Sheets.
  * List-export cells (values, group labels, custom column headers) derive from
  * attacker-controllable IFC values, so any such cell is prefixed with an
- * apostrophe. A leading UTF-8 BOM is treated as file metadata by spreadsheet
- * importers, so a marker hidden behind one still executes; strip the BOM first
- * so the apostrophe guard actually lands in front. Shared by the CSV and XLSX
- * writers so both honour the guideline identically.
+ * apostrophe.
+ *
+ * The trigger is looked for PAST any leading invisibles (BOM, ZWSP, LRM, NBSP,
+ * U+2028/U+2029, ordinary spaces): spreadsheet importers swallow those, so a
+ * marker hidden behind one still executes, while an anchored regex stops
+ * matching. They are looked past, not removed — see `guardSpreadsheetFormula`.
+ *
+ * Used by the XLSX writer for its string cells. The CSV writer calls
+ * `escapeCsvCell` directly instead, because it also needs RFC 4180 quoting;
+ * both reach the same guard in `@ifc-lite/export`.
  */
 export function neutralizeSpreadsheetFormula(s: string): string {
-  // Strip ALL leading invisibles, not just U+FEFF. A zero-width space,
-  // left-to-right mark or non-breaking space in front of `=` does not stop a
-  // spreadsheet reading the cell as a formula, but it does stop an anchored
-  // regex matching, so stripping only the BOM left the others as bypasses.
-  // `packages/sdk/src/namespaces/export.ts` matches past this same class
-  // (#1944); this copy handled the BOM alone.
+  // Delegates to `@ifc-lite/export`'s single guard. The copy that used to live
+  // here bought its invisible-handling by DELETING the leading run of
+  // `\p{Cf}\p{Z}`; `\p{Z}` includes U+0020, so every exported cell silently
+  // lost its leading spaces, against RFC 4180 §2.4 ("Spaces are considered
+  // part of a field and should not be ignored"). The shared guard looks *past*
+  // the run instead of removing it — same payloads guarded, data intact.
   //
-  // `\p{Z}`, not `\p{Zs}`: the separator category also covers `Zl` and `Zp`,
-  // so U+2028 (LINE SEPARATOR) and U+2029 (PARAGRAPH SEPARATOR) would
-  // otherwise remain viable prefixes for hiding a formula trigger.
-  s = s.replace(/^[\p{Cf}\p{Z}]+/u, '');
-  // NOTE a deliberate, unresolved divergence from `packages/lists/src/engine.ts`:
-  // that copy EXEMPTS a genuine number from the `-`/`+` trigger (#1772, comment:
-  // "`-0.35` exported as `'-0.35` and broke Excel SUM()"), whereas this copy
-  // guards it -- and `injection.test.ts` pins `'+1'` as guarded on purpose. So
-  // the viewer's Lists CSV ships every negative measure as text while the
-  // library's does not. Both behaviours are deliberately tested, so they cannot
-  // both be right; picking one is a product decision (broken SUM() vs a cell
-  // that a spreadsheet could re-read as a formula) and is NOT bundled into this
-  // hardening change.
-  return /^[=+\-@\t\r]/.test(s) ? `'${s}` : s;
+  // No options: the numeric exemption is the shared guard's DEFAULT, which is
+  // how the repo stopped disagreeing with itself. `packages/lists/src/engine.ts`
+  // has exempted genuine numbers since #1772 ("`-0.35` exported as `'-0.35` and
+  // broke Excel SUM()"); this call site guarded them, so the same list exported
+  // from the viewer and from the library did not match.
+
+  return guardSpreadsheetFormula(s);
 }
 
 export function buildExportModel(input: BuildModelInput): ExportModel {
@@ -182,9 +201,7 @@ export function buildExportModel(input: BuildModelInput): ExportModel {
     ? rows.map((r) => ({ ...r, values: r.values.map((v, i) => resolver.convertCell(i, v, r.modelId)) }))
     : rows;
 
-  const sumIdx = sumColumnIds
-    .map((id) => ({ id, idx: columns.findIndex((c) => c.id === id) }))
-    .filter((s) => s.idx >= 0);
+  const sumIdx = sumColumnIndices(columns, sumColumnIds);
   const zeroSums = (): Record<string, number> => Object.fromEntries(sumIdx.map((s) => [s.id, 0]));
   const addSums = (acc: Record<string, number>, values: CellValue[]) => {
     for (const s of sumIdx) {
@@ -200,50 +217,14 @@ export function buildExportModel(input: BuildModelInput): ExportModel {
   const groupColumnIds = groupingColumnIds(grouping).filter((id) => columns.some((c) => c.id === id));
   const groupColumnId = groupColumnIds[0] ?? null;
 
-  let groups: ExportGroup[] | null = null;
-  let schedule: ExportModel['schedule'] = null;
-  if (groupColumnIds.length > 0) {
-    const levelIndices = groupColumnIds.map((id) => columns.findIndex((c) => c.id === id));
-    const leafLevel = levelIndices.length - 1;
-    // Bucket + subtotal via the shared helper so the sections match the table
-    // exactly (multi-criteria grouping nests one section level per group
-    // column), then project each LEAF group's member rows to display values.
-    const nested = buildNestedGroupBuckets(
-      convertedRows,
-      levelIndices,
-      sumIdx,
-      (r, idx) => r.values[idx],
-      displayCell,
-      sort ?? null,
-    );
-    groups = nested.map((g) => ({
-      label: g.label,
-      count: g.count,
-      sums: g.sums,
-      level: g.level,
-      path: g.path,
-      rows: g.level === leafLevel ? g.rows.map((r) => r.values) : [],
-    }));
-
-    // Schedule / pivot presentation (issue #1790 round 2): one row per
-    // group-value tuple (leaf group), grouping columns first, then a
-    // first-class Count column, then the configured sums — the same leaf
-    // buckets, just flattened into a single tuple row instead of a section.
-    if (grouping?.view === 'schedule') {
-      const scheduleCols: ExportColumn[] = [
-        ...groupColumnIds.map((id) => {
-          const i = columns.findIndex((c) => c.id === id);
-          return { id, label: exportCols[i]?.label ?? id, numeric: false, summed: false, width: exportCols[i]?.width ?? 120 };
-        }),
-        { id: '__count', label: 'Count', numeric: true, summed: false, width: 80 },
-        ...sumIdx.map((s) => exportCols[s.idx]),
-      ];
-      const scheduleRows: CellValue[][] = nested
-        .filter((g) => g.level === leafLevel)
-        .map((g) => [...g.path, g.count, ...sumIdx.map((s) => g.sums[s.id])]);
-      schedule = { columns: scheduleCols, rows: scheduleRows };
-    }
-  }
+  const { groups, schedule } = buildGroupedExport({ columns: exportCols, rows: flatRows, groupColumnIds, sumColumnIds, formatLabel: displayCell, sort: sort ?? null, scheduleView: grouping?.view === 'schedule' });
 
   return { title, generatedAt, columns: exportCols, groups, rows: flatRows, groupColumnId, groupColumnIds, sumColumnIds, totals, schedule };
+}
+
+/** Document-only group ordering (#6489), using cached converted rows without rerunning IFC evaluation. */
+export function orderExportModelGroups(model: ExportModel, order?: GroupOrder): ExportModel {
+  if (!order || !model.groups) return model;
+  const grouped = buildGroupedExport({ columns: model.columns, rows: model.rows, groupColumnIds: model.groupColumnIds, sumColumnIds: model.sumColumnIds, formatLabel: displayCell, sort: null, scheduleView: model.schedule !== null, groupOrder: order });
+  return { ...model, ...grouped };
 }

@@ -62,7 +62,7 @@ export const CACHE_MAX_SOURCE_SIZE = 150 * 1024 * 1024;
  *  the `fallbackSourceBuffer` path `loadFromCache` already supports), so repeat
  *  opens skip the 10-90s parse+mesh while keeping full feature fidelity.
  *
- *  The spread-sampled cache key (`sourceFingerprint.ts`) only keys the lookup;
+ *  The spread-sampled cache key (`@ifc-lite/cache`'s `source-fingerprint.ts`) only keys the lookup;
  *  because it hydrates cached geometry against the FRESH buffer, a hit is
  *  VALIDATED by the source File's `lastModified` (mtime guard) plus a TRUE
  *  full-file hash re-checked off the main thread (see
@@ -114,26 +114,19 @@ export const THRESHOLDS = {
 // ============================================================================
 
 /**
- * Calculate dynamic batch config based on file size
- * Larger files get larger batches for better throughput
+ * Batch config for a load of the given size.
+ *
+ * The measured size is the whole config: `getStreamingBatchSize` picks the
+ * batch off its own size ladder in `@ifc-lite/geometry`, so passing the size
+ * on is all a caller can influence. (This wrapper used to also return
+ * `initialBatchSize` / `maxBatchSize` ramp-up hints — no consumer ever read
+ * them, and both fields have been removed from `DynamicBatchConfig`.)
  *
  * @param fileSizeMB - File size in megabytes
  * @returns Batch configuration for geometry processing
  */
 export function getDynamicBatchConfig(fileSizeMB: number): DynamicBatchConfig {
-  if (fileSizeMB < 10) {
-    // Small files: smaller batches for responsiveness
-    return { initialBatchSize: 50, maxBatchSize: 200, fileSizeMB };
-  } else if (fileSizeMB < 50) {
-    // Medium files: balanced batching
-    return { initialBatchSize: 100, maxBatchSize: 500, fileSizeMB };
-  } else if (fileSizeMB < 100) {
-    // Large files: larger batches for throughput
-    return { initialBatchSize: 100, maxBatchSize: 1000, fileSizeMB };
-  } else {
-    // Huge files (100MB+): aggressive batching for maximum throughput
-    return { initialBatchSize: 100, maxBatchSize: 3000, fileSizeMB };
-  }
+  return { fileSizeMB };
 }
 
 /**

@@ -52,6 +52,10 @@ export class StubStoreEditor {
     return this.overlay.get(id) ?? null;
   }
 
+  getEntityType(id: number): string | undefined {
+    return this.overlay.get(id)?.type;
+  }
+
   setPositionalAttribute(id: number, index: number, value: unknown): void {
     let entry = this.positional.get(id);
     if (!entry) {
@@ -78,6 +82,15 @@ export class StubStoreEditor {
  */
 export class StubView {
   private positional = new Map<number, Map<number, unknown>>();
+
+  isDeleted(_id: number): boolean { return false; }
+  getNewEntities(): OverlayEntity[] { return []; }
+  getTypeMutations(): Map<number, { newType: string }> { return new Map(); }
+  // What `@ifc-lite/create`'s effective-entity readers ask a view: this stub holds no overlay of its own
+  // (the paired `StubStoreEditor` does), so to them every entity is unknown.
+  getNewEntity(_id: number): OverlayEntity | null { return null; }
+  getEntityTypeMutation(_id: number): { newType: string } | undefined { return undefined; }
+  getAttributeMutationsForEntity(_id: number): Array<{ name: string; value: string }> { return []; }
 
   getPositionalMutationsForEntity(id: number): Map<number, unknown> | null {
     return this.positional.get(id) ?? null;

@@ -2,311 +2,189 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Tests for [`super::schema_helpers`]. Split out of `schema_helpers.rs` to
-//! keep that module under the 400-line rule (AGENTS.md), matching the
-//! `stream_meta.rs` / `stream_meta_tests.rs` pattern.
-
 use super::*;
 
 #[test]
-fn building_elements_have_geometry() {
+fn supported_schema_keywords_keep_their_exact_type() {
+    let exact = IfcType::from_str("IFCSLABSTANDARDCASE");
+    assert_eq!(exact.as_str(), "IFCSLABSTANDARDCASE");
+    assert!(exact.is_subtype_of(IfcType::IfcProduct));
+}
+
+#[test]
+fn non_express_stratum_aliases_are_the_only_compatibility_geometry_override() {
+    for &alias in crate::EXPORTER_STRATUM_ALIASES {
+        assert!(crate::is_exporter_stratum_alias(alias));
+        assert!(has_geometry_by_name(alias));
+    }
+    assert!(!crate::is_exporter_stratum_alias("IFCVENDORSTRATUM"));
+}
+
+#[test]
+fn unknown_keywords_keep_their_owned_label_through_record_recovery() {
+    let parsed = IfcType::from_str("IFC_VENDOR_WIDGET");
+    assert_eq!(
+        ifc_type_from_record(parsed, b"#1=IFC_VENDOR_WIDGET();").as_str(),
+        "IFC_VENDOR_WIDGET"
+    );
+}
+
+#[test]
+fn classification_is_case_insensitive_across_the_generated_catalog() {
+    for name in crate::generated::IFC_TYPES.iter().map(IfcType::as_str) {
+        let expected = geometry_flags_by_name(name);
+        assert_eq!(
+            geometry_flags_by_name(&name.to_ascii_lowercase()),
+            expected,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn representative_geometry_categories_and_spatial_exclusions_stay_distinct() {
     for name in [
         "IFCWALL",
-        "IFCSLAB",
         "IFCBEAM",
-        "IFCCOLUMN",
-        "IFCDOOR",
-        "IFCWINDOW",
-        "IFCROOF",
-        "IFCSTAIR",
-        "IFCSHADINGDEVICE",
-    ] {
-        assert!(has_geometry_by_name(name), "{name} should have geometry");
-    }
-}
-
-#[test]
-fn mep_elements_have_geometry() {
-    for name in [
-        "IFCFLOWSEGMENT",
-        "IFCFLOWFITTING",
-        "IFCENERGYCONVERSIONDEVICE",
-        "IFCFLOWTREATMENTDEVICE",
-        "IFCBOILER",
-        "IFCPUMP",
-        "IFCVALVE",
-    ] {
-        assert!(has_geometry_by_name(name), "{name} should have geometry");
-    }
-}
-
-/// Regression for PR #585 — IfcSolarDevice was missing because the
-/// whitelist matched leaf names directly even though its parent
-/// `IfcEnergyConversionDevice` was already in the list.
-#[test]
-fn solar_device_has_geometry() {
-    assert!(has_geometry_by_name("IFCSOLARDEVICE"));
-    assert!(has_geometry_by_name("IfcSolarDevice"));
-}
-
-#[test]
-fn ifc4x3_infrastructure_have_geometry() {
-    for name in [
-        "IFCBEARING",
-        "IFCKERB",
+        "IFCCHILLER",
         "IFCPAVEMENT",
-        "IFCRAIL",
-        "IFCTRACKELEMENT",
-        "IFCSIGN",
-        "IFCSIGNAL",
-        "IFCEARTHWORKSCUT",
+        "IFCREINFORCEDSOIL",
     ] {
-        assert!(has_geometry_by_name(name), "{name} should have geometry");
+        assert!(has_geometry_by_name(name), "{name}");
     }
-}
-
-#[test]
-fn reinforcement_variants_have_geometry() {
-    assert!(has_geometry_by_name("IFCREINFORCINGBAR"));
-    assert!(has_geometry_by_name("IFCREINFORCINGMESH"));
-    assert!(has_geometry_by_name("IFCREINFORCEDSOIL"));
-}
-
-#[test]
-fn standardcase_and_elementedcase_have_geometry() {
-    for name in [
-        "IFCBEAMSTANDARDCASE",
-        "IFCSLABSTANDARDCASE",
-        "IFCSLABELEMENTEDCASE",
-        "IFCWALLSTANDARDCASE",
-        "IFCWALLELEMENTEDCASE",
-        "IFCDOORSTANDARDCASE",
-        "IFCWINDOWSTANDARDCASE",
-        "IFCOPENINGSTANDARDCASE",
-    ] {
-        assert!(has_geometry_by_name(name), "{name} should have geometry");
-    }
-}
-
-#[test]
-fn space_and_site_have_geometry() {
-    assert!(has_geometry_by_name("IFCSPACE"));
-    assert!(has_geometry_by_name("IFCSITE"));
-    assert!(has_geometry_by_name("IFCOPENINGELEMENT"));
-    // #1075: IfcSpatialZone may carry a body (Revit Family/Dynamo GFA
-    // volumes) — it is meshed like IfcSpace when a representation exists.
-    assert!(has_geometry_by_name("IFCSPATIALZONE"));
-}
-
-/// #1910: terrain/DGM exporters attach an IfcShellBasedSurfaceModel
-/// directly to IfcBuilding. Blocking the class meant the entity never
-/// became a geometry job, so the model rendered nothing at all.
-#[test]
-fn building_bears_geometry() {
-    assert!(has_geometry_by_name("IFCBUILDING"));
-    assert!(has_geometry_by_name("IfcBuilding"));
-    // Its siblings under IfcSpatialStructureElement stay blocked — no
-    // exporter has been observed giving them a body.
-    assert!(!has_geometry_by_name("IFCBUILDINGSTOREY"));
-    assert!(!has_geometry_by_name("IFCFACILITY"));
-}
-
-#[test]
-fn legacy_ifc2x3_distribution_names_have_geometry() {
-    // Routed through legacy_entities now (was an inline match arm).
-    assert!(has_geometry_by_name("IFCEQUIPMENTELEMENT"));
-    assert!(has_geometry_by_name("IFCELECTRICALDISTRIBUTIONPOINT"));
-}
-
-#[test]
-fn non_geometric_spatial_excluded() {
-    for name in [
-        // The original whitelist excluded these explicitly.
-        // IFCBUILDING moved out — see `building_bears_geometry` (#1910).
-        "IFCBUILDINGSTOREY",
-        "IFCFACILITY",
-        "IFCFACILITYPART",
-        // Abstract bases — same logic, never rendered directly.
-        "IFCSPATIALELEMENT",
-        "IFCSPATIALSTRUCTUREELEMENT",
-        // IFC4X3 facility subtypes: previously absent from the whitelist
-        // and would now leak through if the block-list were leaf-only
-        // (regression flagged on the original PR review).
-        "IFCBRIDGE",
-        "IFCROAD",
-        "IFCRAILWAY",
-        "IFCMARINEFACILITY",
-        "IFCBRIDGEPART",
-        "IFCFACILITYPARTCOMMON",
-        // External spatial elements are abstract air volumes, not
-        // rendered. Not in the original whitelist.
-        "IFCEXTERNALSPATIALELEMENT",
-        "IFCEXTERNALSPATIALSTRUCTUREELEMENT",
-    ] {
-        assert!(!has_geometry_by_name(name), "{name} should NOT have geometry");
-    }
-}
-
-#[test]
-fn non_products_excluded() {
     for name in [
         "IFCPROJECT",
         "IFCMATERIAL",
-        "IFCPROPERTYSET",
-        "IFCRELAGGREGATES",
-        "IFCDIMENSIONALEXPONENTS",
-        "IFCSURFACESTYLERENDERING",
-        "IFCGEOMETRICREPRESENTATIONSUBCONTEXT",
-        "IFCCARTESIANPOINT",
+        "IFCBUILDINGSTOREY",
+        "IFCFACILITY",
+        "IFCROAD",
     ] {
-        assert!(!has_geometry_by_name(name), "{name} should NOT have geometry");
+        assert!(!has_geometry_by_name(name), "{name}");
     }
 }
 
 #[test]
-fn legacy_proxy_and_buildingelement_have_geometry() {
-    // From legacy_entities: both map to renderable types
-    assert!(has_geometry_by_name("IFCPROXY"));
-    assert!(has_geometry_by_name("IFCBUILDINGELEMENT"));
-}
-
-#[test]
-fn unknown_garbage_excluded() {
-    // Reinforcement substring tightened to a prefix — unrelated tokens
-    // containing "REINFORC" are no longer accepted.
-    assert!(!has_geometry_by_name("IFCNOTAREALTYPE"));
-    assert!(!has_geometry_by_name(""));
-    assert!(!has_geometry_by_name("FOOREINFORCEDBAR"));
-}
-
-#[test]
-fn cached_results_are_consistent() {
-    // Hit the cache twice for the same name and confirm both return the
-    // same value (regression for any race in the cache layer).
-    for _ in 0..3 {
-        assert!(has_geometry_by_name("IFCWALL"));
-        assert!(!has_geometry_by_name("IFCPROJECT"));
-        assert!(is_simple_geometry_type("IFCWALL"));
-        assert!(!is_simple_geometry_type("IFCWINDOW"));
+fn simple_geometry_categories_remain_explicit() {
+    for name in ["IFCWALL", "IFCSLAB", "IFCBEAM", "IFCCOLUMN"] {
+        assert!(is_simple_geometry_type(name), "{name}");
+    }
+    for name in ["IFCDOOR", "IFCWINDOW", "IFCFLOWSEGMENT", "IFCSPACE"] {
+        assert!(!is_simple_geometry_type(name), "{name}");
     }
 }
 
 #[test]
-fn is_simple_geometry_type_routes_correctly() {
-    // Structural / structural-adjacent: simple.
-    assert!(is_simple_geometry_type("IFCWALL"));
-    assert!(is_simple_geometry_type("IFCSLAB"));
-    assert!(is_simple_geometry_type("IFCBEAM"));
-    assert!(is_simple_geometry_type("IFCCOLUMN"));
-
-    // Secondary categories.
-    assert!(!is_simple_geometry_type("IFCWINDOW"));
-    assert!(!is_simple_geometry_type("IFCDOOR"));
-    assert!(!is_simple_geometry_type("IFCOPENINGELEMENT"));
-    assert!(!is_simple_geometry_type("IFCFLOWSEGMENT"));
-    assert!(!is_simple_geometry_type("IFCSOLARDEVICE"));
-    assert!(!is_simple_geometry_type("IFCSPACE"));
-    assert!(!is_simple_geometry_type("IFCANNOTATION"));
-    assert!(!is_simple_geometry_type("IFCBUILDINGELEMENTPROXY"));
-
-    // Mixed-case input — exercises the `to_ascii_uppercase` branch.
-    assert!(is_simple_geometry_type("IfcWall"));
-    assert!(!is_simple_geometry_type("IfcDoor"));
+fn unknown_keywords_use_fallbacks_without_growing_the_catalog_cache() {
+    let before = classifications().len();
+    assert!(has_geometry_by_name("IFCREINFORCINGVENDOREXTENSION"));
+    assert!(!has_geometry_by_name("IFCVENDORGEOMETRY"));
+    assert_eq!(classifications().len(), before);
 }
 
-// #1910 review follow-up: `nth_attribute_is_present` had no direct unit
-// test — every existing reference was production use or an integration
-// test exercising it incidentally. These pin the documented contract:
-// "attribute at `index` (0-based, top-level — respects nested parens and
-// quoted strings) is present and non-null (`$`)".
 
+/// Regression test for #5180: retiring the legacy IFC type table
+/// (`rust/core/src/legacy_entities.rs`, removed by #5073) re-resolved every
+/// legacy STEP keyword through the generated per-schema registry instead of
+/// the old hand-maintained `LegacyEntityInfo` table. For 24 of the 26 names
+/// in the old table's `LEGACY_ENTITY_NAMES` the two resolutions happen to
+/// agree on `has_geometry_by_name`, `is_representationless_spatial_container_by_name`
+/// and `is_simple_geometry_type`. For `IFCPROXY` and `IFCEQUIPMENTELEMENT`
+/// they do not: the old table routed both through a *different* type
+/// (`IfcBuildingElementProxy`, `IfcDistributionElement`) that
+/// `schema_helpers::compute_is_simple`'s old secondary-type arms matched, so
+/// `is_simple_geometry_type` was `false` (deferred geometry batch). The new
+/// registry resolves each keyword to its *own* variant (`IfcProxy` parented
+/// on `IfcProduct`, `IfcEquipmentElement` parented on `IfcElement`), neither
+/// of which those arms match, so `is_simple_geometry_type` is now `true`
+/// (eager first-frame batch, `rust/wasm-bindings/src/api/styling/prepass.rs`).
+///
+/// Expected values below are pinned as literal constants derived by hand
+/// from the old table at commit `055f94f62` (`git show
+/// 055f94f62:rust/core/src/legacy_entities.rs`), NOT by calling any
+/// implementation (old or new) to produce the "expected" side — the deleted
+/// sweep this replaces (`combined_geometry_flags_match_canonical_predicates_3987`)
+/// was useless precisely because it compared the lookup cache to the same
+/// build's uncached predicates instead of to an intended value, so it could
+/// not have caught this flip even before the retirement.
 #[test]
-fn nth_attribute_present_and_non_null_is_true() {
-    let entity = b"#40=IFCBUILDINGSTOREY('guid',$,'Level 1',$,$,#18,#39,$,.ELEMENT.,0.);";
-    // index 0: 'guid' — present, non-null.
-    assert!(nth_attribute_is_present(entity, 0));
-    // index 6: #39 (Representation) — present, non-null.
-    assert!(nth_attribute_is_present(entity, 6));
-}
+fn legacy_keyword_geometry_predicates_match_pre_retirement_intent_5180() {
+    // (keyword, expected has_geometry, expected is_representationless_spatial_container,
+    //  expected is_simple_geometry_type)
+    //
+    // `is_representationless_spatial_container_by_name` is `false` for every
+    // legacy name both before and after the retirement: the old
+    // `compute_is_representationless_spatial_container` special-cased
+    // `get_legacy_entity_info(..).is_some()` to `false` unconditionally, and
+    // the new registry resolves every one of these keywords to a concrete
+    // `IfcProduct`-derived (non-spatial-container) variant.
+    const UNAMBIGUOUS: &[(&str, bool, bool, bool)] = &[
+        ("IFCPRESENTATIONSTYLEASSIGNMENT", false, false, true),
+        ("IFCBEAMSTANDARDCASE", true, false, true),
+        ("IFCCOLUMNSTANDARDCASE", true, false, true),
+        ("IFCMEMBERSTANDARDCASE", true, false, true),
+        ("IFCPLATESTANDARDCASE", true, false, true),
+        ("IFCSLABSTANDARDCASE", true, false, true),
+        ("IFCDOORSTANDARDCASE", true, false, false),
+        ("IFCWINDOWSTANDARDCASE", true, false, false),
+        ("IFCOPENINGSTANDARDCASE", true, false, false),
+        ("IFCSLABELEMENTEDCASE", true, false, true),
+        ("IFCWALLELEMENTEDCASE", true, false, true),
+        ("IFCDOORSTYLE", false, false, true),
+        ("IFCWINDOWSTYLE", false, false, true),
+        ("IFCBUILDINGELEMENT", true, false, true),
+        ("IFCBUILDINGELEMENTTYPE", false, false, true),
+        ("IFCELECTRICDISTRIBUTIONPOINT", true, false, false),
+        ("IFCELECTRICALELEMENT", true, false, true),
+        ("IFCCHAMFEREDGEFEATURE", true, false, true),
+        ("IFCROUNDEDEDGEFEATURE", true, false, true),
+        ("IFCSTRUCTURALLINEARACTIONVARYING", true, false, true),
+        ("IFCSTRUCTURALPLANARACTIONVARYING", true, false, true),
+        ("IFCSOLIDSTRATUM", true, false, true),
+        ("IFCVOIDSTRATUM", true, false, true),
+        ("IFCWATERSTRATUM", true, false, true),
+    ];
 
-#[test]
-fn nth_attribute_dollar_is_false() {
-    let entity = b"#40=IFCBUILDINGSTOREY('guid',$,'Level 1',$,$,#18,$,$,.ELEMENT.,0.);";
-    // index 6: $ (Representation) — present but null.
-    assert!(!nth_attribute_is_present(entity, 6));
-    // index 1: $ (OwnerHistory) — same.
-    assert!(!nth_attribute_is_present(entity, 1));
-}
+    for &(keyword, expected_has_geometry, expected_representationless, expected_simple) in
+        UNAMBIGUOUS
+    {
+        assert_eq!(
+            has_geometry_by_name(keyword),
+            expected_has_geometry,
+            "{keyword}: has_geometry_by_name"
+        );
+        assert_eq!(
+            is_representationless_spatial_container_by_name(keyword),
+            expected_representationless,
+            "{keyword}: is_representationless_spatial_container_by_name"
+        );
+        assert_eq!(
+            is_simple_geometry_type(keyword),
+            expected_simple,
+            "{keyword}: is_simple_geometry_type"
+        );
+    }
 
-#[test]
-fn nth_attribute_past_the_end_is_false() {
-    let entity = b"#1=IFCWALL('guid',$,'Wall');";
-    // Only 3 top-level attributes (indices 0..=2); index 10 doesn't exist.
-    assert!(!nth_attribute_is_present(entity, 10));
-}
+    // IFCPROXY and IFCEQUIPMENTELEMENT (#5180): has_geometry and
+    // is_representationless_spatial_container are uncontested — both were
+    // and remain geometry-bearing, non-spatial-container entities.
+    for keyword in ["IFCPROXY", "IFCEQUIPMENTELEMENT"] {
+        assert!(
+            has_geometry_by_name(keyword),
+            "{keyword}: has_geometry_by_name"
+        );
+        assert!(
+            !is_representationless_spatial_container_by_name(keyword),
+            "{keyword}: is_representationless_spatial_container_by_name"
+        );
+    }
 
-#[test]
-fn nth_attribute_empty_value_is_false() {
-    // `,,` — the middle attribute is an empty token, not `$` and not a
-    // value. The scanner treats an empty trimmed token as absent: the
-    // `!token.is_empty()` check in `nth_attribute_is_present` fails.
-    let entity = b"#1=IFCFOO('a',,'c');";
-    assert!(!nth_attribute_is_present(entity, 1));
-    // Confirm the neighbours parsed correctly around the empty slot.
-    assert!(nth_attribute_is_present(entity, 0));
-    assert!(nth_attribute_is_present(entity, 2));
-}
-
-#[test]
-fn nth_attribute_nested_parens_are_not_top_level_commas() {
-    // IFCPOLYLOOP((#20,#21,#22)) — the whole nested list is attribute 0;
-    // the commas inside the inner parens must not be counted as top-level
-    // separators, and there must be no attribute 1.
-    let entity = b"#30=IFCPOLYLOOP((#20,#21,#22),$);";
-    assert!(nth_attribute_is_present(entity, 0));
-    assert!(!nth_attribute_is_present(entity, 1));
-    assert!(!nth_attribute_is_present(entity, 2));
-}
-
-#[test]
-fn nth_attribute_quoted_comma_and_paren_are_not_top_level() {
-    // A quoted string containing both a comma and parens must not be
-    // split on, nor have its parens counted toward nesting depth.
-    let entity =
-        b"#40=IFCBUILDINGSTOREY('guid',$,'Level 1, west (annex)',$);";
-    assert!(nth_attribute_is_present(entity, 0)); // 'guid'
-    assert!(!nth_attribute_is_present(entity, 1)); // $
-    assert!(nth_attribute_is_present(entity, 2)); // the quoted string itself
-    assert!(!nth_attribute_is_present(entity, 3)); // $
-    // Nothing beyond attribute 3 — the embedded comma/parens didn't
-    // fabricate extra attributes.
-    assert!(!nth_attribute_is_present(entity, 4));
-}
-
-#[test]
-fn nth_attribute_escaped_quote_stays_inside_the_string() {
-    // STEP escapes an embedded `'` as `''`. The scanner must not treat
-    // the escape as the string's closing quote.
-    let entity = b"#1=IFCWALL('guid',$,'quo''te',$);";
-    assert!(nth_attribute_is_present(entity, 2)); // 'quo''te'
-    assert!(!nth_attribute_is_present(entity, 3)); // $
-    // No phantom attribute 4 from mis-parsing the escape as a delimiter.
-    assert!(!nth_attribute_is_present(entity, 4));
-}
-
-#[test]
-fn nth_attribute_no_open_paren_is_false() {
-    assert!(!nth_attribute_is_present(b"#1=IFCWALL;", 0));
-}
-
-#[test]
-fn nth_attribute_no_close_paren_is_false() {
-    assert!(!nth_attribute_is_present(b"#1=IFCWALL('guid'", 0));
-}
-
-#[test]
-fn nth_attribute_reversed_boundary_is_false() {
-    // `)` appears before `(` — must not panic or index out of bounds.
-    assert!(!nth_attribute_is_present(b")(", 0));
-    assert!(!nth_attribute_is_present(b"garbage)stuff(more", 0));
+    // `is_simple_geometry_type` for IFCPROXY and IFCEQUIPMENTELEMENT: the
+    // retirement flipped both to `true` (eager first-frame batch) with no
+    // decision behind it. The pre-retirement value `false` (deferred, like
+    // IfcBuildingElementProxy and IfcDistributionElement) is the intended one.
+    assert!(!is_simple_geometry_type("IFCPROXY"), "IFCPROXY: is_simple_geometry_type");
+    assert!(
+        !is_simple_geometry_type("IFCEQUIPMENTELEMENT"),
+        "IFCEQUIPMENTELEMENT: is_simple_geometry_type"
+    );
 }

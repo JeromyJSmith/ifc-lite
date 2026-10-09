@@ -7,11 +7,16 @@ import { evaluateCompatibility, findAffected } from './sdk-version.js';
 
 describe('sdk-version', () => {
   it('passes a >= range that still matches', () => {
-    expect(evaluateCompatibility('x', '>=2.0.0', '2.5.0').status).toBe('compatible');
+    const result = evaluateCompatibility('x', '>=2.0.0', '2.5.0');
+    expect(result.status).toBe('compatible');
+    expect(result.reasonCode).toBe('range-match');
+    expect(result.reason).toContain('still matches SDK');
   });
 
   it('flags a >= range that no longer matches', () => {
-    expect(evaluateCompatibility('x', '>=3.0.0', '2.5.0').status).toBe('outdated');
+    const result = evaluateCompatibility('x', '>=3.0.0', '2.5.0');
+    expect(result.status).toBe('outdated');
+    expect(result.reasonCode).toBe('range-mismatch');
   });
 
   it('accepts caret ranges within the same major', () => {
@@ -40,11 +45,15 @@ describe('sdk-version', () => {
   });
 
   it('marks unparseable ranges as permissive', () => {
-    expect(evaluateCompatibility('x', 'totally garbage', '2.5.0').status).toBe('permissive');
+    const result = evaluateCompatibility('x', 'totally garbage', '2.5.0');
+    expect(result.status).toBe('permissive');
+    expect(result.reasonCode).toBe('unsupported-range');
   });
 
   it('marks unparseable SDK versions as permissive', () => {
-    expect(evaluateCompatibility('x', '>=2.0.0', 'nope').status).toBe('permissive');
+    const result = evaluateCompatibility('x', '>=2.0.0', 'nope');
+    expect(result.status).toBe('permissive');
+    expect(result.reasonCode).toBe('invalid-sdk-version');
   });
 
   it('AND comparators within one range all have to satisfy', () => {
@@ -67,6 +76,17 @@ describe('sdk-version', () => {
     expect(evaluateCompatibility('x', '>=2', '2.5.0').status).toBe('compatible');
     expect(evaluateCompatibility('x', '>=2.1', '2.5.0').status).toBe('compatible');
     expect(evaluateCompatibility('x', '>=2.1.0-rc.1', '2.5.0').status).toBe('compatible');
+  });
+
+  it('a bare version pin (no comparator prefix) defaults to exact match', () => {
+    // Regression: `parseRange` defaults a missing comparator symbol to
+    // '=' (see COMPARATOR_RE / the `m[1] ?? '='` fallback), but nothing
+    // exercised a pin without an explicit operator — every other test
+    // uses '>=', '^', or '~'. Mutating the default to '>=' left the
+    // full suite green.
+    expect(evaluateCompatibility('x', '2.0.0', '2.0.0').status).toBe('compatible');
+    expect(evaluateCompatibility('x', '2.0.0', '2.5.0').status).toBe('outdated');
+    expect(evaluateCompatibility('x', '2.0.0', '1.9.0').status).toBe('outdated');
   });
 
   it('findAffected returns one result per installed entry', () => {

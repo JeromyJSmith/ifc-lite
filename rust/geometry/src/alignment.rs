@@ -5,8 +5,8 @@
 //! `IfcAlignmentCurve` evaluation — horizontal + vertical alignment
 //! curves used as the directrix of `IfcSectionedSolidHorizontal`.
 //!
-//! Scope: IFC4x1 alignment entities. These are not in our IFC4X3 codegen
-//! enum, so dispatch is via `IfcType::from_str` cached behind `OnceLock`.
+//! Scope: IFC4x1 alignment entities. The supported-schema enum retains their
+//! exact names; dispatch uses cached `IfcType::from_str` lookups.
 //!
 //! ## Horizontal segments
 //! - `IfcLineSegment2D`           — straight tangent
@@ -30,15 +30,18 @@ use ifc_lite_core::{AttributeValue, DecodedEntity, EntityDecoder, IfcType};
 use nalgebra::{Point3, Vector3};
 use std::sync::OnceLock;
 
-use crate::{Error, Result};
+use crate::gradient::GradientProfile;
+use crate::profiles::ProfileProcessor;
+use crate::{Error, Result, TessellationQuality};
+use ifc_lite_core::IfcSchema;
 
-// --- IFC type lookup (resolves IFC4x1 names not in our IFC4X3 enum) ---
+// --- Cached IFC type lookup for IFC4x1 alignment names ---
 
 macro_rules! ifc_type_fn {
     ($name:ident, $literal:expr) => {
         fn $name() -> IfcType {
             static T: OnceLock<IfcType> = OnceLock::new();
-            *T.get_or_init(|| IfcType::from_str($literal))
+            T.get_or_init(|| IfcType::from_str($literal)).clone()
         }
     };
 }
@@ -210,6 +213,9 @@ pub struct AlignmentFrame {
 pub struct AlignmentCurve {
     horizontal: Vec<HSeg>,
     vertical: Vec<VSeg>,
+    /// IFC4x3 `IfcGradientCurve` vertical profile; when present it
+    /// replaces `vertical` (see [`Self::from_gradient_curve`]).
+    gradient: Option<GradientProfile>,
 }
 
 impl AlignmentCurve {
@@ -223,13 +229,38 @@ impl AlignmentCurve {
     ///   covers the relatively rare case of a sectioned-solid authored
     ///   with a polyline directrix, which is spec-allowed but uncommon.
     ///
+    /// - `IfcGradientCurve` (IFC4x3) — see [`Self::from_gradient_curve`].
+    ///
     /// Returns `Ok(None)` for any other directrix so the caller can
     /// fall back to a straight-line sweep. Errors only on malformed
     /// recognised input (e.g. an `IfcAlignmentCurve` missing
     /// `Horizontal`).
     pub fn parse(directrix: &DecodedEntity, decoder: &mut EntityDecoder) -> Result<Option<Self>> {
+        Self::parse_with_policy(directrix, decoder, false)
+    }
+
+    pub(crate) fn parse_for_sampling(directrix: &DecodedEntity, decoder: &mut EntityDecoder) -> Result<Option<Self>> {
+        Self::parse_with_policy(directrix, decoder, true)
+    }
+
+    fn parse_with_policy(directrix: &DecodedEntity, decoder: &mut EntityDecoder, strict: bool) -> Result<Option<Self>> {
         if directrix.ifc_type == IfcType::IfcPolyline {
-            return Self::from_polyline(directrix, decoder).map(Some);
+            return Self::from_polyline(directrix, decoder, strict).map(Some);
+        }
+        if directrix.ifc_type == IfcType::IfcGradientCurve {
+            if strict {
+                crate::alignment_sampling_curve::validate_composite(directrix, decoder)?;
+                for attr in directrix.get_list(0).ok_or_else(|| Error::geometry("GradientCurve missing Segments"))? {
+                    let id = attr.as_entity_ref().ok_or_else(|| Error::geometry("Gradient segment must be a reference"))?;
+                    let segment = decoder.decode_by_id(id)?;
+                    crate::alignment_sampling_curve::validate_segment_placement(&segment, decoder)?;
+                }
+            }
+            return Self::from_gradient_curve(directrix, decoder);
+        }
+        if directrix.ifc_type == IfcType::IfcCompositeCurve {
+            if strict { crate::alignment_sampling_curve::validate_composite(directrix, decoder)?; }
+            return Self::from_sampled_curve(directrix, decoder);
         }
         if directrix.ifc_type != t_alignment_curve() {
             return Ok(None);
@@ -248,18 +279,24 @@ impl AlignmentCurve {
         // needed to rebase the vertical segments (whose `StartDistAlong`
         // are authored as absolute chainages in the same domain) onto
         // that same 0-origin axis. See `parse_vertical`.
-        let (horizontal, horizontal_base) = parse_horizontal(h_id, decoder, angle_scale)?;
+        let (horizontal, horizontal_base) = parse_horizontal(h_id, decoder, angle_scale, strict)?;
 
         // attr 1 = Vertical (optional)
         let vertical = match directrix.get(1) {
             Some(v) if !v.is_null() => match v.as_entity_ref() {
-                Some(v_id) => parse_vertical(v_id, decoder, horizontal_base)?,
+                Some(v_id) => parse_vertical(v_id, decoder, horizontal_base, strict)?,
+                None if strict => return Err(Error::geometry("Vertical must be a reference")),
                 None => Vec::new(),
             },
             _ => Vec::new(),
         };
 
-        Ok(Some(Self { horizontal, vertical }))
+        Ok(Some(Self { horizontal, vertical, gradient: None }))
+    }
+
+    pub(crate) fn uses_approximation(&self) -> bool {
+        self.gradient.is_some() || self.horizontal.iter().any(|segment| matches!(segment,
+            HSeg::Transition { kind: TransitionKind::CubicParabola | TransitionKind::BiquadraticParabola, .. }))
     }
 
     /// Total length of the horizontal alignment (sum of segment lengths).
@@ -270,11 +307,32 @@ impl AlignmentCurve {
             .unwrap_or(0.0)
     }
 
+    /// Stations where the elevation derivative may change abruptly. Arc
+    /// length integration must split here, including polyline corners.
+    pub(crate) fn station_breaks(&self) -> Vec<f64> {
+        let mut breaks = vec![0.0, self.horizontal_length()];
+        for seg in &self.horizontal {
+            breaks.push(h_cum_start(seg));
+            breaks.push(h_cum_start(seg) + h_length(seg));
+        }
+        for seg in &self.vertical {
+            breaks.push(v_start(seg));
+            breaks.push(v_start(seg) + v_length(seg));
+        }
+        if let Some(profile) = &self.gradient {
+            breaks.extend(profile.station_breaks().map(|s| s - profile.first_station()));
+        }
+        breaks.retain(|s| s.is_finite() && *s >= 0.0 && *s <= self.horizontal_length());
+        breaks.sort_by(f64::total_cmp);
+        breaks.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+        breaks
+    }
+
     /// Build an alignment from an `IfcPolyline` directrix. Each
     /// polyline edge becomes one horizontal Line segment plus one
     /// vertical Line segment so the unified `evaluate(station)` path
     /// works without special-casing in the processor.
-    fn from_polyline(curve: &DecodedEntity, decoder: &mut EntityDecoder) -> Result<Self> {
+    fn from_polyline(curve: &DecodedEntity, decoder: &mut EntityDecoder, strict: bool) -> Result<Self> {
         let points_attr = curve
             .get(0)
             .ok_or_else(|| Error::geometry("IfcPolyline missing Points".to_string()))?;
@@ -292,15 +350,74 @@ impl AlignmentCurve {
                 .as_entity_ref()
                 .ok_or_else(|| Error::geometry("Polyline point is not an entity ref".to_string()))?;
             let p = decoder.decode_by_id(pid)?;
+            if strict && p.ifc_type != IfcType::IfcCartesianPoint {
+                return Err(Error::geometry(format!("Polyline point #{} is not IfcCartesianPoint", pid)));
+            }
             let coords = p
                 .get_list(0)
                 .ok_or_else(|| Error::geometry("CartesianPoint missing Coordinates".to_string()))?;
+            if strict && (!(2..=3).contains(&coords.len()) || coords.iter().any(|v| v.as_float().is_none_or(|n| !n.is_finite()))) {
+                return Err(Error::geometry(format!("Malformed CartesianPoint #{}", pid)));
+            }
             let x = coords.first().and_then(|v| v.as_float()).unwrap_or(0.0);
             let y = coords.get(1).and_then(|v| v.as_float()).unwrap_or(0.0);
             let z = coords.get(2).and_then(|v| v.as_float()).unwrap_or(0.0);
             pts.push((x, y, z));
         }
+        if strict && pts.windows(2).any(|p| (p[1].0 - p[0].0).hypot(p[1].1 - p[0].1) < 1e-12 && (p[1].2 - p[0].2).abs() > 1e-12) {
+            return Err(Error::geometry("A vertical polyline edge cannot use horizontal-distance stationing"));
+        }
+        Self::from_points(&pts)
+    }
 
+    /// IFC4x3 `IfcGradientCurve` directrix: the horizontal layout is its
+    /// 2D `BaseCurve` (attr 2), sampled densely through the shared curve
+    /// sampler (arcs and clothoids included, `curve_segment.rs`) into
+    /// line segments; the elevation is the curve's own vertical profile
+    /// (`gradient.rs`), both indexed by horizontal station. `Ok(None)`
+    /// when either half is missing, so the caller keeps its fallback.
+    fn from_gradient_curve(curve: &DecodedEntity, decoder: &mut EntityDecoder) -> Result<Option<Self>> {
+        let Some(profile) = GradientProfile::from_curve(curve, decoder) else {
+            return Ok(None);
+        };
+        let Some(base_id) = curve.get_ref(2) else {
+            return Ok(None);
+        };
+        let base = decoder.decode_by_id(base_id)?;
+        let samples = ProfileProcessor::new(IfcSchema::new()).get_curve_points(
+            &base,
+            decoder,
+            TessellationQuality::Medium,
+        )?;
+        if samples.len() < 2 {
+            return Ok(None);
+        }
+        let pts: Vec<(f64, f64, f64)> = samples.iter().map(|p| (p.x, p.y, 0.0)).collect();
+        let mut alignment = Self::from_points(&pts)?;
+        alignment.vertical.clear();
+        alignment.gradient = Some(profile);
+        Ok(Some(alignment))
+    }
+
+    /// Any other curve the shared sampler understands (e.g. an IFC4x3
+    /// `'FootPrint'` `IfcCompositeCurve` of line / arc / clothoid segments):
+    /// densely sampled into a point chain, elevation taken from the points.
+    fn from_sampled_curve(curve: &DecodedEntity, decoder: &mut EntityDecoder) -> Result<Option<Self>> {
+        let samples = ProfileProcessor::new(IfcSchema::new()).get_curve_points(
+            curve,
+            decoder,
+            TessellationQuality::Medium,
+        )?;
+        if samples.len() < 2 {
+            return Ok(None);
+        }
+        let pts: Vec<(f64, f64, f64)> = samples.iter().map(|p| (p.x, p.y, p.z)).collect();
+        Self::from_points(&pts).map(Some)
+    }
+
+    /// One horizontal + one vertical Line segment per edge of a 3D point
+    /// chain.
+    fn from_points(pts: &[(f64, f64, f64)]) -> Result<Self> {
         let mut horizontal: Vec<HSeg> = Vec::with_capacity(pts.len() - 1);
         let mut vertical: Vec<VSeg> = Vec::with_capacity(pts.len() - 1);
         let mut cum_xy = 0.0;
@@ -339,7 +456,7 @@ impl AlignmentCurve {
                 "IfcPolyline directrix degenerated to zero horizontal length".to_string(),
             ));
         }
-        Ok(Self { horizontal, vertical })
+        Ok(Self { horizontal, vertical, gradient: None })
     }
 
     /// Evaluate the placement frame at the given station (cumulative
@@ -347,8 +464,7 @@ impl AlignmentCurve {
     /// Extrapolates linearly past either end.
     pub fn evaluate(&self, station: f64) -> AlignmentFrame {
         let (x, y, heading) = self.evaluate_horizontal(station);
-        let z = self.evaluate_vertical(station);
-        let slope = self.evaluate_vertical_slope(station);
+        let (z, slope) = self.evaluate_vertical_frame(station);
         let cos_h = heading.cos();
         let sin_h = heading.sin();
         // Right of travel: rotate horizontal tangent (cos h, sin h) by
@@ -379,25 +495,64 @@ impl AlignmentCurve {
         0.0
     }
 
-    fn evaluate_vertical_slope(&self, station: f64) -> f64 {
-        if self.vertical.is_empty() {
-            return 0.0;
+    /// `(height, slope)` at `station` on the vertical profile, or
+    /// `(0, 0)` when there is none.
+    ///
+    /// A station inside a segment evaluates that segment. Requiring
+    /// `station >= start` as well as `<= start + length` stops a station
+    /// BEFORE a segment's own start from silently clamping into it. A
+    /// station covered by no segment extrapolates from the NEAREST
+    /// segment end: before the first segment that is the first segment's
+    /// entry (its start height and grade, extended backwards), past the
+    /// last it is the last segment's exit, and in a gap it is whichever
+    /// bracketing end is closer. Previously every uncovered station fell
+    /// through to the last segment's exit, so a profile authored from
+    /// station 100 onward put station 0 at the LAST segment's exit grade
+    /// extrapolated backwards across the whole alignment (z = -15 where
+    /// the first segment's start height 10 was right).
+    fn evaluate_vertical_frame(&self, station: f64) -> (f64, f64) {
+        if let Some(profile) = &self.gradient {
+            return profile.evaluate(station + profile.first_station());
         }
+        let Some(first) = self.vertical.first() else {
+            return (0.0, 0.0);
+        };
+        // The nearest segment END at or before `station`, if any.
+        let mut before: Option<&VSeg> = None;
         for seg in &self.vertical {
             let start = v_start(seg);
             let length = v_length(seg);
-            // Require `station >= start` as well as `<= start + length`:
-            // without the lower bound a station BEFORE a segment's own
-            // start still satisfies the upper test and silently clamps
-            // into it. The first segment covers station 0 via its own
-            // `start` (0 after rebasing in `parse_vertical`).
             if station >= start - 1e-9 && station <= start + length + 1e-9 {
                 let local = (station - start).max(0.0).min(length);
-                return v_eval(seg, local).1;
+                return v_eval(seg, local);
+            }
+            if start + length < station {
+                before = Some(seg);
             }
         }
-        let last = self.vertical.last().unwrap();
-        v_eval(last, v_length(last)).1
+        // Nearest segment START after `station`, if any (segments are in
+        // station order, so the first one whose start is past the station).
+        let after = self.vertical.iter().find(|seg| v_start(seg) > station);
+        let seg = match (before, after) {
+            (Some(b), Some(a)) => {
+                let gap_before = station - (v_start(b) + v_length(b));
+                let gap_after = v_start(a) - station;
+                if gap_after < gap_before { a } else { b }
+            }
+            (Some(b), None) => b,
+            (None, Some(a)) => a,
+            (None, None) => first,
+        };
+        if v_start(seg) > station {
+            // Extrapolate backwards from the segment's entry.
+            let (z0, g0) = v_eval(seg, 0.0);
+            (z0 + g0 * (station - v_start(seg)), g0)
+        } else {
+            // Extrapolate forwards from the segment's exit.
+            let length = v_length(seg);
+            let (z_end, slope) = v_eval(seg, length);
+            (z_end + slope * (station - (v_start(seg) + length)), slope)
+        }
     }
 
     fn evaluate_horizontal(&self, station: f64) -> (f64, f64, f64) {
@@ -409,13 +564,17 @@ impl AlignmentCurve {
         // optional), so we treat each segment's own StartPoint /
         // StartDirection as authoritative and use the cumulative
         // SegmentLength sum as the station axis.
-        for seg in &self.horizontal {
+        // Cumulative ends are monotone because segment lengths are
+        // non-negative. A sampled IFC4x3 base curve may have one segment
+        // per metre, and arc-length inversion evaluates it many times.
+        // Negating the old comparison also preserves its NaN fall-through.
+        let index = self.horizontal.partition_point(|seg| {
+            !(station <= h_cum_start(seg) + h_length(seg) + 1e-9)
+        });
+        if let Some(seg) = self.horizontal.get(index) {
             let len = h_length(seg);
-            let cum = h_cum_start(seg);
-            if station <= cum + len + 1e-9 {
-                let local = (station - cum).max(0.0).min(len);
-                return h_eval(seg, local);
-            }
+            let local = (station - h_cum_start(seg)).max(0.0).min(len);
+            return h_eval(seg, local);
         }
         // Past the end → extrapolate tangentially from the last segment.
         let last = self.horizontal.last().unwrap();
@@ -425,29 +584,6 @@ impl AlignmentCurve {
         (x + extra * h.cos(), y + extra * h.sin(), h)
     }
 
-    fn evaluate_vertical(&self, station: f64) -> f64 {
-        if self.vertical.is_empty() {
-            return 0.0;
-        }
-        for seg in &self.vertical {
-            let start = v_start(seg);
-            let length = v_length(seg);
-            // See `evaluate_vertical_slope`: the `station >= start` lower
-            // bound stops a station before this segment from clamping
-            // into it. Vertical starts are rebased to the horizontal's
-            // 0-origin station axis in `parse_vertical`.
-            if station >= start - 1e-9 && station <= start + length + 1e-9 {
-                let local = (station - start).max(0.0).min(length);
-                return v_eval_height(seg, local);
-            }
-        }
-        // Past the end → extrapolate with the last segment's exit slope.
-        let last = self.vertical.last().unwrap();
-        let length = v_length(last);
-        let (z_end, slope) = v_eval(last, length);
-        let extra = station - (v_start(last) + length);
-        z_end + slope * extra
-    }
 }
 
 /// Returns the parsed horizontal segments plus the alignment's
@@ -459,6 +595,7 @@ fn parse_horizontal(
     h_id: u32,
     decoder: &mut EntityDecoder,
     angle_scale: f64,
+    strict: bool,
 ) -> Result<(Vec<HSeg>, f64)> {
     let h_entity = decoder.decode_by_id(h_id)?;
     if h_entity.ifc_type != t_alignment_2d_horizontal() {
@@ -469,6 +606,9 @@ fn parse_horizontal(
     }
     // attr 0 = StartDistAlong (optional); attr 1 = Segments.
     let start_dist_along = h_entity.get_float(0).unwrap_or(0.0);
+    if strict && h_entity.get(0).is_some_and(|a| !a.is_null() && a.as_float().is_none_or(|v| !v.is_finite())) {
+        return Err(Error::geometry("Invalid horizontal StartDistAlong"));
+    }
     let segs_attr = h_entity
         .get(1)
         .ok_or_else(|| Error::geometry("IfcAlignment2DHorizontal missing Segments".to_string()))?;
@@ -509,6 +649,9 @@ fn parse_horizontal(
         let coords = sp
             .get_list(0)
             .ok_or_else(|| Error::geometry("StartPoint missing Coordinates".to_string()))?;
+        if strict && (sp.ifc_type != IfcType::IfcCartesianPoint || coords.len() != 2 || coords.iter().any(|v| v.as_float().is_none_or(|n| !n.is_finite()))) {
+            return Err(Error::geometry("Horizontal StartPoint must contain two finite CartesianPoint coordinates"));
+        }
         let sx = coords.first().and_then(|v| v.as_float()).unwrap_or(0.0);
         let sy = coords.get(1).and_then(|v| v.as_float()).unwrap_or(0.0);
         let heading_raw = curve.get_float(1).ok_or_else(|| {
@@ -518,6 +661,7 @@ fn parse_horizontal(
             ))
         })?;
         let heading = heading_raw * angle_scale;
+        if strict && !heading.is_finite() { return Err(Error::geometry("Nonfinite horizontal heading")); }
         let length = curve.get_float(2).ok_or_else(|| {
             Error::geometry(format!("CurveSegment #{} missing SegmentLength", curve_id))
         })?;
@@ -567,6 +711,9 @@ fn parse_horizontal(
             //   5: IsStartRadiusCCW
             //   6: IsEndRadiusCCW
             //   7: TransitionCurveType (enum — dispatches κ(s) profile)
+            if strict && !matches!(curve.get(7).and_then(|v| v.as_enum()), Some("CLOTHOIDCURVE" | "BLOSSCURVE" | "COSINECURVE" | "SINECURVE" | "CUBICPARABOLA" | "BIQUADRATICPARABOLA")) {
+                return Err(Error::geometry("Unknown TransitionCurveType"));
+            }
             let start_radius = curve.get_float(3);
             let end_radius = curve.get_float(4);
             let start_ccw = read_bool(curve.get(5));
@@ -617,6 +764,7 @@ fn parse_vertical(
     v_id: u32,
     decoder: &mut EntityDecoder,
     horizontal_base: f64,
+    strict: bool,
 ) -> Result<Vec<VSeg>> {
     let v_entity = decoder.decode_by_id(v_id)?;
     if v_entity.ifc_type != t_alignment_2d_vertical() {
@@ -693,6 +841,11 @@ fn parse_vertical(
                     seg_id,
                 ))
             })?;
+            if strict && (!parabola_constant.is_finite() || parabola_constant <= 0.0) {
+                return Err(Error::geometry(format!(
+                    "ParabolicVerSeg #{} has invalid ParabolaConstant", seg_id
+                )));
+            }
             let is_convex = read_bool(seg.get(8));
             VSeg::Parabolic {
                 start,
@@ -707,6 +860,11 @@ fn parse_vertical(
             let radius = seg.get_float(7).ok_or_else(|| {
                 Error::geometry(format!("CircularVerSeg #{} missing Radius", seg_id))
             })?;
+            if strict && (!radius.is_finite() || radius <= 0.0) {
+                return Err(Error::geometry(format!(
+                    "CircularVerSeg #{} has invalid Radius", seg_id
+                )));
+            }
             let is_convex = read_bool(seg.get(8));
             VSeg::CircularArc {
                 start,
@@ -717,6 +875,9 @@ fn parse_vertical(
                 is_convex,
             }
         } else {
+            if strict {
+                return Err(Error::geometry(format!("Unsupported vertical segment #{}: {}", seg_id, seg.ifc_type)));
+            }
             // Unknown vertical subtype — degrade to a straight gradient
             // segment so the sweep at least continues sensibly through it.
             // (The horizontal sibling hard-errors on an unknown curve
@@ -814,6 +975,14 @@ fn h_eval(seg: &HSeg, s: f64) -> (f64, f64, f64) {
             kind,
             ..
         } => {
+            // The parser allows a zero-length stub (a stationing no-op).
+            // Line and Arc evaluate it to their start point for free, but
+            // the blend below divides by `length` (`u / length`, `s / L`),
+            // which at 0/0 is NaN in the heading and then in x and y. A
+            // zero-length segment has no extent: it IS its start.
+            if *length <= 0.0 {
+                return (*sx, *sy, *heading);
+            }
             // heading(s) = h₀ + κ₀·s + (κ₁-κ₀)·L · g(s/L)
             //   where g(u) is the integral of the curvature-blend
             //   profile chosen by the `TransitionKind` (see
@@ -906,265 +1075,6 @@ fn v_eval(seg: &VSeg, s: f64) -> (f64, f64) {
     }
 }
 
-fn v_eval_height(seg: &VSeg, s: f64) -> f64 {
-    v_eval(seg, s).0
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Sanity-check straight-line evaluation: a line segment heading
-    /// along +X must reach `(length, 0)` with unchanged heading.
-    #[test]
-    fn line_segment_evaluation() {
-        let seg = HSeg::Line {
-            sx: 0.0,
-            sy: 0.0,
-            heading: 0.0,
-            length: 10.0,
-            cum_start: 0.0,
-        };
-        let (x, y, h) = h_eval(&seg, 10.0);
-        assert!((x - 10.0).abs() < 1e-9);
-        assert!(y.abs() < 1e-9);
-        assert!(h.abs() < 1e-9);
-    }
-
-    /// Reproduce the issue #828 bridge fixture's first arc: start at
-    /// origin, heading 13.36° (= 0.2332 rad), radius 9279, length 2965.68,
-    /// CW. Per the file, the next segment starts at #103=(2945.13,216.39),
-    /// so the arc end must land there within rounding error.
-    #[test]
-    fn fixture_828_arc_endpoint() {
-        let seg = HSeg::Arc {
-            sx: 0.0,
-            sy: 0.0,
-            heading: 13.35833333_f64.to_radians(),
-            radius: 9279.0,
-            length: 2965.68,
-            ccw: false,
-            cum_start: 0.0,
-        };
-        let (x, y, _) = h_eval(&seg, 2965.68);
-        // ~5-inch tolerance accounts for the truncated 13.358333° heading
-        // in the source file.
-        assert!((x - 2945.13).abs() < 5.0, "x = {} expected ~2945.13", x);
-        assert!((y - 216.39).abs() < 5.0, "y = {} expected ~216.39", y);
-    }
-
-    /// Base placement frame on a straight directrix: right = (0, -1, 0),
-    /// up = (0, 0, 1). `cant_angle` is a stable 0 stub (cant is not
-    /// wired through the parser), so the processor's roll step is a
-    /// no-op at every station.
-    #[test]
-    fn base_frame_axes_and_cant_stub() {
-        // Straight directrix along +X, no slope.
-        let curve = AlignmentCurve {
-            horizontal: vec![HSeg::Line {
-                sx: 0.0,
-                sy: 0.0,
-                heading: 0.0,
-                length: 100.0,
-                cum_start: 0.0,
-            }],
-            vertical: vec![],
-        };
-        let frame = curve.evaluate(50.0);
-        assert!((frame.right.x).abs() < 1e-9);
-        assert!((frame.right.y + 1.0).abs() < 1e-9);
-        assert!((frame.up.z - 1.0).abs() < 1e-9);
-        // Cant is a fixed-0 stub regardless of station.
-        assert!(curve.cant_angle(50.0).abs() < 1e-9);
-        assert!(curve.cant_angle(150.0).abs() < 1e-9);
-    }
-
-    /// `from_polyline` builds a piecewise-linear directrix. Each edge
-    /// becomes one horizontal Line segment + one vertical Line segment;
-    /// `evaluate(station)` walks them in order.
-    #[test]
-    fn polyline_directrix_evaluates_piecewise() {
-        // Build a 3-point polyline directly (we test the construction
-        // logic, not the parsing — that's covered by integration tests).
-        // Path: (0,0,0) → (10, 0, 1) → (10, 10, 2)
-        // Edge 1: heading 0, length 10, gradient 0.1
-        // Edge 2: heading π/2, length 10, gradient 0.1
-        let curve = AlignmentCurve {
-            horizontal: vec![
-                HSeg::Line {
-                    sx: 0.0,
-                    sy: 0.0,
-                    heading: 0.0,
-                    length: 10.0,
-                    cum_start: 0.0,
-                },
-                HSeg::Line {
-                    sx: 10.0,
-                    sy: 0.0,
-                    heading: std::f64::consts::FRAC_PI_2,
-                    length: 10.0,
-                    cum_start: 10.0,
-                },
-            ],
-            vertical: vec![
-                VSeg::Line {
-                    start: 0.0,
-                    length: 10.0,
-                    h0: 0.0,
-                    g0: 0.1,
-                },
-                VSeg::Line {
-                    start: 10.0,
-                    length: 10.0,
-                    h0: 1.0,
-                    g0: 0.1,
-                },
-            ],
-        };
-        // Mid-point of edge 1: station 5.
-        let f1 = curve.evaluate(5.0);
-        assert!((f1.origin.x - 5.0).abs() < 1e-9);
-        assert!((f1.origin.y).abs() < 1e-9);
-        assert!((f1.origin.z - 0.5).abs() < 1e-9);
-        // Mid-point of edge 2: station 15.
-        let f2 = curve.evaluate(15.0);
-        assert!((f2.origin.x - 10.0).abs() < 1e-9);
-        assert!((f2.origin.y - 5.0).abs() < 1e-9);
-        assert!((f2.origin.z - 1.5).abs() < 1e-9);
-    }
-
-    #[test]
-    fn transition_kind_heading_integral_normalised() {
-        // g(0) = 0, g(1) ∈ [0.4, 0.6] (depends on profile — all the
-        // smoothstep-like profiles have ½ for the integral at the
-        // midpoint, and the clothoid has ½ exactly).
-        for kind in [
-            TransitionKind::Clothoid,
-            TransitionKind::Bloss,
-            TransitionKind::Cosine,
-            TransitionKind::Sine,
-            TransitionKind::CubicParabola,
-            TransitionKind::BiquadraticParabola,
-        ] {
-            assert!(kind.heading_integral(0.0).abs() < 1e-12, "{:?}", kind);
-            let mid = kind.heading_integral(0.5);
-            assert!(mid > 0.0 && mid < 0.5, "{:?} mid={}", kind, mid);
-            // Clothoid: ½ · u² → ½ · 1 = ½ at u=1.
-            // Bloss / others: each peaks below ½ as a smooth blend.
-            let end = kind.heading_integral(1.0);
-            assert!(end > 0.0 && end < 1.0, "{:?} end={}", kind, end);
-        }
-    }
-
-    #[test]
-    fn parabolic_vertical_segment() {
-        // From fixture #95: K=36000, sag (IsConvex=false), start gradient
-        // 0.0579, start height 399. At local distance 1680:
-        //   z = 399 + 0.0579·1680 + 1680²/(2·36000)
-        //     = 399 + 97.272 + 39.20  = 535.47
-        let seg = VSeg::Parabolic {
-            start: 3600.0,
-            length: 3685.68,
-            h0: 399.0,
-            g0: 0.0579,
-            parabola_constant: 36000.0,
-            is_convex: false,
-        };
-        let (z, slope) = v_eval(&seg, 1680.0);
-        assert!((z - 535.472).abs() < 0.01, "z = {}", z);
-        assert!((slope - 0.1046).abs() < 1e-3, "slope = {}", slope);
-    }
-
-    /// Regression: an alignment whose `IfcAlignment2DHorizontal.StartDistAlong`
-    /// is a nonzero chainage (1000) must keep its horizontal and vertical
-    /// evaluation in the same station domain. The horizontal geometry is
-    /// indexed from station 0, but the vertical segment's `StartDistAlong`
-    /// is authored as the absolute chainage 1000; without rebasing the two
-    /// axes desync and the vertical lookup clamps to the segment's start
-    /// height everywhere.
-    ///
-    /// Physical setup: a 100 m straight along +X, rising at grade 0.1 from
-    /// height 50. At the halfway station the horizontal position is x = 50,
-    /// so the elevation must be the halfway grade value 50 + 0.1·50 = 55.
-    ///
-    /// Pre-fix (no rebasing) the vertical segment sits at station 1000 while
-    /// the input station is 50, so `evaluate_vertical(50)` clamped into it
-    /// and returned the start height 50 — disagreeing with the horizontal
-    /// axis about where "halfway" is. This assertion fails on main.
-    #[test]
-    fn nonzero_start_dist_along_rebases_vertical_to_horizontal() {
-        let content = "\
-ISO-10303-21;
-HEADER;
-FILE_DESCRIPTION((''),'2;1');
-FILE_NAME('','',(''),(''),'','','');
-FILE_SCHEMA(('IFC4X1'));
-ENDSEC;
-DATA;
-#10=IFCCARTESIANPOINT((0.,0.));
-#11=IFCLINESEGMENT2D(#10,0.,100.);
-#12=IFCALIGNMENT2DHORIZONTALSEGMENT($,$,$,#11);
-#13=IFCALIGNMENT2DHORIZONTAL(1000.,(#12));
-#14=IFCALIGNMENT2DVERSEGLINE($,$,$,1000.,100.,50.,0.1);
-#15=IFCALIGNMENT2DVERTICAL((#14));
-#16=IFCALIGNMENTCURVE(#13,#15,$);
-ENDSEC;
-END-ISO-10303-21;
-";
-        let entity_index = ifc_lite_core::build_entity_index(&content);
-        let mut decoder = EntityDecoder::with_index(&content, entity_index);
-        let directrix = decoder.decode_by_id(16).expect("decode IfcAlignmentCurve");
-        let curve = AlignmentCurve::parse(&directrix, &mut decoder)
-            .expect("parse alignment")
-            .expect("directrix recognised as alignment");
-
-        // Station 0 (physical start): x = 0, z = start height 50.
-        let f0 = curve.evaluate(0.0);
-        assert!((f0.origin.x - 0.0).abs() < 1e-6, "start x = {}", f0.origin.x);
-        assert!((f0.origin.z - 50.0).abs() < 1e-6, "start z = {}", f0.origin.z);
-
-        // Station 50 (halfway): horizontal x = 50, so elevation must be
-        // 50 + 0.1·50 = 55. On main this returns 50 (clamped) and fails.
-        let f_mid = curve.evaluate(50.0);
-        assert!((f_mid.origin.x - 50.0).abs() < 1e-6, "mid x = {}", f_mid.origin.x);
-        assert!(
-            (f_mid.origin.z - 55.0).abs() < 1e-6,
-            "mid z = {} (expected 55; main desyncs vertical and returns ~50)",
-            f_mid.origin.z,
-        );
-
-        // Station 100 (physical end): x = 100, z = 60.
-        let f_end = curve.evaluate(100.0);
-        assert!((f_end.origin.x - 100.0).abs() < 1e-6, "end x = {}", f_end.origin.x);
-        assert!((f_end.origin.z - 60.0).abs() < 1e-6, "end z = {}", f_end.origin.z);
-    }
-
-    /// A negative SegmentLength drives (station - cum).min(length) negative and
-    /// emits NaN world coordinates. It must be rejected as an Err at parse time.
-    /// (Zero-length stubs stay legal; only negative/non-finite is rejected.)
-    #[test]
-    fn negative_segment_length_errors_not_nan() {
-        let content = "\
-ISO-10303-21;
-HEADER;
-FILE_DESCRIPTION((''),'2;1');
-FILE_NAME('','',(''),(''),'','','');
-FILE_SCHEMA(('IFC4X1'));
-ENDSEC;
-DATA;
-#10=IFCCARTESIANPOINT((0.,0.));
-#11=IFCLINESEGMENT2D(#10,0.,-100.);
-#12=IFCALIGNMENT2DHORIZONTALSEGMENT($,$,$,#11);
-#13=IFCALIGNMENT2DHORIZONTAL(0.,(#12));
-#14=IFCALIGNMENT2DVERSEGLINE($,$,$,0.,100.,50.,0.1);
-#15=IFCALIGNMENT2DVERTICAL((#14));
-#16=IFCALIGNMENTCURVE(#13,#15,$);
-ENDSEC;
-END-ISO-10303-21;
-";
-        let entity_index = ifc_lite_core::build_entity_index(&content);
-        let mut decoder = EntityDecoder::with_index(&content, entity_index);
-        let directrix = decoder.decode_by_id(16).expect("decode IfcAlignmentCurve");
-        assert!(AlignmentCurve::parse(&directrix, &mut decoder).is_err());
-    }
-}
+#[path = "alignment_tests.rs"]
+mod tests;

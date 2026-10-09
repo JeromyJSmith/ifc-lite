@@ -27,6 +27,7 @@
 import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import type {
+  DownloadOptions,
   FileSourceProvider,
   ListOptions,
   Page,
@@ -54,7 +55,9 @@ Object.defineProperty(globalThis, 'localStorage', {
 
 const { useViewerStore } = await import('@/store/index.js');
 const { syncSourceModel, isSourceModelSyncing } = await import('./syncSourceModel.js');
+const { getSourceSyncProgress } = await import('./downloadProgress.js');
 type FederatedModel = import('@/store/types.js').FederatedModel;
+type SourceDownloadState = import('./downloadProgress.js').SourceDownloadState;
 type SourceHost = import('@/services/sources/source-host.js').SourceHost;
 
 // ---------------------------------------------------------------------------
@@ -125,7 +128,7 @@ const manifest = {
 
 interface ProviderStub {
   readonly pages?: ReadonlyArray<Page<SourceFile>>;
-  readonly download?: () => Promise<ArrayBuffer>;
+  readonly download?: (ctx: PluginContext, ref: unknown, options?: DownloadOptions) => Promise<ArrayBuffer>;
 }
 
 interface Harness {
@@ -221,8 +224,6 @@ function seedStore(model = makeModel()): void {
     selectedEntityId: null,
     activeStorey: null,
     selectedModelId: null,
-    hiddenEntitiesByModel: new Map(),
-    isolatedEntitiesByModel: new Map(),
   });
 }
 
@@ -478,9 +479,9 @@ describe('syncSourceModel — the revision id lands on the replacement model', (
 
 describe("syncSourceModel — a resync keeps the surviving half of the user's X-ray", () => {
   // Drives the REAL `removeModel`, not the harness stub. `removeModel` runs one
-  // line before `purgeStaleEntityState`, and the stub hid that: #2654 added an
+  // line before the second model-removed purge, and the stub hid that: #2654 added an
   // unconditional `clearGhost()` to `removeModel`, which made the purge's ghost
-  // and isolation filters (syncSourceModel.ts:262-271) dead code on their only
+  // and isolation filters (now visibilitySlice.teardown.ts) dead code on their only
   // production path — every sync silently wiped the user's X-ray — and every
   // test here stayed green because the stub only deletes a map entry.
   const realRemoveModel = (id: string): void => { useViewerStore.getState().removeModel(id); };
@@ -535,5 +536,151 @@ describe("syncSourceModel — a resync keeps the surviving half of the user's X-
       [1005],
       'a resync must not hide the sibling by dropping the isolation wholesale',
     );
+  });
+
+  it("drops a burned id even when the REPLACEMENT's fresh range covers it", async () => {
+    // The one thing that distinguishes this purge from the teardown
+    // `removeModel` ran a line earlier: the replacement is ALREADY LOADED when
+    // `removeModel` runs, so its own survivor set contains the replacement and
+    // it keeps every id the replacement's range happens to cover. Nothing can
+    // legitimately reference the replacement yet, so an id that survived only
+    // by landing inside that fresh range is still stale, and this second pass
+    // — the one that excludes the replacement — is what drops it.
+    //
+    // The two tests above cannot see that: the default harness registers the
+    // replacement with `maxExpressId: 0`, so its range owns nothing but global
+    // id 0 and both pass whether or not the replacement is excluded. Here the
+    // replacement is given a range that COVERS the burned id, which is what
+    // makes the exclusion observable — drop it and 5 survives.
+    seedStore(makeModel({ idOffset: 0, maxExpressId: 100 }));
+    useViewerStore.setState({ ghostExceptEntities: new Set([5]) });
+    const h = makeHarness({}, async (_file, options) => {
+      const id = options?.modelId ?? 'replacement';
+      useViewerStore.setState((state) => {
+        const models = new Map(state.models);
+        models.set(id, makeModel({ id, name: 'replacement', idOffset: 0, maxExpressId: 100 }));
+        return { models };
+      });
+      return id;
+    });
+
+    await syncSourceModel({
+      modelId: MODEL_ID,
+      tag: makeTag(),
+      sourceHost: h.sourceHost,
+      addModel: h.addModel,
+      removeModel: realRemoveModel,
+    });
+
+    // `null`, not an empty Set: a non-null empty ghost set still reads as
+    // "X-ray active, nothing matches" and hides the whole scene.
+    assert.equal(
+      useViewerStore.getState().ghostExceptEntities,
+      null,
+      'an id burned with the replaced model must not be rescued by the replacement occupying its range',
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #4159 bug 5's compounded form: syncing the ACTIVE model reuses `removeModel`
+// ---------------------------------------------------------------------------
+
+describe('syncSourceModel — 2D drawing markup on the synced (active) model, #4159 bug 5', () => {
+  // `doSyncSourceModel` calls `removeModel(modelId)` (the SAME action
+  // `HierarchyPanel.tsx`'s "X" button calls) on the OLD model while the
+  // replacement is already loaded, then — only `if (wasActive)` — calls
+  // `setActiveModel(replacementId)` itself. Before this fix, when the
+  // replacement ended up first among the survivors (the common case: syncing
+  // the only other loaded model, or the first one in `models`' insertion
+  // order), `removeModel`'s teardown silently moved `activeModelId` straight
+  // to `replacementId` with no markup transition at all (bug 5) — which then
+  // made `doSyncSourceModel`'s own `setActiveModel(replacementId)` call a
+  // NO-OP (the id was "already" replacementId), so its call never restored
+  // the atomic clear either. Net effect: the OLD model's markup stayed
+  // attached to the NEW model's id. Drives the REAL `removeModel` for the
+  // same reason the X-ray describe block above does — the harness stub only
+  // deletes a map entry and cannot see this at all.
+  const realRemoveModel = (id: string): void => { useViewerStore.getState().removeModel(id); };
+
+  it('does not leak the synced model\'s old markup onto the replacement\'s id — MUTATION TARGET', async () => {
+    // Exactly one model loaded (the one being synced) — the reproduction
+    // case: after `addModel` registers the replacement, `removeModel(MODEL_ID)`
+    // leaves the replacement as the ONLY survivor, so `remaining[0]` IS the
+    // replacement id, and the post-sync `setActiveModel` call becomes a no-op
+    // unless `removeModel` itself already did the right thing.
+    seedStore();
+    useViewerStore.setState({
+      measure2DResults: [{ id: 'old-measurement', start: { x: 0, y: 0 }, end: { x: 3, y: 4 }, distance: 5 }],
+    });
+    const h = makeHarness();
+
+    await syncSourceModel({
+      modelId: MODEL_ID,
+      tag: makeTag(),
+      sourceHost: h.sourceHost,
+      addModel: h.addModel,
+      removeModel: realRemoveModel,
+    });
+
+    const after = useViewerStore.getState();
+    assert.notEqual(after.activeModelId, MODEL_ID, 'setup sanity: the id must have actually changed');
+    assert.deepEqual(
+      after.measure2DResults,
+      [],
+      'the old model\'s measurement must not still be attached once the replacement is active',
+    );
+  });
+});
+
+// #6375: both Sync buttons (hierarchy model row, source browser file row)
+// draw their ring from this per-model progress, whichever one was clicked.
+describe('syncSourceModel — download progress for the Sync ring', () => {
+  it('publishes the download progress under the model id and clears it once the bytes are in', async () => {
+    const seen: Array<SourceDownloadState | undefined> = [];
+    const h = makeHarness({
+      download: async (_ctx, _ref, options) => {
+        options?.onProgress?.(0, 4);
+        seen.push(getSourceSyncProgress().get(MODEL_ID));
+        options?.onProgress?.(3, 4);
+        seen.push(getSourceSyncProgress().get(MODEL_ID));
+        return new Uint8Array([1, 2, 3, 4]).buffer;
+      },
+    });
+
+    await syncSourceModel({
+      modelId: MODEL_ID,
+      tag: makeTag(),
+      sourceHost: h.sourceHost,
+      addModel: h.addModel,
+      removeModel: h.removeModel,
+    });
+
+    assert.deepEqual(seen, [
+      { phase: 'downloading', received: 0, total: 4 },
+      { phase: 'downloading', received: 3, total: 4 },
+    ]);
+    assert.equal(getSourceSyncProgress().has(MODEL_ID), false, 'no ring once the download is done');
+  });
+
+  it('clears the progress when the download fails', async () => {
+    const h = makeHarness({
+      download: async (_ctx, _ref, options) => {
+        options?.onProgress?.(1, 4);
+        throw new Error('network is down');
+      },
+    });
+
+    await assert.rejects(
+      syncSourceModel({
+        modelId: MODEL_ID,
+        tag: makeTag(),
+        sourceHost: h.sourceHost,
+        addModel: h.addModel,
+        removeModel: h.removeModel,
+      }),
+      /network is down/,
+    );
+    assert.equal(getSourceSyncProgress().has(MODEL_ID), false, 'a failed sync leaves no ring behind');
   });
 });

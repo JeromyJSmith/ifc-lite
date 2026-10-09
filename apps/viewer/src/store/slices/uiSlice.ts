@@ -8,13 +8,10 @@
 
 import type { StateCreator } from 'zustand';
 import {
-  HIERARCHY_MODE_STORAGE_KEY,
-  TOOLBAR_STYLE_STORAGE_KEY,
   RIBBON_COLLAPSED_STORAGE_KEY,
   RIBBON_CONTEXTUAL_TABS_STORAGE_KEY,
   UI_DEFAULTS,
   type RibbonTabId,
-  type ToolbarStyle,
 } from '../constants.js';
 import {
   createGeometryLoadSettings,
@@ -26,24 +23,15 @@ import type { ContactShadingQuality, SeparationLinesQuality } from '@ifc-lite/re
 import type { FederatedModel } from '../types.js';
 import type { GeometryResult } from '@ifc-lite/geometry';
 import type { CesiumPlacementDraft } from './cesiumSlice.js';
+import { applyThemeClasses, hasLoadedModel, initialShowPerformanceStats, persistShowPerformanceStats } from './uiSlice.helpers.js';
+import type { NavigationPreset } from '@/lib/navigation/presets.js';
+import type { SelectedDirectrixSegment } from '@/lib/analytic/segment-selection.js';
+import { getInitialHierarchyMode, getInitialNavigationPreset, persistHierarchyMode, persistNavigationPreset } from './uiPreferences.js';
 
 export type ThemeMode = 'light' | 'dark' | 'colorful';
 export type { GeometryReloadReason } from './geometryLoadSettings.js';
 
 export type HierarchyMode = 'spatial' | 'type' | 'ifc-type' | 'material' | 'groups';
-
-function getInitialHierarchyMode(): HierarchyMode {
-  if (typeof window === 'undefined') return 'spatial';
-  try {
-    const stored = localStorage.getItem(HIERARCHY_MODE_STORAGE_KEY);
-    if (stored === 'spatial' || stored === 'type' || stored === 'ifc-type' || stored === 'material' || stored === 'groups') {
-      return stored;
-    }
-  } catch (err) {
-    console.warn('[hierarchy-mode] storage unavailable; using spatial', err);
-  }
-  return 'spatial';
-}
 
 /**
  * One-shot target for "jump to a property and edit it" flows (issue #1107).
@@ -61,19 +49,23 @@ export interface PropertyFocusTarget {
 }
 
 /**
- * Tools that require edit mode to function. Entering one of them
- * flips `editEnabled` on; leaving edit mode forces these tools
- * back to `'select'`. Keep the list in sync — duplicating the
- * authoring-tool check between `setActiveTool` and
- * `setEditEnabled` is how the two states drift apart in the
- * "enter edit, switch tool, exit edit" flow.
+ * Tools that require edit mode to function. Entering one flips
+ * `editEnabled` on; leaving edit mode forces these back to `'select'`.
+ * Keep in sync between `setActiveTool` and `setEditEnabled` — duplicating
+ * the check is how the two states drift in "enter edit, switch tool, exit".
  */
 const AUTHORING_TOOLS: ReadonlySet<string> = new Set([
-  'addElement',
   'cesium-placement',
-  'split',
-  'spaceSketch',
+  'command',
 ]);
+
+/** The authoring session and collab gate, reached through the combined `get()`. */
+interface WorkspaceCrossSlice {
+  canCollabEdit?: () => boolean;
+  workspaceMode?: 'view' | 'model';
+  enterModelWorkspace?: () => boolean;
+  exitModelWorkspace?: () => void;
+}
 
 /**
  * Cross-slice surface UISlice reaches into via the combined Zustand
@@ -100,23 +92,12 @@ export interface UISlice extends GeometryLoadSettingsState, GeometryLoadSettings
   rightPanelCollapsed: boolean;
   activeTool: string;
   /**
-   * Global edit mode. When `true`, all in-place editing affordances
-   * (inline property/attribute editors, future geometry manipulators,
-   * georeference placement, the add-element draw tools) are unlocked.
-   * When `false` the viewer is strictly read-only — this is the
-   * default. The toggle is surfaced as a single pill in the main
-   * toolbar so the user has one switch for "am I editing anything?"
-   * rather than per-panel toggles.
+   * Global edit mode. When `true`, all in-place editing affordances (inline
+   * property/attribute editors, future geometry manipulators, georeference
+   * placement, the Model workspace's draw tools) are unlocked; `false` (default) is
+   * strictly read-only. One pill in the main toolbar, not per-panel toggles.
    */
   editEnabled: boolean;
-  /**
-   * Space Sketch tool minimized to a small reopen pill. Set when the user
-   * clicks into the 3D scene while the tool is open, so the panel gets out of
-   * the way for inspection without discarding the draft (the overlay stays
-   * mounted — only its panel is visually collapsed). Reset to false on any
-   * tool change so reopening the tool always starts expanded.
-   */
-  spaceSketchMinimized: boolean;
   /** Active tab in the Properties panel. Controlled so in-app flows (e.g.
    *  adding a bSDD property) can jump back to "properties" — issue #1107. */
   propertiesActiveTab: 'properties' | 'quantities' | 'bsdd' | 'raw-step';
@@ -128,9 +109,12 @@ export interface UISlice extends GeometryLoadSettingsState, GeometryLoadSettings
   theme: ThemeMode;
   isMobile: boolean;
   hoverTooltipsEnabled: boolean;
+  showPerformanceStats: boolean;
+  navigationPreset: NavigationPreset;
   visualEnhancementsEnabled: boolean;
-  edgeContrastEnabled: boolean;
-  edgeContrastIntensity: number;
+  /** Show exact authored swept-disk directrices for selected IFC products. */
+  centrelineOverlayEnabled: boolean;
+  selectedDirectrixSegment: SelectedDirectrixSegment | null;
   contactShadingQuality: ContactShadingQuality;
   contactShadingIntensity: number;
   contactShadingRadius: number;
@@ -138,20 +122,12 @@ export interface UISlice extends GeometryLoadSettingsState, GeometryLoadSettings
   separationLinesQuality: SeparationLinesQuality;
   separationLinesIntensity: number;
   separationLinesRadius: number;
-  /**
-   * Desktop toolbar style (issue #1686): the tabbed, IFCFlux-style
-   * `ribbon` (the default) or the original `classic` strip. Persisted
-   * preference — the mobile toolbar is orthogonal (`isMobile` wins on
-   * small screens).
-   */
-  toolbarStyle: ToolbarStyle;
   /** Ribbon collapsed to its tab strip (Office-style double-click). */
   ribbonCollapsed: boolean;
   /**
-   * Ribbon tab showing in the band. Lives in the store rather than the
-   * component so non-React drivers (the ribbon walkthrough, the command
-   * palette) can open a tab; deliberately NOT persisted, so every session
-   * still starts on Home.
+   * Ribbon tab showing in the band. Lives in the store, not the component,
+   * so non-React drivers (walkthrough, command palette) can open a tab;
+   * deliberately NOT persisted, so every session still starts on Home.
    */
   ribbonTab: RibbonTabId;
   /**
@@ -164,9 +140,7 @@ export interface UISlice extends GeometryLoadSettingsState, GeometryLoadSettings
   // Actions
   setLeftPanelCollapsed: (collapsed: boolean) => void;
   setRightPanelCollapsed: (collapsed: boolean) => void;
-  setActiveTool: (tool: string) => void;
-  /** Collapse the Space Sketch panel to a reopen pill (or restore it). */
-  setSpaceSketchMinimized: (minimized: boolean) => void;
+  setActiveTool: (tool: string, via?: import('@/lib/analytics-ui-events').ToolChangeVia) => void; // via: see withToolTelemetry (#5618)
   setEditEnabled: (enabled: boolean) => void;
   toggleEditEnabled: () => void;
   setPropertiesActiveTab: (tab: 'properties' | 'quantities' | 'bsdd' | 'raw-step') => void;
@@ -179,9 +153,11 @@ export interface UISlice extends GeometryLoadSettingsState, GeometryLoadSettings
   toggleColorful: () => void;
   setIsMobile: (isMobile: boolean) => void;
   toggleHoverTooltips: () => void;
+  setShowPerformanceStats: (enabled: boolean) => void;
+  setNavigationPreset: (preset: NavigationPreset) => void;
   setVisualEnhancementsEnabled: (enabled: boolean) => void;
-  setEdgeContrastEnabled: (enabled: boolean) => void;
-  setEdgeContrastIntensity: (intensity: number) => void;
+  setCentrelineOverlayEnabled: (enabled: boolean) => void;
+  setSelectedDirectrixSegment: (segment: SelectedDirectrixSegment | null) => void;
   setContactShadingQuality: (quality: ContactShadingQuality) => void;
   setContactShadingIntensity: (intensity: number) => void;
   setContactShadingRadius: (radius: number) => void;
@@ -189,32 +165,22 @@ export interface UISlice extends GeometryLoadSettingsState, GeometryLoadSettings
   setSeparationLinesQuality: (quality: SeparationLinesQuality) => void;
   setSeparationLinesIntensity: (intensity: number) => void;
   setSeparationLinesRadius: (radius: number) => void;
-  /** Switch the desktop toolbar style and persist the choice. */
-  setToolbarStyle: (style: ToolbarStyle) => void;
   /** Collapse/expand the ribbon band and persist the choice. */
   setRibbonCollapsed: (collapsed: boolean) => void;
   /** Open a ribbon tab (session-local). */
   setRibbonTab: (tab: RibbonTabId) => void;
   /** Turn contextual tab following on/off and persist the choice. */
   setRibbonContextualTabs: (enabled: boolean) => void;
-}
 
-/** Apply the correct CSS classes on <html> for the given theme */
-function applyThemeClasses(theme: ThemeMode) {
-  const el = document.documentElement;
-  el.classList.toggle('dark', theme === 'dark');
-  el.classList.toggle('colorful', theme === 'colorful');
-}
-
-/**
- * Returns true when any geometry is loaded — federated model map has
- * entries OR the legacy single-model `geometryResult` is non-null with
- * at least one mesh. Centralised here so the merge-layers toggle has
- * a single source of truth for "is a model loaded?".
- */
-function hasLoadedModel(state: UICrossSliceState): boolean {
-  if (state.models.size > 0) return true;
-  return (state.geometryResult?.meshes.length ?? 0) > 0;
+  /**
+   * When true, `AnonymizedExportDialog` should auto-open. Set by the entity
+   * context menu ("Export anonymized…") and the Command Palette
+   * (`export:anonymized`) — the two entry points that are not the export
+   * toolbar dropdown itself. Consumed once then cleared by the dialog
+   * (mirrors `flavorDialogRequested`, `extensionsSlice.ts`).
+   */
+  anonymizedExportRequested: boolean;
+  setAnonymizedExportRequested: (requested: boolean) => void;
 }
 
 export const createUISlice: StateCreator<UISlice & UICrossSliceState, [], [], UISlice> = (set, get) => ({
@@ -225,16 +191,17 @@ export const createUISlice: StateCreator<UISlice & UICrossSliceState, [], [], UI
   rightPanelCollapsed: false,
   activeTool: UI_DEFAULTS.ACTIVE_TOOL,
   editEnabled: false,
-  spaceSketchMinimized: false,
   propertiesActiveTab: 'properties',
   hierarchyMode: getInitialHierarchyMode(),
   pendingPropertyFocus: null,
   theme: UI_DEFAULTS.THEME,
   isMobile: false,
   hoverTooltipsEnabled: UI_DEFAULTS.HOVER_TOOLTIPS_ENABLED,
+  showPerformanceStats: initialShowPerformanceStats(),
+  navigationPreset: getInitialNavigationPreset(),
   visualEnhancementsEnabled: UI_DEFAULTS.VISUAL_ENHANCEMENTS_ENABLED,
-  edgeContrastEnabled: UI_DEFAULTS.EDGE_CONTRAST_ENABLED,
-  edgeContrastIntensity: UI_DEFAULTS.EDGE_CONTRAST_INTENSITY,
+  centrelineOverlayEnabled: false,
+  selectedDirectrixSegment: null,
   contactShadingQuality: UI_DEFAULTS.CONTACT_SHADING_QUALITY,
   contactShadingIntensity: UI_DEFAULTS.CONTACT_SHADING_INTENSITY,
   contactShadingRadius: UI_DEFAULTS.CONTACT_SHADING_RADIUS,
@@ -242,87 +209,69 @@ export const createUISlice: StateCreator<UISlice & UICrossSliceState, [], [], UI
   separationLinesQuality: UI_DEFAULTS.SEPARATION_LINES_QUALITY,
   separationLinesIntensity: UI_DEFAULTS.SEPARATION_LINES_INTENSITY,
   separationLinesRadius: UI_DEFAULTS.SEPARATION_LINES_RADIUS,
-  toolbarStyle: UI_DEFAULTS.TOOLBAR_STYLE,
   ribbonCollapsed: UI_DEFAULTS.RIBBON_COLLAPSED,
   ribbonTab: UI_DEFAULTS.RIBBON_TAB,
   ribbonContextualTabs: UI_DEFAULTS.RIBBON_CONTEXTUAL_TABS,
+  anonymizedExportRequested: false,
 
   // Actions
   setLeftPanelCollapsed: (leftPanelCollapsed) => set({ leftPanelCollapsed }),
   setRightPanelCollapsed: (rightPanelCollapsed) => set({ rightPanelCollapsed }),
   setActiveTool: (activeTool) => {
-    // Authoring tools require edit mode. Entering one of them flips
-    // the global toggle on so the rest of the UI (Properties panel,
-    // future manipulators) stays in sync. Read-only tools leave the
-    // flag alone.
-    // Any tool change that actually lands also resets the Space Sketch minimize
-    // state, so the panel is never stranded collapsed after switching tools and
-    // a fresh open of the tool always starts expanded. A tool change the collab
-    // gate below rejects is not a tool change, so it leaves the flag alone.
+    // Authoring tools require edit mode; entering one flips the global
+    // toggle on so the rest of the UI (Properties panel, future
+    // manipulators) stays in sync — read-only tools leave it alone.
     //
-    // Leaving the Measure tool (activeTool currently 'measure', landing on
-    // something else) must discard any in-progress measurement gesture —
-    // MeasureOverlay only mounts while activeTool === 'measure' (see
-    // ToolOverlays.tsx), so this is the ONE place a stray drag or polyline
-    // click-sequence can be left stranded. Routed through
-    // measurementSlice's resetMeasureGesture rather than duplicating the
-    // clear here, so there's exactly one place that has to know what
-    // "in-progress gesture" means (see measurementSlice.ts's measureMode
-    // doc comment).
+    // Leaving 'measure' must discard any in-progress gesture — MeasureOverlay
+    // only mounts while activeTool === 'measure' (ToolOverlays.tsx), so this
+    // is the one place a stray drag/polyline sequence could be left stranded.
+    // Routed through measurementSlice's resetMeasureGesture instead of
+    // duplicating the clear here, keeping one place that knows what
+    // "in-progress gesture" means (see measurementSlice.ts's measureMode doc).
     const leavingMeasure = get().activeTool === 'measure' && activeTool !== 'measure';
     if (AUTHORING_TOOLS.has(activeTool)) {
       // Collab role gate: in a shared session only editor/admin may
       // unlock authoring. Viewers/commenters can still pick read-only
       // tools, so we only block the authoring branch.
-      const canEdit = (get() as unknown as { canCollabEdit?: () => boolean }).canCollabEdit;
-      if (canEdit && !canEdit()) return;
+      const cross = get() as unknown as WorkspaceCrossSlice;
+      if (cross.canCollabEdit && !cross.canCollabEdit()) return;
       if (leavingMeasure) (get() as unknown as { resetMeasureGesture?: () => void }).resetMeasureGesture?.();
-      set({ activeTool, editEnabled: true, spaceSketchMinimized: false });
+      // Authoring happens in the Model workspace; no editable model, no tool.
+      if (cross.workspaceMode !== 'model' && cross.enterModelWorkspace && !cross.enterModelWorkspace()) return;
+      set({ activeTool, editEnabled: true });
       return;
     }
     if (leavingMeasure) (get() as unknown as { resetMeasureGesture?: () => void }).resetMeasureGesture?.();
-    set({ activeTool, spaceSketchMinimized: false });
+    set({ activeTool });
   },
-  setSpaceSketchMinimized: (spaceSketchMinimized) => set({ spaceSketchMinimized }),
   setEditEnabled: (editEnabled) => {
+    // Edit mode is the Model workspace's (#6232): entering or leaving goes
+    // through the session slice, which keeps `editEnabled` in step (no
+    // editable model = no workspace = edit mode stays off). The bare flag is
+    // for a UISlice composed without the session slice.
+    const cross = get() as unknown as WorkspaceCrossSlice;
     if (editEnabled) {
       // Collab role gate: only editor/admin (or single-user, role===null)
-      // may enter edit mode. This is the single chokepoint that unlocks
-      // the gizmo, geometry card, add-element draw tools, and the inline
-      // property editors — gating it here covers every authoring surface.
-      const canEdit = (get() as unknown as { canCollabEdit?: () => boolean }).canCollabEdit;
-      if (canEdit && !canEdit()) return;
-    }
-    if (!editEnabled) {
-      // Flipping edit mode off must clear every authoring sub-state
-      // that depends on it — otherwise the viewer ends up "not in
-      // edit mode" but still carrying a georef draft or a half-drawn
-      // slab polygon. Cross-slice reset lives here so callers don't
-      // have to remember to mop up.
-      set((s) => ({
-        editEnabled: false,
-        activeTool: AUTHORING_TOOLS.has(s.activeTool) ? 'select' : s.activeTool,
-        spaceSketchMinimized: false,
-        cesiumPlacementEditMode: false,
-        cesiumPlacementDraftModelId: null,
-        cesiumPlacementDraft: null,
-      }));
+      // may enter edit mode — the single chokepoint for every authoring surface.
+      if (cross.canCollabEdit && !cross.canCollabEdit()) return;
+      if (cross.enterModelWorkspace) cross.enterModelWorkspace();
+      else set({ editEnabled: true });
       return;
     }
-    // Turning edit mode ON with nothing selected auto-opens the
-    // AddElement panel — most "I want to edit" sessions start
-    // with adding something, and forcing the user to click an
-    // extra button to reach the panel adds friction. When a
-    // selection already exists, leave activeTool alone so the
-    // Properties panel + Geometry edit card stay primary.
-    set((s) => {
-      const next: Partial<UISlice & UICrossSliceState> = { editEnabled: true };
-      const slice = s as unknown as { selectedEntity?: unknown };
-      if (s.activeTool === 'select' && !slice.selectedEntity) {
-        next.activeTool = 'addElement';
-      }
-      return next;
-    });
+    if (cross.workspaceMode === 'model' && cross.exitModelWorkspace) {
+      cross.exitModelWorkspace();
+      return;
+    }
+    // Flipping edit mode off must clear every authoring sub-state that
+    // depends on it — otherwise the viewer ends up "not in edit mode" but
+    // still carrying a georef draft or a half-drawn slab polygon.
+    set((s) => ({
+      editEnabled: false,
+      activeTool: AUTHORING_TOOLS.has(s.activeTool) ? 'select' : s.activeTool,
+      cesiumPlacementEditMode: false,
+      cesiumPlacementDraftModelId: null,
+      cesiumPlacementDraft: null,
+    }));
   },
   toggleEditEnabled: () => {
     get().setEditEnabled(!get().editEnabled);
@@ -332,11 +281,7 @@ export const createUISlice: StateCreator<UISlice & UICrossSliceState, [], [], UI
 
   setHierarchyMode: (mode) => {
     set({ hierarchyMode: mode });
-    try {
-      localStorage.setItem(HIERARCHY_MODE_STORAGE_KEY, mode);
-    } catch (err) {
-      console.warn('[hierarchy-mode] persist failed; in-memory only', err);
-    }
+    persistHierarchyMode(mode);
   },
 
   setPendingPropertyFocus: (pendingPropertyFocus) => set({ pendingPropertyFocus }),
@@ -368,9 +313,17 @@ export const createUISlice: StateCreator<UISlice & UICrossSliceState, [], [], UI
 
   setIsMobile: (isMobile) => set({ isMobile }),
   toggleHoverTooltips: () => set((state) => ({ hoverTooltipsEnabled: !state.hoverTooltipsEnabled })),
+  setShowPerformanceStats: (showPerformanceStats) => {
+    persistShowPerformanceStats(showPerformanceStats);
+    set({ showPerformanceStats });
+  },
+  setNavigationPreset: (navigationPreset) => {
+    persistNavigationPreset(navigationPreset);
+    set({ navigationPreset });
+  },
   setVisualEnhancementsEnabled: (visualEnhancementsEnabled) => set({ visualEnhancementsEnabled }),
-  setEdgeContrastEnabled: (edgeContrastEnabled) => set({ edgeContrastEnabled }),
-  setEdgeContrastIntensity: (edgeContrastIntensity) => set({ edgeContrastIntensity }),
+  setCentrelineOverlayEnabled: (centrelineOverlayEnabled) => set({ centrelineOverlayEnabled }),
+  setSelectedDirectrixSegment: (selectedDirectrixSegment) => set({ selectedDirectrixSegment }),
   setContactShadingQuality: (contactShadingQuality) => set({ contactShadingQuality }),
   setContactShadingIntensity: (contactShadingIntensity) => set({ contactShadingIntensity }),
   setContactShadingRadius: (contactShadingRadius) => set({ contactShadingRadius }),
@@ -378,19 +331,6 @@ export const createUISlice: StateCreator<UISlice & UICrossSliceState, [], [], UI
   setSeparationLinesQuality: (separationLinesQuality) => set({ separationLinesQuality }),
   setSeparationLinesIntensity: (separationLinesIntensity) => set({ separationLinesIntensity }),
   setSeparationLinesRadius: (separationLinesRadius) => set({ separationLinesRadius }),
-
-
-  setToolbarStyle: (toolbarStyle) => {
-    // Persist eagerly so the next page-load boots straight into the chosen
-    // style (constants.ts `resolveInitialToolbarStyle`). Wrap in try/catch —
-    // Safari private mode / locked storage throws.
-    try {
-      localStorage.setItem(TOOLBAR_STYLE_STORAGE_KEY, toolbarStyle);
-    } catch (err) {
-      console.warn('[toolbar-style] persist failed; in-memory only', err);
-    }
-    set({ toolbarStyle });
-  },
 
   setRibbonCollapsed: (ribbonCollapsed) => {
     try {
@@ -411,4 +351,6 @@ export const createUISlice: StateCreator<UISlice & UICrossSliceState, [], [], UI
     }
     set({ ribbonContextualTabs });
   },
+
+  setAnonymizedExportRequested: (anonymizedExportRequested) => set({ anonymizedExportRequested }),
 });

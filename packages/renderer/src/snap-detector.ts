@@ -1,3 +1,7 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
 import type { MeshData } from '@ifc-lite/geometry';
 import type { Ray, Vec3, Intersection } from './raycaster.js';
 import { Raycaster } from './raycaster.js';
@@ -26,6 +30,7 @@ export interface SnapTarget {
     vertices?: Vec3[]; // For edges/faces
     edgeIndex?: number;
     faceIndex?: number;
+    sourceCurve?: import('./source-curve-snap.js').SourceCurveIdentity & { kind: 'line' | 'arc'; length: number; t: number };
   };
 }
 
@@ -33,6 +38,16 @@ export interface SnapOptions {
   snapToVertices: boolean;
   snapToEdges: boolean;
   snapToFaces: boolean;
+  /**
+   * Declared but never read. Documented as a world-units snap distance, but
+   * every proximity check in `SnapDetector` uses {@link screenSnapRadius}
+   * (pixels) instead — see the two call sites that pass `opts.screenSnapRadius`
+   * into the candidate search. Snapping is therefore purely screen-space and
+   * zoom-dependent; changing this value has no effect. Set
+   * {@link screenSnapRadius} instead. Slated for removal; see issue #2731.
+   *
+   * @deprecated Ignored — `screenSnapRadius` is the value that is read.
+   */
   snapRadius: number; // In world units
   screenSnapRadius: number; // In pixels
   /**
@@ -130,7 +145,7 @@ export class SnapDetector {
     intersection: Intersection | null,
     camera: { position: Vec3; fov: number },
     screenHeight: number,
-    options: Partial<SnapOptions> = {}
+    options: Partial<SnapOptions> = {}, accept?: (target: SnapTarget) => boolean,
   ): SnapTarget | null {
     const opts = { ...this.defaultOptions, ...options };
 
@@ -170,7 +185,7 @@ export class SnapDetector {
     }
 
     // Return best target
-    return this.getBestSnapTarget(targets);
+    return this.getBestSnapTarget(accept ? targets.filter(accept) : targets);
   }
 
   /**
@@ -750,5 +765,4 @@ export class SnapDetector {
 
     return targets[0];
   }
-
 }

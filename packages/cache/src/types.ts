@@ -84,8 +84,82 @@ export const MAGIC = 0x4C434649; // "IFCL" in little-endian
  *   cache-hit load (first paint after the FIRST chunk instead of a full
  *   deserialize) and is the on-disk foundation for evict-to-disk residency.
  *   Per-mesh record layout inside a chunk is UNCHANGED from v12.
+ *
+ * v14: the per-mesh record gains the two DISJOINT source ids (#3199) —
+ *   `geometryItemId` (an `IfcRepresentationItem`) and `materialId` (an
+ *   `IfcMaterial`), two u32 written unconditionally with **0xFFFFFFFF** meaning
+ *   absent. NOT 0, deliberately: `#0` is not a STEP instance name, but
+ *   `router/layers.rs` DOES decode an unreferenced layer (an air gap) as
+ *   `material_id = 0`. The producer filters that to absent as of #3199, so 0
+ *   should never reach this record — the sentinel keeps the encoding correct
+ *   without depending on that, since an absence marker the domain can produce
+ *   is one upstream change from being wrong again.
+ *   Bumped rather than read leniently because the record is positional: a v13
+ *   reader handed a v14 record would take the origin's first f64 out of the two
+ *   new u32 and every field after it would be garbage. A v14 reader still reads
+ *   v13 records correctly — the fields are version-gated and degrade to
+ *   `undefined`, which is the same state the runtime uses where the identity is
+ *   genuinely merged away, so an old cache degrades to "unknown" and never to a
+ *   WRONG id.
+ *
+ * v15: the Entities section gains a trailing `rawTypeName: Uint32Array[count]`
+ *   of interned-string indices, appended after the typeRanges triples. Only
+ *   ~1/4 of the concrete IFC product classes in the generated schema registry
+ *   have an `IfcTypeEnum` member, so the enum column alone cannot name the
+ *   rest; the live parser table has carried a raw-name column for that
+ *   fallback all along and the cache did not, which turned every such element
+ *   into 'Unknown' on a cache load. Bumped rather than sniffed because the
+ *   section is positional: a v14 section has nothing after the triples, so a
+ *   reader that read the column unconditionally would consume whatever
+ *   follows. A v15 reader still reads v14 sections — the column is
+ *   version-gated and degrades to the enum-only name, exactly the pre-v15
+ *   behaviour.
+ *
+ * v15->v16: instanced shards go to IFNS v2 (#2985). Their instance records gain
+ *   a trailing `itemId` and declare a 92-byte stride, and the InstancedShards
+ *   section stores shard bytes VERBATIM -- it never re-encodes. So a v2 shard
+ *   this build writes would sit under a cache key an OLDER bundle still
+ *   matches, and that bundle's decoder is a strict `version !== 1` throw which
+ *   `useGeometryStreaming` swallows with a console.warn. Every instanced
+ *   occurrence would vanish while the flat geometry kept drawing: it reads as
+ *   missing geometry, not as a version error. Deploy skew reaches that without
+ *   a rollback (a tab opened before the deploy, an edge still serving the
+ *   previous bundle), and this repo has been bitten by deploy skew before.
+ *   The bump splits the keyspace rather than sharing it: an old bundle looks
+ *   for v15, misses, re-parses, and writes v1 shards it can read; this build
+ *   looks for v16. This is the ONE bump here that is deliberately destructive
+ *   -- every existing entry re-meshes once -- because the alternative is a
+ *   silent partial render on a bundle nobody can update.
+ *
+ * v16->v17: the QuantityTable gains a `qsetGlobalId` column (#3606),
+ *   mirroring PropertyTable's `psetGlobalId` — `QuantityTable.getForEntity`
+ *   now groups on (qsetName, qsetGlobalId) instead of qsetName alone, so
+ *   two distinct `IfcElementQuantity` instances sharing a literal name
+ *   (federated merge, or an exporter emitting the same Qto_ set twice)
+ *   stay separate instead of the second instance's quantities landing
+ *   under the first instance's GlobalId.
+ *
+ * v17->v18: the Relationships section gains a trailing shadowed-rel-ids
+ *   trailer per direction (#3782): `RelationshipGraphBuilder.addEdge` now
+ *   folds a repeat (source, target, type) triple into the surviving edge
+ *   instead of dropping it, keeping the extra `IfcRel*` express ids so a
+ *   delete of the surviving one doesn't erase a connection a sibling
+ *   instance still names. Appended AFTER `edgeRelIds` so the v17 prefix
+ *   stays byte-identical; a v18 reader handed a v17 section simply stops
+ *   there and never emits `shadowedRelationshipIds` — matches the pre-v18
+ *   in-memory behaviour exactly, since those graphs never tracked them
+ *   either. Not the destructive kind of bump: no existing cache entry is
+ *   wrong to read, only silent about a rare case until it is re-parsed.
  */
-export const FORMAT_VERSION = 13;
+/** v19: optional canonical appearance provenance per mesh and a shared source-index
+ * pool in the geometry head. Earlier records remain unmarked; viewer cache keys
+ * include the version, so old entries reparse once rather than invent provenance. */
+/** v20: optional exact WASM RTC frame provenance in CoordinateInfo. Older
+ * records remain readable with that provenance absent. */
+/** v21: relationship indexing covers every schema-resolvable exact IfcRel*
+ * class (#4205). The bytes are unchanged, but cache keys must miss v20 graphs
+ * that were produced before those buckets existed. */
+export const FORMAT_VERSION = 23; // v22: per-mesh IFC finish (NaN = absent), #5582; v23: finishes on type geometry, mapped-item styles and instanced shards (IFNS field 2), #5984
 
 /** Geometry chunking parameters (v13+). Grouping is a WRITE-side layout
  *  policy: readers only trust the directory, so these can change without a
@@ -106,6 +180,8 @@ export enum GeometryChunkFlags {
 
 /** One entry of the v13 geometry chunk directory. */
 export interface GeometryChunkInfo {
+  /** v19 decoded header pool shared across chunks; not a directory wire field. */
+  appearanceSources?: readonly Uint32Array[];
   /** World AABB of the chunk's meshes (f32, for future priority/culling). */
   aabbMin: [number, number, number];
   aabbMax: [number, number, number];
@@ -215,6 +291,10 @@ export interface CacheWriteOptions {
    * latency matters more than entry size.
    */
   compressGeometryChunks?: boolean;
+  /** Use one lazy browser module worker for geometry compression (default false).
+   * Requires Worker support and a bundled worker asset; failure rejects the write.
+   * Has no effect when compression is disabled or all chunks are below its floor. */
+  compressGeometryChunksInWorker?: boolean;
 }
 
 /**
@@ -275,7 +355,16 @@ export interface CacheEntityRef {
 }
 
 export interface CacheEntityIndex {
-  byId: Iterable<[number, CacheEntityRef]>;
+  byId: Iterable<[number, CacheEntityRef]> & {
+    /** Optional borrowed columns equivalent to iteration; never mutated/transferred. */
+    getColumns?(): {
+      expressIds: Uint32Array;
+      byteOffsets: Uint32Array;
+      byteLengths: Uint32Array;
+      typeIndices: Uint16Array;
+      typeStrings: string[];
+    };
+  };
 }
 
 export interface CachedEntityIndexColumns {

@@ -28,45 +28,38 @@
  */
 
 import type { IfcDataStore, IfcSourceBytes } from '@ifc-lite/parser';
-import { asSourceBytes } from '@ifc-lite/parser';
+import { asSourceBytes, STEP_TRIVIA } from '@ifc-lite/parser';
 import type { EffectiveEntityIndex } from './effective-index.js';
-import { splitTopLevelArgs } from './step-argument-parser.js';
+import { readStepSlots, splitTopLevelListItems } from './step-argument-parser.js';
+import { readRelationshipSlotLowerBound } from './relationship-slot-bounds.js';
+import type { IfcSchemaVersion } from './schema-converter.js';
+// Schema-derived type-set machinery (INFRASTRUCTURE_TYPES, PRODUCT_TYPES,
+// collectDescendantNames) lives in `entity-type-sets.ts` — shared with
+// `subset-roots.ts`, which derives IFC_ROOT_TYPES the same way. Re-exported
+// below so every existing `from './reference-collector.js'` import keeps
+// working unchanged.
+import { INFRASTRUCTURE_TYPES, PRODUCT_TYPES, collectDescendantNames } from './entity-type-sets.js';
+export { INFRASTRUCTURE_TYPES, PRODUCT_TYPES, collectDescendantNames };
 
 /**
- * UTF-8 decode of `[start, end)` of the source. Mirrors `step-exporter.ts` /
- * `merged-exporter.ts`'s local `decodeRange` (SAB-safe via the accessor);
- * duplicated rather than shared because this is the only place in the file
- * that needs text instead of raw bytes, and it is only reached for `IFCREL*`
- * entities under `visibleOnly` (see `collectReferencedEntityIds`).
+ * `#N=TYPE(...)` record split into prefix/type/args/suffix, with STEP trivia
+ * (whitespace and/or a `/* ... *​/` comment, #3789) tolerated between the
+ * type name and `(` — same adjacency fix as `entity-extractor.ts`'s
+ * `extractEntity`. Shared by both line rewriters below.
+ *
+ * Groups: 1=prefix, 2=type, 3=args, 4=suffix. The type needs its OWN capture
+ * because slicing it back out of the prefix only worked while nothing could
+ * sit between it and `(`: a commented record yielded the type
+ * `IFCRELCONNECTSSTRUCTURALMEMBER/* c *​/`, matching no {@link
+ * isOptionalTrailingRef} entry, so its omitted trailing ref dropped the WHOLE
+ * line instead of becoming `$`. `.trim()` hides the whitespace-only form.
  */
-function decodeRange(src: IfcSourceBytes, start: number, end: number): string {
-  return src.decodeUtf8(start, end);
-}
-
+export const BARE_REF_RE = new RegExp(`^${STEP_TRIVIA}#(\\d+)${STEP_TRIVIA}$`); // bare `#N` ref, trivia-tolerant (#4227), exported for reuse
 /** ASCII code points for byte-level scanning. */
 const HASH = 0x23;  // '#'
 const ZERO = 0x30;  // '0'
 const NINE = 0x39;  // '9'
 const QUOTE = 0x27; // "'"
-
-/** Entity types that form the shared file infrastructure and must always be included. */
-const INFRASTRUCTURE_TYPES = new Set([
-  'IFCOWNERHISTORY',
-  'IFCAPPLICATION',
-  'IFCPERSON',
-  'IFCORGANIZATION',
-  'IFCPERSONANDORGANIZATION',
-  'IFCUNITASSIGNMENT',
-  'IFCSIUNIT',
-  'IFCDERIVEDUNIT',
-  'IFCDERIVEDUNITELEMENT',
-  'IFCCONVERSIONBASEDUNIT',
-  'IFCMEASUREWITHUNIT',
-  'IFCDIMENSIONALEXPONENTS',
-  'IFCMONETARYUNIT',
-  'IFCGEOMETRICREPRESENTATIONCONTEXT',
-  'IFCGEOMETRICREPRESENTATIONSUBCONTEXT',
-]);
 
 /**
  * Spatial structure entity types — always included as roots.
@@ -87,122 +80,6 @@ const SPATIAL_STRUCTURE_TYPES = new Set([
   // Abstract spatial types (rarely instantiated but handle gracefully)
   'IFCSPATIALELEMENT', 'IFCSPATIALSTRUCTUREELEMENT', 'IFCSPATIALZONE',
   'IFCEXTERNALSPATIALELEMENT', 'IFCEXTERNALSPATIALSTRUCTUREELEMENT',
-]);
-
-/**
- * Complete set of all IfcProduct subtypes from the IFC4 + IFC4X3 schemas,
- * excluding spatial structure types (handled above). Generated from the
- * schema registry's inheritanceChain metadata.
- *
- * 202 types — full IFC schema coverage. The hiddenIds fallback below
- * catches any types that may exist in future schema versions.
- */
-const PRODUCT_TYPES = new Set([
-  // IfcElement > IfcBuildingElement
-  'IFCBEAM', 'IFCBEAMSTANDARDCASE', 'IFCBUILDINGELEMENT',
-  'IFCBUILDINGELEMENTPART', 'IFCBUILDINGELEMENTPROXY', 'IFCBUILTELEMENT',
-  'IFCCHIMNEY', 'IFCCOLUMN', 'IFCCOLUMNSTANDARDCASE',
-  'IFCCOVERING', 'IFCCURTAINWALL',
-  'IFCDEEPFOUNDATION', 'IFCDOOR', 'IFCDOORSTANDARDCASE',
-  'IFCFOOTING', 'IFCMEMBER', 'IFCMEMBERSTANDARDCASE',
-  'IFCPILE', 'IFCPLATE', 'IFCPLATESTANDARDCASE',
-  'IFCRAILING', 'IFCRAMP', 'IFCRAMPFLIGHT',
-  'IFCROOF', 'IFCSHADINGDEVICE',
-  'IFCSLAB', 'IFCSLABELEMENTEDCASE', 'IFCSLABSTANDARDCASE',
-  'IFCSTAIR', 'IFCSTAIRFLIGHT',
-  'IFCWALL', 'IFCWALLELEMENTEDCASE', 'IFCWALLSTANDARDCASE',
-  'IFCWINDOW', 'IFCWINDOWSTANDARDCASE',
-  // IfcElement > IfcDistributionElement
-  'IFCDISTRIBUTIONELEMENT', 'IFCDISTRIBUTIONCONTROLELEMENT',
-  'IFCDISTRIBUTIONFLOWELEMENT', 'IFCDISTRIBUTIONCHAMBERELEMENT',
-  'IFCDISTRIBUTIONPORT', 'IFCDISTRIBUTIONBOARD',
-  // IfcDistributionControlElement subtypes
-  'IFCACTUATOR', 'IFCALARM', 'IFCCONTROLLER',
-  'IFCFLOWINSTRUMENT', 'IFCPROTECTIVEDEVICETRIPPINGUNIT',
-  'IFCSENSOR', 'IFCUNITARYCONTROLELEMENT',
-  // IfcFlowController subtypes
-  'IFCAIRTERMINALBOX', 'IFCDAMPER', 'IFCELECTRICDISTRIBUTIONBOARD',
-  'IFCELECTRICTIMECONTROL', 'IFCFLOWCONTROLLER', 'IFCFLOWMETER',
-  'IFCPROTECTIVEDEVICE', 'IFCSWITCHINGDEVICE', 'IFCVALVE',
-  // IfcFlowFitting subtypes
-  'IFCCABLECARRIERFITTING', 'IFCCABLEFITTING',
-  'IFCDUCTFITTING', 'IFCFLOWFITTING', 'IFCJUNCTIONBOX', 'IFCPIPEFITTING',
-  // IfcFlowMovingDevice subtypes
-  'IFCCOMPRESSOR', 'IFCFAN', 'IFCFLOWMOVINGDEVICE', 'IFCPUMP',
-  // IfcFlowSegment subtypes
-  'IFCCABLECARRIERSEGMENT', 'IFCCABLESEGMENT', 'IFCCONVEYORSEGMENT',
-  'IFCDUCTSEGMENT', 'IFCFLOWSEGMENT', 'IFCPIPESEGMENT',
-  // IfcFlowStorageDevice subtypes
-  'IFCELECTRICFLOWSTORAGEDEVICE', 'IFCFLOWSTORAGEDEVICE', 'IFCTANK',
-  // IfcFlowTerminal subtypes
-  'IFCAIRTERMINAL', 'IFCAUDIOVISUALAPPLIANCE', 'IFCCOMMUNICATIONSAPPLIANCE',
-  'IFCELECTRICAPPLIANCE', 'IFCFIRESUPPRESSIONTERMINAL', 'IFCFLOWTERMINAL',
-  'IFCLAMP', 'IFCLIGHTFIXTURE', 'IFCLIQUIDTERMINAL',
-  'IFCMEDICALDEVICE', 'IFCMOBILETELECOMMUNICATIONSAPPLIANCE',
-  'IFCOUTLET', 'IFCSANITARYTERMINAL', 'IFCSPACEHEATER',
-  'IFCSTACKTERMINAL', 'IFCWASTETERMINAL',
-  // IfcFlowTreatmentDevice subtypes
-  'IFCDUCTSILENCER', 'IFCELECTRICFLOWTREATMENTDEVICE',
-  'IFCFILTER', 'IFCFLOWTREATMENTDEVICE', 'IFCINTERCEPTOR',
-  // IfcEnergyConversionDevice subtypes
-  'IFCAIRTOAIRHEATRECOVERY', 'IFCBOILER', 'IFCBURNER',
-  'IFCCHILLER', 'IFCCOIL', 'IFCCONDENSER',
-  'IFCCOOLEDBEAM', 'IFCCOOLINGTOWER',
-  'IFCELECTRICGENERATOR', 'IFCELECTRICMOTOR',
-  'IFCENERGYCONVERSIONDEVICE', 'IFCENGINE',
-  'IFCEVAPORATIVECOOLER', 'IFCEVAPORATOR',
-  'IFCHEATEXCHANGER', 'IFCHUMIDIFIER', 'IFCMOTORCONNECTION',
-  'IFCSOLARDEVICE', 'IFCTRANSFORMER', 'IFCTUBEBUNDLE',
-  'IFCUNITARYEQUIPMENT',
-  // IfcElement > IfcElementAssembly
-  'IFCELEMENT', 'IFCELEMENTASSEMBLY',
-  // IfcElement > IfcElementComponent
-  'IFCELEMENTCOMPONENT', 'IFCFASTENER',
-  'IFCMECHANICALFASTENER', 'IFCDISCRETEACCESSORY',
-  'IFCVIBRATIONDAMPER', 'IFCVIBRATIONISOLATOR',
-  'IFCIMPACTPROTECTIONDEVICE',
-  // IfcElement > IfcFeatureElement
-  'IFCFEATUREELEMENT', 'IFCFEATUREELEMENTADDITION', 'IFCFEATUREELEMENTSUBTRACTION',
-  'IFCOPENINGELEMENT', 'IFCOPENINGSTANDARDCASE',
-  'IFCPROJECTIONELEMENT', 'IFCSURFACEFEATURE', 'IFCVOIDINGFEATURE',
-  // IfcElement > IfcFurnishingElement
-  'IFCFURNISHINGELEMENT', 'IFCFURNITURE', 'IFCSYSTEMFURNITUREELEMENT',
-  // IfcElement > IfcGeographicElement / IfcCivilElement
-  'IFCGEOGRAPHICELEMENT', 'IFCCIVILELEMENT',
-  // IfcElement > IfcTransportElement / IfcTransportationDevice / IfcVehicle
-  'IFCTRANSPORTELEMENT', 'IFCTRANSPORTATIONDEVICE', 'IFCVEHICLE',
-  // IfcElement > IfcReinforcingElement
-  'IFCREINFORCINGELEMENT', 'IFCREINFORCINGBAR', 'IFCREINFORCINGMESH',
-  'IFCTENDON', 'IFCTENDONANCHOR', 'IFCTENDONCONDUIT',
-  // IfcElement > IFC4X3 additions
-  'IFCBEARING', 'IFCCAISSONFOUNDATION', 'IFCCOURSE',
-  'IFCEARTHWORKSCUT', 'IFCEARTHWORKSELEMENT', 'IFCEARTHWORKSFILL',
-  'IFCKERB', 'IFCMOORINGDEVICE', 'IFCNAVIGATIONELEMENT',
-  'IFCPAVEMENT', 'IFCRAIL', 'IFCREINFORCEDSOIL', 'IFCSIGN', 'IFCSIGNAL',
-  'IFCTRACKELEMENT',
-  // IFC4X3 alignment and positioning
-  'IFCALIGNMENT', 'IFCALIGNMENTCANT', 'IFCALIGNMENTHORIZONTAL',
-  'IFCALIGNMENTSEGMENT', 'IFCALIGNMENTVERTICAL',
-  'IFCLINEARELEMENT', 'IFCLINEARPOSITIONINGELEMENT',
-  'IFCPOSITIONINGELEMENT', 'IFCREFERENT',
-  // IFC4X3 geotechnical
-  'IFCBOREHOLE', 'IFCGEOMODEL', 'IFCGEOSLICE',
-  'IFCGEOTECHNICALASSEMBLY', 'IFCGEOTECHNICALELEMENT', 'IFCGEOTECHNICALSTRATUM',
-  // IfcProduct (non-element)
-  'IFCANNOTATION', 'IFCGRID', 'IFCPORT', 'IFCPROXY',
-  'IFCSPACE', 'IFCVIRTUALELEMENT',
-  // IfcStructuralItem / IfcStructuralActivity
-  'IFCSTRUCTURALACTION', 'IFCSTRUCTURALACTIVITY',
-  'IFCSTRUCTURALCONNECTION', 'IFCSTRUCTURALCURVEACTION',
-  'IFCSTRUCTURALCURVECONNECTION', 'IFCSTRUCTURALCURVEMEMBER',
-  'IFCSTRUCTURALCURVEMEMBERVARYING', 'IFCSTRUCTURALCURVEREACTION',
-  'IFCSTRUCTURALITEM', 'IFCSTRUCTURALLINEARACTION',
-  'IFCSTRUCTURALMEMBER', 'IFCSTRUCTURALPLANARACTION',
-  'IFCSTRUCTURALPOINTACTION', 'IFCSTRUCTURALPOINTCONNECTION',
-  'IFCSTRUCTURALPOINTREACTION', 'IFCSTRUCTURALREACTION',
-  'IFCSTRUCTURALSURFACEACTION', 'IFCSTRUCTURALSURFACECONNECTION',
-  'IFCSTRUCTURALSURFACEMEMBER', 'IFCSTRUCTURALSURFACEMEMBERVARYING',
-  'IFCSTRUCTURALSURFACEREACTION',
 ]);
 
 // ---------------------------------------------------------------------------
@@ -500,7 +377,7 @@ export function collectReferencedEntityIds(
         : (sourceRelGroups = relationshipRefGroupsFromSourceLine(
             entityIndex,
             entityId,
-            decodeRange(src, ref.byteOffset, ref.byteOffset + ref.byteLength),
+            src.decodeUtf8(ref.byteOffset, ref.byteOffset + ref.byteLength),
           ));
       if (!relationshipRefsSurviveExclusion(groups, isBridgeTargetExcluded)) {
         continue;
@@ -533,11 +410,8 @@ export function collectReferencedEntityIds(
       // at all). Gated on the cheap `hasSourceMutation` check so an entity
       // with nothing queued — the overwhelming majority — still takes the
       // plain byte scan below with no decode/parse cost.
-      const generalGroups = relationshipRefGroupsFromSourceLine(
-        entityIndex,
-        entityId,
-        decodeRange(src, ref.byteOffset, ref.byteOffset + ref.byteLength),
-      );
+      const decodedLine = src.decodeUtf8(ref.byteOffset, ref.byteOffset + ref.byteLength);
+      const generalGroups = relationshipRefGroupsFromSourceLine(entityIndex, entityId, decodedLine);
       for (const group of generalGroups) {
         if (Array.isArray(group)) refs.push(...group);
         else refs.push(group as number);
@@ -554,8 +428,47 @@ export function collectReferencedEntityIds(
       // union can only ADD ids already missed by the positional parse — the
       // walk de-dupes via `visited`, so re-adding an id the parse already
       // found costs nothing beyond the duplicate push.
+      //
+      // BUT the scan reads the entity's ORIGINAL, pre-override bytes — it has
+      // no notion that a queued positional/named-attribute mutation REPLACED
+      // one parsed slot's value. Left unguarded, that resurrects the exact id
+      // an override retargeted AWAY from (e.g. `anonymize-placement.ts`
+      // repointing `IfcLocalPlacement.RelativePlacement` off the original,
+      // real-coordinate axis onto a freshly cloned zeroed one): the old axis
+      // id is absent from `generalGroups` (correctly superseded) but the raw
+      // scan still finds `#<oldAxis>` sitting right there in the unmutated
+      // bytes and pushes it straight back in, so the un-anonymized axis and
+      // its `IfcCartesianPoint` survive in the export, orphaned but present
+      // with the real coordinate in plaintext (blocker found in review: the
+      // two predicates — "was this slot overridden" and "is this id still
+      // referenced" — disagreed again, the same defect class as #2637).
+      //
+      // Fix: an id only belongs in `removedByOverride` when it was captured
+      // at a slot `extractRelationshipRefGroupsIndexed` COULD parse (i.e. it
+      // is present in `originalGroups`) and the effective, post-override
+      // answer (`generalGroups`, already flattened into `refs` above) no
+      // longer contains it. A doubly-nested-list ref was never parseable in
+      // the first place — its slot yields `undefined` in `originalGroups` —
+      // so it can never land in this set and the union still rescues it,
+      // exactly as before. An id genuinely still referenced from some OTHER,
+      // un-overridden slot of the same entity stays out of this set too
+      // (set membership, not per-slot bookkeeping), so it is never wrongly
+      // dropped.
+      const originalGroups = extractRelationshipRefGroupsIndexed(decodedLine);
+      const effectiveFlat = new Set(refs);
+      const removedByOverride = new Set<number>();
+      for (const group of originalGroups) {
+        if (group === undefined) continue;
+        for (const id of Array.isArray(group) ? group : [group]) {
+          if (!effectiveFlat.has(id)) removedByOverride.add(id);
+        }
+      }
       const mutatedSpan = src.slice(ref.byteOffset, ref.byteOffset + ref.byteLength);
-      extractRefsFromBytes(mutatedSpan, 0, mutatedSpan.length, refs);
+      const scanned: number[] = [];
+      extractRefsFromBytes(mutatedSpan, 0, mutatedSpan.length, scanned);
+      for (const id of scanned) {
+        if (!removedByOverride.has(id)) refs.push(id);
+      }
     } else {
       // Hand the byte scanner an already-narrowed record. `slice` is a
       // `subarray` on a contiguous source, so this is the same zero-copy read.
@@ -613,10 +526,10 @@ export function collectReferencedEntityIds(
  *
  * Returns the line unchanged when it names nothing excluded, a rewritten line
  * when a list member was dropped, or `null` to mean "do not emit this
- * relationship at all". A line this cannot parse as a single `#N=TYPE(...);`
- * record is returned unchanged — the source-iteration pass's own byte-range
- * and mutation passes are what validate that shape; this function only ever
- * narrows what a well-formed one contains.
+ * relationship at all". A STEP entity line whose validated slot layout cannot
+ * be read is withheld too: retaining an unverified line here could retain the
+ * exact excluded reference this output gate exists to remove. Non-entity text
+ * is returned unchanged.
  *
  * `isExcluded` is a predicate rather than a fixed `Set` because "excluded"
  * has two independent sources that a caller may need to combine: a
@@ -626,52 +539,87 @@ export function collectReferencedEntityIds(
  * this exact dangling-ref shape (#2398): a relationship that still names an
  * entity the session deleted ships the same `#N` with no `#N=` line, on a
  * path with no `visibleOnly` involved at all.
+ *
+ * `schemaVersion` is optional and, when given, holds a narrowed list to its
+ * OWN declared lower bound (`relationship-slot-bounds.ts`, reading the line's
+ * own `record.type` against the version-correct schema registry) before
+ * accepting the narrowing — see that file's doc for why: an `IFCREL*` line's
+ * own list attributes are never declared above `[1:?]` in any of the three
+ * schemas this repo ships (checked across all `IfcRel*` entities), so every
+ * EXISTING caller that omits it keeps its exact prior behaviour. A
+ * `STYLE_RESCUE_TYPES` line CAN carry a higher bound —
+ * `IfcTextureMap.Vertices` is `LIST [3:?]` — so callers on that path (#5262)
+ * pass it. When narrowing would still drop a slot below its own bound, the
+ * slot is left exactly as the source wrote it, the excluded ref(s) still
+ * dangling: the same "narrow reach only, never a new invalid shape" choice
+ * `narrowNonRelPositionalRefLists` already makes for the sibling
+ * non-relationship rule (#5181).
  */
 export function filterHiddenRefsFromRelationshipLine(
   line: string,
   isExcluded: (id: number) => boolean,
+  schemaVersion?: IfcSchemaVersion,
 ): string | null {
-  const match = line.match(/^(#\d+\s*=\s*\w+\()([\s\S]*)(\)\s*;)\s*$/);
-  if (!match) return line;
-  const [, prefix, argsText, suffix] = match;
-  const attrs = splitTopLevelArgs(argsText);
-  const entityType = prefix.slice(prefix.indexOf('=') + 1, -1).trim().toUpperCase();
+  const record = readStepSlots(line);
+  // This helper is also the output gate for relationship/source-style lines.
+  // Once a line identifies itself as a STEP entity, refusing its slot layout
+  // must withhold the whole record; emitting it unchanged can retain exactly
+  // the dangling reference this gate exists to remove (#4200).
+  if (record === null) return /^\s*#\d+\s*=/.test(line) ? null : line;
+  const attrs = [...record.slots];
+  const entityType = record.type;
 
   let changed = false;
   const nextAttrs: string[] = [];
   for (let index = 0; index < attrs.length; index++) {
-    const attr = attrs[index];
+    const rawAttr = attrs[index];
+    const attr = rawAttr.trim();
+    const leading = rawAttr.slice(0, rawAttr.indexOf(attr));
+    const trailing = rawAttr.slice(rawAttr.indexOf(attr) + attr.length);
     if (attr.length >= 2 && attr.charCodeAt(0) === 0x28 /* '(' */ && attr.charCodeAt(attr.length - 1) === 0x29 /* ')' */) {
       const inner = attr.slice(1, -1);
-      const items = inner.trim() === '' ? [] : splitTopLevelArgs(inner);
+      const items = inner.trim() === '' ? [] : splitTopLevelListItems(inner);
       const survivors = items.filter((item) => {
-        const refMatch = item.match(/^#(\d+)$/);
+        const refMatch = item.match(BARE_REF_RE);
         return !(refMatch && isExcluded(Number(refMatch[1])));
       });
       if (survivors.length !== items.length) {
         if (survivors.length === 0) return null;
+        if (schemaVersion !== undefined) {
+          const lowerBound = readRelationshipSlotLowerBound(entityType, index, schemaVersion);
+          if (lowerBound !== undefined && survivors.length < lowerBound) {
+            // Narrowing would still leave this slot below its OWN declared
+            // lower bound (#5262) — e.g. `IfcTextureMap.Vertices`,
+            // `LIST [3:?]`: 2 survivors is a DIFFERENT invalid file than the
+            // dangling ref it would replace. Leave it exactly as the source
+            // wrote it; the excluded ref stays dangling, the pre-existing
+            // defect class this whole gate only narrows the REACH of.
+            nextAttrs.push(rawAttr);
+            continue;
+          }
+        }
         changed = true;
-        nextAttrs.push(`(${survivors.join(',')})`);
+        nextAttrs.push(`${leading}(${survivors.join(',')})${trailing}`);
         continue;
       }
-      nextAttrs.push(attr);
+      nextAttrs.push(rawAttr);
       continue;
     }
 
-    const refMatch = attr.match(/^#(\d+)$/);
+    const refMatch = attr.match(BARE_REF_RE);
     if (refMatch && isExcluded(Number(refMatch[1]))) {
       if (isOptionalTrailingRef(entityType, attrs.length, index)) {
         changed = true;
-        nextAttrs.push('$');
+        nextAttrs.push(`${leading}$${trailing}`);
         continue;
       }
       return null;
     }
-    nextAttrs.push(attr);
+    nextAttrs.push(rawAttr);
   }
 
   if (!changed) return line;
-  return `${prefix}${nextAttrs.join(',')}${suffix}`;
+  return `${record.prefix}${nextAttrs.join(',')}${record.suffix}`;
 }
 
 /**
@@ -682,7 +630,7 @@ export function filterHiddenRefsFromRelationshipLine(
  * AdditionalConditions, SupportedLength, ConditionCoordinateSystem`) is
  * declared `OPTIONAL IfcAxis2Placement3D` in both IFC4 (`IFC4_ADD2_TC1.exp`
  * line 8523) and IFC4X3 (`IFC4X3.exp` line 9774), and `IFCAXIS2PLACEMENT3D`
- * is the one entry in {@link StepExporter.isGeometryEntity}'s allowlist an
+ * is the one entry in {@link isGeometryEntity}'s allowlist (`@ifc-lite/export`'s `step-geometry-types.ts`) an
  * `IFCREL*` line can name in a single-valued slot — re-derived by scanning
  * every `IFCREL*` attribute in both schema files against that allowlist
  * (`scripts/` has no permanent copy of this scan; it was run ad hoc against
@@ -757,13 +705,12 @@ export function relationshipRefsSurviveExclusion(
  * {@link relationshipRefGroupsFromSourceLine} needs to splice a positional or
  * named-attribute override into the right slot.
  *
- * Built from the exact same primitives (`splitTopLevelArgs`, the `#(\d+)`
+ * Built from the exact same primitives (`splitTopLevelListItems`, the `#(\d+)`
  * ref pattern) `filterHiddenRefsFromRelationshipLine` uses, so the two
  * extraction routes (this one from text, `refGroupsOf` from an authored
  * attribute list) feed the SAME decision function identically. A line that
- * does not parse as a single `#N=TYPE(...);` record yields no groups —
- * nothing to exclude on, so the relationship survives, matching that
- * function's own "return line unchanged" behavior for the same input shape.
+ * does not parse as a single `#N=TYPE(...);` record yields no groups. Callers
+ * that emit source records separately apply the withholding gate above.
  *
  * A parenthesised list holding a NON-reference item (an inline typed value
  * alongside, or instead of, `#N` members) yields `undefined` for that slot
@@ -776,29 +723,44 @@ export function relationshipRefsSurviveExclusion(
  * #2637: this used to collapse a mixed list to "every remaining id
  * excluded" and block on it).
  */
-function extractRelationshipRefGroupsIndexed(line: string): Array<number | number[] | undefined> {
-  const match = line.match(/^(#\d+\s*=\s*\w+\()([\s\S]*)(\)\s*;)\s*$/);
-  if (!match) return [];
-  const attrs = splitTopLevelArgs(match[2]);
-  const groups: Array<number | number[] | undefined> = [];
-  for (const attr of attrs) {
-    if (attr.length >= 2 && attr.charCodeAt(0) === 0x28 /* '(' */ && attr.charCodeAt(attr.length - 1) === 0x29 /* ')' */) {
-      const inner = attr.slice(1, -1);
-      const items = inner.trim() === '' ? [] : splitTopLevelArgs(inner);
-      const ids: number[] = [];
-      let hasNonRefItem = false;
-      for (const item of items) {
-        const refMatch = item.match(/^#(\d+)$/);
-        if (refMatch) ids.push(Number(refMatch[1]));
-        else hasNonRefItem = true;
-      }
-      groups.push(hasNonRefItem ? undefined : ids);
-      continue;
+/**
+ * Classify ONE already-split top-level STEP argument token as a
+ * `relationshipRefsSurviveExclusion` group: a parenthesised SET/LIST becomes
+ * a `number[]` of the `#N` members it holds (or `undefined` when it mixes in
+ * a non-reference item — see {@link extractRelationshipRefGroupsIndexed}'s
+ * doc for why a mixed list can never be the reason a line is withheld), a
+ * bare `#N` becomes that `number`, and anything else (`$`, a literal, an
+ * enum token) becomes `undefined`.
+ *
+ * Factored out of {@link extractRelationshipRefGroupsIndexed} so a caller
+ * that already has an entity's arguments split (`subset-entity-reader.ts`'s
+ * `readEntityArgs`, used by `anonymize-export.ts` to pre-prune an
+ * unresolvable relationship ahead of the closure walk) can classify each one
+ * without re-deriving this same char-by-char grouping rule a second time —
+ * exactly the class of duplicated STEP-line parsing this module's own
+ * comments (#2637) call out as a defect source.
+ */
+export function refGroupFromArg(attr: string): number | number[] | undefined {
+  attr = attr.trim();
+  if (attr.length >= 2 && attr.charCodeAt(0) === 0x28 /* '(' */ && attr.charCodeAt(attr.length - 1) === 0x29 /* ')' */) {
+    const inner = attr.slice(1, -1);
+    const items = inner.trim() === '' ? [] : splitTopLevelListItems(inner);
+    const ids: number[] = [];
+    let hasNonRefItem = false;
+    for (const item of items) {
+      const refMatch = item.match(BARE_REF_RE);
+      if (refMatch) ids.push(Number(refMatch[1]));
+      else hasNonRefItem = true;
     }
-    const refMatch = attr.match(/^#(\d+)$/);
-    groups.push(refMatch ? Number(refMatch[1]) : undefined);
+    return hasNonRefItem ? undefined : ids;
   }
-  return groups;
+  const refMatch = attr.match(BARE_REF_RE);
+  return refMatch ? Number(refMatch[1]) : undefined;
+}
+
+function extractRelationshipRefGroupsIndexed(line: string): Array<number | number[] | undefined> {
+  const record = readStepSlots(line);
+  return record === null ? [] : record.slots.map(refGroupFromArg);
 }
 
 /**
@@ -870,7 +832,7 @@ export function getVisibleEntityIds(
 ): { roots: Set<number>; hiddenProductIds: Set<number> } {
   const roots = new Set<number>();
   const hiddenProductIds = new Set<number>();
-
+  // @raw-entity-enumeration-ok Step export supplies its effective index; this fallback serves baked MergeExporter inputs
   const entries: Iterable<[number, { type: string }]> = index ?? dataStore.entityIndex.byId;
   for (const [expressId, entityRef] of entries) {
     const typeUpper = index
@@ -968,13 +930,13 @@ function propagateOpeningExclusions(
   // replaced (`if (!source) return`) never fired in practice, because even a
   // zero-length Uint8Array is truthy; keeping the byte check scoped to the byte
   // scan is what preserves that behaviour. See #2339.
-
+  // @raw-entity-enumeration-ok Step export supplies effective relationship buckets; MergeExporter reparses edits before this fallback
   const relVoidsIds = (index?.byType ?? dataStore.entityIndex.byType).get('IFCRELVOIDSELEMENT') ?? [];
   if (relVoidsIds.length === 0) return;
-
   const refs: number[] = [];
 
   for (const relId of relVoidsIds) {
+    // @raw-entity-enumeration-ok selected ids come from the effective bucket or a baked merge input above
     const entityRef = index ? index.get(relId) : dataStore.entityIndex.byId.get(relId);
     if (!entityRef) continue;
 
@@ -1026,97 +988,12 @@ function propagateOpeningExclusions(
 }
 
 // ---------------------------------------------------------------------------
-// Style entity collection (reverse pass)
+// Style / layer entity collection (reverse pass) — moved to style-closure.ts
 // ---------------------------------------------------------------------------
 
-/**
- * Collect style entities (IFCSTYLEDITEM, etc.) that reference geometry already
- * in the closure, then transitively follow their style references.
- *
- * In IFC STEP, IFCSTYLEDITEM references a geometry RepresentationItem, but
- * nothing references the StyledItem back. So the forward closure walk misses
- * them entirely. This function does a reverse pass using the byType index:
- * for each styled item, check if any referenced ID is in the closure. If yes,
- * add the styled item and walk its style chain into the closure.
- *
- * Uses byType for O(styledItems) instead of O(allEntities), and byte-level
- * scanning for #ID extraction.
- *
- * Must be called AFTER collectReferencedEntityIds so the closure is complete.
- *
- * @param closure - The existing closure set (mutated in place)
- * @param source - The original STEP file source buffer
- * @param entityIndex - Full entity index with type info and byType lookup
- */
-export function collectStyleEntities(
-  closure: Set<number>,
-  source: Uint8Array | IfcSourceBytes,
-  entityIndex: {
-    byId: {
-      get(expressId: number): { type: string; byteOffset: number; byteLength: number } | undefined;
-      has(expressId: number): boolean;
-      refsOf?(expressId: number): readonly number[] | undefined;
-    };
-    byType: Map<string, number[]>;
-  },
-): void {
-  const src = asSourceBytes(source);
-  const queue: number[] = [];
-  const refs: number[] = [];
-  const refsInto = (expressId: number, ref: { byteOffset: number; byteLength: number }): void => {
-    refs.length = 0;
-    const authored = entityIndex.byId.refsOf?.(expressId);
-    if (authored) refs.push(...authored);
-    else {
-      const span = src.slice(ref.byteOffset, ref.byteOffset + ref.byteLength);
-      extractRefsFromBytes(span, 0, span.length, refs);
-    }
-  };
-
-  // Use byType index for direct lookup — O(styledItems) not O(allEntities)
-  const styledItemIds = entityIndex.byType.get('IFCSTYLEDITEM') ?? [];
-  const styledRepIds = entityIndex.byType.get('IFCSTYLEDREPRESENTATION') ?? [];
-
-  for (const ids of [styledItemIds, styledRepIds]) {
-    for (const expressId of ids) {
-      if (closure.has(expressId)) continue;
-
-      const entityRef = entityIndex.byId.get(expressId);
-      if (!entityRef) continue;
-
-      // Check if any referenced ID is in the closure
-      refsInto(expressId, entityRef);
-
-      let referencesClosureEntity = false;
-      for (let i = 0; i < refs.length; i++) {
-        if (closure.has(refs[i])) {
-          referencesClosureEntity = true;
-          break;
-        }
-      }
-
-      if (referencesClosureEntity) {
-        closure.add(expressId);
-        queue.push(expressId);
-      }
-    }
-  }
-
-  // Walk forward from newly added style entities to pull in their style chain
-  // (IfcPresentationStyleAssignment → IfcSurfaceStyle → IfcSurfaceStyleRendering → IfcColourRgb)
-  while (queue.length > 0) {
-    const entityId = queue.pop()!;
-    const ref = entityIndex.byId.get(entityId);
-    if (!ref) continue;
-
-    refsInto(entityId, ref);
-
-    for (let i = 0; i < refs.length; i++) {
-      const referencedId = refs[i];
-      if (!closure.has(referencedId) && entityIndex.byId.has(referencedId)) {
-        closure.add(referencedId);
-        queue.push(referencedId);
-      }
-    }
-  }
-}
+// `collectStyleEntities` (IFCSTYLEDITEM / IFCSTYLEDREPRESENTATION /
+// IFCPRESENTATIONLAYERASSIGNMENT / IFCPRESENTATIONLAYERWITHSTYLE rescue) now
+// lives in `style-closure.ts`, split out for the same reason
+// `collectGeoreferencingEntities` was: this file was already at its module
+// size budget. It still uses `collectRefsInByteRange` (above) for its byte
+// scan.

@@ -5,12 +5,14 @@
 /**
  * Visibility state slice
  *
- * Supports both single-model (legacy) and multi-model visibility.
- * Multi-model visibility uses model-scoped Maps.
+ * Entity ids are global ids (`FederationRegistry.toGlobalId`), so one set
+ * covers every loaded model; a single model uses `globalId === expressId`.
  */
 
 import type { StateCreator } from 'zustand';
-import type { TypeVisibility, EntityRef } from '../types.js';
+import type { ViewerState } from '../index.js';
+import { resetVisibilityReasons } from '../../lib/visibility/visibility-reasons.js';
+import type { TypeVisibility } from '../types.js';
 import {
   getPersistedTypeVisibility,
   TYPE_VISIBILITY_STORAGE_KEYS,
@@ -20,8 +22,28 @@ import {
   type TypeViewMode,
 } from '../constants.js';
 
+/**
+ * ## These two channels are shared, and every write of them is invalidating
+ *
+ * `isolatedEntities` / `ghostExceptEntities` are shared by clash, IDS,
+ * "Isolate in 3D", assembly isolation, `LayerDiffView`, BCF, the
+ * basket and `syncSourceModel`. Features record what they installed so they
+ * can release only that, and a record left behind after ANOTHER owner replaced
+ * the channel starts matching again the moment a third owner installs equal
+ * content — at which point the stale owner's next release destroys that
+ * owner's presentation (#2654 fourth review).
+ *
+ * The actions below therefore do NOT each carry that invalidation, and must
+ * not start to: it is performed once for the whole store, by the wrapped `set`
+ * every slice and every `useViewerStore.setState` goes through
+ * (`store/visibility-invalidation.ts`). Review of #2867 did answer it here, in
+ * a helper each channel-writing action called — and the list was incomplete on
+ * the day it was written (`showAllInAllModels` below, and ten actions in
+ * `pinboardSlice`). A list of writers is not an invariant.
+ */
+
 export interface VisibilitySlice {
-  // State (legacy - single model)
+  // State
   hiddenEntities: Set<number>;
   isolatedEntities: Set<number> | null;
   /** X-Ray context: when non-null, every entity NOT in this set renders ghosted
@@ -29,9 +51,16 @@ export interface VisibilitySlice {
    *  rest stays visible for context. `null` = no ghosting. Drives the renderer's
    *  `ghostExceptIds`. */
   ghostExceptEntities: Set<number> | null;
+  visibilityRevision: number;
   /** Class-level filter (from Class tab type-group clicks) — independent of isolatedEntities */
   classFilter: { ids: Set<number>; label: string } | null;
   typeVisibility: TypeVisibility;
+  /** IFC class names the EMBEDDING HOST hid (the embed's `hideTypes`), folded
+   *  by `lib/host-hidden-ifc-types.ts`; `null` in the full viewer, which has no
+   *  host. Distinct from the user's own `typeVisibility` toggles; both apply.
+   *  Unlike a mesh filter this also reaches the symbolic 2D overlay, which is
+   *  not a mesh (#2934). */
+  hostHiddenIfcTypes: ReadonlySet<string> | null;
   /** 3D view mode for the Model/Types switch (#957 follow-up). 'model' shows
    *  placed occurrences (default); 'types' shows the type-library shapes. */
   typeViewMode: TypeViewMode;
@@ -42,13 +71,8 @@ export interface VisibilitySlice {
    *  (class 0), so the switch stays hidden for them. */
   hasTypeGeometry: boolean;
 
-  // State (multi-model)
-  /** Hidden entities per model */
-  hiddenEntitiesByModel: Map<string, Set<number>>;
-  /** Isolated entities per model (null = show all in that model) */
-  isolatedEntitiesByModel: Map<string, Set<number>>;
 
-  // Actions (legacy - maintained for backward compatibility)
+  // Actions
   hideEntity: (id: number) => void;
   hideEntities: (ids: number[]) => void;
   showEntity: (id: number) => void;
@@ -79,47 +103,69 @@ export interface VisibilitySlice {
   setIsolatedEntities: (ids: Set<number> | null) => void;
   /** Ghost everything except these entities (X-Ray context). `null` clears it. */
   setGhostExceptEntities: (ids: Set<number> | null) => void;
+  /**
+   * Put a previously CAPTURED view back, all three fields at once.
+   *
+   * Restoring through the individual setters cannot express this: each of them
+   * clears the others (isolation and ghosting are mutually exclusive, and
+   * isolation supersedes per-entity hiding), so a three-call replay passes
+   * through intermediate states the user never had. That used to be invisible;
+   * it stopped being invisible once a channel write started invalidating the
+   * ownership records it makes stale (review of #2867) — restoring a captured
+   * clash GHOST went `setIsolatedEntities(null)` (which nulls the ghost
+   * channel, killing the record) and only then `setGhostExceptEntities(...)`,
+   * so the presentation came back with its claim laundered off. That is #2662
+   * P2 by another route, and `useClash.run-preserves-isolation.test.tsx` catches
+   * it.
+   *
+   * One `set()`, one final state, one invalidation pass against it: a record
+   * that still content-matches what the restore put back survives.
+   *
+   * It is NOT otherwise equivalent to the replay, and both divergences are
+   * deliberate (measured in `store/visibility-channel-invalidation.test.ts`):
+   *
+   *  - `classFilter` is left alone. The replay reached `setHiddenEntities`
+   *    whenever anything was hidden, and that setter nulls the class filter, so
+   *    closing a view-snapshot tool used to drop a Class-tab filter it never
+   *    touched.
+   *  - a captured ISOLATION now survives a non-empty captured hidden set. The
+   *    replay restored the isolation and then `setHiddenEntities` nulled it
+   *    again one call later, so that combination came back without its
+   *    isolation. This is the fix, not a side effect — but it is a behaviour
+   *    change, not a no-op refactor.
+   *
+   * Both channels are written exactly as captured, including a both-non-null
+   * pair — see the body for why that pair is legal.
+   */
+  restoreVisibilityState: (prior: {
+    isolated: Set<number> | null;
+    ghostExcept: Set<number> | null;
+    hidden: Set<number>;
+  }) => void;
   /** Clear X-Ray context ghosting. */
   clearGhost: () => void;
 
-  // Actions (multi-model)
-  /** Hide entity in specific model */
-  hideEntityInModel: (modelId: string, expressId: number) => void;
-  /** Hide multiple entities in specific model */
-  hideEntitiesInModel: (modelId: string, expressIds: number[]) => void;
-  /** Show entity in specific model */
-  showEntityInModel: (modelId: string, expressId: number) => void;
-  /** Show multiple entities in specific model */
-  showEntitiesInModel: (modelId: string, expressIds: number[]) => void;
-  /** Toggle entity visibility in specific model */
-  toggleEntityVisibilityInModel: (modelId: string, expressId: number) => void;
-  /** Check if entity is visible in specific model */
-  isEntityVisibleInModel: (modelId: string, expressId: number) => boolean;
-  /** Get hidden entity IDs for a specific model */
-  getHiddenEntitiesForModel: (modelId: string) => Set<number>;
-  /** Clear visibility state for a model (when model is removed) */
-  clearModelVisibility: (modelId: string) => void;
   /** Show all entities across all models */
   showAllInAllModels: () => void;
+  /** Set the embedding host's class hide list. Embed only. */
+  setHostHiddenIfcTypes: (hidden: ReadonlySet<string> | null) => void;
 }
 
-export const createVisibilitySlice: StateCreator<VisibilitySlice, [], [], VisibilitySlice> = (set, get) => ({
-  // Initial state (legacy)
+export const createVisibilitySlice: StateCreator<ViewerState, [], [], VisibilitySlice> = (set, get) => ({
+  // Initial state
   hiddenEntities: new Set(),
   isolatedEntities: null,
-  ghostExceptEntities: null,
+  ghostExceptEntities: null, visibilityRevision: 0,
   classFilter: null,
   // Read persisted toggles fresh so the user's choices survive reloads.
   typeVisibility: getPersistedTypeVisibility(),
   typeViewMode: getPersistedTypeViewMode(),
+  // Host config, not user or model state: only an embedding page sets it.
+  hostHiddenIfcTypes: null,
   // Derived from geometry at load time — no model is open yet, so default false.
   hasTypeGeometry: false,
 
-  // Initial state (multi-model)
-  hiddenEntitiesByModel: new Map(),
-  isolatedEntitiesByModel: new Map(),
-
-  // Actions (legacy)
+  // Actions
   hideEntity: (id) => set((state) => {
     const newHidden = new Set(state.hiddenEntities);
     newHidden.add(id);
@@ -161,13 +207,14 @@ export const createVisibilitySlice: StateCreator<VisibilitySlice, [], [], Visibi
       state.isolatedEntities.has(id);
 
     if (isAlreadyIsolated) {
-      return { isolatedEntities: null };
+      return { isolatedEntities: null, ghostExceptEntities: state.ghostExceptEntities };
     } else {
       // Isolate this entity (and unhide it)
       const newHidden = new Set(state.hiddenEntities);
       newHidden.delete(id);
       return {
         isolatedEntities: new Set([id]),
+        ghostExceptEntities: state.ghostExceptEntities,
         hiddenEntities: newHidden,
       };
     }
@@ -181,19 +228,23 @@ export const createVisibilitySlice: StateCreator<VisibilitySlice, [], [], Visibi
       ids.every(id => state.isolatedEntities!.has(id));
 
     if (isAlreadyIsolated) {
-      return { isolatedEntities: null };
+      return { isolatedEntities: null, ghostExceptEntities: state.ghostExceptEntities };
     } else {
       // Isolate these entities (and unhide them)
       const newHidden = new Set(state.hiddenEntities);
       ids.forEach(id => newHidden.delete(id));
       return {
         isolatedEntities: idsSet,
+        ghostExceptEntities: state.ghostExceptEntities,
         hiddenEntities: newHidden,
       };
     }
   }),
 
-  clearIsolation: () => set({ isolatedEntities: null }),
+  clearIsolation: () => set((state) => ({
+    isolatedEntities: null,
+    ghostExceptEntities: state.ghostExceptEntities,
+  })),
 
   setClassFilter: (ids, label) => set((state) => {
     const idsSet = new Set(ids);
@@ -209,16 +260,25 @@ export const createVisibilitySlice: StateCreator<VisibilitySlice, [], [], Visibi
 
   clearClassFilter: () => set({ classFilter: null }),
 
-  clearAllFilters: () => set({ isolatedEntities: null, classFilter: null, ghostExceptEntities: null }),
+  clearAllFilters: () => set({
+    isolatedEntities: null,
+    ghostExceptEntities: null,
+    classFilter: null,
+  }),
 
-  showAll: () => set({ hiddenEntities: new Set(), isolatedEntities: null, classFilter: null, ghostExceptEntities: null }),
+  showAll: () => resetVisibilityReasons({ getState: get, setState: (patch) => set(patch) }),
 
-  setHiddenEntities: (ids) => set({ hiddenEntities: new Set(ids), isolatedEntities: null, classFilter: null, ghostExceptEntities: null }),
+  setHiddenEntities: (ids) => set({
+    isolatedEntities: null,
+    ghostExceptEntities: null,
+    hiddenEntities: new Set(ids),
+    classFilter: null,
+  }),
 
   setIsolatedEntities: (ids) => set({
     isolatedEntities: ids ? new Set(ids) : null,
-    hiddenEntities: new Set(), // Clear hidden when setting isolation
     ghostExceptEntities: null, // Isolation (hide) and ghosting are mutually exclusive
+    hiddenEntities: new Set<number>(), // Clear hidden when setting isolation
   }),
 
   setGhostExceptEntities: (ids) => set({
@@ -227,7 +287,28 @@ export const createVisibilitySlice: StateCreator<VisibilitySlice, [], [], Visibi
     isolatedEntities: null,
   }),
 
-  clearGhost: () => set({ ghostExceptEntities: null }),
+  restoreVisibilityState: ({ isolated, ghostExcept, hidden }) => set({
+    // Verbatim, both channels together — including the both-non-null pair,
+    // which IS reachable and is therefore restored rather than normalised. The
+    // individual setters each clear the other channel, but the actions that
+    // deliberately PRESERVE it (`isolateEntity` / `isolateEntities` /
+    // `clearIsolation` / `clearGhost`) do not, so
+    // `setGhostExceptEntities([9]); isolateEntity(5)` leaves isolated={5} and
+    // ghost={9} — and `showPinboard` reaches the same shape from the basket
+    // side. The pair is coherent downstream — isolation filters, ghosting then
+    // fades what survived it (`lib/geo/cesium-model-glb.ts`, which restates the
+    // render pass's order for the world view) — and a capture that observed it
+    // is a view the user actually had; normalising one channel away here would
+    // restore a view they never saw.
+    isolatedEntities: isolated ? new Set(isolated) : null,
+    ghostExceptEntities: ghostExcept ? new Set(ghostExcept) : null,
+    hiddenEntities: new Set(hidden),
+  }),
+
+  clearGhost: () => set((state) => ({
+    ghostExceptEntities: null,
+    isolatedEntities: state.isolatedEntities,
+  })),
 
   isEntityVisible: (id) => {
     const state = get();
@@ -265,6 +346,8 @@ export const createVisibilitySlice: StateCreator<VisibilitySlice, [], [], Visibi
     return { typeVisibility: { ...TYPE_VISIBILITY_SEMANTIC_DEFAULTS } };
   }),
 
+  setHostHiddenIfcTypes: (hidden) => set(() => ({ hostHiddenIfcTypes: hidden })),
+
   setTypeViewMode: (mode) => set(() => {
     if (typeof window !== 'undefined') {
       try { localStorage.setItem(TYPE_VIEW_MODE_STORAGE_KEY, mode); }
@@ -281,106 +364,5 @@ export const createVisibilitySlice: StateCreator<VisibilitySlice, [], [], Visibi
     state.hasTypeGeometry === value ? state : { hasTypeGeometry: value }
   )),
 
-  // Actions (multi-model)
-  hideEntityInModel: (modelId, expressId) => set((state) => {
-    const newMap = new Map(state.hiddenEntitiesByModel);
-    const modelHidden = new Set(newMap.get(modelId) || []);
-    modelHidden.add(expressId);
-    newMap.set(modelId, modelHidden);
-    return { hiddenEntitiesByModel: newMap };
-  }),
-
-  hideEntitiesInModel: (modelId, expressIds) => set((state) => {
-    const newMap = new Map(state.hiddenEntitiesByModel);
-    const modelHidden = new Set(newMap.get(modelId) || []);
-    expressIds.forEach(id => modelHidden.add(id));
-    newMap.set(modelId, modelHidden);
-    return { hiddenEntitiesByModel: newMap };
-  }),
-
-  showEntityInModel: (modelId, expressId) => set((state) => {
-    const newMap = new Map(state.hiddenEntitiesByModel);
-    const modelHidden = newMap.get(modelId);
-    if (modelHidden) {
-      const newSet = new Set(modelHidden);
-      newSet.delete(expressId);
-      if (newSet.size === 0) {
-        newMap.delete(modelId);
-      } else {
-        newMap.set(modelId, newSet);
-      }
-    }
-    return { hiddenEntitiesByModel: newMap };
-  }),
-
-  showEntitiesInModel: (modelId, expressIds) => set((state) => {
-    const newMap = new Map(state.hiddenEntitiesByModel);
-    const modelHidden = newMap.get(modelId);
-    if (modelHidden) {
-      const newSet = new Set(modelHidden);
-      expressIds.forEach(id => newSet.delete(id));
-      if (newSet.size === 0) {
-        newMap.delete(modelId);
-      } else {
-        newMap.set(modelId, newSet);
-      }
-    }
-    return { hiddenEntitiesByModel: newMap };
-  }),
-
-  toggleEntityVisibilityInModel: (modelId, expressId) => set((state) => {
-    const newMap = new Map(state.hiddenEntitiesByModel);
-    const modelHidden = new Set(newMap.get(modelId) || []);
-
-    if (modelHidden.has(expressId)) {
-      modelHidden.delete(expressId);
-      if (modelHidden.size === 0) {
-        newMap.delete(modelId);
-      } else {
-        newMap.set(modelId, modelHidden);
-      }
-    } else {
-      modelHidden.add(expressId);
-      newMap.set(modelId, modelHidden);
-    }
-
-    return { hiddenEntitiesByModel: newMap };
-  }),
-
-  isEntityVisibleInModel: (modelId, expressId) => {
-    const state = get();
-    const modelHidden = state.hiddenEntitiesByModel.get(modelId);
-    if (modelHidden?.has(expressId)) return false;
-
-    const modelIsolated = state.isolatedEntitiesByModel.get(modelId);
-    if (modelIsolated && !modelIsolated.has(expressId)) return false;
-
-    return true;
-  },
-
-  getHiddenEntitiesForModel: (modelId) => {
-    return get().hiddenEntitiesByModel.get(modelId) || new Set();
-  },
-
-  clearModelVisibility: (modelId) => set((state) => {
-    const newHiddenMap = new Map(state.hiddenEntitiesByModel);
-    const newIsolatedMap = new Map(state.isolatedEntitiesByModel);
-    newHiddenMap.delete(modelId);
-    newIsolatedMap.delete(modelId);
-    return {
-      hiddenEntitiesByModel: newHiddenMap,
-      isolatedEntitiesByModel: newIsolatedMap,
-    };
-  }),
-
-  showAllInAllModels: () => set({
-    hiddenEntities: new Set(),
-    isolatedEntities: null,
-    classFilter: null,
-    // "Show all" must also drop any X-ray context (clash focus, Space Sketch
-    // preview) — the single-model showAll already does.
-    ghostExceptEntities: null,
-    hiddenEntitiesByModel: new Map(),
-    isolatedEntitiesByModel: new Map(),
-  }),
+  showAllInAllModels: () => resetVisibilityReasons({ getState: get, setState: (patch) => set(patch) }),
 });

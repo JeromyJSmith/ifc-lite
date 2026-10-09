@@ -6,10 +6,39 @@ import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert';
 import type { IfcDataStore } from '@ifc-lite/parser';
 import type { GeometryResult } from '@ifc-lite/geometry';
-import { createModelSlice, type ModelSlice, type ModelCrossSliceState } from './modelSlice.js';
+import { createModelSlice, type ModelSlice } from './modelSlice.js';
 import type { FederatedModel } from '../types.js';
+import { __resetLiveMarkupCacheForTests } from './drawing2DSlice.markupTransition.js';
+import { getDefaultDrawing2DState, type Measure2DResult } from './drawing2DSlice.js';
 
-type ModelTestState = ModelSlice & ModelCrossSliceState;
+/**
+ * Store fields other slices own that this harness has to seed.
+ *
+ * This used to be `modelSlice`'s exported `ModelCrossSliceState`. It is gone
+ * from the slice: teardown no longer reaches across, so the only cross-slice
+ * write left in production is `dataSlice`'s two active-model pointers, and the
+ * slice is typed over `ViewerState` like `collabSlice`. What remains is a
+ * HARNESS concern — `createModelSlice` is driven here with a stub `get()` that
+ * holds the model slice alone, and the teardown composition it dispatches
+ * reads these fields off that stub — so the list lives with the harness that
+ * seeds it rather than in the slice.
+ */
+interface ModelHarnessCrossState {
+  ifcDataStore: IfcDataStore | null;
+  geometryResult: GeometryResult | null;
+  meshColorBackup: Map<number, [number, number, number, number]> | null;
+  selectedEntityId: number | null;
+  selectedEntityIds: Set<number>;
+  selectedStoreys: Set<number>;
+  hiddenEntities: Set<number>;
+  isolatedEntities: Set<number> | null;
+  ghostExceptEntities: Set<number> | null;
+  classFilter: { ids: Set<number>; label: string } | null;
+  pinboardEntities: Set<string>;
+  hierarchyBasketSelection: Set<string>;
+}
+
+type ModelTestState = ModelSlice & ModelHarnessCrossState;
 
 /** The selection fields `removeModel` purges. They belong to another slice, so
  *  the slice under test reads them through a cast and so does this file. */
@@ -27,6 +56,17 @@ interface SelectionFields {
 interface PinboardFields {
   pinboardEntities: Set<string>;
   hierarchyBasketSelection: Set<string>;
+}
+
+/** The 2D drawing markup fields (drawing2DSlice), reached through a cast for
+ *  the same reason as `SelectionFields`/`PinboardFields` above — they live on
+ *  another slice this harness does not construct. */
+interface Drawing2DMarkupFields {
+  measure2DResults: Measure2DResult[];
+}
+
+function sampleMeasure(id: string): Measure2DResult {
+  return { id, start: { x: 0, y: 0 }, end: { x: 3, y: 4 }, distance: 5 };
 }
 
 // Typed setter / getter shim that mirrors zustand's StateCreator
@@ -88,9 +128,19 @@ describe('ModelSlice', () => {
       ...slice,
       ifcDataStore: null,
       geometryResult: null,
+      meshColorBackup: null,
+      selectedEntityId: null,
+      selectedEntityIds: new Set(),
+      selectedStoreys: new Set(),
+      hiddenEntities: new Set(),
+      isolatedEntities: null,
+      ghostExceptEntities: null,
+      classFilter: null,
       pinboardEntities: new Set<string>(),
       hierarchyBasketSelection: new Set<string>(),
+      ...getDefaultDrawing2DState(),
     };
+    __resetLiveMarkupCacheForTests();
   });
 
   describe('initial state', () => {
@@ -170,6 +220,56 @@ describe('ModelSlice', () => {
       assert.strictEqual(state.models.get('model-2')?.ifcDataStore, secondStore);
       assert.strictEqual(state.models.get('model-2')?.geometryResult, secondGeometry);
     });
+
+    describe('2D drawing markup on the first-model branch — #4159 bug 3', () => {
+      // `addModel`'s `state.models.size === 0` branch is a THIRD production
+      // writer of `activeModelId` with markup consequences that the module
+      // doc on `drawing2DSlice.markupTransition.ts` originally missed — see
+      // that file's doc for the corrected claim. Reachable in production via
+      // `useFileCommands.tsx`'s multi-model `handleRefresh`: it calls
+      // `clearAllModels()` (whose `'all-models-cleared'` teardown arm is a
+      // deliberate no-op for the flat markup fields, per
+      // `drawing2DSlice.teardown.ts`) and then reloads every model through
+      // `addModel()`, without an intervening `resetViewerState()`.
+      beforeEach(() => {
+        __resetLiveMarkupCacheForTests();
+      });
+
+      it('does not attribute stale markup to a model loaded via addModel after clearAllModels — MUTATION TARGET', () => {
+        state.addModel(createMockModel('model-1', 'First'));
+        Object.assign(state, { measure2DResults: [sampleMeasure('mA')] });
+
+        state.clearAllModels();
+        assert.strictEqual(state.activeModelId, null, 'setup sanity: clearAllModels must drop activeModelId');
+        assert.deepStrictEqual(
+          (state as unknown as Drawing2DMarkupFields).measure2DResults,
+          [sampleMeasure('mA')],
+          'setup sanity: clearAllModels\' teardown arm for markup is a deliberate no-op, so the field is still stale here',
+        );
+
+        state.addModel(createMockModel('model-2', 'Second'));
+
+        assert.strictEqual(state.activeModelId, 'model-2');
+        assert.deepStrictEqual(
+          (state as unknown as Drawing2DMarkupFields).measure2DResults,
+          [],
+          'model-1\'s stale measurement must not carry over onto model-2 via the first-model addModel branch',
+        );
+      });
+
+      it('leaves a genuinely fresh first load unaffected', () => {
+        assert.strictEqual(state.activeModelId, null);
+        assert.deepStrictEqual((state as unknown as Drawing2DMarkupFields).measure2DResults, []);
+
+        const model = createMockModel('model-1', 'Only');
+        state.addModel(model);
+
+        assert.strictEqual(state.activeModelId, 'model-1');
+        assert.strictEqual(state.ifcDataStore, model.ifcDataStore);
+        assert.strictEqual(state.geometryResult, model.geometryResult);
+        assert.deepStrictEqual((state as unknown as Drawing2DMarkupFields).measure2DResults, []);
+      });
+    });
   });
 
   describe('upsertModel', () => {
@@ -203,6 +303,54 @@ describe('ModelSlice', () => {
       state.upsertModel(createMockModel('model-1', 'A'));
       state.upsertModel(createMockModel('model-2', 'B'));
       assert.strictEqual(state.activeModelId, 'model-1');
+    });
+
+    describe('2D drawing markup on the first-model branch — #4159 bug 6', () => {
+      // `upsertModel` resolves `activeModelId` as `state.activeModelId ??
+      // model.id` — the same "adopt the first model of the session" shape
+      // `addModel`'s `state.models.size === 0` branch has (bug 3, above) —
+      // but wrote it directly instead of through `markupTransitionPatch`.
+      // Reachable in production via `collabSlice.ts`'s room-join path and
+      // `useIfcLoader.ts`'s AI-agent load path, both of which call
+      // `upsertModel` and can be the first model of a session.
+      beforeEach(() => {
+        __resetLiveMarkupCacheForTests();
+      });
+
+      it('does not attribute stale markup to a model adopted via upsertModel after clearAllModels — MUTATION TARGET', () => {
+        state.addModel(createMockModel('model-1', 'First'));
+        Object.assign(state, { measure2DResults: [sampleMeasure('mA')] });
+
+        state.clearAllModels();
+        assert.strictEqual(state.activeModelId, null, 'setup sanity: clearAllModels must drop activeModelId');
+        assert.deepStrictEqual(
+          (state as unknown as Drawing2DMarkupFields).measure2DResults,
+          [sampleMeasure('mA')],
+          'setup sanity: clearAllModels\' teardown arm for markup is a deliberate no-op, so the field is still stale here',
+        );
+
+        state.upsertModel(createMockModel('model-2', 'Second'));
+
+        assert.strictEqual(state.activeModelId, 'model-2');
+        assert.deepStrictEqual(
+          (state as unknown as Drawing2DMarkupFields).measure2DResults,
+          [],
+          'model-1\'s stale measurement must not carry over onto model-2 via the first-model upsertModel branch',
+        );
+      });
+
+      it('leaves a genuinely fresh first upsert unaffected', () => {
+        assert.strictEqual(state.activeModelId, null);
+        assert.deepStrictEqual((state as unknown as Drawing2DMarkupFields).measure2DResults, []);
+
+        const model = createMockModel('model-1', 'Only');
+        state.upsertModel(model);
+
+        assert.strictEqual(state.activeModelId, 'model-1');
+        assert.strictEqual(state.ifcDataStore, model.ifcDataStore);
+        assert.strictEqual(state.geometryResult, model.geometryResult);
+        assert.deepStrictEqual((state as unknown as Drawing2DMarkupFields).measure2DResults, []);
+      });
     });
   });
 
@@ -404,6 +552,166 @@ describe('ModelSlice', () => {
       assert.strictEqual(state.activeModelId, 'model-1');
     });
 
+    describe('2D drawing markup on the active model — #4159 bug 5', () => {
+      // `removeModel` moves `activeModelId` to the survivor through the
+      // teardown-registry composition (`viewerTeardown`), NOT through
+      // `setActiveModel`. Before this fix, `drawing2DSlice.teardown.ts`'s
+      // `'model-removed'` arm was `notApplicable` for every case, including
+      // "the removed model WAS the active one" — so the flat
+      // `measure2DResults` (and its four siblings) kept describing the
+      // just-removed model under the SURVIVOR's new active id, exactly the
+      // cross-model leak bug 2 fixed for an ordinary `setActiveModel` switch.
+      // These tests drive the REAL `removeModel` action (not a stub), which
+      // reaches the real, module-wide `viewerTeardown` registry — so this is
+      // the same code path production and `syncSourceModel.ts` both use.
+      beforeEach(() => {
+        __resetLiveMarkupCacheForTests();
+      });
+
+      it('does not leak the removed active model\'s markup into the survivor\'s fields — MUTATION TARGET', () => {
+        state.addModel(createMockModel('model-1', 'First'));
+        state.addModel(createMockModel('model-2', 'Second'));
+        state.setActiveModel('model-1');
+        Object.assign(state, { measure2DResults: [sampleMeasure('mA')] });
+
+        state.removeModel('model-1');
+
+        assert.strictEqual(state.activeModelId, 'model-2', 'setup sanity: model-2 must be the successor');
+        const after = state as unknown as Drawing2DMarkupFields;
+        assert.deepStrictEqual(
+          after.measure2DResults,
+          [],
+          'model-1\'s measurement must not still be attached once model-2 becomes active',
+        );
+      });
+
+      it('restores a survivor\'s OWN earlier markup on removal, not empty defaults — MUTATION TARGET', () => {
+        // model-2 was active earlier this session (with its own markup) and
+        // was switched away from in favour of model-1 — `setActiveModel`
+        // captured model-2's data into the live cache when that happened.
+        // Removing model-1 (now active) must hand model-2 back its REAL
+        // data, the same way switching back to it manually would.
+        state.addModel(createMockModel('model-1', 'First'));
+        state.addModel(createMockModel('model-2', 'Second'));
+        state.setActiveModel('model-2');
+        Object.assign(state, { measure2DResults: [sampleMeasure('mB')] });
+        state.setActiveModel('model-1');
+        Object.assign(state, { measure2DResults: [sampleMeasure('mA')] });
+
+        state.removeModel('model-1');
+
+        assert.strictEqual(state.activeModelId, 'model-2');
+        const after = state as unknown as Drawing2DMarkupFields;
+        assert.strictEqual(after.measure2DResults[0]?.id, 'mB', 'model-2\'s own earlier markup must come back, not empty defaults or model-1\'s data');
+      });
+
+      it('leaves the markup fields untouched when the removed model was not active', () => {
+        state.addModel(createMockModel('model-1', 'First'));
+        state.addModel(createMockModel('model-2', 'Second'));
+        state.setActiveModel('model-1');
+        Object.assign(state, { measure2DResults: [sampleMeasure('mA')] });
+
+        state.removeModel('model-2');
+
+        assert.strictEqual(state.activeModelId, 'model-1');
+        const after = state as unknown as Drawing2DMarkupFields;
+        assert.strictEqual(after.measure2DResults[0]?.id, 'mA', 'removing an INACTIVE model must not touch the active model\'s own markup');
+      });
+
+      it('clears to defaults when the removed active model was the last one loaded', () => {
+        state.addModel(createMockModel('model-1', 'Only'));
+        Object.assign(state, { measure2DResults: [sampleMeasure('mA')] });
+
+        state.removeModel('model-1');
+
+        assert.strictEqual(state.activeModelId, null);
+        const after = state as unknown as Drawing2DMarkupFields;
+        assert.deepStrictEqual(after.measure2DResults, []);
+      });
+    });
+
+    describe('global-id state (selection sets / hidden / isolated / ghost / class filter)', () => {
+      // `syncSourceModel.ts`'s second model-removed purge already purges these
+      // exact fields on the same-modelId resync path (comment above this
+      // block's parent `describe`). `removeModel` never got the same
+      // treatment for anything past the EntityRef-shaped selection fields —
+      // these are keyed by bare `globalId`, not `{modelId, expressId}`, so a
+      // stale entry can't be spotted by comparing `.modelId`; it has to be
+      // resolved against which surviving model's parse/overlay range owns it.
+      function federatedModel(id: string, idOffset: number): FederatedModel {
+        const m = createMockModel(id, id);
+        m.idOffset = idOffset;
+        m.maxExpressId = 100;
+        return m;
+      }
+
+      it('clears isolatedEntities to null when every isolated id belonged to the removed model', () => {
+        state.addModel(federatedModel('model-1', 0));
+        state.addModel(federatedModel('model-2', 1000));
+        Object.assign(state, { isolatedEntities: new Set([5, 7]) });
+
+        state.removeModel('model-1');
+
+        // A non-null empty Set would still read as "isolation active,
+        // nothing matches" and hide every surviving entity — worse than the
+        // dangling ids it replaces. Must be null, not an empty Set.
+        assert.strictEqual((state as unknown as { isolatedEntities: unknown }).isolatedEntities, null);
+      });
+
+      it('keeps the surviving id and drops only the removed model\'s id from a mixed isolatedEntities set', () => {
+        state.addModel(federatedModel('model-1', 0));
+        state.addModel(federatedModel('model-2', 1000));
+        // 5 belongs to model-1 (offset 0), 1005 belongs to model-2 (offset 1000).
+        Object.assign(state, { isolatedEntities: new Set([5, 1005]) });
+
+        state.removeModel('model-1');
+
+        const after = state as unknown as { isolatedEntities: Set<number> | null };
+        assert.deepStrictEqual(after.isolatedEntities, new Set([1005]));
+      });
+
+      it('leaves isolatedEntities untouched when it names no id from the removed model', () => {
+        state.addModel(federatedModel('model-1', 0));
+        state.addModel(federatedModel('model-2', 1000));
+        Object.assign(state, { isolatedEntities: new Set([1005]) });
+
+        state.removeModel('model-1');
+
+        const after = state as unknown as { isolatedEntities: Set<number> | null };
+        assert.deepStrictEqual(after.isolatedEntities, new Set([1005]));
+      });
+
+      it('purges ghostExceptEntities, hiddenEntities, selectedEntityIds, selectedStoreys and classFilter the same way', () => {
+        state.addModel(federatedModel('model-1', 0));
+        state.addModel(federatedModel('model-2', 1000));
+        Object.assign(state, {
+          ghostExceptEntities: new Set([5, 1005]),
+          hiddenEntities: new Set([6, 1006]),
+          selectedEntityIds: new Set([7, 1007]),
+          selectedStoreys: new Set([8, 1008]),
+          selectedEntityId: 9,
+          classFilter: { ids: new Set([10, 1010]), label: 'Walls' },
+        });
+
+        state.removeModel('model-1');
+
+        const after = state as unknown as {
+          ghostExceptEntities: Set<number> | null;
+          hiddenEntities: Set<number>;
+          selectedEntityIds: Set<number>;
+          selectedStoreys: Set<number>;
+          selectedEntityId: number | null;
+          classFilter: { ids: Set<number>; label: string } | null;
+        };
+        assert.deepStrictEqual(after.ghostExceptEntities, new Set([1005]));
+        assert.deepStrictEqual(after.hiddenEntities, new Set([1006]));
+        assert.deepStrictEqual(after.selectedEntityIds, new Set([1007]));
+        assert.deepStrictEqual(after.selectedStoreys, new Set([1008]));
+        assert.strictEqual(after.selectedEntityId, null, 'id 9 belonged only to the removed model');
+        assert.deepStrictEqual(after.classFilter, { ids: new Set([1010]), label: 'Walls' });
+      });
+    });
+
     it('purges the REMOVED model\'s refs from the pinboard basket and keeps every survivor', () => {
       // pinboardSlice's `pinboardEntities` / `hierarchyBasketSelection` are
       // Set<string> of entityRef strings ("modelId:expressId"), the exact
@@ -462,6 +770,38 @@ describe('ModelSlice', () => {
 
       assert.strictEqual(state.models.size, 0);
       assert.strictEqual(state.activeModelId, null);
+    });
+
+    it('clears every global-id set (isolate/ghost/hidden/selection/class filter) unconditionally', () => {
+      state.addModel(createMockModel('model-1', 'First'));
+      Object.assign(state, {
+        isolatedEntities: new Set([1]),
+        ghostExceptEntities: new Set([2]),
+        hiddenEntities: new Set([3]),
+        selectedEntityIds: new Set([4]),
+        selectedStoreys: new Set([5]),
+        selectedEntityId: 6,
+        classFilter: { ids: new Set([7]), label: 'Doors' },
+      });
+
+      state.clearAllModels();
+
+      const after = state as unknown as {
+        isolatedEntities: unknown;
+        ghostExceptEntities: unknown;
+        hiddenEntities: Set<number>;
+        selectedEntityIds: Set<number>;
+        selectedStoreys: Set<number>;
+        selectedEntityId: number | null;
+        classFilter: unknown;
+      };
+      assert.strictEqual(after.isolatedEntities, null);
+      assert.strictEqual(after.ghostExceptEntities, null);
+      assert.strictEqual(after.hiddenEntities.size, 0);
+      assert.strictEqual(after.selectedEntityIds.size, 0);
+      assert.strictEqual(after.selectedStoreys.size, 0);
+      assert.strictEqual(after.selectedEntityId, null);
+      assert.strictEqual(after.classFilter, null);
     });
 
     it('clears the pinboard basket along with every model', () => {

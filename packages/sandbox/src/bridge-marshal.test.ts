@@ -20,7 +20,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import type { BimContext, EntityRef } from '@ifc-lite/sdk';
+import { createBimContext, type BimBackend, type BimContext, type EntityRef } from '@ifc-lite/sdk';
 import { createSandbox } from './sandbox.js';
 
 /** Permissions for a sandbox that only needs `bim.export`. */
@@ -33,6 +33,13 @@ const EXPORT_ONLY = {
   lens: false,
   export: true,
   files: false,
+} as const;
+
+const VIEWER_AND_QUERY = {
+  ...EXPORT_ONLY,
+  query: true,
+  viewer: true,
+  export: false,
 } as const;
 
 /** Build a stub BimContext whose `export` namespace records and answers. */
@@ -59,6 +66,18 @@ async function withSandbox<T>(
   fn: (evalCode: (code: string) => Promise<unknown>) => Promise<T>,
 ): Promise<T> {
   const sandbox = await createSandbox(sdk, { permissions: EXPORT_ONLY });
+  try {
+    return await fn(async (code) => (await sandbox.eval(code, { typescript: false })).value);
+  } finally {
+    sandbox.dispose();
+  }
+}
+
+async function withViewerSandbox<T>(
+  sdk: BimContext,
+  fn: (evalCode: (code: string) => Promise<unknown>) => Promise<T>,
+): Promise<T> {
+  const sandbox = await createSandbox(sdk, { permissions: VIEWER_AND_QUERY });
   try {
     return await fn(async (code) => (await sandbox.eval(code, { typescript: false })).value);
   } finally {
@@ -106,6 +125,56 @@ describe('entityRefs argument unmarshalling', () => {
   });
 });
 
+describe('resetColors optional entity refs (#4789)', () => {
+  it('preserves omitted, undefined, empty, and nonempty values through the real VM', async () => {
+    const calls: Array<EntityRef[] | undefined> = [];
+    const sdk = {
+      viewer: { resetColors: (refs?: EntityRef[]) => calls.push(refs) },
+    } as unknown as BimContext;
+
+    await withViewerSandbox(sdk, async (run) => {
+      await run('bim.viewer.resetColors()');
+      await run('bim.viewer.resetColors(undefined)');
+      await run('bim.viewer.resetColors([])');
+      await run("bim.viewer.resetColors([{ ref: { modelId: 'm', expressId: 7 } }])");
+      await expect(run('bim.viewer.resetColors(null)')).rejects.toThrow(/map/);
+    });
+
+    expect(calls).toEqual([
+      undefined,
+      undefined,
+      [],
+      [{ modelId: 'm', expressId: 7 }],
+    ]);
+  });
+
+  it('keeps a zero-match query from clearing real SDK color state', async () => {
+    const overrides = new Set([1, 2]);
+    const calls: Array<EntityRef[] | undefined> = [];
+    const backend = {
+      query: { entities: () => [] },
+      viewer: {
+        resetColors: (refs?: EntityRef[]) => {
+          calls.push(refs);
+          if (!refs) overrides.clear();
+          else for (const ref of refs) overrides.delete(ref.expressId);
+        },
+      },
+    } as unknown as BimBackend;
+    const sdk = createBimContext({ backend });
+
+    await withViewerSandbox(sdk, async (run) => {
+      await run("bim.viewer.resetColors(bim.query.byType('IfcDoesNotExist'))");
+      expect([...overrides]).toEqual([1, 2]);
+      expect(calls).toEqual([]);
+
+      await run('bim.viewer.resetColors()');
+      expect([...overrides]).toEqual([]);
+      expect(calls).toEqual([undefined]);
+    });
+  });
+});
+
 describe("returns: 'string' marshalling", () => {
   it('hands a string back as a string', async () => {
     const { sdk } = stubSdk({ csv: () => 'Name\nWall A\n' });
@@ -129,6 +198,31 @@ describe("returns: 'string' marshalling", () => {
       );
       expect(value, `non-string return of type ${label}`).toBeNull();
     }
+  });
+});
+
+describe('marshalValue typed-array handling', () => {
+  it('marshals a Uint8Array as a real, indexable script array', async () => {
+    // A typed array's own enumerable properties ARE its numeric indices, so
+    // walking one with the generic-object branch (Object.entries) used to
+    // hand the script `{ "0": 73, "1": 70, "2": 67 }` — no `.length`, and
+    // `Array.isArray()` false. `bim.export.ifc()` returns exactly this shape
+    // once STEP output exceeds V8's string-length limit and falls back to
+    // `Uint8Array` chunks (step-exporter.ts): small models marshal fine,
+    // large ones silently hand the script junk.
+    const { sdk } = stubSdk({ json: () => new Uint8Array([73, 70, 67]) });
+    const value = await withSandbox(sdk, (run) =>
+      run(
+        `const r = bim.export.json([], []); JSON.stringify({ isArray: Array.isArray(r), length: r.length, values: r })`,
+      ),
+    );
+    expect(value).toBe('{"isArray":true,"length":3,"values":[73,70,67]}');
+  });
+
+  it('marshals a Float64Array element inside a plain array the same way', async () => {
+    const { sdk } = stubSdk({ json: () => ({ samples: new Float64Array([1.5, 2.5]) }) });
+    const value = await withSandbox(sdk, (run) => run(`bim.export.json([], [])`));
+    expect(value).toEqual({ samples: [1.5, 2.5] });
   });
 });
 
@@ -168,5 +262,114 @@ describe('marshalValue cycle guard', () => {
     const { sdk } = stubSdk({ json: () => root });
     const value = await withSandbox(sdk, (run) => run(`bim.export.json([], [])`));
     expect(value).toEqual({ level: 0, child: { level: 1, back: null } });
+  });
+});
+
+describe('marshalValue hostile typed-array inputs', () => {
+  it('degrades a detached typed array instead of killing the whole call', async () => {
+    // Transferring an ArrayBuffer to a worker detaches it — the large-model
+    // export path does exactly this. Every element access on the view then
+    // throws from host code, `Array.from` included, and an escaping throw
+    // takes down the entire `bim.*` call rather than one value.
+    const view = new Uint8Array([1, 2, 3]);
+    structuredClone(view.buffer, { transfer: [view.buffer] });
+    expect(view.byteLength, 'fixture must actually be detached').toBe(0);
+
+    const { sdk } = stubSdk({ json: () => ({ chunk: view, ok: 'still here' }) });
+    const value = await withSandbox(sdk, (run) => run(`bim.export.json([], [])`));
+    // The rest of the payload must survive: the failure being fixed is that
+    // `ok` never reached the script at all.
+    expect(value).toEqual({ chunk: {}, ok: 'still here' });
+  });
+
+  it('does not hand a script a plausible-looking array of nulls for 64-bit ints', async () => {
+    // BigInt64Array elements are bigints, which marshal to null. As an array
+    // that is `[null, null]` — `Array.isArray` true, `.length` correct, and
+    // indistinguishable from a genuine array of nulls. The object shape is
+    // just as lossy but visibly not a sequence of numbers.
+    const { sdk } = stubSdk({ json: () => new BigInt64Array([1n, 2n]) });
+    const value = await withSandbox(sdk, (run) =>
+      run(`const r = bim.export.json([], []); JSON.stringify({ isArray: Array.isArray(r), r })`),
+    );
+    expect(value).toBe('{"isArray":false,"r":{"0":null,"1":null}}');
+  });
+
+  it('does not turn a DataView into an array of its byte range', async () => {
+    // A DataView is a byte-range accessor, not a sequence of elements: it has
+    // no index properties, and `Array.from` reads its `length` as undefined
+    // and answers `[]` — an empty array a script reads as "zero elements"
+    // rather than "not a sequence".
+    const { sdk } = stubSdk({ json: () => new DataView(new Uint8Array([7, 8]).buffer) });
+    const value = await withSandbox(sdk, (run) =>
+      run(`const r = bim.export.json([], []); JSON.stringify({ isArray: Array.isArray(r), r })`),
+    );
+    expect(value).toBe('{"isArray":false,"r":{}}');
+  });
+});
+
+/**
+ * #4738: `export.ifc` now reads an empty ref list as "an isolation filter
+ * matched nothing" and refuses it, so the bridge has to keep "the script
+ * passed nothing" distinguishable from "the script passed an empty array".
+ * The `entityRefs` unmarshaller answered `[]` for both, which turned a
+ * sandboxed `bim.export.ifc()` — the documented way to export the whole model
+ * — into the refusal.
+ *
+ * These run the real `ExportNamespace` behind the real bridge: only the
+ * backend below it is a recorder, so the guard, the marshalling and the
+ * generated parameter list are all the shipping ones. `bim.export.csv()`
+ * keeps answering `[]` (pinned above), which is what bounds this change to
+ * the one method whose contract needs the distinction.
+ */
+describe('an omitted entity list survives the bridge for export.ifc (#4738)', () => {
+  /** A real BimContext whose backend records what the namespace passed down. */
+  function realSdk(): { sdk: BimContext; seen: unknown[] } {
+    const seen: unknown[] = [];
+    const backend = {
+      export: {
+        ifc: (refs: unknown) => { seen.push(refs); return 'ISO-10303-21;WHOLE'; },
+        download: () => {},
+      },
+    } as unknown as Parameters<typeof createBimContext>[0]['backend'];
+    return { sdk: createBimContext({ backend }), seen };
+  }
+
+  it('bim.export.ifc() exports the whole model instead of being refused', async () => {
+    const { sdk, seen } = realSdk();
+    // RED before the fix: the call threw
+    // "export.ifc: the entity list is empty, so an isolation filter matched
+    // nothing", because the bridge handed the namespace `[]`.
+    const value = await withSandbox(sdk, (run) => run(`bim.export.ifc()`));
+    expect(value).toBe('ISO-10303-21;WHOLE');
+    // `undefined`, not `[]`: the absence reaches the backend, which is what lets
+    // a backend that cannot guess a model (the viewer's) answer the whole model.
+    expect(seen).toEqual([undefined]);
+  });
+
+  it('an explicit undefined is the same absence — the documented migration', async () => {
+    // `ifc(undefined, options)` is what the guide tells callers to write in
+    // place of `ifc([], options)`. The handle exists and dumps to `undefined`,
+    // so an arity-only check would have run `.map` on it and thrown a
+    // TypeError inside the one environment the optional arg type is for.
+    const { sdk, seen } = realSdk();
+    const value = await withSandbox(sdk, (run) => run(`bim.export.ifc(undefined, { schema: 'IFC4' })`));
+    expect(value).toBe('ISO-10303-21;WHOLE');
+    expect(seen).toEqual([undefined]);
+  });
+
+  it('leaves the non-optional entityRefs methods loud on an explicit null', async () => {
+    // Scoping the new absence to `export.ifc` matters in both directions: for
+    // `csv`/`json`/`viewer.*` an explicit null is a script bug, and answering
+    // `[]` would turn it into a header-only CSV or a silent no-op. Only an
+    // OMITTED argument is `[]` for those (pinned above).
+    const { sdk } = stubSdk({});
+    await expect(withSandbox(sdk, (run) => run(`bim.export.csv(null, { columns: ['Name'] })`)))
+      .rejects.toThrow(/map/);
+  });
+
+  it('bim.export.ifc([]) is still refused, so the distinction is real', async () => {
+    const { sdk, seen } = realSdk();
+    await expect(withSandbox(sdk, (run) => run(`bim.export.ifc([])`))).rejects.toThrow(/matched nothing/);
+    expect(seen).toEqual([]);
   });
 });

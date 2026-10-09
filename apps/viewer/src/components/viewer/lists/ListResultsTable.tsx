@@ -12,34 +12,33 @@
  * rows), so 100K+ rows stay smooth.
  */
 
-import React, { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { ArrowUp, ArrowDown, Search, Eye, EyeOff, Download, ChevronRight, ChevronDown, FileText, FileSpreadsheet, FileType } from 'lucide-react';
+import { ArrowUp, ArrowDown, Search, Eye, EyeOff, Download, ChevronDown, FileText, FileSpreadsheet, FileType } from 'lucide-react';
 import { Input } from '@/components/ui/input';
-import { Button } from '@/components/ui/button';
-import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
+import { IconButton } from '@/components/ui/icon-button';
+import { EmptyState } from '@/components/ui/empty-state';
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem } from '@/components/ui/dropdown-menu';
 import { useViewerStore } from '@/store';
-import { getVisibleBasketEntityRefsFromStore } from '@/store/basketVisibleSet';
-import { toGlobalIdFromModels } from '@/store/globalId';
-import { useEntityListMultiSelect, type MultiSelectItem } from '@/hooks/useEntityListMultiSelect';
 import { groupingColumnIds, type ListResult, type ListRow, type ColumnDefinition, type ListGrouping } from '@ifc-lite/lists';
 import type { ProjectUnits } from '@ifc-lite/parser';
 import { exportList, buildExportModel, EXPORT_LABELS, type ExportFormat } from '@/lib/lists/export';
 import { resolveListColumnUnits } from '@/lib/units/list-column-units';
-import { posthog } from '@/lib/analytics';
+import { toast } from '@/components/ui/toast';
 import { cn } from '@/lib/utils';
 import { columnToAutoColor } from '@/lib/lists/columnToAutoColor';
 import { AUTO_COLOR_FROM_LIST_ID } from '@/store/slices/lensSlice';
-import { ColumnHeaderMenu } from './ColumnHeaderMenu';
+import { useTranslation } from '@/i18n/useTranslation'; import { ColumnHeaderMenu } from './ColumnHeaderMenu'; import { formatLocaleCount } from './formatLocaleCount';
 import { ListGroupingBar } from './ListGroupingBar';
 import { ListScheduleTable } from './ListScheduleTable';
-import {
-  formatCellValue, compareCells, detectNumericColumns, autoColumnWidth,
+import { ListGroupHeaderRow } from './ListGroupHeaderRow';
+import { useListRowSelection } from './useListRowSelection';
+import { useListVisibilityActions } from './useListVisibilityActions';
+import { useVisibleListRows } from './useVisibleListRows';
+import { ColumnResizeHandle } from './ColumnResizeHandle';
+import { formatCellValue, compareCells, detectNumericColumns, autoColumnWidth,
   buildGroupedView, flatTotals, buildScheduleRows, rebuildGrouping,
-  type DisplayItem, type Totals, type ScheduleRow,
-} from './list-table-utils';
-
+  type DisplayItem, type Totals, type ScheduleRow } from './list-table-utils';
 interface ListResultsTableProps {
   result: ListResult;
   /** List name — used as the export title / filename. */
@@ -57,7 +56,7 @@ interface ListResultsTableProps {
 }
 
 export function ListResultsTable({ result, listName, grouping, onGroupingChange, modelUnits }: ListResultsTableProps) {
-  const unitDisplayOverrides = useViewerStore((s) => s.unitDisplayOverrides);
+  const { t, locale } = useTranslation(); const unitDisplayOverrides = useViewerStore((s) => s.unitDisplayOverrides);
   const parentRef = useRef<HTMLDivElement>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [sortCol, setSortCol] = useState<number | null>(null);
@@ -67,24 +66,10 @@ export function ListResultsTable({ result, listName, grouping, onGroupingChange,
   const [widthOverrides, setWidthOverrides] = useState<Record<string, number>>({});
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
 
-  const selectedEntityId = useViewerStore((s) => s.selectedEntityId);
-  const selectedEntityIds = useViewerStore((s) => s.selectedEntityIds);
   const activateAutoColorFromColumn = useViewerStore((s) => s.activateAutoColorFromColumn);
   const activeLensId = useViewerStore((s) => s.activeLensId);
-  const { select: onMultiSelect } = useEntityListMultiSelect();
 
-  // Visibility state — re-filter when 3D visibility changes.
-  const hiddenEntities = useViewerStore((s) => s.hiddenEntities);
-  const isolatedEntities = useViewerStore((s) => s.isolatedEntities);
-  const classFilter = useViewerStore((s) => s.classFilter);
-  const lensHiddenIds = useViewerStore((s) => s.lensHiddenIds);
-  const selectedStoreys = useViewerStore((s) => s.selectedStoreys);
-  const typeVisibility = useViewerStore((s) => s.typeVisibility);
-  const hiddenEntitiesByModel = useViewerStore((s) => s.hiddenEntitiesByModel);
-  const isolatedEntitiesByModel = useViewerStore((s) => s.isolatedEntitiesByModel);
-  const models = useViewerStore((s) => s.models);
-  const activeBasketViewId = useViewerStore((s) => s.activeBasketViewId);
-  const geometryResult = useViewerStore((s) => s.geometryResult);
+  const visibilityActions = useListVisibilityActions();
 
   const columns = result.columns;
   const numericCols = useMemo(() => detectNumericColumns(columns, result.rows), [columns, result.rows]);
@@ -96,19 +81,8 @@ export function ListResultsTable({ result, listName, grouping, onGroupingChange,
     [columns, modelUnits, unitDisplayOverrides],
   );
 
-  const visibilityFilteredRows = useMemo(() => {
-    if (!filterByVisibility) return result.rows;
-    const visibleSet = new Set<string>();
-    for (const ref of getVisibleBasketEntityRefsFromStore()) visibleSet.add(`${ref.modelId}:${ref.expressId}`);
-    return result.rows.filter((row) => {
-      const modelId = row.modelId === 'default' ? 'legacy' : row.modelId;
-      return visibleSet.has(`${modelId}:${row.entityId}`);
-    });
-  }, [
-    result.rows, filterByVisibility, hiddenEntities, isolatedEntities, classFilter, lensHiddenIds,
-    selectedStoreys, typeVisibility, hiddenEntitiesByModel, isolatedEntitiesByModel, models,
-    activeBasketViewId, geometryResult,
-  ]);
+  // "Visible only" — ignoring the list's own isolation (#6368).
+  const visibilityFilteredRows = useVisibleListRows(result.rows, filterByVisibility);
 
   const filteredRows = useMemo(() => {
     if (!searchQuery) return visibilityFilteredRows;
@@ -258,26 +232,10 @@ export function ListResultsTable({ result, listName, grouping, onGroupingChange,
     setExpandedGroups(allExpanded ? new Set() : new Set(groupKeys));
   }, [allExpanded, groupKeys]);
 
-  // `startWidth` is passed in (rather than looked up here) so the SAME
-  // resize handler works for both the normal column header and the schedule
-  // (pivot) header, which index into different width arrays.
-  const startResize = useCallback((e: React.MouseEvent, colId: string, startWidth: number) => {
-    e.preventDefault(); e.stopPropagation();
-    const startX = e.clientX;
-    const onMove = (ev: MouseEvent) => setWidthOverrides((p) => ({ ...p, [colId]: Math.max(56, startWidth + (ev.clientX - startX)) }));
-    const onUp = () => {
-      window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp);
-      document.body.style.cursor = ''; document.body.style.userSelect = '';
-    };
-    window.addEventListener('mousemove', onMove); window.addEventListener('mouseup', onUp);
-    document.body.style.cursor = 'col-resize'; document.body.style.userSelect = 'none';
-  }, []);
-
-  // Export honours the on-screen view: configured columns, the active
-  // grouping (sections + per-group count/sums), and the grand totals.
+  // Export honours the on-screen columns, grouping, sums, and totals.
   const handleExport = useCallback((format: ExportFormat) => {
     const model = buildExportModel({
-      title: listName?.trim() || 'List',
+      title: listName?.trim() || t('lists.resultsTable.defaultTitle'),
       columns,
       rows: sortedRows,
       grouping,
@@ -288,77 +246,46 @@ export function ListResultsTable({ result, listName, grouping, onGroupingChange,
       modelUnits,
       unitDisplayOverrides,
     });
-    void exportList(format, model);
-    // Counts only — never the list title or column/property names (confidential).
-    posthog.capture('export_completed', {
-      format,
-      surface: 'list_results',
-      row_count: sortedRows.length,
-      column_count: columns.length,
+    void exportList(format, model).catch((error) => {
+      console.error('[Lists] export failed:', error);
+      toast.error(t('lists.resultsTable.exportFailed', { message: error instanceof Error ? error.message : 'Unknown error' }));
     });
-  }, [listName, columns, sortedRows, grouping, sortCol, sortDir, numericCols, columnWidths, modelUnits, unitDisplayOverrides]);
-
-  // Flat, ordered list of the selectable rows (group headers excluded) and a
-  // lookup from a row to its position, so Shift+click range-select works over
-  // the on-screen order. (#1463)
-  const selectableItems = useMemo<MultiSelectItem[]>(() => {
-    const out: MultiSelectItem[] = [];
-    for (const it of items) {
-      if (it.kind !== 'row') continue;
-      const r = (it as { row: ListRow }).row;
-      out.push({
-        globalId: toGlobalIdFromModels(models, r.modelId, r.entityId),
-        modelId: r.modelId,
-        expressId: r.entityId,
-      });
-    }
-    return out;
-  }, [items, models]);
-  const rowIndexByKey = useMemo(() => {
-    const m = new Map<string, number>();
-    selectableItems.forEach((it, idx) => m.set(`${it.modelId}:${it.expressId}`, idx));
-    return m;
-  }, [selectableItems]);
-
-  const handleRowClick = useCallback((row: ListRow, e: React.MouseEvent) => {
-    const idx = rowIndexByKey.get(`${row.modelId}:${row.entityId}`);
-    if (idx === undefined) return;
-    onMultiSelect(selectableItems, idx, e);
-  }, [rowIndexByKey, selectableItems, onMultiSelect]);
-
+  }, [listName, columns, sortedRows, grouping, sortCol, sortDir, numericCols, columnWidths, modelUnits, unitDisplayOverrides, t]);
+  // Every rendered line's member rows, in the virtualizer's index space: a
+  // group header selects its whole subtree, a schedule row its tuple (#6368).
+  const selectionLines = useMemo<ListRow[][]>(
+    () => (scheduleMode ? scheduleRows.map((r) => r.rows) : items.map((it) => (it.kind === 'group' ? it.rows : [it.row]))),
+    [scheduleMode, scheduleRows, items]);
+  const selection = useListRowSelection(selectionLines, scheduleMode ? 'schedule' : 'nested');
   return (
     <div className="flex-1 flex flex-col min-h-0">
       {/* Search / actions */}
       <div className="flex items-center gap-2 px-3 py-1.5 border-b">
         <Search className="h-3.5 w-3.5 text-muted-foreground" />
-        <Input
-          placeholder="Filter results..."
+        <Input aria-label={t('lists.resultsTable.filterInputLabel')}
+          placeholder={t('lists.resultsTable.filterPlaceholder')}
           value={searchQuery}
           onChange={(e) => setSearchQuery(e.target.value)}
           className="h-7 text-xs border-0 shadow-none focus-visible:ring-0 px-0"
         />
         <span className="text-xs text-muted-foreground whitespace-nowrap">
-          {sortedRows.length}{(searchQuery || filterByVisibility) ? ` / ${result.rows.length}` : ''} rows
+          {(searchQuery || filterByVisibility) ? t('lists.resultsTable.rowCountOfTotal', { count: sortedRows.length, countDisplay: formatLocaleCount(sortedRows.length, locale), total: formatLocaleCount(result.rows.length, locale) }) : t('lists.resultsTable.rowCount', { count: sortedRows.length, countDisplay: formatLocaleCount(sortedRows.length, locale) })}
         </span>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button variant="ghost" size="icon-sm" className={cn('h-6 w-6 shrink-0', filterByVisibility && 'text-primary')} aria-label={filterByVisibility ? 'Showing visible objects only' : 'Showing all objects'} aria-pressed={filterByVisibility} onClick={() => setFilterByVisibility((p) => !p)}>
-              {filterByVisibility ? <Eye className="h-3.5 w-3.5" /> : <EyeOff className="h-3.5 w-3.5" />}
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent>{filterByVisibility ? 'Showing visible objects only' : 'Showing all objects'}</TooltipContent>
-        </Tooltip>
+        <IconButton
+          label={filterByVisibility ? t('lists.resultsTable.showingVisibleOnly') : t('lists.resultsTable.showingAllObjects')}
+          size="icon-sm"
+          className={cn('h-6 w-6 shrink-0', filterByVisibility && 'text-primary')}
+          aria-pressed={filterByVisibility}
+          onClick={() => setFilterByVisibility((p) => !p)}
+        >
+          {filterByVisibility ? <Eye className="h-3.5 w-3.5" /> : <EyeOff className="h-3.5 w-3.5" />}
+        </IconButton>
         <DropdownMenu>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <DropdownMenuTrigger asChild>
-                <Button variant="ghost" size="icon-sm" className="h-6 w-6 shrink-0" aria-label="Export">
-                  <Download className="h-3.5 w-3.5" />
-                </Button>
-              </DropdownMenuTrigger>
-            </TooltipTrigger>
-            <TooltipContent>Export…</TooltipContent>
-          </Tooltip>
+          <DropdownMenuTrigger asChild>
+            <IconButton label={t('lists.resultsTable.exportAriaLabel')} tooltip={t('lists.resultsTable.exportEllipsis')} size="icon-sm" className="h-6 w-6 shrink-0">
+              <Download className="h-3.5 w-3.5" />
+            </IconButton>
+          </DropdownMenuTrigger>
           <DropdownMenuContent align="end" className="w-44">
             <DropdownMenuItem className="gap-2 text-xs" onClick={() => handleExport('csv')}>
               <FileText className="h-3.5 w-3.5" /> {EXPORT_LABELS.csv}
@@ -402,9 +329,12 @@ export function ListResultsTable({ result, listName, grouping, onGroupingChange,
           totals={totals}
           widthOverrides={widthOverrides}
           setWidthOverrides={setWidthOverrides}
-          startResize={startResize}
           onHeaderClick={handleHeaderClick}
           virtualizer={virtualizer}
+          isRowSelected={selection.isSelected}
+          onRowActivate={selection.activate}
+          rowVisibility={(i) => visibilityActions.activeChannel(scheduleRows[i]?.key ?? '')}
+          onRowVisibilityAction={(i, channel) => { const r = scheduleRows[i]; if (r) visibilityActions.run(r.key, r.rows, channel); }}
         />
       ) : (
         <div style={{ minWidth: totalWidth }}>
@@ -427,14 +357,14 @@ export function ListResultsTable({ result, listName, grouping, onGroupingChange,
                   style={{ width: columnWidths[colIdx] }}
                 >
                   <button className="flex min-w-0 flex-1 items-center gap-1 hover:text-foreground" onClick={() => handleHeaderClick(colIdx)}>
-                    {groupedBy && <ChevronDown className="h-3 w-3 shrink-0 text-primary" aria-label="grouped" />}
+                    {groupedBy && <ChevronDown className="h-3 w-3 shrink-0 text-primary" aria-label={t('lists.resultsTable.groupedAriaLabel')} />}
                     {groupedBy && groupColumnIds.length > 1 && (
-                      <span className="shrink-0 text-[9px] font-semibold tabular-nums text-primary" aria-label={`grouping level ${groupLevel + 1}`}>
+                      <span className="shrink-0 text-2xs font-semibold tabular-nums text-primary" aria-label={t('lists.resultsTable.groupingLevelAriaLabel', { level: groupLevel + 1 })}>
                         {groupLevel + 1}
                       </span>
                     )}
                     <span className="truncate">{col.label ?? col.propertyName}{unit ? ` (${unit})` : ''}</span>
-                    {summed && <span className="text-primary">Σ</span>}
+                    {summed && <span className="text-primary">{t('lists.resultsTable.sumIcon')}</span>}
                     {sortCol === colIdx && (sortDir === 'asc' ? <ArrowUp className="h-3 w-3 shrink-0" /> : <ArrowDown className="h-3 w-3 shrink-0" />)}
                   </button>
                   {onGroupingChange && (
@@ -450,19 +380,18 @@ export function ListResultsTable({ result, listName, grouping, onGroupingChange,
                       onColorBy={() => handleColorByColumn(col, colIdx)}
                     />
                   )}
-                  <div
-                    onMouseDown={(e) => startResize(e, col.id, columnWidths[colIdx])}
-                    onClick={(e) => e.stopPropagation()}
-                    onDoubleClick={() => setWidthOverrides((p) => { const n = { ...p }; delete n[col.id]; return n; })}
-                    className="absolute right-0 top-0 h-full w-1.5 cursor-col-resize hover:bg-primary/40"
-                    title="Drag to resize · double-click to auto-fit"
+                  <ColumnResizeHandle
+                    columnId={col.id}
+                    width={columnWidths[colIdx]}
+                    title={`${col.label ?? col.propertyName}: ${t('lists.resultsTable.dragToResizeTitle')}`}
+                    setWidthOverrides={setWidthOverrides}
                   />
                 </div>
               );
             })}
           </div>
-
           {/* Virtualized rows / group headers */}
+          {sortedRows.length === 0 && <EmptyState icon={<FileSpreadsheet className="size-8" />} title={t('lists.resultsTable.noRows')} />}
           <div style={{ height: `${virtualizer.getTotalSize()}px`, width: '100%', position: 'relative' }}>
             {virtualizer.getVirtualItems().map((vRow) => {
               const item = items[vRow.index];
@@ -470,49 +399,40 @@ export function ListResultsTable({ result, listName, grouping, onGroupingChange,
               const transform = `translateY(${vRow.start}px)`;
 
               if (item.kind === 'group') {
-                const expanded = expandedGroups.has(item.key);
                 return (
-                  <div
+                  <ListGroupHeaderRow
                     key={vRow.key}
-                    className="absolute left-0 top-0 flex w-full cursor-pointer border-b border-border/40 bg-muted/50 hover:bg-muted/70"
-                    style={{ transform }}
-                    onClick={() => toggleGroupExpand(item.key)}
-                  >
-                    {columns.map((col, colIdx) => (
-                      <div
-                        key={col.id}
-                        className="flex items-center gap-1 border-r border-border/20 px-2 py-1 text-xs font-medium shrink-0"
-                        // Sub-groups indent one step per nesting level (#1790).
-                        style={{ width: columnWidths[colIdx], ...(colIdx === 0 && item.level > 0 ? { paddingLeft: 8 + item.level * 14 } : undefined) }}
-                      >
-                        {colIdx === 0 && (
-                          <>
-                            {expanded ? <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" /> : <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />}
-                            <span className="truncate" title={item.label}>{item.label}</span>
-                            <span className="ml-1 shrink-0 rounded-full bg-foreground/10 px-1.5 text-[10px] tabular-nums text-muted-foreground">{item.count.toLocaleString()}</span>
-                          </>
-                        )}
-                        {sumColumnIds.includes(col.id) && (
-                          <span className="ml-auto font-mono tabular-nums">{formatCellValue(item.sums[col.id])}</span>
-                        )}
-                      </div>
-                    ))}
-                  </div>
+                    item={item}
+                    expanded={expandedGroups.has(item.key)}
+                    selected={selection.isSelected(vRow.index)}
+                    columns={columns}
+                    columnWidths={columnWidths}
+                    sumColumnIds={sumColumnIds}
+                    transform={transform}
+                    onToggleExpand={toggleGroupExpand}
+                    onSelect={(modifiers) => selection.activate(vRow.index, modifiers)}
+                    visibility={visibilityActions.activeChannel(item.key)}
+                    onVisibilityAction={(channel) => visibilityActions.run(item.key, item.rows, channel)}
+                  />
                 );
               }
 
               const row = item.row;
-              const globalId = toGlobalIdFromModels(models, row.modelId, row.entityId);
-              const isSelected = selectedEntityIds.has(globalId) || globalId === selectedEntityId;
+              const isSelected = selection.isSelected(vRow.index);
               return (
-                <div
+                <button
                   key={vRow.key}
-                  className={cn('absolute left-0 top-0 flex w-full cursor-pointer select-none border-b border-border/30 hover:bg-muted/40', isSelected && 'bg-primary/10')}
+                  type="button"
+                  aria-pressed={isSelected}
+                  className={cn('absolute left-0 top-0 flex w-full cursor-pointer select-none border-b border-border/30 text-left hover:bg-muted/40', isSelected && 'bg-primary/10')}
                   style={{ transform }}
-                  onClick={(e) => handleRowClick(row, e)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); selection.activate(vRow.index, event); }
+                  }}
+                  onClick={(e) => selection.activate(vRow.index, e)}
                 >
                   {row.values.map((value, colIdx) => (
-                    <div
+                    <span
                       key={colIdx}
                       className={cn('border-r border-border/20 px-2 py-1 text-xs truncate shrink-0', numericCols[colIdx] && 'text-right font-mono tabular-nums')}
                       // Member rows sit one indent step past the deepest group header.
@@ -520,19 +440,18 @@ export function ListResultsTable({ result, listName, grouping, onGroupingChange,
                       title={value !== null ? String(value) : ''}
                     >
                       {formatCellValue(value)}
-                    </div>
+                    </span>
                   ))}
-                </div>
+                </button>
               );
             })}
           </div>
-
           {/* Grand-totals footer (sticky, aligned under columns) */}
           {showSumRow && (
             <div className="flex sticky bottom-0 z-10 border-t-2 border-border bg-muted/90 backdrop-blur-sm">
               {columns.map((col, colIdx) => (
                 <div key={col.id} className="flex items-center border-r border-border/30 px-2 py-1 text-xs font-semibold shrink-0" style={{ width: columnWidths[colIdx] }}>
-                  {colIdx === 0 && <span className="text-muted-foreground">Total · {totals.count.toLocaleString()}</span>}
+                  {colIdx === 0 && <span className="text-muted-foreground">{t('lists.resultsTable.totalCount', { count: formatLocaleCount(totals.count, locale) })}</span>}
                   {sumColumnIds.includes(col.id) && (
                     <span className="ml-auto font-mono tabular-nums text-foreground">{formatCellValue(totals.sums[col.id])}</span>
                   )}

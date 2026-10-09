@@ -12,30 +12,21 @@
  */
 
 import type { StateCreator } from 'zustand';
-import type { EntityRef, FederatedModel } from '../types.js';
-import { stringToEntityRef } from '../types.js';
-import type { IfcDataStore } from '@ifc-lite/parser';
-import type { GeometryResult } from '@ifc-lite/geometry';
+import type { FederatedModel } from '../types.js';
 import { federationRegistry, type GlobalIdLookup } from '@ifc-lite/renderer';
-import {
-  endClashScenePresentation,
-  type ClashSceneTeardown,
-} from '@/lib/clash/visibility-ownership';
-
-/**
- * Cross-slice fields the model actions write to. `ifcDataStore` and
- * `geometryResult` are owned by `dataSlice` but `modelSlice`'s set()
- * calls need to keep them in sync with the active model.
- */
-export interface ModelCrossSliceState {
-  ifcDataStore: IfcDataStore | null;
-  geometryResult: GeometryResult | null;
-  /** Pinboard/basket state (pinboardSlice) `removeModel`/`clearAllModels`
-   *  purge of refs the removed model(s) owned — same entityRef-string
-   *  keying as `selectedEntitiesSet`. See `removeModel`'s comment for why. */
-  pinboardEntities: Set<string>;
-  hierarchyBasketSelection: Set<string>;
-}
+import type { ViewerState } from '../index.js';
+import { localIdInParseRange, localIdInOverlay } from '../globalId.js';
+import { viewerTeardown } from '../teardown-registry.js';
+import { modelAppearanceAssets } from '../../lib/appearance/model-assets.js';
+import { modelRemovedScope } from '../teardown-scope.js';
+import { endIdsRowFocusPresentation, type IDSRowFocusPresentation } from '../../lib/ids/visibility-ownership.js';
+import { endClashScenePresentation, type ClashSceneTeardown } from '@/lib/clash/visibility-ownership';
+import { markupTransitionPatch } from './drawing2DSlice.markupTransition.js';
+import { isolateModelsPatch, modelFieldPatch, modelsVisibilityPatch } from './modelSlice.visibility.js';
+import { upsertModelPatch } from './modelSlice.upsert.js';
+import { clearModelLayouts } from '@/lib/rooms/room-layout';
+import { endChartVisibilityPresentation } from '@/lib/charts/visibility-ownership';
+import { toPublishedGlobalIdFromState } from '../federation-overlay-publication.js';
 
 export interface ModelSlice {
   // State
@@ -59,6 +50,10 @@ export interface ModelSlice {
   setActiveModel: (modelId: string | null) => void;
   /** Toggle model visibility */
   setModelVisibility: (modelId: string, visible: boolean) => void;
+  /** Set visibility on many models in ONE write (`modelSlice.visibility.ts`, #4215). */
+  setModelsVisibility: (modelIds: Iterable<string>, visible: boolean) => void;
+  /** Show exactly `modelIds`, hide every other loaded model, in one write (#4215). */
+  isolateModels: (modelIds: Iterable<string>) => void;
   /** Toggle model collapsed state in hierarchy */
   setModelCollapsed: (modelId: string, collapsed: boolean) => void;
   /** Rename a model */
@@ -107,7 +102,9 @@ export interface ModelSlice {
    * It shares the range and overlay predicates with the unscoped resolver
    * above, so the two cannot drift — a private range check in a caller is how
    * this codebase produced two resolvers that disagreed about the same id space
-   * (#2697).
+   * (#2697). Those predicates (`localIdInParseRange` / `localIdInOverlay`) live
+   * in `store/globalId.ts`, the same functions `teardown-scope.ts`'s
+   * `modelRemovedScope` calls for its survivor check (#3343).
    *
    * Not the only spelling in the repo, and this doc must not claim otherwise:
    * `store/globalId.ts` `fromGlobalIdFromModels` holds an independent copy that
@@ -121,35 +118,12 @@ export interface ModelSlice {
 }
 
 /**
- * Parse-time ownership: a model owns `[idOffset, idOffset + maxExpressId]` from
- * the original parse. Returns the LOCAL express id, or `null`.
- *
- * `model.idOffset` bare, no `?? 0`: it is a required `number` on
- * `FederatedModel` (`store/types.ts`), and the unscoped resolver this is
- * extracted from has always read it bare. `null` is returned for a miss, so a
- * caller must test `!== null` — local id `0` is a legitimate answer and a
- * truthiness test would drop it.
+ * `localIdInParseRange` / `localIdInOverlay` live in `store/globalId.ts` now
+ * (#3343) — that is the cycle-free home for the "does a surviving model own
+ * this global id" rule shared with `teardown-scope.ts`'s `modelRemovedScope`.
+ * They used to be defined here; keep this pointer so a reader who remembers
+ * that lands in the right file.
  */
-function localIdInParseRange(model: FederatedModel, globalId: number): number | null {
-  const localId = globalId - model.idOffset;
-  return localId >= 0 && localId <= model.maxExpressId ? localId : null;
-}
-
-/**
- * Overlay ownership: duplicates / scripted adds through StoreEditor land ABOVE
- * the model's parse-time `maxExpressId`, so `localIdInParseRange` cannot see
- * them; the model's mutation view can. Returns the LOCAL express id, or `null`.
- */
-function localIdInOverlay(
-  model: FederatedModel,
-  globalId: number,
-  view: { getNewEntity: (id: number) => unknown } | undefined,
-): number | null {
-  if (!view) return null;
-  const localId = globalId - model.idOffset;
-  if (localId <= model.maxExpressId) return null; // parse-range's business
-  return view.getNewEntity(localId) !== null ? localId : null;
-}
 
 /** The mutation views registered on the store, if the owning slice is present. */
 function mutationViewsOf(
@@ -158,7 +132,23 @@ function mutationViewsOf(
   return (state as { mutationViews?: Map<string, { getNewEntity: (id: number) => unknown }> }).mutationViews;
 }
 
-export const createModelSlice: StateCreator<ModelSlice & ModelCrossSliceState, [], [], ModelSlice> = (set, get) => ({
+/**
+ * The model slice, typed over the WHOLE store.
+ *
+ * There used to be a `ModelCrossSliceState` here: sixteen fields owned by
+ * `dataSlice`, `selectionSlice`, `visibilitySlice` and `pinboardSlice`,
+ * declared on this slice purely so `removeModel` and `clearAllModels` could
+ * type-check their reach into all of them. Teardown no longer reaches: it returns a patch composed by the owning slices
+ * (`store/teardown-registry.ts`), so the interface is gone.
+ *
+ * What is left is real and is not teardown: `addModel`, `upsertModel`,
+ * `updateModel` and `setActiveModel` keep `dataSlice`'s `ifcDataStore` /
+ * `geometryResult` pointed at the ACTIVE model, in the same `set` that moves
+ * the model map. `ViewerState` — the same generic `collabSlice` uses — is how
+ * that is declared now: the store's own type, not a hand-listed shadow of five
+ * other slices that could silently drift from them.
+ */
+export const createModelSlice: StateCreator<ViewerState, [], [], ModelSlice> = (set, get) => ({
   // Initial state
   models: new Map(),
   activeModelId: null,
@@ -171,11 +161,17 @@ export const createModelSlice: StateCreator<ModelSlice & ModelCrossSliceState, [
     // If first model, make it active
     // If adding more models, collapse all existing by default
     if (state.models.size === 0) {
+      // #4159 bug 3: this branch also moves `activeModelId` (null -> model.id)
+      // and goes through the same choke point `setActiveModel` uses — see
+      // `drawing2DSlice.markupTransition.ts`'s doc. Fresh session ->
+      // `defaultMarkupPatch()`, restating the fields' own defaults: no-op.
+      const markupPatch = markupTransitionPatch(state, model.id);
       return {
         models: newModels,
         activeModelId: model.id,
         ifcDataStore: model.ifcDataStore ?? null,
         geometryResult: model.geometryResult ?? null,
+        ...markupPatch,
       };
     } else {
       // Collapse existing models when adding new ones
@@ -188,20 +184,11 @@ export const createModelSlice: StateCreator<ModelSlice & ModelCrossSliceState, [
     }
   }),
 
-  upsertModel: (model) => set((state) => {
-    const newModels = new Map(state.models);
-    const existing = newModels.get(model.id);
-    newModels.set(model.id, existing ? { ...existing, ...model } : model);
-    const activeModelId = state.activeModelId ?? model.id;
-    const activeModel = newModels.get(activeModelId) ?? null;
-
-    return {
-      models: newModels,
-      activeModelId,
-      ifcDataStore: activeModel?.ifcDataStore ?? null,
-      geometryResult: activeModel?.geometryResult ?? null,
-    };
-  }),
+  // #4159 bug 6: routed through `markupTransitionPatch` — see
+  // `modelSlice.upsert.ts`'s doc for why this is a sibling module rather
+  // than inline (this slice is at its module-size budget) and for the
+  // shape of the bug this closes.
+  upsertModel: (model) => set((state) => upsertModelPatch(state, model)),
 
   updateModel: (modelId, patch) => set((state) => {
     const model = state.models.get(modelId);
@@ -239,14 +226,14 @@ export const createModelSlice: StateCreator<ModelSlice & ModelCrossSliceState, [
       clearMutations?: (id: string) => void;
       clearMutationView?: (id: string) => void;
       clearGeneratedSchedule?: () => number;
-      idsValidationReport?: { modelInfo: { modelId: string } } | null;
+      idsValidationReport?: { modelInfo: { modelId: string }[] } | null;
       clearIdsValidationReport?: () => void;
       removeSourceTag?: (id: string) => void;
       pointCloudDeviationComputed?: boolean;
       setPointCloudDeviationComputed?: (computed: boolean) => void;
     };
     cross.clearMutations?.(modelId);
-    cross.clearMutationView?.(modelId);
+    cross.clearMutationView?.(modelId); clearModelLayouts(modelId); // the Room tool's filed layouts (wasm plates)
     // Drop the model's cloud-source provenance tag (sourcesSlice) so the
     // sources UI stops offering "Sync from source" for a model that no
     // longer exists and the tag map cannot grow without bound.
@@ -274,9 +261,9 @@ export const createModelSlice: StateCreator<ModelSlice & ModelCrossSliceState, [
     // Unconditional, not "only if the
     // focused clash names this model": a clash id is `${ruleId} ${lo} ${hi}`
     // with `lo`/`hi` themselves `model:expressId`, and parsing it here would be
-    // a third, subtly different reading of a key format — the exact hazard the
-    // selection purge below calls out and routes through `stringToEntityRef`
-    // to avoid. Losing a highlight on an unrelated model's removal is cheap;
+    // a third, subtly different reading of a key format — the exact hazard
+    // `slices/selectionSlice.teardown.ts` calls out and routes through
+    // `stringToEntityRef` to avoid. Losing a highlight on an unrelated model's removal is cheap;
     // an orphaned opaque solid over the survivors is not.
     //
     // The clash RESULT is deliberately kept: it is a list the user is reading,
@@ -298,12 +285,30 @@ export const createModelSlice: StateCreator<ModelSlice & ModelCrossSliceState, [
     // — verified against `mutationSlice.clearMutations` — but that is a
     // property of today's implementations, not of this call site.
     endClashScenePresentation(() => get() as unknown as ClashSceneTeardown, 'model-removed');
+    // The IDS per-row focus (#2867) owns the same two shared channels clash
+    // does — `focusEntity` installs the activated row's element into
+    // `isolatedEntities` or `ghostExceptEntities` — and a row isolation left
+    // standing over a federation that just changed is the same blank viewport
+    // #2654 describes, with nothing on screen to explain it. Released by
+    // IDS's OWN record, so a presentation belonging to clash, the spaces
+    // X-ray or IDS's set-level isolate buttons survives untouched. The row
+    // focus's colour marker goes with it — both channels it wrote.
+    //
+    // CORRECTION (review of #2867): an earlier revision of this comment
+    // claimed this "must also precede the IDS clears below, which drop the
+    // record". It does not. The only clear below is
+    // `clearIdsValidationReport`, which releases through this same helper
+    // BEFORE nulling the record — moving this call after it passes the whole
+    // suite (verified). The order here is not load-bearing and is not
+    // asserted; what IS load-bearing is the release-before-null order INSIDE
+    // `clearIdsValidationReport` (idsSlice), where it is asserted.
+    endIdsRowFocusPresentation(get() as unknown as IDSRowFocusPresentation);
 
     // If the removed model is the one the current IDS report describes, that
     // report is stale by definition — its results reference a model that no
     // longer exists, and the panel's controlled model picker would bind to a
     // now-missing option. Drop it so the panel self-heals (#1702 C2).
-    if (cross.idsValidationReport?.modelInfo.modelId === modelId) {
+    if (cross.idsValidationReport?.modelInfo.some((m) => m.modelId === modelId)) {
       cross.clearIdsValidationReport?.();
     }
 
@@ -347,112 +352,32 @@ export const createModelSlice: StateCreator<ModelSlice & ModelCrossSliceState, [
       compareCross.clearCompare?.();
     }
 
-    set((state) => {
-      const newModels = new Map(state.models);
-      newModels.delete(modelId);
+    // Unregister from the federation registry. This used to sit INSIDE the
+    // `set` updater below; it is a side effect on a singleton rather than
+    // state, and nothing between here and the `set` reads it — the survivor
+    // predicate is computed from `models`, not from the registry. Partial
+    // removal BURNS the freed offset range instead of reclaiming it
+    // (`federation-registry.ts`), which is why a teardown may purge THIS
+    // model's global ids and leave every survivor's alone.
+    federationRegistry.unregisterModel(modelId);
 
-      // Unregister from federation registry
-      federationRegistry.unregisterModel(modelId);
-
-      // Update activeModelId if removed model was active
-      let newActiveId = state.activeModelId;
-      if (state.activeModelId === modelId) {
-        const remaining = Array.from(newModels.keys());
-        newActiveId = remaining.length > 0 ? remaining[0] : null;
-      }
-
-      const activeModel = newActiveId ? newModels.get(newActiveId) : null;
-
-      // Selection state keys off modelId, so anything pointing at the removed
-      // model is now dangling: `models.get(selectedEntity.modelId)` returns
-      // undefined and the properties panel silently renders nothing rather
-      // than re-resolving, leaving a ghost selection until the user clicks
-      // elsewhere. `activeStorey` likewise stays pinned to a storey in a model
-      // that no longer exists, which the Solo level display and floorplan read.
-      //
-      // `syncSourceModel`'s purgeStaleReferences already does exactly this for
-      // the same-modelId resync path; full removal needed the same treatment
-      // and never got it. Entries belonging to OTHER models are preserved —
-      // clearing wholesale would drop a federated sibling's live selection.
-      // Selection lives on selectionSlice; reached through a narrow cast the
-      // same way the mutation/IDS/source-tag actions above are reached via
-      // `cross`, since a slice's own StateCreator is typed to its own fields.
-      // Every field is optional here, not just cast: `modelSlice.test.ts`
-      // drives this action through a harness that stubs `set`/`get` with the
-      // model slice alone, so selection fields are genuinely absent there. A
-      // slice reaching across must tolerate that rather than assume the
-      // combined store.
-      const sel = state as unknown as Partial<{
-        selectedEntity: EntityRef | null;
-        activeStorey: EntityRef | null;
-        selectedEntities: EntityRef[];
-        selectedEntitiesSet: Set<string>;
-        selectedModelId: string | null;
-        pinboardEntities: Set<string>;
-        hierarchyBasketSelection: Set<string>;
-      }>;
-      const priorEntities = sel.selectedEntities ?? [];
-      const priorSet = sel.selectedEntitiesSet ?? new Set<string>();
-      const keptEntities = priorEntities.filter((e) => e.modelId !== modelId);
-      const selectionTouchedRemoved =
-        sel.selectedEntity?.modelId === modelId ||
-        sel.activeStorey?.modelId === modelId ||
-        keptEntities.length !== priorEntities.length;
-
-      // Pinboard/basket state (pinboardSlice) is keyed the same way as
-      // `selectedEntitiesSet` above -- Set<string> of "modelId:expressId"
-      // entityRef strings -- but was never purged here. `pinboardEntities`
-      // is documented in pinboardSlice.ts as the basket's SOURCE OF TRUTH:
-      // every basket edit (`addToBasket`/`removeFromBasket`/`showPinboard`)
-      // re-derives `isolatedEntities` from it via `toGlobalIdForRef`, and
-      // `toGlobalIdFromModels` falls back to the RAW, un-offset expressId
-      // when a ref's modelId is no longer in `models`. A stale ref surviving
-      // removal therefore doesn't just dangle inertly: the next basket
-      // operation resolves it to a bare, unscaled global id that can collide
-      // with a real entity in any surviving model whose own offset range
-      // covers that raw number (any model with idOffset 0, notably) --
-      // silently co-isolating or co-hiding an entity the user never touched.
-      const priorPinboard = sel.pinboardEntities ?? new Set<string>();
-      const priorHierarchyBasket = sel.hierarchyBasketSelection ?? new Set<string>();
-      const keptPinboard = new Set(
-        [...priorPinboard].filter((k) => stringToEntityRef(k).modelId !== modelId)
-      );
-      const keptHierarchyBasket = new Set(
-        [...priorHierarchyBasket].filter((k) => stringToEntityRef(k).modelId !== modelId)
-      );
-      const pinboardTouchedRemoved =
-        keptPinboard.size !== priorPinboard.size || keptHierarchyBasket.size !== priorHierarchyBasket.size;
-
-      return {
-        models: newModels,
-        activeModelId: newActiveId,
-        ifcDataStore: activeModel?.ifcDataStore ?? null,
-        geometryResult: activeModel?.geometryResult ?? null,
-        ...(selectionTouchedRemoved
-          ? {
-              selectedEntity:
-                sel.selectedEntity?.modelId === modelId ? null : sel.selectedEntity,
-              activeStorey: sel.activeStorey?.modelId === modelId ? null : sel.activeStorey,
-              selectedEntities: keptEntities,
-              // Parsed with the shared helper rather than a `${modelId}:`
-              // prefix test: `stringToEntityRef` splits on the FIRST colon, so
-              // a prefix match would also strip a sibling model whose id
-              // merely starts with this one's id plus a colon. Using the same
-              // parse every other consumer uses keeps this filter from
-              // becoming a third, subtly different reading of the same key.
-              selectedEntitiesSet: new Set(
-                [...priorSet].filter(
-                  (k) => stringToEntityRef(k).modelId !== modelId
-                )
-              ),
-              selectedModelId: sel.selectedModelId === modelId ? null : (sel.selectedModelId ?? null),
-            }
-          : {}),
-        ...(pinboardTouchedRemoved
-          ? { pinboardEntities: keptPinboard, hierarchyBasketSelection: keptHierarchyBasket }
-          : {}),
-      };
-    });
+    // One composed patch, built by the slices that own the fields
+    // (`store/teardown-registry.ts`) — including `dataSlice`'s scoped purge of
+    // the mesh-colour backup, which used to be computed here.
+    // `modelRemovedScope` carries the survivor-range predicate every
+    // global-id-keyed slice filters on: the loop that used to live in this
+    // function AND, verbatim, in `syncSourceModel`'s second purge.
+    //
+    // Read the state ONCE and hand the same object to both: the scope's
+    // survivor set and the contributions that filter against it must not be
+    // computed off two different snapshots.
+    //
+    // Applied through the slice's own `set`, which is the store's wrapped
+    // setter, so the shared isolate / ghost channels this can null still go
+    // through `withVisibilityOwnershipInvalidation`.
+    const state = get();
+    set(viewerTeardown(modelRemovedScope(state, modelId), state));
+    modelAppearanceAssets.remove(modelId);
   },
 
   clearAllModels: () => {
@@ -483,8 +408,26 @@ export const createModelSlice: StateCreator<ModelSlice & ModelCrossSliceState, [
     // nothing left for either to refer to, and `resetViewerState`
     // (store/index.ts) has always nulled the visibility fields here.
     endClashScenePresentation(() => get() as unknown as ClashSceneTeardown, 'federation-cleared');
+    endChartVisibilityPresentation(get());
+    // Same claim, released the same way: with every model gone the clash
+    // helper above has already cleared both channels outright, so this
+    // normally just drops the record — which it must, because a record that
+    // outlives its presentation re-matches as soon as any other owner
+    // installs equal content (#2654 fourth review).
+    endIdsRowFocusPresentation(get() as unknown as IDSRowFocusPresentation);
     // Clear the federation registry
     federationRegistry.clear();
+    // With `models` about to become empty every global-id set
+    // `removeModel` purges by range (selection, hidden, isolated, ghost, class
+    // filter, and the per-model maps): with zero survivors every id in them is
+    // stale by definition, so the composed teardown at the end of this function
+    // clears them unconditionally rather than repeating the range check for an
+    // always-true answer. `isolatedEntities`/`ghostExceptEntities` clear to
+    // `null` (not an empty `Set`) for the same reason `removeModel` does — an
+    // empty-but-set isolate would hide the very next model loaded, until it
+    // does. Each of those clears now lives with the slice that owns the field;
+    // this note stays here because it is the reason the OVERLAY call below is
+    // unconditional too.
     // `federationRegistry.clear()` above resets the offset counter to 0, so
     // the very next model registered can be handed the exact global ids a
     // still-registered overlay layer's `hiddenIds`/`colorOverrides` name.
@@ -564,54 +507,42 @@ export const createModelSlice: StateCreator<ModelSlice & ModelCrossSliceState, [
       lensCross.setLensRuleEntityIds?.(new Map());
       lensCross.setLensAutoColorLegend?.([]);
     }
-    return set({
-      models: new Map(),
-      activeModelId: null,
-      ifcDataStore: null,
-      geometryResult: null,
-      // Same dangling-ref shape as `removeModel`'s pinboard purge above, for
-      // the full-teardown path: with every model gone, every basket ref is
-      // stale by definition.
-      pinboardEntities: new Set(),
-      hierarchyBasketSelection: new Set(),
-    });
+    // One composed patch, built by the slices that own the fields
+    // (`store/teardown-registry.ts`). Every 'all-models-cleared' arm clears
+    // unconditionally rather than range-checking: `federationRegistry.clear()`
+    // above restarts the offset counter at 0, so with zero survivors every
+    // stored global id is stale by definition AND the very next model loaded
+    // can be handed those exact numbers back.
+    set(viewerTeardown({ kind: 'all-models-cleared' }, get()));
+    modelAppearanceAssets.clear();
   },
 
   setActiveModel: (modelId) => set((state) => {
     const activeModel = modelId ? state.models.get(modelId) : null;
+    // 2D drawing markup (#4159): `measure2DResults` and friends are flat,
+    // federation-wide fields — not scoped per model — so an `activeModelId`
+    // swap must carry them along in this SAME atomic patch. Delegated to
+    // `markupTransitionPatch` (drawing2DSlice.markupTransition.ts), the one
+    // function `drawing2DSlice.teardown.ts`'s `'model-removed'` arm ALSO
+    // calls (that arm fires when `removeModel` moves `activeModelId` via
+    // `modelSlice.teardown.ts`'s own contribution) — see that module's doc
+    // for why a second, independent implementation here is exactly what kept
+    // re-breaking this. A no-op (`{}`) when the id is not actually changing,
+    // so re-selecting the already-active model touches nothing.
+    const markupPatch = markupTransitionPatch(state, modelId);
     return {
       activeModelId: modelId,
       ifcDataStore: activeModel?.ifcDataStore ?? null,
       geometryResult: activeModel?.geometryResult ?? null,
+      ...markupPatch,
     };
   }),
 
-  setModelVisibility: (modelId, visible) => set((state) => {
-    const model = state.models.get(modelId);
-    if (!model) return {};
-
-    const newModels = new Map(state.models);
-    newModels.set(modelId, { ...model, visible });
-    return { models: newModels };
-  }),
-
-  setModelCollapsed: (modelId, collapsed) => set((state) => {
-    const model = state.models.get(modelId);
-    if (!model) return {};
-
-    const newModels = new Map(state.models);
-    newModels.set(modelId, { ...model, collapsed });
-    return { models: newModels };
-  }),
-
-  setModelName: (modelId, name) => set((state) => {
-    const model = state.models.get(modelId);
-    if (!model) return {};
-
-    const newModels = new Map(state.models);
-    newModels.set(modelId, { ...model, name });
-    return { models: newModels };
-  }),
+  setModelVisibility: (modelId, visible) => set((state) => modelFieldPatch(state, modelId, { visible })),
+  setModelsVisibility: (modelIds, visible) => set((state) => modelsVisibilityPatch(state, modelIds, visible)),
+  isolateModels: (modelIds) => set((state) => isolateModelsPatch(state, modelIds)),
+  setModelCollapsed: (modelId, collapsed) => set((state) => modelFieldPatch(state, modelId, { collapsed })),
+  setModelName: (modelId, name) => set((state) => modelFieldPatch(state, modelId, { name })),
 
   // Getters (synchronous access via get())
   getModel: (modelId) => get().models.get(modelId),
@@ -632,9 +563,7 @@ export const createModelSlice: StateCreator<ModelSlice & ModelCrossSliceState, [
     return federationRegistry.registerModel(modelId, maxExpressId);
   },
 
-  toGlobalId: (modelId: string, expressId: number) => {
-    return federationRegistry.toGlobalId(modelId, expressId);
-  },
+  toGlobalId: (modelId: string, expressId: number) => toPublishedGlobalIdFromState(federationRegistry, get(), modelId, expressId),
 
   fromGlobalId: (globalId: number) => {
     return federationRegistry.fromGlobalId(globalId);

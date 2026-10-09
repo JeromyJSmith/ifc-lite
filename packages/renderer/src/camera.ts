@@ -5,19 +5,19 @@
 /**
  * Camera and orbit controls
  *
- * Uses composition pattern: delegates to CameraControls (orbit/pan/zoom),
- * CameraAnimator (transitions/inertia/presets), and CameraProjection
- * (screen-world conversion/bounds fitting).
+ * Uses composition pattern: delegates to CameraControls (orbit/pan/zoom), CameraAnimator
+ * (transitions/inertia/presets), and CameraProjection (screen-world conversion/bounds fitting).
  */
 
 import type { Vec3, Mat4 } from './types.js';
 import { MathUtils } from './math.js';
-import { CameraControls } from './camera-controls.js';
+import { CameraControls, type InteractionMode } from './camera-controls.js';
 import type { CameraInternalState, ProjectionMode } from './camera-state.js';
 import { CameraAnimator } from './camera-animation.js';
 import { CameraProjection } from './camera-projection.js';
 import { FirstPersonNavigator } from './camera-first-person.js';
-import { updateCameraMatrices } from './camera-matrices.js';
+import { updateCameraMatrices, updateCameraRelativeFrame } from './camera-matrices.js';
+import { CameraOrientation } from './camera-orientation.js';
 import { pickFitPolicy, type Bounds3, type FitPolicy, type PickFitPolicyOptions } from './camera-fit-policy.js';
 import {
   DEFAULT_ORTHO_SIZE,
@@ -25,6 +25,9 @@ import {
   isUsableDistance,
   usableOrthoSize,
 } from './camera-guards.js';
+import { RelativeToEyeFrame } from './relative-to-eye.js';
+import { surfaceZoomStep } from './camera-surface-zoom.js';
+import { CAMERA_CONSTANTS } from './constants.js';
 
 export class Camera {
   private state: CameraInternalState;
@@ -32,6 +35,11 @@ export class Camera {
   private animator: CameraAnimator;
   private projection: CameraProjection;
   private firstPerson: FirstPersonNavigator;
+  private orientation: CameraOrientation;
+  /** The sole renderer camera frame used by all RTE-capable consumers. */
+  private readonly relativeToEyeFrame = new RelativeToEyeFrame();
+  /** Mirror of the controls' gate, for the surface zoom below (#5393). */
+  private interactionMode: InteractionMode = 'all';
 
   constructor() {
     // Geometry is converted from IFC Z-up to WebGL Y-up during import
@@ -54,25 +62,20 @@ export class Camera {
       orbitAnchorBounds: null,
     };
 
-    // Bound straight to the module-level function rather than to
-    // `this.updateMatrices()`: this closure is the per-frame path every
-    // sub-system drives the matrices through, and routing it via the private
-    // method would add a hop to it. Depth is therefore unchanged from before
-    // the extraction (closure → one call), and the callee is monomorphic.
-    const updateMatrices = () => updateCameraMatrices(this.state);
+    // All pose writers publish the ordinary and relative frames together.
+    const updateMatrices = () => this.updateMatrices();
     this.controls = new CameraControls(this.state, updateMatrices);
-    this.projection = new CameraProjection(this.state, updateMatrices);
+    this.projection = new CameraProjection(this.state, updateMatrices, this.relativeToEyeFrame);
     this.animator = new CameraAnimator(this.state, updateMatrices, this.controls, this.projection);
     this.firstPerson = new FirstPersonNavigator(this.state, updateMatrices);
+    this.orientation = new CameraOrientation(this.state, this.animator, updateMatrices);
     this.updateMatrices();
   }
 
-  /**
-   * Cold-path convenience for this class's own setters. The hot path uses the
-   * closure built in the constructor; see the note there.
-   */
+  /** Publish both camera frames after every setter, gesture and animation. */
   private updateMatrices(): void {
     updateCameraMatrices(this.state);
+    updateCameraRelativeFrame(this.state, this.relativeToEyeFrame);
   }
 
   /**
@@ -139,14 +142,21 @@ export class Camera {
     this.controls.setOrbitCenter(center);
   }
 
+  /** Restrict interactive orbit/pan/zoom (embed `controls` param, #2934). */
+  setInteractionMode(mode: InteractionMode): void {
+    this.interactionMode = mode;
+    this.controls.setInteractionMode(mode);
+  }
+
   /**
    * Orbit camera around the current pivot (Y-up coordinate system).
    * If orbitCenter is set, both position and target rotate around it.
    * Otherwise, position rotates around target (standard orbit).
    */
   orbit(deltaX: number, deltaY: number, addVelocity = false): void {
+    // Gate both side effects on whether `orbit` applied, or a rejected gesture half-applies (#2934 review).
+    if (!this.controls.orbit(deltaX, deltaY)) return;
     this.animator.resetPresetTracking();
-    this.controls.orbit(deltaX, deltaY);
     if (addVelocity) {
       this.animator.addOrbitVelocity(deltaX, deltaY);
     }
@@ -157,14 +167,14 @@ export class Camera {
    */
   pan(deltaX: number, deltaY: number, addVelocity = false): void {
     // Pan speed depends on distance; compute before pan (pan preserves distance).
-    // `getDistance()` reports the pose verbatim, so a malformed one makes this
-    // NaN — and the inertia loop *latches* it: it spends velocity only while
-    // `Math.abs(velocity) > minVelocity`, which is false for NaN, so a NaN pan
-    // velocity is never applied and never decays. Pan inertia would stay dead
-    // for the rest of the session even after the pose is corrected (#2441).
-    // Skip the velocity rather than seed it with an invented speed.
+    // `getDistance()` reports the pose verbatim, so a malformed one makes this NaN —
+    // and the inertia loop *latches* it: it spends velocity only while
+    // `Math.abs(velocity) > minVelocity`, false for NaN, so a NaN pan velocity is
+    // never applied and never decays, staying dead for the rest of the session even
+    // after the pose is corrected (#2441). Skip it rather than seed an invented speed.
     const distance = this.getDistance();
-    this.controls.pan(deltaX, deltaY);
+    // Gate inertia on whether `pan` applied, same reason as `orbit` above (#2934 review).
+    if (!this.controls.pan(deltaX, deltaY)) return;
     if (addVelocity && isUsableDistance(distance, 0)) {
       this.animator.addPanVelocity(deltaX, deltaY, distance * 0.001);
     }
@@ -178,19 +188,44 @@ export class Camera {
    * @param mouseY - Mouse Y position in canvas coordinates
    * @param canvasWidth - Canvas width
    * @param canvasHeight - Canvas height
+   * @param fastZoom - Pure dolly (Shift / Cesium): the full step translates the rig
+   * @param surfacePoint - World point on the visible surface under the cursor
+   *   (#5393). Zooming IN approaches it and stops short of it; it is ignored
+   *   for zoom-out, fast zoom and orthographic. The surface step applies no
+   *   inertia, so `addVelocity` has no effect on it.
    */
-  zoom(delta: number, addVelocity = false, mouseX?: number, mouseY?: number, canvasWidth?: number, canvasHeight?: number, fastZoom?: boolean): void {
-    this.controls.zoom(delta, mouseX, mouseY, canvasWidth, canvasHeight, fastZoom);
+  zoom(delta: number, addVelocity = false, mouseX?: number, mouseY?: number, canvasWidth?: number, canvasHeight?: number, fastZoom?: boolean, surfacePoint?: Vec3): void {
+    // Zooming IN over geometry approaches the picked surface instead of the
+    // target plane, so repeated notches stop short of it (#5393). Pure dolly
+    // (fast zoom, Cesium) and orthographic keep the plain path.
+    if (surfacePoint && delta < 0 && !fastZoom && this.zoomTowardSurface(delta, surfacePoint)) return;
+    // Gate inertia on whether `zoom` applied, same reason as `orbit` above (#2934 review).
+    if (!this.controls.zoom(delta, mouseX, mouseY, canvasWidth, canvasHeight, fastZoom)) return;
     if (addVelocity) {
       const normalizedDelta = Math.sign(delta) * Math.min(Math.abs(delta) * 0.001, 0.1);
       this.animator.addZoomVelocity(normalizedDelta);
     }
   }
 
+  /** One zoom-in notch toward a picked surface point; false = not applied. */
+  private zoomTowardSurface(delta: number, point: Vec3): boolean {
+    // Same gate as CameraControls.zoom: only 'all' may dolly (#2934).
+    if (this.interactionMode !== 'all' || this.state.projectionMode !== 'perspective') return false;
+    const fraction = Math.min(Math.abs(delta) * CAMERA_CONSTANTS.ZOOM_SENSITIVITY, CAMERA_CONSTANTS.MAX_ZOOM_DELTA);
+    const next = surfaceZoomStep(this.state.camera, point, fraction);
+    if (!next) return false;
+    // The orbit centre is left where it is on purpose: the mouse path re-seats
+    // it on every orbit start, and the new target already sits at the surface.
+    // In place, like every other pose writer: callers may hold these objects.
+    Object.assign(this.state.camera.position, next.position);
+    Object.assign(this.state.camera.target, next.target);
+    this.updateMatrices();
+    return true;
+  }
+
   /**
-   * Fit view to bounding box
-   * Sets camera to southeast isometric view (typical BIM starting view)
-   * Y-up coordinate system: Y is vertical
+   * Fit view to bounding box. Sets camera to southeast isometric view (typical
+   * BIM starting view). Y-up coordinate system: Y is vertical
    */
   fitToBounds(min: Vec3, max: Vec3): void {
     this.projection.fitToBounds(min, max);
@@ -356,7 +391,20 @@ export class Camera {
   }
 
   getViewProjMatrix(): Mat4 {
-    return this.state.viewProjMatrix;
+    return { m: new Float32Array(this.state.viewProjMatrix.m) };
+  }
+
+  /** The reverse-Z projection matrix (perspective or orthographic); a copy. */
+  getProjMatrix(): Mat4 {
+    return { m: new Float32Array(this.state.projMatrix.m) };
+  }
+
+  /**
+   * Return the shared RTE frame for the current camera state. GPU consumers
+   * must use this instead of deriving a second camera rebase.
+   */
+  getRelativeToEyeFrame(): RelativeToEyeFrame {
+    return this.relativeToEyeFrame;
   }
 
   getPosition(): Vec3 {
@@ -382,81 +430,32 @@ export class Camera {
   }
 
   /**
-   * Get distance from camera position to target.
+   * The aspect ratio (width / height) the projection is currently built from.
    *
-   * Deliberately **unsanitized**: it reports the pose as it actually is, so a
-   * malformed one (a BCF viewpoint restored from a file reaches the public
-   * setters unvalidated) yields NaN rather than a substituted number. This is
-   * a measurement, not a control input: it is what `useBCF` reads back when
-   * restoring a viewpoint and what the BCF overlay scales markers by. There is
-   * no substitute that is right for every reader — a plausible-looking `1`
-   * would place every restored target one unit from the eye — and returning a
-   * number here would contradict `getPosition()`/`getTarget()`, which are raw,
-   * leaving callers no way to tell that the pose is broken. Gesture code inside
-   * this package guards with {@link isUsableDistance} instead; each gesture
-   * needs a different fallback. Callers OUTSIDE the package cannot use that
-   * predicate (it is package-internal) and are not all guarded — see #2466 for
-   * the viewpoint-restore path (#2441).
+   * This is the DRAWING BUFFER's ratio. Since #5383 the buffer is the CSS box
+   * scaled by one pixel ratio on both axes, so the two agree up to integer
+   * rounding of the buffer (the width used to be floored to a multiple of 64,
+   * which made them differ by up to 63 pixels).
+   *
+   * The buffer ratio is the right one for BCF (#3612). A viewpoint's snapshot
+   * PNG comes from `canvas.toDataURL()`, which encodes that same drawing
+   * buffer, so the `<AspectRatio>` written beside it describes the image
+   * actually in the archive. It is also the ratio the projection matrix used,
+   * so a viewer restoring the camera reproduces the framing.
+   *
+   * Always finite and positive -- {@link setAspect} rejects anything else --
+   * which is what BCF 3.0's `PositiveDouble` schema type requires.
    */
-  getDistance(): number {
-    const dir = {
-      x: this.state.camera.position.x - this.state.camera.target.x,
-      y: this.state.camera.position.y - this.state.camera.target.y,
-      z: this.state.camera.position.z - this.state.camera.target.z,
-    };
-    return Math.sqrt(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
+  getAspect(): number {
+    return this.state.camera.aspect;
   }
 
-  /**
-   * Get current camera rotation angles in degrees
-   * Returns { azimuth, elevation } where:
-   * - azimuth: horizontal rotation (0-360), 0 = front
-   * - elevation: vertical rotation (-90 to 90), 0 = horizon
-   */
-  getRotation(): { azimuth: number; elevation: number } {
-    const dir = {
-      x: this.state.camera.position.x - this.state.camera.target.x,
-      y: this.state.camera.position.y - this.state.camera.target.y,
-      z: this.state.camera.position.z - this.state.camera.target.z,
-    };
-    const distance = Math.sqrt(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
-    // `distance < 1e-6` alone is a magnitude test, not a finiteness one: the
-    // comparison is false for NaN, so a malformed pose fell through the guard
-    // that looked like it was catching it, and `Math.asin(Math.max(-1,
-    // Math.min(1, NaN)))` is NaN — a NaN elevation that leaves the renderer
-    // entirely, into the viewer's rotation readout and the measurement
-    // handlers (#2441). Same neutral answer as the degenerate pose, which is
-    // preserved verbatim.
-    if (!isUsableDistance(distance, 1e-6)) return { azimuth: 0, elevation: 0 };
+  /** Raw pose distance; non-finite source poses remain observable. */
+  getDistance(): number { return this.orientation.getDistance(); }
 
-    // Elevation: angle from horizontal plane
-    const elevation = Math.asin(Math.max(-1, Math.min(1, dir.y / distance))) * 180 / Math.PI;
+  getRotation(): { azimuth: number; elevation: number } { return this.orientation.getRotation(); }
 
-    // Calculate azimuth smoothly using up vector
-    // The up vector defines the "screen up" direction, which determines rotation
-    const upX = this.state.camera.up.x;
-    const upY = this.state.camera.up.y;
-    const upZ = this.state.camera.up.z;
-
-    // Project up vector onto horizontal plane (XZ plane)
-    const upLen = Math.sqrt(upX * upX + upZ * upZ);
-
-    let azimuth: number;
-    if (upLen > 0.01) {
-      // Use up vector projection for azimuth (smooth and consistent)
-      azimuth = (Math.atan2(-upX, -upZ) * 180 / Math.PI + 360) % 360;
-
-      // For bottom view, flip azimuth
-      if (elevation < -80 && upY < 0) {
-        azimuth = (azimuth + 180) % 360;
-      }
-    } else {
-      // Fallback: use position-based azimuth when up vector is vertical
-      azimuth = (Math.atan2(dir.x, dir.z) * 180 / Math.PI + 360) % 360;
-    }
-
-    return { azimuth, elevation };
-  }
+  setRotation(azimuth: number, elevation: number): void { this.orientation.setRotation(azimuth, elevation); }
 
   /**
    * Unproject screen coordinates to a ray in world space

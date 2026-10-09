@@ -38,6 +38,7 @@ import {
   calculateViewportBounds,
   calculateOptimalScaleBarLength,
 } from '@ifc-lite/drawing-2d';
+import { nextSheetTemplateId } from './sheetSlice.persistence';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // STATE TYPES
@@ -107,7 +108,7 @@ export interface SheetSlice extends SheetState {
 // HELPER FUNCTIONS
 // ═══════════════════════════════════════════════════════════════════════════
 
-function createDefaultSheet(options?: SheetCreationOptions): DrawingSheet {
+export function createDefaultSheet(options?: SheetCreationOptions): DrawingSheet {
   const paper = PAPER_SIZE_REGISTRY[options?.paperId || 'A3_LANDSCAPE'];
   const frameStyle = (options?.frameStyle || 'professional') as FrameStyle;
   const framePreset = FRAME_PRESETS[frameStyle];
@@ -141,14 +142,18 @@ function createDefaultSheet(options?: SheetCreationOptions): DrawingSheet {
   };
 }
 
+/** Active-sheet fields a clear or a session teardown destroys. `savedSheetTemplates`
+ *  is deliberately absent: the user's template library outlives both, and
+ *  `set(getDefaultState())` here once wiped it (issue #2802, confirmed bug #1). */
+export const getClearedSheetState = (): Omit<SheetState, 'savedSheetTemplates'> => ({
+  activeSheet: null,
+  sheetEnabled: false,
+  sheetPanelVisible: false,
+  titleBlockEditorVisible: false,
+});
+
 function getDefaultState(): SheetState {
-  return {
-    activeSheet: null,
-    sheetEnabled: false,
-    sheetPanelVisible: false,
-    titleBlockEditorVisible: false,
-    savedSheetTemplates: [],
-  };
+  return { ...getClearedSheetState(), savedSheetTemplates: [] };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -177,13 +182,9 @@ export const createSheetSlice: StateCreator<SheetSlice, [], [], SheetSlice> = (
     set({ activeSheet: { ...current, ...updates } });
   },
 
-  // `clearSheet` resets the *active* sheet/panel state, not the user's
-  // saved template library. `getDefaultState()` also seeds the store's
-  // initial state (which correctly starts with no templates), so it can't
-  // be reused verbatim here without wiping `savedSheetTemplates` on every
-  // "clear" click.
-  clearSheet: () =>
-    set((s) => ({ ...getDefaultState(), savedSheetTemplates: s.savedSheetTemplates })),
+  // Resets the *active* sheet/panel state, not the user's saved template
+  // library — same explicit field list `sheetSlice.teardown.ts` uses.
+  clearSheet: () => set(getClearedSheetState()),
 
   setSheetEnabled: (enabled) => {
     if (enabled && !get().activeSheet) {
@@ -492,10 +493,9 @@ export const createSheetSlice: StateCreator<SheetSlice, [], [], SheetSlice> = (
   saveAsTemplate: (name) => {
     const current = get().activeSheet;
     if (!current) return;
-
     const template: DrawingSheet = {
       ...current,
-      id: `template-${Date.now()}`,
+      id: nextSheetTemplateId(get().savedSheetTemplates),
       name,
     };
     set((s) => ({

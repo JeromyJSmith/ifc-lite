@@ -21,6 +21,7 @@ import {
   type WorkerRequest,
   type WorkerResponse,
 } from './protocol.js';
+import { normalizePointStride } from './stride.js';
 // Format-specific decoders are lazy-imported in `createSource` below. That
 // keeps the IIFE bundle this worker ships in (see scripts/build-worker-bundle.mjs)
 // small — only the format the consumer actually opens gets pulled into the
@@ -56,23 +57,44 @@ self.onmessage = (event: MessageEvent<WorkerRequest>) => {
 };
 
 async function handleOpen(msg: Extract<WorkerRequest, { kind: 'open' }>): Promise<void> {
+  // Hoisted so the catch below can release a source that was created
+  // (and possibly opened) but never made it into `sources` — see the
+  // comment at the `post()` call.
+  let opened: OpenSource | undefined;
   try {
     const source = await createSource(msg.format, msg.blob, {
       label: msg.label,
-      downsample: { stride: Math.max(1, msg.stride | 0) },
+      downsample: { stride: normalizePointStride(msg.stride) },
       originOffset: msg.originOffset,
     });
     const abort = new AbortController();
     const info = await source.open(abort.signal);
+    opened = { source, abort };
     const sourceId = nextSourceId++;
-    sources.set(sourceId, { source, abort });
+    // Report success to the client BEFORE registering the source. If
+    // `post()` throws (e.g. a future `PointSourceInfo` field that isn't
+    // structured-cloneable), the client never learns `sourceId` and can
+    // therefore never send `close`/`abort` for it — so it must not be
+    // reachable through `sources` either, or the underlying file
+    // reader / native buffers would leak for the life of the worker.
+    // The catch below releases `source` in that case.
     post({
       kind: 'opened',
       requestId: msg.requestId,
       sourceId,
       info,
     });
+    sources.set(sourceId, { source, abort });
+    opened = undefined; // ownership transferred to `sources`
   } catch (err) {
+    if (opened) {
+      try {
+        opened.abort.abort();
+        opened.source.close();
+      } catch (closeErr) {
+        console.warn('[decode-worker] cleanup after failed open() post failed:', errMessage(closeErr));
+      }
+    }
     post({
       kind: 'error',
       requestId: msg.requestId,

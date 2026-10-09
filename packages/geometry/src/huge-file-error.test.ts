@@ -1,3 +1,7 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
 import { describe, expect, it } from 'vitest';
 import { largeFilePrepassError } from './huge-file-error.js';
 
@@ -8,7 +12,8 @@ describe('largeFilePrepassError', () => {
     const e = largeFilePrepassError(new Error('unreachable executed'), 3.9 * GB);
     expect(e).not.toBeNull();
     expect(e!.message).toContain('3.9 GB');
-    expect(e!.message).toMatch(/desktop app/);
+    expect(e!.message).toContain('may exceed available WebAssembly memory');
+    expect(e!.message).toMatch(/native ifc-lite CLI\/server/);
     expect(e!.message).toMatch(/4 ?GB|32-bit|WebAssembly/);
   });
 

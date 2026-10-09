@@ -8,21 +8,13 @@
  * Exports IFC data to IFCX JSON format.
  */
 
-import type { IfcxFile, IfcxNode, IfcxHeader, ImportNode } from './types.js';
-import type { EntityTable, PropertyTable, PropertySet, SpatialHierarchy } from '@ifc-lite/data';
+import type { IfcxFile, IfcxNode, IfcxHeader } from './types.js';
+import type { EntityTable, PropertyTable, SpatialHierarchy } from '@ifc-lite/data';
 import type { MutablePropertyView } from '@ifc-lite/mutations';
 import { IFCX_VERSION } from '@ifc-lite/data';
-
-// ============================================================================
-// Standard IFCX schema imports
-// ============================================================================
-
-/** Standard IFC5 schema package URIs, keyed by the attribute prefix they provide. */
-const IFCX_SCHEMA_IMPORTS = {
-  IFC_CORE: 'https://ifcx.dev/@standards.buildingsmart.org/ifc/core/ifc@v5a.ifcx',
-  IFC_PROP: 'https://ifcx.dev/@standards.buildingsmart.org/ifc/core/prop@v5a.ifcx',
-  USD: 'https://ifcx.dev/@openusd.org/usd@v1.ifcx',
-} as const;
+import { collectRequiredImports } from './writer-imports.js';
+import { writerEntities } from './writer-entities.js';
+import { hasSpatialRelationshipEdits, indexSpatialEdges } from './writer-spatial.js';
 
 /**
  * Options for IFCX export
@@ -52,6 +44,17 @@ export interface IfcxExportData {
   properties?: PropertyTable;
   /** Spatial hierarchy */
   spatialHierarchy?: SpatialHierarchy;
+  /**
+   * Complete effective spatial relationship edges for an edited session.
+   * A caller with source STEP records can derive these from the parser's
+   * effective relationship overlay. This replaces the parsed hierarchy when
+   * applyMutations is true; pass the entire spatial edge set, not only edits.
+   */
+  effectiveSpatialEdges?: ReadonlyArray<{
+    sourceId: number;
+    targetId: number;
+    relationshipType: string;
+  }>;
   /** String table for lookups */
   strings?: { get(idx: number): string };
   /** Optional mutation view for property changes */
@@ -137,7 +140,15 @@ export class IfcxWriter {
    */
   private collectNodes(options: IfcxExportOptions): IfcxNode[] {
     const nodes: IfcxNode[] = [];
-    const { entities, spatialHierarchy, mutationView, idToPath } = this.data;
+    const { spatialHierarchy, mutationView, idToPath } = this.data;
+    const rows = writerEntities(this.data, options.applyMutations !== false);
+    const effectiveSpatial = options.applyMutations !== false
+      ? this.data.effectiveSpatialEdges : undefined;
+    if (mutationView && options.applyMutations !== false
+      && !effectiveSpatial && hasSpatialRelationshipEdits(this.data.entities, mutationView)) {
+      throw new Error('IFCX export needs effectiveSpatialEdges for edited spatial relationships');
+    }
+    const effectiveChildren = effectiveSpatial && indexSpatialEdges(effectiveSpatial);
 
     // Single source of truth for expressId -> path, built once up front so that
     // an entity's own path and any *reference* to that entity as a child
@@ -152,32 +163,34 @@ export class IfcxWriter {
     // a node referenced only as someone else's child). Those entries must
     // survive even though the entity loop below never visits that id.
     const resolvedPaths = new Map<number, string>(idToPath ?? []);
-    for (let i = 0; i < entities.count; i++) {
-      const expressId = entities.expressId[i];
-      const typeEnum = entities.typeEnum[i];
+    if (options.applyMutations !== false && mutationView && typeof mutationView.isDeleted === 'function') {
+      for (const id of resolvedPaths.keys()) if (mutationView.isDeleted(id)) resolvedPaths.delete(id);
+    }
+    for (const row of rows) {
+      const { expressId } = row;
       resolvedPaths.set(
         expressId,
-        idToPath?.get(expressId) ?? this.generatePath(expressId, typeEnum)
+        idToPath?.get(expressId)
+          ?? this.generatePath(expressId, row.typeName, row.globalId)
       );
     }
 
-    // Process entities from table
-    for (let i = 0; i < entities.count; i++) {
-      const expressId = entities.expressId[i];
-      const typeEnum = entities.typeEnum[i];
+    // Process the effective entity set, including authored nodes.
+    for (const row of rows) {
+      const { expressId } = row;
 
       // Get or generate path
-      const path = resolvedPaths.get(expressId) ?? this.generatePath(expressId, typeEnum);
-
-      // Get entity name
-      const name = this.getString(entities.name[i]);
-      const globalId = this.getString(entities.globalId[i]);
+      // The map above has a row for every entity, so the fallback is
+      // unreachable — but it must derive the path the same way regardless, or
+      // an entity's own path and every reference to it could disagree.
+      const path = resolvedPaths.get(expressId)
+        ?? this.generatePath(expressId, row.typeName, row.globalId);
 
       // Build attributes
       const attributes: Record<string, unknown> = {};
 
       // Add IFC class (requires both code and uri per official schema)
-      const typeName = this.getTypeName(typeEnum);
+      const typeName = row.typeName;
       if (typeName) {
         attributes['bsi::ifc::class'] = {
           code: typeName,
@@ -186,13 +199,12 @@ export class IfcxWriter {
       }
 
       // IFC5 uses bsi::ifc::prop:: namespace for name/description (not bsi::ifc::name)
-      if (name) {
-        attributes['bsi::ifc::prop::Name'] = name;
+      if (row.name) {
+        attributes['bsi::ifc::prop::Name'] = row.name;
       }
 
-      const description = this.getString(entities.description[i]);
-      if (description) {
-        attributes['bsi::ifc::prop::Description'] = description;
+      if (row.description) {
+        attributes['bsi::ifc::prop::Description'] = row.description;
       }
 
       // Add properties if requested
@@ -209,7 +221,7 @@ export class IfcxWriter {
       };
 
       // Add children based on spatial hierarchy
-      const children = this.getChildrenForEntity(expressId, spatialHierarchy, resolvedPaths);
+      const children = this.getChildrenForEntity(expressId, spatialHierarchy, resolvedPaths, effectiveChildren);
       if (Object.keys(children).length > 0) {
         node.children = children;
       }
@@ -259,17 +271,25 @@ export class IfcxWriter {
   private getChildrenForEntity(
     entityId: number,
     spatialHierarchy: SpatialHierarchy | undefined,
-    resolvedPaths: Map<number, string>
+    resolvedPaths: Map<number, string>,
+    effectiveChildren?: ReadonlyMap<number, readonly number[]>,
   ): Record<string, string | null> {
     const children: Record<string, string | null> = {};
 
-    if (!spatialHierarchy) return children;
+    if (!spatialHierarchy && !effectiveChildren) return children;
 
     // Check if this entity has contained elements
-    const containedElements = spatialHierarchy.byStorey.get(entityId) ||
-                              spatialHierarchy.byBuilding.get(entityId) ||
-                              spatialHierarchy.bySite.get(entityId) ||
-                              spatialHierarchy.bySpace.get(entityId);
+    // @raw-entity-enumeration-ok parsed hierarchy is the source-only/default path; effectiveSpatialEdges replaces it for live relationships
+    const sourceChildren = effectiveChildren ? [] : [
+      ...(spatialHierarchy?.byStorey.get(entityId) ?? []),
+      // @raw-entity-enumeration-ok source hierarchy only when complete effective edges are absent
+      ...(spatialHierarchy?.byBuilding.get(entityId) ?? []),
+      // @raw-entity-enumeration-ok source hierarchy only when complete effective edges are absent
+      ...(spatialHierarchy?.bySite.get(entityId) ?? []),
+      // @raw-entity-enumeration-ok source hierarchy only when complete effective edges are absent
+      ...(spatialHierarchy?.bySpace.get(entityId) ?? []),
+    ];
+    const containedElements = effectiveChildren ? effectiveChildren.get(entityId) ?? [] : sourceChildren;
 
     if (containedElements) {
       for (const childId of containedElements) {
@@ -290,56 +310,26 @@ export class IfcxWriter {
   }
 
   /**
-   * Get string from string table
+   * Generate path for an entity.
+   *
+   * A node's `path` IS the entity's identity in IFCX: the reader hands it
+   * straight back as the GlobalId (`entity-extractor.ts`: "Use path as
+   * GlobalId"), the sibling IFC5 exporter keys nodes by GlobalId for that
+   * reason, and the buildingSMART v5a schemas committed under
+   * `packages/export/src/__fixtures__/schemas/` define no attribute that could
+   * carry a GlobalId instead — there is no other slot for it.
+   *
+   * So synthesizing `ifc:<Type>.<expressId>` for an entity that HAS a
+   * GlobalId did not merely pick a different name: it discarded the real IFC
+   * identity on the way through and invented one in its place, and expressId
+   * is not stable across files, so nothing downstream could federate or
+   * re-match the node. The synthetic form remains the fallback for an entity
+   * with no GlobalId (and an explicit `idToPath` entry still wins over both,
+   * so a round-trip keeps the paths the source file authored).
    */
-  private getString(idx: number): string {
-    if (idx === 0 || !this.data.strings) return '';
-    return this.data.strings.get(idx) || '';
-  }
-
-  /**
-   * Get type name from enum
-   */
-  private getTypeName(typeEnum: number): string | undefined {
-    // Map common type enums to IFC class names
-    const typeMap: Record<number, string> = {
-      1: 'IfcProject',
-      2: 'IfcSite',
-      3: 'IfcBuilding',
-      4: 'IfcBuildingStorey',
-      5: 'IfcSpace',
-      10: 'IfcWall',
-      11: 'IfcWallStandardCase',
-      12: 'IfcDoor',
-      13: 'IfcWindow',
-      14: 'IfcSlab',
-      15: 'IfcColumn',
-      16: 'IfcBeam',
-      17: 'IfcRoof',
-      18: 'IfcStair',
-      19: 'IfcRailing',
-      20: 'IfcCurtainWall',
-      21: 'IfcCovering',
-      22: 'IfcPlate',
-      23: 'IfcMember',
-      24: 'IfcPile',
-      25: 'IfcFooting',
-      30: 'IfcFurnishingElement',
-      31: 'IfcSystemFurnitureElement',
-      32: 'IfcDistributionElement',
-      33: 'IfcBuildingElementProxy',
-      40: 'IfcOpeningElement',
-    };
-
-    return typeMap[typeEnum] || undefined;
-  }
-
-  /**
-   * Generate path for an entity
-   */
-  private generatePath(expressId: number, typeEnum: number): string {
-    const typeName = this.getTypeName(typeEnum) || 'IfcElement';
-    return `ifc:${typeName}.${expressId}`;
+  private generatePath(expressId: number, typeName: string | undefined, globalId?: string): string {
+    if (globalId) return globalId;
+    return `ifc:${typeName ?? 'IfcElement'}.${expressId}`;
   }
 
   /**
@@ -348,47 +338,6 @@ export class IfcxWriter {
   private generateId(): string {
     return `ifcx_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
   }
-}
-
-/**
- * Scan data nodes and return the list of standard IFCX import URIs needed
- * for the attribute namespaces actually used.
- */
-function collectRequiredImports(nodes: IfcxNode[]): ImportNode[] {
-  let needsIfcCore = false;
-  let needsIfcProp = false;
-  let needsUsd = false;
-
-  for (const node of nodes) {
-    if (!node.attributes) continue;
-    for (const key of Object.keys(node.attributes)) {
-      // IFC core schemas: class, presentation, material, spaceBoundary
-      if (!needsIfcCore && (
-        key === 'bsi::ifc::class' ||
-        key.startsWith('bsi::ifc::presentation::') ||
-        key === 'bsi::ifc::material' ||
-        key === 'bsi::ifc::spaceBoundary'
-      )) {
-        needsIfcCore = true;
-      }
-      // IFC property schemas: bsi::ifc::prop::*
-      if (!needsIfcProp && key.startsWith('bsi::ifc::prop::')) {
-        needsIfcProp = true;
-      }
-      // USD schemas: usd::*
-      if (!needsUsd && key.startsWith('usd::')) {
-        needsUsd = true;
-      }
-      if (needsIfcCore && needsIfcProp && needsUsd) break;
-    }
-    if (needsIfcCore && needsIfcProp && needsUsd) break;
-  }
-
-  const imports: ImportNode[] = [];
-  if (needsIfcCore) imports.push({ uri: IFCX_SCHEMA_IMPORTS.IFC_CORE });
-  if (needsIfcProp) imports.push({ uri: IFCX_SCHEMA_IMPORTS.IFC_PROP });
-  if (needsUsd) imports.push({ uri: IFCX_SCHEMA_IMPORTS.USD });
-  return imports;
 }
 
 /**

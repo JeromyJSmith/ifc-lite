@@ -8,6 +8,7 @@
 
 import type { IfcStoreBase as IfcDataStore, IfcEntity, IfcAttributeValue, PropertySet, QuantitySet, PropertyValue } from '@ifc-lite/data';
 import { getRawNamedAttributes, extractRootAttributesFromEntity } from '@ifc-lite/parser';
+import { resolveEntityTypeName } from './resolve-type-name.js';
 import { RelationshipType } from '@ifc-lite/data';
 
 function coerceRaw(raw: IfcAttributeValue): string | number | boolean | null {
@@ -35,10 +36,12 @@ function coerceRaw(raw: IfcAttributeValue): string | number | boolean | null {
 }
 
 export function extractAllEntityAttributesFromEntity(
-  entity: IfcEntity
+  entity: IfcEntity,
+  schemaVersion?: IfcDataStore['schemaVersion'],
 ): Array<{ name: string; value: string | number | boolean }> {
   const result: Array<{ name: string; value: string | number | boolean }> = [];
-  for (const { name, raw } of getRawNamedAttributes(entity)) {
+  const registeredVersion = schemaVersion === 'IFC5' ? undefined : schemaVersion;
+  for (const { name, raw } of getRawNamedAttributes(entity, registeredVersion)) {
     const value = coerceRaw(raw);
     if (value !== null) result.push({ name, value });
   }
@@ -117,7 +120,7 @@ export class EntityNode {
   allAttributes(): Array<{ name: string; value: string | number | boolean }> {
     const entity = this.store.getEntity(this.expressId);
     if (entity) {
-      return extractAllEntityAttributesFromEntity(entity);
+      return extractAllEntityAttributesFromEntity(entity, this.store.schemaVersion);
     }
 
     // Fallback: return individually known attributes
@@ -130,8 +133,9 @@ export class EntityNode {
   }
 
   get type(): string {
-    return this.store.entities.getTypeName(this.expressId);
+    return resolveEntityTypeName(this.store, this.expressId);
   }
+
 
   // Spatial containment
   contains(): EntityNode[] {
@@ -139,10 +143,43 @@ export class EntityNode {
   }
   
   containedIn(): EntityNode | null {
-    const nodes = this.getRelated(RelationshipType.ContainsElements, 'inverse');
-    return nodes[0] ?? null;
+    const candidates = this.getRelated(RelationshipType.ContainsElements, 'inverse');
+    if (candidates.length < 2) return candidates[0] ?? null;
+    // #4314: more than one candidate - a malformed file naming this element
+    // in more than one IfcRelContainedInSpatialStructure edge (#4311).
+    // First-declared still wins, but only among containers that are actually
+    // reachable from IfcProject: a container with no IfcRelAggregates edge
+    // back to the project is a node `SpatialHierarchyBuilder.buildNode`
+    // never visits, so `elementToStorey` never lets it win a tie either
+    // (#4310) - returning it here is a dangling answer no caller can walk
+    // anywhere from, and one `elementToStorey` disagrees with.
+    //
+    // The set is not recomputed here: `SpatialHierarchyBuilder.build()`
+    // already runs `computeReachableSpatialNodes` once per parse and
+    // publishes the result on the hierarchy, and this reads THAT set - the
+    // one `elementToStorey`'s own tie-break was resolved against - so the
+    // two answers cannot drift apart. A store with no spatial hierarchy has
+    // no reachability information (and no `elementToStorey` to disagree
+    // with), and one where no candidate is reachable has no better answer;
+    // both fall back to the first-declared candidate, so this never turns a
+    // present answer into null.
+    const reachable = this.store.spatialHierarchy?.reachableSpatialNodes;
+    if (!reachable) return candidates[0];
+    return candidates.find((candidate) => reachable.has(candidate.expressId)) ?? candidates[0];
   }
-  
+
+  /**
+   * True when this element has more than one direct
+   * `IfcRelContainedInSpatialStructure` edge, i.e. `containedIn()`'s answer
+   * (first-declared wins) was a tie-break rather than the only candidate the
+   * source file declared (#4311). Duplicate edges naming the SAME structure
+   * collapse to one before either method ever sees them (relationship-graph
+   * dedupe), so this only fires on genuinely different candidates.
+   */
+  containedInAmbiguous(): boolean {
+    return this.getRelated(RelationshipType.ContainsElements, 'inverse').length > 1;
+  }
+
   // Aggregation
   decomposes(): EntityNode[] {
     return this.getRelated(RelationshipType.Aggregates, 'forward');
@@ -252,9 +289,19 @@ export class EntityNode {
   }
 
   property(psetName: string, propName: string): PropertyValue | null {
-    const props = this.store.getProperties(this.expressId);
-    const pset = props.find(p => p.name === psetName);
-    return pset?.properties.find(p => p.name === propName)?.value ?? null;
+    // Two distinct IfcPropertySet entities sharing the same Name is a
+    // legitimate model shape, and the on-demand extraction path returns one
+    // array entry per underlying set rather than merging them. `.find()`
+    // would stop at the first same-named set and miss a property that only
+    // lives on a later one with that name (the same defect fixed in
+    // `PropertyTable.getProperty`, #2907) — so every same-named set is
+    // checked here instead.
+    for (const pset of this.store.getProperties(this.expressId)) {
+      if (pset.name !== psetName) continue;
+      const prop = pset.properties.find(p => p.name === propName);
+      if (prop) return prop.value;
+    }
+    return null;
   }
 
   quantities(): QuantitySet[] {
@@ -262,9 +309,14 @@ export class EntityNode {
   }
 
   quantity(qsetName: string, quantityName: string): number | null {
-    const qsets = this.store.getQuantities(this.expressId);
-    const qset = qsets.find(q => q.name === qsetName);
-    return qset?.quantities.find(q => q.name === quantityName)?.value ?? null;
+    // Mirrors property() above: check every same-named quantity set rather
+    // than stopping at the first one.
+    for (const qset of this.store.getQuantities(this.expressId)) {
+      if (qset.name !== qsetName) continue;
+      const quantity = qset.quantities.find(q => q.name === quantityName);
+      if (quantity) return quantity.value;
+    }
+    return null;
   }
 
   private getRelated(relType: RelationshipType, direction: 'forward' | 'inverse'): EntityNode[] {

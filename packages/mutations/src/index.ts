@@ -20,6 +20,14 @@ export {
   type EntityTypeNormalizer,
 } from './store-editor.js';
 export { ChangeSetManager } from './change-set.js';
+export { recordCompoundMutation, undoRecordedMutationOperations } from './compound-recording.js';
+export { storeHasSourceEntity } from './source-entity-index.js';
+export {
+  iterateEffectiveEntityIds,
+  type EntityEnumerationSource,
+  type EffectiveEntityId,
+} from './effective-entity-enumeration.js';
+export { MutationGuardError, type MutationGuard } from './mutation-guard.js';
 export {
   BulkQueryEngine,
   type SelectionCriteria,
@@ -27,9 +35,8 @@ export {
   type BulkQuery,
   type BulkQueryPreview,
   type BulkQueryResult,
-  type PropertyFilter,
-  type FilterOperator,
 } from './bulk-query-engine.js';
+export { BULK_WRITABLE_ATTRIBUTES } from './bulk-attribute-action.js';
 export {
   CsvConnector,
   type CsvRow,
@@ -41,6 +48,8 @@ export {
   type ImportProgress,
   type CsvParseOptions,
 } from './csv-connector.js';
+export { buildMatchContext, matchRowAgainstContext } from './csv-match.js';
+export { parseValue, PARSE_INVALID } from './csv-parse-value.js';
 export {
   changeSetToOps,
   deriveEntityIdentity,
@@ -49,3 +58,5 @@ export {
   type DerivedIdentityEntry,
   type EntityIdentityResolver,
 } from './change-set-to-ops.js';
+
+export type { EntityOperation, EntityOperationEffect, EntityPreparationOptions, PreparedEntityOperations } from './cooperative-operation-types.js';

@@ -4,7 +4,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { ParquetExporter } from './parquet-exporter.js';
-import type { EntityRef, IfcDataStore } from '@ifc-lite/parser';
+import { IfcParser, type EntityRef, type IfcDataStore } from '@ifc-lite/parser';
 import type { GeometryResult, MeshData } from '@ifc-lite/geometry';
 import { MutablePropertyView as LiveMutablePropertyView } from '@ifc-lite/mutations';
 import {
@@ -158,6 +158,72 @@ describe('ParquetExporter overlay deletions (#2046)', () => {
     expect(after).not.toContain('Wall2 (deleted)');
   });
 
+  // Nothing in EXPRESS forbids two `IfcRelContainedInSpatialStructure`
+  // instances from naming the same (storey, wall) pair (#3760). The graph
+  // dedupes the edge to one, keeping the second `IfcRel*`'s express id on
+  // `shadowedRelationshipIds` instead of dropping it — a real STEP record in
+  // the source file. `writeRelationships` used to walk `edgeRelIds` alone,
+  // so that shadowed `IfcRel*` never got its own `Relationships.parquet`
+  // row (#3782 review).
+  it('emits one Relationships.parquet row per shadowed IfcRel id, not just the survivor', async () => {
+    const dataStore = buildDataStore();
+    const relBuilder = new RelationshipGraphBuilder();
+    relBuilder.addEdge(10, 1, RelationshipType.ContainsElements, 100);
+    relBuilder.addEdge(10, 1, RelationshipType.ContainsElements, 102); // redundant IfcRel
+    dataStore.relationships = relBuilder.build();
+
+    const exporter = new ParquetExporter(dataStore);
+    const bytes = await exporter.exportTable('relationships');
+    const rows = decodeParquet(bytes);
+
+    const relIdsFor10to1 = rows
+      .filter((r) => r.SourceId === 10 && r.TargetId === 1)
+      .map((r) => r.RelId)
+      .sort();
+    expect(relIdsFor10to1).toEqual([100, 102]);
+  });
+
+  // The row's `RelId` names an `IfcRel*` entity, and an `IfcRel*` record IS a
+  // row in Entities.parquet (the columnar parser indexes it like any other
+  // line). `writeRelationships` filtered only the two endpoints, so deleting
+  // the relationship record itself left a `RelId` in Relationships.parquet
+  // pointing at an entity no other table has. A deleted survivor must drop
+  // its own row while a still-live shadowed `IfcRel*` keeps the connection —
+  // the same rule `edgeSurvives` applies in the CLI/MCP `related()` path.
+  it('drops a Relationships.parquet row whose own IfcRel entity is deleted, keeping a live shadowed one', async () => {
+    const dataStore = buildDataStore();
+    const relBuilder = new RelationshipGraphBuilder();
+    relBuilder.addEdge(10, 1, RelationshipType.ContainsElements, 100);
+    relBuilder.addEdge(10, 1, RelationshipType.ContainsElements, 102); // redundant IfcRel
+    dataStore.relationships = relBuilder.build();
+
+    const view = new LiveMutablePropertyView(null, 'm1');
+    view.deleteEntity(100); // delete the surviving IfcRel record, not an endpoint
+
+    const exporter = new ParquetExporter(dataStore, undefined, view);
+    const rows = decodeParquet(await exporter.exportTable('relationships'));
+
+    const relIds = rows.filter((r) => r.SourceId === 10 && r.TargetId === 1).map((r) => r.RelId);
+    expect(relIds).toEqual([102]);
+  });
+
+  it('drops the edge entirely from Relationships.parquet once every IfcRel record naming it is deleted', async () => {
+    const dataStore = buildDataStore();
+    const relBuilder = new RelationshipGraphBuilder();
+    relBuilder.addEdge(10, 1, RelationshipType.ContainsElements, 100);
+    relBuilder.addEdge(10, 1, RelationshipType.ContainsElements, 102);
+    dataStore.relationships = relBuilder.build();
+
+    const view = new LiveMutablePropertyView(null, 'm1');
+    view.deleteEntity(100);
+    view.deleteEntity(102);
+
+    const exporter = new ParquetExporter(dataStore, undefined, view);
+    const rows = decodeParquet(await exporter.exportTable('relationships'));
+
+    expect(rows.filter((r) => r.SourceId === 10 && r.TargetId === 1)).toEqual([]);
+  });
+
   it('still exports everything when no mutation view is supplied (back-compat)', async () => {
     const dataStore = buildDataStore();
     const exporter = new ParquetExporter(dataStore);
@@ -202,6 +268,34 @@ describe('ParquetExporter overlay deletions (#2046)', () => {
     const entityIds = rows.map((r) => r.EntityId);
     expect(entityIds).toContain(1);
     expect(entityIds).not.toContain(2);
+  });
+});
+
+describe('ParquetExporter effective entity rows (#5249)', () => {
+  it('writes created entities after source rows with effective root fields and omits tombstones', async () => {
+    const store = buildDataStore();
+    const view = new LiveMutablePropertyView(null, 'm1');
+    view.setExpressIdWatermark(2);
+    view.deleteEntity(2);
+    const wall = view.createEntity('IfcWall', ['new-wall-guid', null, 'Draft wall', 'Draft description', 'Partition']);
+    view.setAttribute(wall.expressId, 'Name', 'Authored wall');
+    view.setPositionalAttribute(wall.expressId, 3, 'Final description');
+    view.setEntityType(wall.expressId, 'IfcDoor');
+    const transient = view.createEntity('IfcWall', ['transient-guid', null, 'Transient']);
+    view.deleteEntity(transient.expressId);
+    const wallType = view.createEntity('IfcWallType', ['new-type-guid', null, 'Authored type']);
+
+    const rows = decodeParquet(await new ParquetExporter(store, undefined, view).exportTable('entities'));
+
+    expect(rows.map((row) => row.ExpressId)).toEqual([1, wall.expressId, wallType.expressId]);
+    expect(rows.find((row) => row.ExpressId === wall.expressId)).toMatchObject({
+      GlobalId: 'new-wall-guid', Name: 'Authored wall', Description: 'Final description',
+      Type: 'IfcDoor', ObjectType: 'Partition', HasGeometry: false, IsType: false,
+      ContainedInStorey: -1, DefinedByType: -1, GeometryIndex: -1,
+    });
+    expect(rows.find((row) => row.ExpressId === wallType.expressId)).toMatchObject({
+      Type: 'IfcWallType', IsType: true,
+    });
   });
 });
 
@@ -297,6 +391,71 @@ describe('ParquetExporter overlay deletions reach the geometry tables', () => {
       expect(Number(row.BuildingId)).toBe(-1);
       expect(Number(row.SiteId)).toBe(-1);
     }
+  });
+
+  it('writes ZIP version-needed 2.0 on every DEFLATE entry of the .bos archive (#3612)', async () => {
+    // JSZip hardcoded "version needed to extract" to 1.0 on every entry while
+    // compressing with DEFLATE, which the ZIP APPNOTE (4.4.3) says needs 2.0.
+    // Read the raw headers: JSZip's own reader never checks the field.
+    const bytes = await new ParquetExporter(buildDataStoreWithById()).exportBOS({ includeGeometry: false });
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    let eocd = bytes.length - 22;
+    while (eocd >= 0 && view.getUint32(eocd, true) !== 0x06054b50) eocd--;
+    expect(eocd).toBeGreaterThanOrEqual(0);
+    const count = view.getUint16(eocd + 10, true);
+    expect(count).toBeGreaterThan(1);
+    let p = view.getUint32(eocd + 16, true);
+    for (let i = 0; i < count; i++) {
+      expect(view.getUint32(p, true)).toBe(0x02014b50);
+      const lfh = view.getUint32(p + 42, true);
+      expect(view.getUint16(p + 10, true), 'central directory method').toBe(8);
+      expect(view.getUint16(p + 6, true), 'central directory version needed').toBe(0x0014);
+      expect(view.getUint32(lfh, true)).toBe(0x04034b50);
+      expect(view.getUint16(lfh + 4, true), 'local header version needed').toBe(0x0014);
+      p += 46 + view.getUint16(p + 28, true) + view.getUint16(p + 30, true) + view.getUint16(p + 32, true);
+    }
+  });
+
+  it('exports edited and authored containment from the effective relationships (#5249)', async () => {
+    const ifc = `ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION((''),'2;1');
+FILE_NAME('','',(''),(''),'','','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('0Project00000000000001',$,'Project',$,$,$,$,$,$);
+#10=IFCBUILDINGSTOREY('0Storey0000000000000010',$,'Level 1',$,$,$,$,$,.ELEMENT.,0.);
+#11=IFCBUILDINGSTOREY('0Storey0000000000000011',$,'Level 2',$,$,$,$,$,.ELEMENT.,3.);
+#21=IFCRELAGGREGATES('0RelAggregate0000000021',$,$,$,#1,(#10,#11));
+#30=IFCWALL('0Wall00000000000000030',$,'Wall A',$,$,$,$,$,$);
+#40=IFCRELCONTAINEDINSPATIALSTRUCTURE('0RelContained0000000040',$,$,$,(#30),#10);
+ENDSEC;
+END-ISO-10303-21;`;
+    const bytes = new TextEncoder().encode(ifc);
+    const store = await new IfcParser().parseColumnar(bytes.buffer as ArrayBuffer, { disableWorkerScan: true });
+    const view = new LiveMutablePropertyView(null, 'm1');
+    view.setExpressIdWatermark(40);
+    const exporter = new ParquetExporter(store, undefined, view);
+    const JSZip = (await import('jszip')).default;
+    const spatialRows = async () => {
+      const archive = await JSZip.loadAsync(await exporter.exportBOS({ includeGeometry: false }));
+      return decodeParquet(await archive.file('SpatialHierarchy.parquet')!.async('uint8array'));
+    };
+
+    expect((await spatialRows()).map(({ ElementId, StoreyId }) => [ElementId, StoreyId])).toEqual([[30, 10]]);
+    view.setPositionalAttribute(40, 5, '#11');
+    expect((await spatialRows()).map(({ ElementId, StoreyId }) => [ElementId, StoreyId])).toEqual([[30, 11]]);
+
+    view.deleteEntity(40);
+    const wall = view.createEntity('IfcWall', ['0Wall00000000000000041', null, 'Wall B', null, null, null, null, null, null]);
+    view.createEntity('IfcRelContainedInSpatialStructure',
+      ['0RelContained0000000042', null, null, null, ['#30', `#${wall.expressId}`], '#11']);
+    expect((await spatialRows()).map(({ ElementId, StoreyId }) => [ElementId, StoreyId]))
+      .toEqual([[30, 11], [wall.expressId, 11]]);
+
+    view.deleteEntity(11);
+    expect(await spatialRows()).toEqual([]);
   });
 
   it('exports an express id above 2^31 without wrapping it negative', async () => {
@@ -438,8 +597,9 @@ function buildDataStoreWithById(): MockDataStore {
 
 describe('ParquetExporter overlay retypes', () => {
   // StepExporter/Ifc5Exporter resolve `effective.typeOf(id)` before emitting
-  // an entity's class (step-exporter.ts:961, `effectiveType = typeMut?.newType
-  // ?? entity.type`), so a `setEntityType` retype changes what those two
+  // an entity's class (`const effectiveType = typeMut?.newType ?? entity.type`
+  // in `step-overlay-entities.ts`), so a `setEntityType` retype changes what
+  // those two
   // exporters write. `writeEntities` filters rows by `effective.isDeleted`
   // (the #2046 fix); before this fix it still read `Type` straight off
   // `entities.typeEnum` — the SOURCE class — never consulting the same
@@ -566,5 +726,181 @@ describe('ParquetExporter overlay retypes', () => {
     const unknownType = rows.find((r) => r.Name === 'Unknown1')?.Type;
     expect(unknownType).not.toBe('Unknown');
     expect((unknownType as string).toLowerCase()).toContain('someunknown');
+  });
+});
+
+// Independent-reader parity hunt: `IfcParser.parseColumnar` (`packages/parser`'s
+// only parse path, used by every real caller) never calls `.add()` on the
+// `PropertyTableBuilder`/`QuantityTableBuilder` it constructs — properties and
+// quantities are served lazily through `onDemandPropertyMap`/
+// `onDemandQuantityMap` + `store.getProperties()`/`store.getQuantities()`
+// instead. `writeProperties`/`writeQuantities` read `store.properties`/
+// `store.quantities` (the never-populated bulk table) directly, so
+// `Properties.parquet`/`Quantities.parquet` came out with zero rows for every
+// model parsed the normal way — verified independently: DuckDB opened the
+// exported `.bos` archive from `tests/models/ara3d/duplex.ifc` (a real parse,
+// not this file's hand-built fixtures) and read back 0 rows from both tables
+// despite the source file carrying 2,960 `IFCPROPERTYSET`/
+// `IFCRELDEFINESBYPROPERTIES`/`IFCELEMENTQUANTITY` lines. `Entities.parquet`
+// and `Relationships.parquet` — populated eagerly during parse, unaffected by
+// this gap — read back correctly throughout, so this test's mock leaves them
+// on the ordinary bulk-table path as the control.
+describe('ParquetExporter on-demand properties/quantities (independent-reader parity hunt)', () => {
+  function buildOnDemandDataStore(): MockDataStore {
+    const strings = new StringTable();
+
+    const entityBuilder = new EntityTableBuilder(1, strings);
+    entityBuilder.add(1, 'IFCWALL', 'wall-1-guid', 'Wall1', '', '');
+
+    const relBuilder = new RelationshipGraphBuilder();
+    relBuilder.addEdge(10, 1, RelationshipType.ContainsElements, 100);
+
+    // Empty bulk tables — exactly what `parseLite` produces: the builders
+    // exist but nothing was ever `.add()`-ed to them.
+    const emptyProperties = new PropertyTableBuilder(strings).build();
+    const emptyQuantities = new QuantityTableBuilder(strings).build();
+
+    const onDemandPropertyMap = new Map<number, number[]>([[1, [200]]]);
+    const onDemandQuantityMap = new Map<number, number[]>([[1, [300]]]);
+
+    const store = {
+      fileSize: 0,
+      schemaVersion: 'IFC4',
+      entityCount: 1,
+      parseTime: 0,
+      source: new Uint8Array(0),
+      entityIndex: { byId: new Map<number, EntityRef>(), byType: new Map<string, number[]>() },
+      strings,
+      entities: entityBuilder.build(),
+      properties: emptyProperties,
+      quantities: emptyQuantities,
+      relationships: relBuilder.build(),
+      onDemandPropertyMap,
+      onDemandQuantityMap,
+      // Stand in for `extractPropertiesOnDemand`/`extractQuantitiesOnDemand`
+      // without a real source buffer to re-parse — same shape the real
+      // accessor returns (`packages/data/src/property-table.ts`'s
+      // `PropertySet`/`packages/data/src/quantity-table.ts`'s `QuantitySet`).
+      getProperties: (expressId: number) => {
+        if (expressId !== 1) return [];
+        return [{
+          name: 'Pset_WallCommon',
+          globalId: 'pset-1-guid',
+          properties: [
+            { name: 'IsExternal', type: PropertyValueType.Boolean, value: true },
+            { name: 'Reference', type: PropertyValueType.String, value: 'Basic Wall' },
+            // IfcPropertyBoundedValue keeps a REAL type tag but its on-demand
+            // representation is a display string, not a scalar measurement.
+            { name: 'PermittedLength', type: PropertyValueType.Real, value: '0.25 [0.1 – 0.5]' },
+            { name: 'NominalLength', type: PropertyValueType.Real, value: 0.25 },
+          ],
+        }];
+      },
+      getQuantities: (expressId: number) => {
+        if (expressId !== 1) return [];
+        return [{
+          name: 'Qto_WallBaseQuantities',
+          quantities: [
+            { name: 'Length', type: QuantityType.Length, value: 4.2 },
+          ],
+        }];
+      },
+    } as unknown as MockDataStore;
+
+    return store;
+  }
+
+  it('reads Properties.parquet through onDemandPropertyMap when the bulk table is empty', async () => {
+    const dataStore = buildOnDemandDataStore();
+    const exporter = new ParquetExporter(dataStore);
+    const rows = decodeParquet(await exporter.exportTable('properties'));
+
+    expect(rows).toHaveLength(4);
+    const isExternal = rows.find((r) => r.PropName === 'IsExternal');
+    expect(isExternal?.EntityId).toBe(1);
+    expect(isExternal?.PsetName).toBe('Pset_WallCommon');
+    expect(isExternal?.ValueBool).toBe(true);
+    const reference = rows.find((r) => r.PropName === 'Reference');
+    expect(reference?.ValueString).toBe('Basic Wall');
+    const bounded = rows.find((r) => r.PropName === 'PermittedLength');
+    expect(bounded?.ValueString).toBe('0.25 [0.1 – 0.5]');
+    expect(bounded?.ValueReal).toBeNull();
+    const scalar = rows.find((r) => r.PropName === 'NominalLength');
+    expect(scalar?.ValueReal).toBeCloseTo(0.25);
+  });
+
+  it('exports live property and quantity edits plus sets on a created entity (#5249)', async () => {
+    const store = buildOnDemandDataStore();
+    const view = new LiveMutablePropertyView(null, 'm1');
+    view.setOnDemandExtractor(id => store.getProperties(id));
+    view.setQuantityExtractor(id => store.getQuantities(id));
+    view.setExpressIdWatermark(1);
+    view.setProperty(1, 'Pset_WallCommon', 'Reference', 'Edited wall');
+    view.deleteProperty(1, 'Pset_WallCommon', 'IsExternal');
+    view.setQuantity(1, 'Qto_WallBaseQuantities', 'Length', 9.5, QuantityType.Length);
+    const created = view.createEntity('IfcWall', ['new-guid', null, 'New wall']);
+    view.createPropertySet(created.expressId, 'Pset_New', [{ name: 'Code', value: 'N-1' }]);
+    view.createQuantitySet(created.expressId, 'Qto_New', [{ name: 'Height', value: 2.4, quantityType: QuantityType.Length }]);
+
+    const exporter = new ParquetExporter(store, undefined, view);
+    const properties = decodeParquet(await exporter.exportTable('properties'));
+    const quantities = decodeParquet(await exporter.exportTable('quantities'));
+    expect(properties.find(r => r.PropName === 'Reference')?.ValueString).toBe('Edited wall');
+    expect(properties.some(r => r.PropName === 'IsExternal')).toBe(false);
+    expect(properties.find(r => r.EntityId === created.expressId)?.ValueString).toBe('N-1');
+    expect(quantities.find(r => r.QuantityName === 'Length')?.Value).toBeCloseTo(9.5);
+    expect(quantities.find(r => r.EntityId === created.expressId)?.Value).toBeCloseTo(2.4);
+
+    const JSZip = (await import('jszip')).default;
+    const archive = await JSZip.loadAsync(await exporter.exportBOS({ includeGeometry: false }));
+    const metadata = JSON.parse(await archive.file('Metadata.json')!.async('string'));
+    expect(metadata.statistics.propertyCount).toBe(properties.length);
+  });
+
+  it('applies property edits when the source uses bulk tables (#5249)', async () => {
+    const store = buildDataStore();
+    const view = new LiveMutablePropertyView(store.properties, 'm1');
+    view.setProperty(1, 'Pset_WallCommon', 'IsExternal', false, PropertyValueType.Boolean);
+    view.deleteEntity(2);
+    const rows = decodeParquet(await new ParquetExporter(store, undefined, view).exportTable('properties'));
+    expect(rows).toHaveLength(1);
+    expect(rows[0].EntityId).toBe(1);
+    expect(rows[0].ValueBool).toBe(false);
+  });
+
+  it('reads Quantities.parquet through onDemandQuantityMap when the bulk table is empty', async () => {
+    const dataStore = buildOnDemandDataStore();
+    const exporter = new ParquetExporter(dataStore);
+    const rows = decodeParquet(await exporter.exportTable('quantities'));
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0].EntityId).toBe(1);
+    expect(rows[0].QsetName).toBe('Qto_WallBaseQuantities');
+    expect(rows[0].QuantityName).toBe('Length');
+    expect(rows[0].Value).toBeCloseTo(4.2);
+  });
+
+  it('still exports Entities/Relationships (the bulk path, unaffected by this gap) alongside the on-demand tables', async () => {
+    const dataStore = buildOnDemandDataStore();
+    const exporter = new ParquetExporter(dataStore);
+
+    const entityRows = decodeParquet(await exporter.exportTable('entities'));
+    expect(entityRows.map((r) => r.Name)).toContain('Wall1');
+
+    const relRows = decodeParquet(await exporter.exportTable('relationships'));
+    expect(relRows.map((r) => r.TargetId)).toContain(1);
+  });
+
+  it('honours overlay deletions on the on-demand property/quantity path', async () => {
+    const dataStore = buildOnDemandDataStore();
+    const view = new LiveMutablePropertyView(null, 'm1');
+    view.deleteEntity(1);
+
+    const exporter = new ParquetExporter(dataStore, undefined, view);
+    const propRows = decodeParquet(await exporter.exportTable('properties'));
+    const qtyRows = decodeParquet(await exporter.exportTable('quantities'));
+
+    expect(propRows).toHaveLength(0);
+    expect(qtyRows).toHaveLength(0);
   });
 });

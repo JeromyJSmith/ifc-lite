@@ -6,8 +6,8 @@
  * QuantityTable serialization
  */
 
-import type { QuantityTable, QuantitySet, StringTable } from '@ifc-lite/data';
-import { comparePropertyValues } from '@ifc-lite/data';
+import type { QuantityTable, StringTable } from '@ifc-lite/data';
+import { comparePropertyValues, groupQuantitySetsByInstance } from '@ifc-lite/data';
 import { BufferWriter, BufferReader } from '../utils/buffer-utils.js';
 
 /**
@@ -20,6 +20,7 @@ export function writeQuantities(writer: BufferWriter, quantities: QuantityTable)
 
   writer.writeTypedArray(quantities.entityId);
   writer.writeTypedArray(quantities.qsetName);
+  writer.writeTypedArray(quantities.qsetGlobalId);
   writer.writeTypedArray(quantities.quantityName);
   writer.writeTypedArray(quantities.quantityType);
   writer.writeTypedArray(quantities.value);
@@ -40,20 +41,22 @@ export function readQuantities(reader: BufferReader, strings: StringTable): Quan
 
   const entityId = reader.readUint32Array(count);
   const qsetName = reader.readUint32Array(count);
+  const qsetGlobalId = reader.readUint32Array(count);
   const quantityName = reader.readUint32Array(count);
   const quantityType = reader.readUint8Array(count);
   const value = reader.readFloat64Array(count);
   const unitId = reader.readInt32Array(count);
   const formula = reader.readUint32Array(count);
 
-  const entityIndex = readIndex(reader);
-  const qsetIndex = readIndex(reader);
-  const quantityIndex = readIndex(reader);
+  const entityIndex = readIndex(reader, count, 'entityIndex');
+  const qsetIndex = readIndex(reader, count, 'qsetIndex');
+  const quantityIndex = readIndex(reader, count, 'quantityIndex');
 
   return {
     count,
     entityId,
     qsetName,
+    qsetGlobalId,
     quantityName,
     quantityType,
     value,
@@ -65,30 +68,16 @@ export function readQuantities(reader: BufferReader, strings: StringTable): Quan
 
     getForEntity: (id) => {
       const rowIndices = entityIndex.get(id) || [];
-      const qsets = new Map<string, QuantitySet>();
-
-      for (const idx of rowIndices) {
-        const qsetNameStr = strings.get(qsetName[idx]);
-
-        if (!qsets.has(qsetNameStr)) {
-          qsets.set(qsetNameStr, {
-            name: qsetNameStr,
-            quantities: [],
-          });
-        }
-
-        const qset = qsets.get(qsetNameStr)!;
-        const quantNameStr = strings.get(quantityName[idx]);
-
-        qset.quantities.push({
-          name: quantNameStr,
-          type: quantityType[idx],
-          value: value[idx],
-          formula: formula[idx] > 0 ? strings.get(formula[idx]) : undefined,
-        });
-      }
-
-      return Array.from(qsets.values());
+      return groupQuantitySetsByInstance(
+        rowIndices,
+        qsetName,
+        qsetGlobalId,
+        quantityName,
+        quantityType,
+        value,
+        formula,
+        strings,
+      );
     },
 
     getQuantityValue: (id, qset, quant) => {
@@ -168,7 +157,18 @@ function writeIndex(writer: BufferWriter, index: Map<number, number[]>): void {
   }
 }
 
-function readIndex(reader: BufferReader): Map<number, number[]> {
+/**
+ * Read a row-index table (entityIndex/qsetIndex/quantityIndex): key -> row
+ * indices into the parallel column arrays. Each row index MUST be < rowCount
+ * — the column arrays (entityId, qsetName, quantityType, value, ...) are
+ * fixed-size typed arrays, so an out-of-range read returns `undefined`
+ * instead of throwing. A corrupt cache with an inflated row index would
+ * otherwise flow `undefined` names and values into `getForEntity` results and
+ * `NaN` into `sumByType` silently instead of failing the cache load. Same
+ * defect shape, and same fix, as `entity-index.ts`'s `typeIndex` bounds
+ * check and `properties.ts`'s equivalent guard.
+ */
+function readIndex(reader: BufferReader, rowCount: number, name: string): Map<number, number[]> {
   const size = reader.readUint32();
   const index = new Map<number, number[]>();
   for (let i = 0; i < size; i++) {
@@ -176,7 +176,14 @@ function readIndex(reader: BufferReader): Map<number, number[]> {
     const valueCount = reader.readUint32();
     const values: number[] = [];
     for (let j = 0; j < valueCount; j++) {
-      values.push(reader.readUint32());
+      const rowIndex = reader.readUint32();
+      if (rowIndex >= rowCount) {
+        throw new Error(
+          `Corrupt cache QuantityTable ${name}: row index ${rowIndex} for key ${key} ` +
+            `exceeds row count ${rowCount}`,
+        );
+      }
+      values.push(rowIndex);
     }
     index.set(key, values);
   }

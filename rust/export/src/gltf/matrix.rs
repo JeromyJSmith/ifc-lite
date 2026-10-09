@@ -8,20 +8,26 @@
 //! to that occurrence's Y-up BAKED world position, minus the model-wide
 //! `scene_center` that the root node carries:
 //!
-//!   N_k = T(-scene_center) · S · [ T(-rtc) · (M_k · M_ref⁻¹) · T(rtc) ] · S⁻¹ · T(template_origin_yup)
+//!   N_k = T(-scene_center) · B · (M_k · M_ref⁻¹) · B⁻¹ · T(template_origin_yup)
 //!
 //! where `M = transform · local · canonical` is the per-occurrence world placement
-//! from `InstanceMeta` (Z-up, **pre-RTC**), `rtc` is the model RTC/site offset the
-//! baker subtracted (Z-up), and `S` is the Z-up→Y-up basis `(x,y,z) → (x, z, -y)`.
-//! The `T(-rtc)·…·T(rtc)` conjugation moves the relative transform from the pre-RTC
-//! frame `M` lives in into the POST-RTC baked frame the template geometry is in —
-//! without it, a rotated occurrence under a non-zero site/georef offset is
-//! mis-translated by `(R_rel - I)·rtc` (kilometres at national-grid scale). Everything
+//! from `InstanceMeta` (Z-up, **pre-RTC**) and `B = S · Rᵀ · T(-rtc)` is everything
+//! that happened to the vertices after `M` was captured: the model RTC/site offset
+//! the baker subtracted (`rtc`, Z-up), the site placement's inverse rotation `Rᵀ`
+//! the `site_local` tier baked in on top of it, and the Z-up→Y-up basis
+//! `S: (x,y,z) → (x, z, -y)` the assembler applied. Conjugating by `B` moves the
+//! relative transform from the pre-RTC native frame `M` lives in into the baked
+//! frame the template geometry is actually in — without the `T(-rtc)` factor a
+//! rotated occurrence under a non-zero site/georef offset is mis-translated by
+//! `(R_rel - I)·rtc` (kilometres at national-grid scale), and without `Rᵀ` a
+//! translated sibling under a yawed site is mis-translated by `(I - Rᵀ)·d`
+//! (metres at building scale, #4118). Everything
 //! is f64, recomputed from the f64 `InstanceMeta` (NOT the collator's f32 `rel`), so
 //! the absolute-magnitude terms cancel to a small, f32-precise translation before the
 //! final downcast even at national-grid coordinates.
 
 use ifc_lite_geometry::InstanceMeta;
+use ifc_lite_processing::MeshCoordinateSpace;
 
 /// Z-up→Y-up basis as a row-major 4x4 (linear part only; `(x,y,z) → (x, z, -y)`).
 const S_YUP: [f64; 16] = [
@@ -57,6 +63,74 @@ fn mat4_mul(a: &[f64; 16], b: &[f64; 16]) -> [f64; 16] {
         }
     }
     out
+}
+
+/// The basis the baked template geometry lives in relative to the frame
+/// `InstanceMeta` (hence a collator `rel`) is expressed in:
+/// `S_YUP · native_to_baked(tier)`.
+///
+/// Three conversions separate them, and this function owns none of the
+/// knowledge about the last two. The assembler converts every visible mesh's
+/// baked positions Z-up→Y-up before collation — that is `S_YUP`, and it is an
+/// export-crate fact. Everything the BAKER did is
+/// `ifc_lite_processing::native_to_baked`: the model RTC offset it subtracted,
+/// and (in the `site_local` tier only) the site placement's inverse rotation
+/// `Rᵀ` that `convert_mesh_to_site_local` applied afterwards. Both of those
+/// terms matter and neither is optional — the RTC one leaves a residual of
+/// `(R_rel - I) · rtc`, hundreds of kilometres for a rotated sibling at
+/// national-grid magnitude, and the `Rᵀ` one leaves `(I - Rᵀ)·d`, metres for a
+/// 6 m sibling under a 34 degree site yaw, which is what made a rotated site
+/// instance nothing at all (#4118).
+///
+/// `space` is the tag the pipeline stamped on the result
+/// (`ProcessingResult::mesh_coordinate_space`), and it is what decides whether
+/// a site rotation was removed. It used to be INFERRED here, from
+/// `site_zup.is_some()` — a second encoding of the same fact, kept true only
+/// because `site_restore` happened to filter the placement by the same tag one
+/// call up. Two encodings of one fact is the defect (#4611): the tier taxonomy
+/// belongs to `native_to_baked`, next to the converter that creates the
+/// divergence, and this function's job is to hand it the tag rather than to
+/// re-derive it.
+///
+/// Used at BOTH sites that need it — `build_gltf` hands it to
+/// `collate_refs_in_basis` as the `baked_basis`, and
+/// [`occurrence_node_matrix_composed`] conjugates `rel` by it to build the
+/// shipped node matrix — so the frame the check verifies in is the frame the
+/// export actually places in, by construction rather than by two copies agreeing.
+pub(super) fn baked_basis_yup(
+    space: MeshCoordinateSpace,
+    rtc_zup: [f64; 3],
+    site_zup: Option<&[f64]>,
+) -> [f64; 16] {
+    mat4_mul(
+        &S_YUP,
+        &ifc_lite_processing::native_to_baked(space, site_zup, rtc_zup),
+    )
+}
+
+/// The inverse of [`baked_basis_yup`], built without a general inversion.
+///
+/// `B = S_YUP · Rᵀ · T(-rtc)`, so `B⁻¹ = T(rtc) · R · S_YUP⁻¹`. `R` is recovered
+/// by transposing `native_to_baked`'s 3x3 block, which is exact: the block is
+/// the transpose of an `IfcAxis2Placement3D` rotation, orthonormal by
+/// construction, and the length-unit scale the router applies touches only a
+/// placement's translation column. That transpose-is-the-inverse identity is
+/// not a new assumption here — it is the one `apply_inverse_rotation_in_place`
+/// uses to un-rotate the vertices in the first place.
+fn baked_basis_yup_inverse(
+    space: MeshCoordinateSpace,
+    rtc_zup: [f64; 3],
+    site_zup: Option<&[f64]>,
+) -> [f64; 16] {
+    let b = ifc_lite_processing::native_to_baked(space, site_zup, rtc_zup);
+    #[rustfmt::skip]
+    let r = [
+        b[0], b[4], b[8],  0.0,
+        b[1], b[5], b[9],  0.0,
+        b[2], b[6], b[10], 0.0,
+        0.0,  0.0,  0.0,   1.0,
+    ];
+    mat4_mul(&mat4_translation(rtc_zup), &mat4_mul(&r, &S_YUP_INV))
 }
 
 /// Row-major translation matrix.
@@ -135,20 +209,67 @@ pub(super) fn compose_world_meta(meta: &InstanceMeta) -> [f64; 16] {
 pub(super) fn occurrence_node_matrix(
     occ: &InstanceMeta,
     m_ref_inv: &[f64; 16],
+    space: MeshCoordinateSpace,
     rtc_zup: [f64; 3],
+    site_zup: Option<&[f64]>,
     template_origin_yup: [f64; 3],
     scene_center: [f64; 3],
 ) -> [f32; 16] {
-    let m_k = compose_world_meta(occ);
+    occurrence_node_matrix_composed(
+        compose_world_meta(occ),
+        m_ref_inv,
+        space,
+        rtc_zup,
+        site_zup,
+        template_origin_yup,
+        scene_center,
+    )
+}
+
+/// The same, from a world placement already composed.
+///
+/// `compose_world_meta` is the only thing this derivation reads out of an
+/// `InstanceMeta`, so a caller that has to keep one record per mesh can keep the
+/// 128-byte product instead of the 424-byte struct. That is what lets the
+/// bounded assembler afford instancing at all.
+pub(super) fn occurrence_node_matrix_composed(
+    m_k: [f64; 16],
+    m_ref_inv: &[f64; 16],
+    space: MeshCoordinateSpace,
+    rtc_zup: [f64; 3],
+    site_zup: Option<&[f64]>,
+    template_origin_yup: [f64; 3],
+    scene_center: [f64; 3],
+) -> [f32; 16] {
     // rel maps the template's PRE-RTC world geometry onto occurrence k's.
     let rel_pre = mat4_mul(&m_k, m_ref_inv);
-    // Conjugate into the POST-RTC baked frame the geometry actually lives in.
-    let rel_baked = mat4_mul(
-        &mat4_translation([-rtc_zup[0], -rtc_zup[1], -rtc_zup[2]]),
-        &mat4_mul(&rel_pre, &mat4_translation(rtc_zup)),
+    // Conjugate `rel` into the frame the BAKED template geometry lives in:
+    // POST-RTC (the offset the baker subtracted), site-local-rotated where the
+    // baker rotated it, and Y-up (the conversion the assembler applied).
+    // `B · rel · B⁻¹` with `B = S_YUP · Rᵀ · T(-rtc)`, which is the same `B` the
+    // collator is handed as its `baked_basis` — shared through
+    // [`baked_basis_yup`] so the two cannot drift apart.
+    //
+    // This is NOT bit-identical to computing the conjugations separately
+    // (`S · (Rᵀ · (T(-rtc) · rel · T(rtc)) · R) · S⁻¹`), and the earlier claim
+    // that it was is wrong. Folding `S` in is exact — `S_YUP` is a signed
+    // permutation, so multiplying by it only moves and negates entries — but
+    // folding the TRANSLATIONS re-associates real additions, and f64 addition is
+    // not associative: a reviewer measured a max delta of 9.3e-10 m across
+    // 20,000 georeferenced cases. `Rᵀ` is a third factor of the same kind and
+    // does not change the argument: it is an orthonormal 3x3, so it neither
+    // grows the magnitudes being added nor introduces a new cancellation, and
+    // the re-association delta stays at that scale. It IS harmless here for two
+    // independent reasons, both worth stating because neither is obvious: the
+    // result is cast to f32 below (a ~1e-9 m difference at building scale is far
+    // under one f32 ULP, so the emitted bytes are unchanged), and the collator
+    // tolerance this basis feeds floors at 1e-6 m, a thousand times wider.
+    // Anything that changes either — an f64 node matrix, a tighter tolerance —
+    // makes the delta visible and this note is the warning.
+    let rel_yup = mat4_mul(
+        &mat4_mul(&baked_basis_yup(space, rtc_zup, site_zup), &rel_pre),
+        &baked_basis_yup_inverse(space, rtc_zup, site_zup),
     );
-    // Conjugate Z-up→Y-up (the template was converted by the same S).
-    let rel_yup = mat4_mul(&mat4_mul(&S_YUP, &rel_baked), &S_YUP_INV);
     let n = mat4_mul(
         &mat4_translation([-scene_center[0], -scene_center[1], -scene_center[2]]),
         &mat4_mul(&rel_yup, &mat4_translation(template_origin_yup)),
@@ -157,227 +278,5 @@ pub(super) fn occurrence_node_matrix(
 }
 
 #[cfg(test)]
-mod tests {
-    #[test]
-    fn occurrence_matrix_reconstructs_rotated_instance_under_national_grid_rtc() {
-        // A ROTATED occurrence at NATIONAL-GRID coordinates: the node matrix is built
-        // from the same InstanceMeta the baker would carry; reconstructing the
-        // occurrence from the template's baked-local geometry must land on the
-        // occurrence's own baked geometry to sub-millimetre, even though the relative
-        // transform's absolute terms are ~1e5 m. (A pre-RTC `rel` applied to post-RTC
-        // geometry — the bug — misplaces this by ~(R-I)·rtc, i.e. hundreds of metres.)
-        use ifc_lite_geometry::InstanceMeta;
-
-        // Row-major helpers.
-        let translate = |t: [f64; 3]| -> [f64; 16] {
-            [1., 0., 0., t[0], 0., 1., 0., t[1], 0., 0., 1., t[2], 0., 0., 0., 1.]
-        };
-        // Rotation about Z (Z-up): (x,y) rotate, z fixed.
-        let rot_z = |deg: f64| -> [f64; 16] {
-            let (s, c) = (deg.to_radians().sin(), deg.to_radians().cos());
-            [c, -s, 0., 0., s, c, 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.]
-        };
-        let apply = |m: &[f64; 16], p: [f64; 3]| -> [f64; 3] {
-            [
-                m[0] * p[0] + m[1] * p[1] + m[2] * p[2] + m[3],
-                m[4] * p[0] + m[5] * p[1] + m[6] * p[2] + m[7],
-                m[8] * p[0] + m[9] * p[1] + m[10] * p[2] + m[11],
-            ]
-        };
-
-        // Placements (Z-up, pre-RTC): template upright, occurrence rotated 37° about Z.
-        let m_ref = super::mat4_mul(&translate([10., 20., 5.]), &rot_z(0.0));
-        let m_k = super::mat4_mul(&translate([60., 35., 5.]), &rot_z(37.0));
-        // National-grid RTC the baker subtracts (e.g. Dutch RD-ish easting/northing).
-        let rtc = [155_000.0_f64, 463_000.0, 0.0];
-
-        // Canonical (rep-local) geometry — a few non-degenerate points.
-        let canonical = [
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [0.0, 2.0, 0.0],
-            [0.5, 0.5, 1.5],
-            [2.0, 0.3, 0.7],
-        ];
-        // Baked = placement·canonical - rtc, in Z-up.
-        let bake = |m: &[f64; 16]| -> Vec<[f64; 3]> {
-            canonical
-                .iter()
-                .map(|&x| {
-                    let w = apply(m, x);
-                    [w[0] - rtc[0], w[1] - rtc[1], w[2] - rtc[2]]
-                })
-                .collect()
-        };
-        let tmpl_baked = bake(&m_ref);
-        let occ_baked = bake(&m_k);
-
-        // Template origin = centroid of its baked geometry; local = baked - origin.
-        let n = canonical.len() as f64;
-        let origin_z = {
-            let mut o = [0.0; 3];
-            for p in &tmpl_baked {
-                for k in 0..3 {
-                    o[k] += p[k] / n;
-                }
-            }
-            o
-        };
-        // Convert template origin + local, and the occurrence's baked truth, to Y-up.
-        let origin_yup = crate::frame::yup_f64(origin_z);
-        let tmpl_local_yup: Vec<[f64; 3]> = tmpl_baked
-            .iter()
-            .map(|p| crate::frame::yup_f64([p[0] - origin_z[0], p[1] - origin_z[1], p[2] - origin_z[2]]))
-            .collect();
-        let occ_world_yup: Vec<[f64; 3]> = occ_baked.iter().map(|p| crate::frame::yup_f64(*p)).collect();
-
-        // scene_center = centre of the combined baked Y-up AABB.
-        let mut lo = [f64::INFINITY; 3];
-        let mut hi = [f64::NEG_INFINITY; 3];
-        for p in tmpl_baked.iter().chain(occ_baked.iter()) {
-            let y = crate::frame::yup_f64(*p);
-            for k in 0..3 {
-                lo[k] = lo[k].min(y[k]);
-                hi[k] = hi[k].max(y[k]);
-            }
-        }
-        let scene_center = [(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5, (lo[2] + hi[2]) * 0.5];
-
-        let meta = |transform: [f64; 16]| InstanceMeta {
-            transform,
-            local_transform: None,
-            canonical_transform: None,
-            rep_identity: 42,
-            instanceable: true,
-        };
-        let m_ref_inv = super::affine_inverse(&super::compose_world_meta(&meta(m_ref)))
-            .expect("template placement invertible");
-        let node = super::occurrence_node_matrix(&meta(m_k), &m_ref_inv, rtc, origin_yup, scene_center);
-
-        // Reconstruct: world = scene_center(root) + node(col-major) · template_local.
-        let mut max_err = 0.0f64;
-        for (lv, truth) in tmpl_local_yup.iter().zip(&occ_world_yup) {
-            let (x, y, z) = (lv[0], lv[1], lv[2]);
-            let world = [
-                scene_center[0] + node[0] as f64 * x + node[4] as f64 * y + node[8] as f64 * z + node[12] as f64,
-                scene_center[1] + node[1] as f64 * x + node[5] as f64 * y + node[9] as f64 * z + node[13] as f64,
-                scene_center[2] + node[2] as f64 * x + node[6] as f64 * y + node[10] as f64 * z + node[14] as f64,
-            ];
-            for k in 0..3 {
-                max_err = max_err.max((world[k] - truth[k]).abs());
-            }
-        }
-        assert!(
-            max_err < 1e-3,
-            "rotated instance under national-grid RTC mis-reconstructed by {max_err} m"
-        );
-    }
-
-    #[test]
-    fn affine_inverse_rejects_singular_placement() {
-        // Zero scale on X collapses the upper 3x3, so there is no affine inverse and the
-        // caller must fall back to the flat (non-instanced) path.
-        let m = [
-            0.0, 0.0, 0.0, 5.0, //
-            0.0, 1.0, 0.0, 0.0, //
-            0.0, 0.0, 1.0, 0.0, //
-            0.0, 0.0, 0.0, 1.0,
-        ];
-        assert!(super::affine_inverse(&m).is_none());
-    }
-
-    #[test]
-    fn compose_world_meta_applies_canonical_then_local_then_transform() {
-        use ifc_lite_geometry::InstanceMeta;
-        // Non-commuting factors so the ORDER is observable: canonical shifts +x, local
-        // rotates 90° about z, transform shifts +x again. A point at the origin must go
-        // origin -(canonical)-> (1,0,0) -(local rot)-> (0,1,0) -(transform)-> (10,1,0).
-        let rot_z90 = [
-            0.0, -1.0, 0.0, 0.0, //
-            1.0, 0.0, 0.0, 0.0, //
-            0.0, 0.0, 1.0, 0.0, //
-            0.0, 0.0, 0.0, 1.0,
-        ];
-        let translate = |t: [f64; 3]| {
-            [
-                1.0, 0.0, 0.0, t[0], //
-                0.0, 1.0, 0.0, t[1], //
-                0.0, 0.0, 1.0, t[2], //
-                0.0, 0.0, 0.0, 1.0,
-            ]
-        };
-        let meta = InstanceMeta {
-            transform: translate([10.0, 0.0, 0.0]),
-            local_transform: Some(rot_z90),
-            canonical_transform: Some(translate([1.0, 0.0, 0.0])),
-            rep_identity: 1,
-            instanceable: true,
-        };
-        let m = super::compose_world_meta(&meta);
-        // Row-major apply to the origin: the translation column is (m[3], m[7], m[11]).
-        let world = [m[3], m[7], m[11]];
-        let want = [10.0, 1.0, 0.0];
-        for k in 0..3 {
-            assert!((world[k] - want[k]).abs() < 1e-9, "axis {k}: {} != {}", world[k], want[k]);
-        }
-    }
-
-    #[test]
-    fn zero_rtc_places_non_identity_occurrence() {
-        use ifc_lite_geometry::InstanceMeta;
-        // With rtc = 0 (the baker subtracted no offset) the conjugation is a no-op, but the
-        // node must STILL place a NON-identity occurrence correctly. Reconstructing the
-        // template's local geometry through the node has to land on the occurrence's own
-        // Y-up world geometry — this catches translation / rotation / matrix-layout errors
-        // an identity-in/identity-out check cannot.
-        let rot_z = |deg: f64| -> [f64; 16] {
-            let (s, c) = (deg.to_radians().sin(), deg.to_radians().cos());
-            [c, -s, 0., 0., s, c, 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.]
-        };
-        let translate = |t: [f64; 3]| {
-            [1., 0., 0., t[0], 0., 1., 0., t[1], 0., 0., 1., t[2], 0., 0., 0., 1.]
-        };
-        let apply = |m: &[f64; 16], p: [f64; 3]| {
-            [
-                m[0] * p[0] + m[1] * p[1] + m[2] * p[2] + m[3],
-                m[4] * p[0] + m[5] * p[1] + m[6] * p[2] + m[7],
-                m[8] * p[0] + m[9] * p[1] + m[10] * p[2] + m[11],
-            ]
-        };
-        let meta = |transform: [f64; 16]| InstanceMeta {
-            transform,
-            local_transform: None,
-            canonical_transform: None,
-            rep_identity: 3,
-            instanceable: true,
-        };
-
-        // Template at identity placement (baked geometry = canonical, origin 0); occurrence
-        // rotated 25° about Z and translated. rtc / origin / scene_center all zero.
-        let m_ref = super::compose_world_meta(&meta(super::IDENTITY16));
-        let m_ref_inv = super::affine_inverse(&m_ref).expect("identity invertible");
-        let m_k = super::compose_world_meta(&meta(
-            super::mat4_mul(&translate([7.0, -3.0, 2.0]), &rot_z(25.0)),
-        ));
-        let node = super::occurrence_node_matrix(&meta(m_k), &m_ref_inv, [0.0; 3], [0.0; 3], [0.0; 3]);
-
-        let canonical = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.3, 0.4, 0.5]];
-        let mut max_err = 0.0f64;
-        for &p in &canonical {
-            // Template local (Y-up): identity template at origin 0, so just the Y-up point.
-            let lv = crate::frame::yup_f64(p);
-            // Truth: the occurrence's own baked (rtc = 0) geometry, in Y-up.
-            let truth = crate::frame::yup_f64(apply(&m_k, p));
-            let world = [
-                node[0] as f64 * lv[0] + node[4] as f64 * lv[1] + node[8] as f64 * lv[2] + node[12] as f64,
-                node[1] as f64 * lv[0] + node[5] as f64 * lv[1] + node[9] as f64 * lv[2] + node[13] as f64,
-                node[2] as f64 * lv[0] + node[6] as f64 * lv[1] + node[10] as f64 * lv[2] + node[14] as f64,
-            ];
-            for k in 0..3 {
-                max_err = max_err.max((world[k] - truth[k]).abs());
-            }
-        }
-        // The node matrix is downcast to f32, so the bound is f32 precision, not f64.
-        assert!(max_err < 1e-4, "zero-rtc non-identity occurrence mis-placed by {max_err}");
-    }
-}
+#[path = "matrix_tests.rs"]
+mod tests;

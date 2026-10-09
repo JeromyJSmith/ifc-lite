@@ -10,6 +10,7 @@
 
 use ifc_lite_core::{DecodedEntity, EntityDecoder, IfcType};
 
+use super::frame_parts::{single_frame_source, SourceParts};
 use super::GeometryRouter;
 use crate::{Error, Mesh, Result, SubMeshCollection};
 
@@ -30,7 +31,13 @@ impl GeometryRouter {
         } else {
             Some(texture_index)
         };
-        self.process_element_with_submeshes_impl(element, decoder, true, textures)
+        self.process_element_with_submeshes_impl(
+            element,
+            decoder,
+            true,
+            textures,
+            super::processing::SourceHygiene::Watertight,
+        )
     }
 
     /// Tessellate an `IfcRepresentationMap`'s `MappedRepresentation` and bake
@@ -48,6 +55,10 @@ impl GeometryRouter {
     /// MappingOrigin axis placement is the only transform. It is the caller's
     /// responsibility to only invoke this for orphan representation maps so
     /// normally-instanced typed products aren't double-rendered.
+    ///
+    /// Errors when the map's items cannot share one f64 frame (#6446); use
+    /// [`Self::process_representation_map_with_texture`] to keep such a map
+    /// at full precision.
     pub fn process_representation_map(
         &self,
         rep_map: &DecodedEntity,
@@ -55,11 +66,11 @@ impl GeometryRouter {
     ) -> Result<Mesh> {
         let empty = rustc_hash::FxHashMap::default();
         let parts = self.process_representation_map_with_texture(rep_map, decoder, &empty)?;
-        let mut mesh = Mesh::new();
+        let mut mesh = SourceParts::default();
         for (part, _uvs, _texture) in parts {
             mesh.merge(&part);
         }
-        Ok(mesh)
+        single_frame_source("IfcRepresentationMap", rep_map.id, mesh.into_parts())
     }
 
     /// Texture-aware variant of [`Self::process_representation_map`] (issue
@@ -67,8 +78,9 @@ impl GeometryRouter {
     /// `IfcTriangulatedFaceSet` item becomes its OWN part carrying its UVs +
     /// decoded image (so a representation with several differently-textured
     /// items renders each with the correct image), and all untextured items are
-    /// merged into a single part with empty UVs / no texture. The MappingOrigin
-    /// placement is baked into every part.
+    /// merged into a single part with empty UVs / no texture, except that
+    /// untextured items in frames at least 1 km apart stay separate untextured
+    /// parts (#6446). The MappingOrigin placement is baked into every part.
     pub fn process_representation_map_with_texture(
         &self,
         rep_map: &DecodedEntity,
@@ -95,7 +107,28 @@ impl GeometryRouter {
             .ok_or_else(|| Error::geometry("Representation missing Items".to_string()))?;
         let items = decoder.resolve_ref_list(items_attr)?;
 
-        let mut untextured = Mesh::new();
+        // Whether a dropped item here is a real content gap, or just this router
+        // declining to mesh a 2D representation it was never meant to mesh.
+        //
+        // The occurrence path filters representations with `is_body_representation`
+        // before it ever reaches an item (`processing.rs`, "Skip 'Axis', 'Curve2D',
+        // 'FootPrint'"). The TYPE path does not: `plan_type_geometry` selects
+        // RepresentationMaps by reference/instantiation only and never looks at the
+        // identifier, so a Revit/ArchiCAD `IfcDoorType` carrying a 'FootPrint' or
+        // 'Annotation' map hands us `IfcGeometricCurveSet` / `IfcPolyline` /
+        // `IfcAnnotationFillArea` — none of which have a processor, all of which are
+        // CORRECTLY absent from a 3D view. Counting those made a clean model warn
+        // "N representation items dropped ... elements are missing or incomplete",
+        // which is exactly the false positive that would teach users to ignore it.
+        //
+        // Only the counting is gated, not the walk: a non-body map still runs
+        // through the loop (merging nothing) so geometry output is byte-identical.
+        // The scope also makes the count per SOURCE rather than per call — this
+        // map may already have been walked through `mapped_item.rs` — see
+        // `GeometryRouter::enter_unsupported_source`.
+        let _drop_scope = self.enter_unsupported_source(rep_map.id, &mapped_rep);
+
+        let mut untextured = SourceParts::default();
         // One entry per textured item — keeps each item with its own image.
         let mut textured: Vec<(
             Mesh,
@@ -106,14 +139,30 @@ impl GeometryRouter {
             // A nested IfcMappedItem inside a type's own representation: process
             // it (applies its MappingTarget) rather than dropping its geometry.
             if item.ifc_type == IfcType::IfcMappedItem {
-                if let Ok(sub_mesh) = self.process_mapped_item_cached(&item, decoder) {
-                    untextured.merge(&sub_mesh); // already scaled inside the cached path
+                match self.process_mapped_item_parts(&item, decoder) {
+                    // already scaled inside the cached path
+                    Ok(sub_parts) => sub_parts.iter().for_each(|part| untextured.merge(part)),
+                    Err(_e) => {
+                        self.record_unsupported_item(item.ifc_type.clone());
+                        crate::diag::diag_debug!(
+                            { item_id = item.id, error = %_e,
+                              "skipping unsupported nested IfcMappedItem in representation map" }
+                            else {
+                                #[cfg(debug_assertions)]
+                                eprintln!(
+                                    "[ifc-lite] Skipping unsupported nested IfcMappedItem #{} in representation map: {}",
+                                    item.id, _e
+                                );
+                            }
+                        );
+                    }
                 }
                 continue;
             }
 
-            // Textured tessellated face set → its own part with per-vertex UVs (#961).
-            if item.ifc_type == IfcType::IfcTriangulatedFaceSet {
+            // Textured tessellated face set → its own part with per-vertex UVs (#961);
+            // a terrain TIN is a face set that only appends `Flags` (#5942).
+            if matches!(item.ifc_type, IfcType::IfcTriangulatedFaceSet | IfcType::IfcTriangulatedIrregularNetwork) {
                 if let Some(map) = texture_index.get(&item.id) {
                     let proc = crate::processors::TriangulatedFaceSetProcessor::new();
                     if let Ok((mut sub_mesh, sub_uvs)) =
@@ -126,13 +175,46 @@ impl GeometryRouter {
                 }
             }
 
-            if let Some(processor) = self.processors.get(&item.ifc_type) {
-                if let Ok(mut sub_mesh) =
-                    processor.process(&item, decoder, &self.schema, self.tessellation_quality)
-                {
-                    sub_mesh.validate_indices();
-                    self.scale_mesh(&mut sub_mesh);
-                    untextured.merge(&sub_mesh);
+            match self.processors.get(&item.ifc_type, self.schema) {
+                Some(processor) => match processor.process(
+                    &item,
+                    decoder,
+                    self.schema,
+                    self.tessellation_quality,
+                ) {
+                    Ok(mut sub_mesh) => {
+                        sub_mesh.validate_indices();
+                        self.scale_mesh(&mut sub_mesh);
+                        untextured.merge(&sub_mesh);
+                    }
+                    Err(_e) => {
+                        self.record_unsupported_item(item.ifc_type.clone());
+                        crate::diag::diag_debug!(
+                            { item_id = item.id, ifc_type = ?item.ifc_type,
+                              error = %_e, "skipping unsupported representation-map item" }
+                            else {
+                                #[cfg(debug_assertions)]
+                                eprintln!(
+                                    "[ifc-lite] Skipping unsupported representation-map item #{} ({:?}): {}",
+                                    item.id, item.ifc_type, _e
+                                );
+                            }
+                        );
+                    }
+                },
+                None => {
+                    self.record_unsupported_item(item.ifc_type.clone());
+                    crate::diag::diag_debug!(
+                        { item_id = item.id, ifc_type = ?item.ifc_type,
+                          "skipping unsupported representation-map item (no processor)" }
+                        else {
+                            #[cfg(debug_assertions)]
+                            eprintln!(
+                                "[ifc-lite] Skipping unsupported representation-map item #{} ({:?}): no processor",
+                                item.id, item.ifc_type
+                            );
+                        }
+                    );
                 }
             }
         }
@@ -169,7 +251,7 @@ impl GeometryRouter {
             mesh.clean_degenerate();
             out.push((mesh, uvs, Some(texture)));
         }
-        if !untextured.is_empty() {
+        for mut untextured in untextured.into_parts().into_iter().filter(|mesh| !mesh.is_empty()) {
             if let Some(t) = &origin_transform {
                 self.transform_mesh_local(&mut untextured, t);
             }

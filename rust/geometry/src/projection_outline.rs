@@ -85,24 +85,38 @@ fn axis_coord(p: [f64; 3], axis: ProjectionAxis) -> f64 {
 /// slivers, small enough to keep real footprints.
 const DEGENERATE_AREA: f64 = 1.0e-8;
 
-/// Maximum number of triangles to feed into the i_overlay union. Meshes with
-/// more valid projected triangles bail out early and return `None` to prevent
-/// unbounded computation time in pathological geometry.
-const MAX_OVERLAY_TRIANGLES: usize = 50_000;
+/// Maximum number of triangles to feed into the i_overlay union. A mesh with
+/// more valid projected triangles is refused with [`NoOutline::OverBudget`]
+/// as soon as the projection loop crosses the cap, before the union runs, to
+/// bound computation time on pathological geometry.
+pub const MAX_OVERLAY_TRIANGLES: usize = 50_000;
+
+/// Why [`mesh_outline_2d`] produced no outline. The two are different
+/// answers for the caller: an `Empty` element has no footprint to draw; an
+/// `OverBudget` one has a footprint that was not computed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoOutline {
+    /// The mesh has no triangles, or every projected triangle is degenerate
+    /// (edge-on to the view) and nothing survives the union.
+    Empty,
+    /// More than [`MAX_OVERLAY_TRIANGLES`] valid projected triangles; the
+    /// union was not attempted. `triangles` is the mesh's own triangle count.
+    OverBudget { triangles: usize },
+}
 
 /// Compute the winding-independent 2D footprint outline of a triangle mesh.
 ///
 /// `positions` is flat XYZ (len = 3·vertexCount); `indices` is flat triangle
-/// indices. Returns `None` when the mesh has no triangles or the projection
-/// collapses to nothing (e.g. a mesh entirely edge-on to the view).
+/// indices. Returns [`NoOutline`] when there is no outline to return, and
+/// which of the two reasons applies.
 pub fn mesh_outline_2d(
     positions: &[f32],
     indices: &[u32],
     axis: ProjectionAxis,
     flipped: bool,
-) -> Option<MeshOutline> {
+) -> Result<MeshOutline, NoOutline> {
     if indices.len() < 3 {
-        return None;
+        return Err(NoOutline::Empty);
     }
     let vertex_count = positions.len() / 3;
 
@@ -166,17 +180,15 @@ pub fn mesh_outline_2d(
         } else {
             clip.push(path);
         }
+        // Refuse as soon as the cap is crossed: the union is the unbounded
+        // part, and projecting the rest of the mesh first is wasted work.
+        if subject.len() + clip.len() > MAX_OVERLAY_TRIANGLES {
+            return Err(NoOutline::OverBudget { triangles: indices.len() / 3 });
+        }
     }
 
     if subject.is_empty() {
-        return None;
-    }
-
-    // Bail out if the polygon set exceeds the safety limit to prevent
-    // unbounded computation in i_overlay on pathological geometry.
-    let total_polys = subject.len() + clip.len();
-    if total_polys > MAX_OVERLAY_TRIANGLES {
-        return None;
+        return Err(NoOutline::Empty);
     }
 
     // Single triangle -> its own outline (skip the union round-trip).
@@ -196,10 +208,10 @@ pub fn mesh_outline_2d(
     }
 
     if contours.is_empty() {
-        return None;
+        return Err(NoOutline::Empty);
     }
 
-    Some(MeshOutline {
+    Ok(MeshOutline {
         contours,
         axis_min: axis_min as f32,
         axis_max: axis_max as f32,
@@ -207,110 +219,5 @@ pub fn mesh_outline_2d(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Axis-aligned box positions, X[x0,x1] Y[y0,y1] Z[z0,z1]. `flip_winding`
-    /// reverses every triangle so we can prove winding-independence.
-    fn box_mesh(
-        x0: f32,
-        x1: f32,
-        y0: f32,
-        y1: f32,
-        z0: f32,
-        z1: f32,
-        flip_winding: bool,
-    ) -> (Vec<f32>, Vec<u32>) {
-        let positions = vec![
-            x0, y0, z0, x1, y0, z0, x1, y1, z0, x0, y1, z0, // z0 face corners 0..3
-            x0, y0, z1, x1, y0, z1, x1, y1, z1, x0, y1, z1, // z1 face corners 4..7
-        ];
-        let mut indices = vec![
-            0, 1, 2, 0, 2, 3, // z0
-            4, 6, 5, 4, 7, 6, // z1
-            0, 4, 5, 0, 5, 1, // y0
-            1, 5, 6, 1, 6, 2, // x1
-            2, 6, 7, 2, 7, 3, // y1
-            3, 7, 4, 3, 4, 0, // x0
-        ];
-        if flip_winding {
-            for tri in indices.chunks_exact_mut(3) {
-                tri.swap(1, 2);
-            }
-        }
-        (positions, indices)
-    }
-
-    fn bbox_2d(contours: &[Vec<[f32; 2]>]) -> (f32, f32, f32, f32) {
-        let mut minx = f32::INFINITY;
-        let mut miny = f32::INFINITY;
-        let mut maxx = f32::NEG_INFINITY;
-        let mut maxy = f32::NEG_INFINITY;
-        for c in contours {
-            for p in c {
-                minx = minx.min(p[0]);
-                miny = miny.min(p[1]);
-                maxx = maxx.max(p[0]);
-                maxy = maxy.max(p[1]);
-            }
-        }
-        (minx, miny, maxx, maxy)
-    }
-
-    #[test]
-    fn box_footprint_is_a_rectangle_viewed_down() {
-        // View down Y: footprint = X×Z rectangle.
-        let (pos, idx) = box_mesh(1.0, 4.0, 0.0, 2.0, -1.0, 1.0, false);
-        let out = mesh_outline_2d(&pos, &idx, ProjectionAxis::Y, false).expect("outline");
-        // One closed outer ring.
-        assert_eq!(out.contours.len(), 1, "expected a single footprint ring");
-        let (minx, miny, maxx, maxy) = bbox_2d(&out.contours);
-        // axis='y' → 2D (u=x, v=z): u ∈ [1,4], v ∈ [-1,1].
-        assert!((minx - 1.0).abs() < 1e-4 && (maxx - 4.0).abs() < 1e-4, "u range {minx}..{maxx}");
-        assert!((miny + 1.0).abs() < 1e-4 && (maxy - 1.0).abs() < 1e-4, "v range {miny}..{maxy}");
-        assert!((out.axis_min - 0.0).abs() < 1e-4 && (out.axis_max - 2.0).abs() < 1e-4);
-    }
-
-    #[test]
-    fn outline_is_winding_independent() {
-        // Same box, all triangles reversed — must yield the SAME footprint.
-        let (pos_a, idx_a) = box_mesh(0.0, 2.0, 0.0, 3.0, 0.0, 2.0, false);
-        let (pos_b, idx_b) = box_mesh(0.0, 2.0, 0.0, 3.0, 0.0, 2.0, true);
-        let a = mesh_outline_2d(&pos_a, &idx_a, ProjectionAxis::Y, false).expect("a");
-        let b = mesh_outline_2d(&pos_b, &idx_b, ProjectionAxis::Y, false).expect("b");
-        assert_eq!(bbox_2d(&a.contours), bbox_2d(&b.contours), "footprint must not depend on winding");
-        assert!(!b.contours.is_empty(), "flipped winding must still yield a footprint");
-    }
-
-    #[test]
-    fn flipped_axis_mirrors_u() {
-        let (pos, idx) = box_mesh(1.0, 4.0, 0.0, 2.0, -1.0, 1.0, false);
-        let unflipped = mesh_outline_2d(&pos, &idx, ProjectionAxis::Y, false).expect("unflipped");
-        let flipped = mesh_outline_2d(&pos, &idx, ProjectionAxis::Y, true).expect("flipped");
-        let (uminx, _, umaxx, _) = bbox_2d(&unflipped.contours);
-        let (fminx, _, fmaxx, _) = bbox_2d(&flipped.contours);
-        // Flipping mirrors U: [1,4] → [-4,-1].
-        assert!((fminx + umaxx).abs() < 1e-4, "min should mirror max: {fminx} vs {umaxx}");
-        assert!((fmaxx + uminx).abs() < 1e-4, "max should mirror min: {fmaxx} vs {uminx}");
-    }
-
-    #[test]
-    fn two_disjoint_boxes_give_two_contours() {
-        let (mut pos, mut idx) = box_mesh(0.0, 1.0, 0.0, 1.0, 0.0, 1.0, false);
-        let (pos2, idx2) = box_mesh(5.0, 6.0, 0.0, 1.0, 0.0, 1.0, false);
-        let base = (pos.len() / 3) as u32;
-        pos.extend_from_slice(&pos2);
-        idx.extend(idx2.iter().map(|i| i + base));
-        let out = mesh_outline_2d(&pos, &idx, ProjectionAxis::Y, false).expect("outline");
-        assert_eq!(out.contours.len(), 2, "two disjoint footprints expected");
-    }
-
-    #[test]
-    fn empty_or_degenerate_returns_none() {
-        assert!(mesh_outline_2d(&[], &[], ProjectionAxis::Y, false).is_none());
-        // Single zero-area triangle (all colinear in projection): edge-on strip.
-        let pos = vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 2.0, 0.0, 0.0];
-        let idx = vec![0, 1, 2];
-        assert!(mesh_outline_2d(&pos, &idx, ProjectionAxis::Y, false).is_none());
-    }
-}
+#[path = "projection_outline_tests.rs"]
+mod tests;

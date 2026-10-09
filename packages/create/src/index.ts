@@ -28,65 +28,37 @@
 
 export { IfcCreator } from './ifc-creator.js';
 
-// In-store builders — emit elements into an existing parsed IfcDataStore
-// via a `StoreEditor` overlay (closes the merge-roundtrip gap from #592).
-export { addColumnToStore, type ColumnInStoreParams, type ColumnBuildResult } from './in-store/column.js';
-export { addWallToStore, type WallInStoreParams, type WallBuildResult } from './in-store/wall.js';
-export { addSlabToStore, type SlabInStoreParams, type SlabRectangleParams, type SlabPolygonParams, type SlabBuildResult } from './in-store/slab.js';
-export { addBeamToStore, type BeamInStoreParams, type BeamBuildResult } from './in-store/beam.js';
-export { addDoorToStore, type DoorInStoreParams, type DoorBuildResult } from './in-store/door.js';
-export { addWindowToStore, type WindowInStoreParams, type WindowBuildResult } from './in-store/window.js';
-export { addSpaceToStore, type SpaceInStoreParams, type SpaceRectangleParams, type SpacePolygonParams, type SpaceBuildResult } from './in-store/space.js';
+// Terrain & survey emitters (IFC4X3) — the entity set the LandXML→IFC v1
+// mapping needs. See `docs/architecture/landxml-to-ifc-mapping.md`.
+export type {
+  GeoreferencingParams, SurveyPointParams, SurveyPropertySetParams,
+  TerrainSurfaceParams, TerrainSurfaceResult, TerrainWriter,
+} from './ifc-creator-terrain.js';
+
+// LandXML → IFC4X3 v1. Contract: `docs/architecture/landxml-to-ifc-mapping.md`.
 export {
-  addSpatialZonesToStore,
-  spatialZonesSupported,
-  type SpatialZoneInput,
-  type SpatialZoneInStoreParams,
-  type SpatialZoneBuildResult,
-  type SpatialZoneType,
-} from './in-store/spatial-zone.js';
-export { addRoofToStore, type RoofInStoreParams, type RoofRectangleParams, type RoofPolygonParams, type RoofBuildResult } from './in-store/roof.js';
-export { addPlateToStore, type PlateInStoreParams, type PlateRectangleParams, type PlatePolygonParams, type PlateBuildResult } from './in-store/plate.js';
-export { addMemberToStore, type MemberInStoreParams, type MemberBuildResult } from './in-store/member.js';
-export { resolveSpatialAnchor } from './in-store/resolve-anchor.js';
-export type { SpatialAnchor } from './in-store/anchor.js';
+  LANDXML_IFC_MAPPING_VERSION, landXmlGlobalId, landXmlToIfc, type LandXmlIfcOptions,
+} from './landxml/landxml-to-ifc.js';
 export {
-  duplicateInStore,
-  type SourceAttributes,
-  type DuplicateInStoreOptions,
-  type DuplicateBuildResult,
-  type Vec3 as DuplicateVec3,
-} from './in-store/duplicate.js';
-export { resolveDuplicateSource } from './in-store/resolve-source.js';
+  TRANSVERSE_MERCATOR_BOUNDS, checkCoordinateOrder, type CrsPlausibilityBounds,
+} from './landxml/coordinate-plausibility.js';
 export {
-  detectEnclosedAreas,
-  type Vec2 as AutoSpaceVec2,
-  type Segment as AutoSpaceSegment,
-  type DetectedSpace,
-  type DetectOptions as AutoSpaceDetectOptions,
-} from './in-store/auto-space-detect.js';
+  alignmentMappingOf, alignmentRefusalMessage, collectRefusals, isMappableSurface, refusalReason,
+} from './landxml/refusals.js';
 export {
-  extractWallSegmentsForStorey,
-  existingSpaceFootprintsByStorey,
-  type OverlayWallReader,
-  type WallExtractionResult,
-} from './in-store/extract-walls.js';
-export {
-  generateSpacesFromWalls,
-  offsetRoomFootprint,
-  GENERATED_SPACE_OBJECTTYPE,
-  type GenerateSpacesOptions,
-  type GenerateSpacesResult,
-  type BoundaryMode,
-} from './in-store/generate-spaces.js';
-export {
-  generateSpaces,
-  listStoreys,
-  type GenerateSpacesAllOptions,
-  type GenerateSpacesAllResult,
-  type GenerateSpacesStoreyResult,
-  type StoreyInfo,
-} from './in-store/generate-spaces-all.js';
+  ALIGNMENT_POSITION_TOLERANCE_M, cogoPointResolver, isAlignmentRecord, mapAlignments,
+  type AlignmentMapping, type HorizontalSegment, type HorizontalSegmentType, type MappedAlignment,
+  type PointResolver, type RefusedAlignment,
+} from './landxml/alignment-mapping.js';
+export type { AlignmentParams, AlignmentResult } from './ifc-creator-alignment.js';
+export type { AlignmentVerticalParams } from './ifc-creator-alignment-vertical.js';
+export type { VerticalSegment, VerticalSegmentType } from './landxml/profile-geometry.js';
+export type { StationEquationParams } from './ifc-creator-alignment-referents.js';
+export type * from './landxml/source-types.js';
+export type * from './landxml/result-types.js';
+
+// In-store authoring API, kept separate from create-from-scratch types.
+export * from './in-store/index.js';
 
 export type {
   // Geometry primitives
@@ -136,6 +108,7 @@ export type {
 
   // Properties & quantities
   PropertyType,
+  PropertyMeasureType,
   PropertyDef,
   PropertySetDef,
   QuantityKind,
@@ -152,27 +125,54 @@ export type {
   BuildingParams,
   StoreyParams,
 
-  // Scheduling / 4D (IfcWorkSchedule, IfcTask, IfcRelSequence)
+  // Scheduling / 4D (IfcWorkSchedule, IfcTask, IfcRelSequence, IfcWorkCalendar)
   // Canonical IFC-prefixed names are preferred; legacy short names are kept
   // as aliases for existing callers.
   IfcWorkScheduleParams,
   IfcWorkPlanParams,
   IfcTaskParams,
   IfcRelSequenceParams,
+  IfcWorkCalendarParams,
+  IfcWorkTimeParams,
+  IfcRecurrencePatternParams,
+  IfcTimePeriodParams,
   IfcWorkScheduleType,
   IfcTaskPredefinedType,
   IfcTaskDurationType,
   IfcRelSequenceType,
+  IfcWorkCalendarType,
+  IfcRecurrenceType,
   WorkScheduleParams,
   WorkPlanParams,
   TaskParams,
   SequenceParams,
+  WorkCalendarParams,
+  WorkTimeParams,
+  RecurrencePatternParams,
+  TimePeriodParams,
   WorkScheduleType,
   TaskPredefinedType,
   TaskDurationType,
   SequenceType,
+  WorkCalendarType,
+  RecurrenceType,
 
   // Results
   CreatedEntity,
   CreateResult,
 } from './types.js';
+// Cost / 5D authoring (IfcCostSchedule, IfcCostItem, IfcCostValue)
+export type {
+  CostArithmeticOperator,
+  CostItemParams,
+  CostItemPredefinedType,
+  CostMeasureType,
+  CostQuantityKind,
+  CostQuantityParams,
+  CostScheduleParams,
+  CostSchedulePredefinedType,
+  CostSIUnitType,
+  CostTypedValue,
+  CostValueParams,
+  SIUnitParams,
+} from './types-cost.js';

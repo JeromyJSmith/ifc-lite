@@ -106,6 +106,7 @@ export function supportsStandardGeoreferencing(
 }
 
 export function getIfcLengthUnitScale(dataStore: IfcDataStore | null | undefined): number {
+  if (dataStore?.lengthUnitScale !== undefined) return dataStore.lengthUnitScale;
   if (!dataStore?.source?.length || !dataStore.entityIndex) return 1;
   return extractLengthUnitScale(dataStore.source, dataStore.entityIndex);
 }
@@ -182,6 +183,9 @@ export function mergeMapConversion(
     xAxisAbscissa: mutations?.xAxisAbscissa ?? original?.xAxisAbscissa,
     xAxisOrdinate: mutations?.xAxisOrdinate ?? original?.xAxisOrdinate,
     scale: mutations?.scale ?? original?.scale,
+    factorX: mutations?.factorX ?? original?.factorX,
+    factorY: mutations?.factorY ?? original?.factorY,
+    factorZ: mutations?.factorZ ?? original?.factorZ,
   };
 }
 

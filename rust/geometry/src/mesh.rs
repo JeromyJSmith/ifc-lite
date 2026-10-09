@@ -29,6 +29,24 @@ pub struct InstanceMeta {
     pub instanceable: bool,
 }
 
+/// The kernel's f64 supporting plane for one output triangle, carried forward
+/// from `kernel::mesh_bridge::tris_to_mesh` (issue #3914). `consolidate_coplanar`
+/// buckets triangles into coplanar groups by re-deriving a plane from each
+/// triangle's f32-ROUNDED vertices; on a rotated/tilted face this can straddle
+/// the bucket's quantization boundary and split one physical plane into two
+/// adjacent buckets that its cross-bucket seam-conform pass (tangential-only)
+/// cannot stitch back together, tearing the mesh. The kernel already computes
+/// each output triangle's plane in f64, BEFORE that f32 cast — carrying it
+/// forward gives `consolidate_coplanar` the same plane identity for both
+/// triangles without inventing a new tolerance or clustering pass.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlaneTag {
+    /// Unit plane normal (f64), oriented to match the triangle's winding.
+    pub n: [f64; 3],
+    /// Plane offset: `n . v` for any vertex `v` of the triangle.
+    pub d: f64,
+}
+
 /// Triangle mesh
 #[derive(Debug, Clone)]
 pub struct Mesh {
@@ -39,8 +57,9 @@ pub struct Mesh {
     /// Triangle indices (i0, i1, i2)
     pub indices: Vec<u32>,
     /// Whether RTC offset has already been subtracted from positions.
-    /// Set by `FacetedBrepProcessor::process_with_rtc` to prevent
-    /// `transform_mesh` from double-subtracting RTC.
+    /// Set by a processor's `GeometryProcessor::process_in_rtc_frame` hook
+    /// (which rebases in f64 before narrowing) so the final world transform
+    /// does not subtract RTC a second time.
     pub rtc_applied: bool,
     /// Per-mesh local origin (f64), in the RTC/world frame. When non-zero,
     /// `positions` are stored RELATIVE to this origin (so they stay small and
@@ -64,6 +83,23 @@ pub struct Mesh {
     /// [`InstanceMeta::transform`]). `None` when no placement was applied
     /// (synthetic/test meshes) — see issue #1474.
     pub local_to_world: Option<[f64; 16]>,
+    /// Welded in the OBJECT FRAME by `mesh_weld::weld_mesh`/`weld_sub_mesh`
+    /// (its only setters; `rebuilt_like` clears it like `instance_meta`). The
+    /// real "already welded?" answer `build_mesh_data` today INFERS (#4122).
+    pub welded_in_object_frame: bool,
+    /// Per-triangle kernel-f64 supporting planes (issue #3914), 1:1 with
+    /// `indices.chunks_exact(3)` when `Some`. Carried by direct kernel union
+    /// output so `consolidate_coplanar` can repair a plane bucket split caused
+    /// by the f64-to-f32 cast. Difference and intersection outputs deliberately
+    /// leave this `None`: they can become operands of later booleans, where
+    /// merging their intermediate plane buckets changes subsequent cuts
+    /// (#5012). Every constructor/weld/merge/transform that changes triangle
+    /// count, order, or position MUST also leave this `None` (mirrors
+    /// `instance_meta`'s "no longer canonical" contract): a stale tag pointing
+    /// at the wrong post-edit triangle would silently mis-bucket
+    /// `consolidate_coplanar`. `None` is always safe; callers fall back to the
+    /// geometric re-derivation.
+    pub plane_tags: Option<Vec<PlaneTag>>,
 }
 
 /// A sub-mesh with its source geometry item ID.
@@ -115,13 +151,32 @@ impl SubMesh {
 #[derive(Debug, Clone, Default)]
 pub struct SubMeshCollection {
     pub sub_meshes: Vec<SubMesh>,
+    /// What `SubMesh::geometry_id` MEANS here: `false` (default) an
+    /// `IfcRepresentationItem`, `true` an `IfcMaterial` (only `layers.rs` builds
+    /// those). Uniform across the collection, which is why it lives on it.
+    ///
+    /// Deliberately NOT `geometry_class == GEOM_CLASS_LAYER_SLICE`, which cannot
+    /// answer it: that class is stamped from `is_material_layer_sliceable`, a
+    /// static check made BEFORE the geometry runs, while
+    /// `try_layered_sub_meshes` can still return `None` and fall through to the
+    /// rep-item path — so rep-item ids can carry class 3 (#3199).
+    /// SCOPE: it decides only which FIELD `emit_sub_meshes` emits the id under —
+    /// five style lookups in `element.rs` still read `geometry_id` as a rep item
+    /// on BOTH paths, safe only by express-id uniqueness (#3211).
+    pub ids_are_materials: bool,
 }
 
 impl SubMeshCollection {
     /// Create a new empty collection
     pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `geometry_id`s are `IfcMaterial` ids. Only `layers.rs` builds these.
+    pub fn of_materials() -> Self {
         Self {
-            sub_meshes: Vec::new(),
+            ids_are_materials: true,
+            ..Self::default()
         }
     }
 
@@ -183,6 +238,8 @@ impl Mesh {
             instance_meta: None,
             local_bounds: None,
             local_to_world: None,
+            welded_in_object_frame: false,
+            plane_tags: None,
         }
     }
 
@@ -197,6 +254,8 @@ impl Mesh {
             instance_meta: None,
             local_bounds: None,
             local_to_world: None,
+            welded_in_object_frame: false,
+            plane_tags: None,
         }
     }
 
@@ -243,6 +302,8 @@ impl Mesh {
             instance_meta: None,
             local_bounds: self.local_bounds,
             local_to_world: self.local_to_world,
+            welded_in_object_frame: false,
+            plane_tags: None,
         }
     }
 
@@ -472,17 +533,19 @@ impl Mesh {
             self.indices.clear();
             return;
         }
-        let mut valid = Vec::with_capacity(self.indices.len());
-        for chunk in self.indices.chunks(3) {
-            if chunk.len() == 3
-                && (chunk[0] as usize) < vertex_count
+        let original_len = self.indices.len();
+        let mut kept = 0;
+        for read in (0..original_len / 3 * 3).step_by(3) {
+            let chunk = [self.indices[read], self.indices[read + 1], self.indices[read + 2]];
+            if (chunk[0] as usize) < vertex_count
                 && (chunk[1] as usize) < vertex_count
-                && (chunk[2] as usize) < vertex_count
-            {
-                valid.extend_from_slice(chunk);
+                && (chunk[2] as usize) < vertex_count {
+                if kept != read { self.indices[kept..kept + 3].copy_from_slice(&chunk); }
+                kept += 3;
             }
         }
-        self.indices = valid;
+        self.indices.truncate(kept);
+        self.indices.shrink_to(original_len);
     }
 
     /// Drop triangles that collapsed into degenerate needles when the mesh was
@@ -535,14 +598,13 @@ impl Mesh {
         let dist = |a: [f64; 3], b: [f64; 3]| -> f64 {
             ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
         };
-
-        let mut kept = Vec::with_capacity(self.indices.len());
-        for tri in self.indices.chunks_exact(3) {
+        // #3988: compact only after a drop; bound retained capacity as before.
+        let original_len = self.indices.len();
+        let mut kept = 0;
+        for read in (0..original_len / 3 * 3).step_by(3) {
+            let tri = [self.indices[read], self.indices[read + 1], self.indices[read + 2]];
             let (ia, ib, ic) = (tri[0], tri[1], tri[2]);
-            // Drop any out-of-range triangle BEFORE the unchecked `bits()` closure
-            // indexes positions[] (unlike `vert()` below, `bits()` has no bounds
-            // check). Matches the drop-not-panic contract of vert()/validate_indices;
-            // sibling drop_thin_triangles guards the same way.
+            // Guard before bits() indexes positions; invalid triangles are dropped.
             if ia as usize >= vertex_count
                 || ib as usize >= vertex_count
                 || ic as usize >= vertex_count
@@ -563,17 +625,16 @@ impl Mesh {
             let e2 = dist(vc, va);
             let min_edge = e0.min(e1).min(e2);
             let max_edge = e0.max(e1).max(e2);
-            // Catastrophic needle: a sliver whose longest edge dwarfs its
-            // shortest by >1e5. min_edge==0 is already handled by the bit check
-            // above, so a finite ratio here means near-but-not-identical f32.
+            // Drop catastrophic needles; bit-identical zero edges were handled above.
             if min_edge > 0.0 && max_edge / min_edge > MAX_ASPECT {
                 continue;
             }
-            kept.extend_from_slice(tri);
+            if kept != read { self.indices[kept..kept + 3].copy_from_slice(&tri); }
+            kept += 3;
         }
-        self.indices = kept;
+        self.indices.truncate(kept);
+        self.indices.shrink_to(original_len);
     }
-
     /// Check if mesh is empty
     #[inline]
     pub fn is_empty(&self) -> bool {
@@ -670,22 +731,25 @@ impl Mesh {
     /// triangulated as-is; vertex welding can't merge them (the vertices are
     /// distinct), so this catches them. At `h_eps` ≈ 15 µm — far below any real
     /// architectural feature — the dropped triangles carry no area, so the
-    /// surrounding triangulation still covers the face (visually lossless,
-    /// watertight-preserving). Only `indices` change.
+    /// surrounding triangulation still covers the face (visually lossless).
+    /// Only `indices` change.
+    ///
+    /// NOT watertight-preserving on its own: when the sliver's apex is a vertex
+    /// the neighbours still use (an extrusion's side walls, the next brep face),
+    /// dropping it leaves a T-junction (#5313). Use
+    /// [`clean_degenerate_watertight`](Self::clean_degenerate_watertight) where
+    /// the surface must stay closed.
     pub fn drop_thin_triangles(&mut self, h_eps: f64) {
+        self.drop_thin_triangles_inner(h_eps, false);
+    }
+
+    fn drop_thin_triangles_inner(&mut self, h_eps: f64, keep_closed: bool) {
         if self.indices.len() < 3 {
             return;
         }
         let vertex_count = self.positions.len() / 3;
-        let p = |i: u32| -> [f64; 3] {
-            let i = i as usize;
-            [
-                self.positions[i * 3] as f64,
-                self.positions[i * 3 + 1] as f64,
-                self.positions[i * 3 + 2] as f64,
-            ]
-        };
         let mut kept = Vec::with_capacity(self.indices.len());
+        let mut slivers: Vec<[u32; 3]> = Vec::new();
         for tri in self.indices.chunks_exact(3) {
             if (tri[0] as usize) >= vertex_count
                 || (tri[1] as usize) >= vertex_count
@@ -693,27 +757,18 @@ impl Mesh {
             {
                 continue;
             }
-            let (a, b, c) = (p(tri[0]), p(tri[1]), p(tri[2]));
-            let d = |u: [f64; 3], v: [f64; 3]| {
-                ((u[0] - v[0]).powi(2) + (u[1] - v[1]).powi(2) + (u[2] - v[2]).powi(2)).sqrt()
-            };
-            let longest = d(a, b).max(d(b, c)).max(d(c, a));
-            if longest <= 0.0 {
+            let [a, b, c] = [tri[0], tri[1], tri[2]].map(|i| tjunction::pos_of(self, i));
+            let Some(height) = tjunction::height(a, b, c) else {
                 continue; // fully collapsed
-            }
-            let ux = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-            let vx = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
-            let cr = [
-                ux[1] * vx[2] - ux[2] * vx[1],
-                ux[2] * vx[0] - ux[0] * vx[2],
-                ux[0] * vx[1] - ux[1] * vx[0],
-            ];
-            let area = 0.5 * (cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]).sqrt();
-            let height = 2.0 * area / longest;
+            };
             if height < h_eps {
+                slivers.push([tri[0], tri[1], tri[2]]);
                 continue; // collinear / zero-area sliver
             }
             kept.extend_from_slice(tri);
+        }
+        if keep_closed && !slivers.is_empty() {
+            tjunction::split_across_dropped_slivers(self, &mut kept, &slivers, h_eps);
         }
         self.indices = kept;
     }
@@ -727,10 +782,10 @@ impl Mesh {
     /// silhouettes (the regression reported on large breps); BIMcollab and
     /// other viewers don't show them because they clean degenerates on import.
     ///
-    /// Deliberately **does not weld vertices**. The pipeline emits per-face
-    /// flat-shaded facet soup on purpose (each facet keeps its own vertices +
-    /// normal so creases stay sharp — see issue #846); welding would share
-    /// vertices across facets and re-smooth every crease. Instead we drop only
+    /// Deliberately **does not weld vertices**: that is the source weld's job
+    /// (`mesh_weld`, run from the placement appliers), and that weld keys on the
+    /// quantized NORMAL too, so two facets meeting at a crease keep their own
+    /// vertices and stay sharp (issue #846). Here we drop only
     /// the genuinely-degenerate triangles via
     /// [`drop_thin_triangles`](Self::drop_thin_triangles) below the kernel's
     /// reconcile grid (`1/65536 ≈ 15.3 µm`): coincident-pair needles (area 0)
@@ -755,6 +810,20 @@ impl Mesh {
         // The kernel's canonical reconcile grid (power-of-two for
         // bit-determinism). Sub-grid triangles are below kernel resolution.
         self.drop_thin_triangles(crate::kernel::mesh_bridge::SNAP_GRID);
+    }
+
+    /// [`clean_degenerate`](Self::clean_degenerate) for SOURCE geometry that
+    /// must stay closed: drops the same slivers, then splits the triangle
+    /// across each dropped sliver's long edge at the sliver's apex whenever a
+    /// kept triangle still uses that apex, so the drop cannot open a
+    /// T-junction (#5313). May append vertices (an apex copy carrying the
+    /// split face's normal), so it is only for meshes with no parallel
+    /// per-vertex array outside `Mesh` (the textured channel's UVs rule it out
+    /// there). The router's source-hygiene chokepoints use it; the void/CSG
+    /// paths keep `clean_degenerate`, whose output their own closure gates and
+    /// census judge.
+    pub fn clean_degenerate_watertight(&mut self) {
+        self.drop_thin_triangles_inner(crate::kernel::mesh_bridge::SNAP_GRID, true);
     }
 
     /// Drop triangles with ANY vertex outside `[min - pad, max + pad]`, then
@@ -866,659 +935,13 @@ impl Default for Mesh {
     }
 }
 
-/// Shared welding implementation backing `Mesh::welded_by_position`.
-///
-/// The dedupe key is `quantized_position` only. `average_normals=true`
-/// accumulates contributing normals into the welded vertex and
-/// renormalizes at the end.
-fn weld_impl(mesh: &Mesh, position_eps: f32, average_normals: bool) -> Mesh {
-    use rustc_hash::FxHashMap;
+#[path = "mesh_position_weld.rs"]
+mod mesh_position_weld;
+use mesh_position_weld::weld_impl;
 
-    let n_verts = mesh.positions.len() / 3;
-    if n_verts == 0 {
-        return Mesh::new();
-    }
-
-    let has_normals = mesh.normals.len() == mesh.positions.len();
-    let pos_scale = 1.0 / position_eps.max(f32::MIN_POSITIVE);
-    let q_pos = |v: f32| -> i64 { (v * pos_scale).round() as i64 };
-
-    // Dedupe key: quantized position only.
-    type Key = [i64; 3];
-    let mut canonical: FxHashMap<Key, u32> = FxHashMap::default();
-    let mut old_to_new: Vec<u32> = Vec::with_capacity(n_verts);
-    let mut new_positions: Vec<f32> = Vec::with_capacity(n_verts * 3);
-    let mut new_normals: Vec<f32> = Vec::with_capacity(n_verts * 3);
-    // For the average-normals path, accumulate the un-normalized sum so
-    // a final pass can normalize. The sum buffer is parallel to
-    // `new_positions` chunks.
-    let mut normal_accum: Vec<(f64, f64, f64)> = Vec::new();
-    if average_normals {
-        normal_accum.reserve(n_verts);
-    }
-
-    for i in 0..n_verts {
-        let px = mesh.positions[i * 3];
-        let py = mesh.positions[i * 3 + 1];
-        let pz = mesh.positions[i * 3 + 2];
-        let (nx, ny, nz) = if has_normals {
-            (
-                mesh.normals[i * 3],
-                mesh.normals[i * 3 + 1],
-                mesh.normals[i * 3 + 2],
-            )
-        } else {
-            (0.0, 0.0, 0.0)
-        };
-        let key: Key = [q_pos(px), q_pos(py), q_pos(pz)];
-
-        if let Some(&new_idx) = canonical.get(&key) {
-            old_to_new.push(new_idx);
-            if average_normals {
-                let slot = &mut normal_accum[new_idx as usize];
-                slot.0 += nx as f64;
-                slot.1 += ny as f64;
-                slot.2 += nz as f64;
-            }
-        } else {
-            let new_idx = (new_positions.len() / 3) as u32;
-            canonical.insert(key, new_idx);
-            old_to_new.push(new_idx);
-            new_positions.push(px);
-            new_positions.push(py);
-            new_positions.push(pz);
-            if has_normals {
-                new_normals.push(nx);
-                new_normals.push(ny);
-                new_normals.push(nz);
-            }
-            if average_normals {
-                normal_accum.push((nx as f64, ny as f64, nz as f64));
-            }
-        }
-    }
-
-    // For average-normals path: normalize the accumulated sums and
-    // write them back over the first-vertex-wins values stored above.
-    if average_normals && has_normals {
-        new_normals.clear();
-        new_normals.reserve(normal_accum.len() * 3);
-        for (sx, sy, sz) in &normal_accum {
-            let len_sq = sx * sx + sy * sy + sz * sz;
-            if len_sq > 1e-24 {
-                let inv = 1.0 / len_sq.sqrt();
-                new_normals.push((*sx * inv) as f32);
-                new_normals.push((*sy * inv) as f32);
-                new_normals.push((*sz * inv) as f32);
-            } else {
-                // Degenerate accumulation (opposing normals cancelled);
-                // fall back to a neutral up-Z so consumers don't see NaN.
-                new_normals.push(0.0);
-                new_normals.push(0.0);
-                new_normals.push(1.0);
-            }
-        }
-    }
-
-    // Re-index triangles, dropping degenerates and out-of-bound input
-    // triangles the same way `validate_indices` does so a malformed
-    // input mesh weld-then-renders fine instead of panicking later.
-    let mut new_indices: Vec<u32> = Vec::with_capacity(mesh.indices.len());
-    for chunk in mesh.indices.chunks_exact(3) {
-        let i0_raw = chunk[0] as usize;
-        let i1_raw = chunk[1] as usize;
-        let i2_raw = chunk[2] as usize;
-        if i0_raw >= n_verts || i1_raw >= n_verts || i2_raw >= n_verts {
-            continue;
-        }
-        let i0 = old_to_new[i0_raw];
-        let i1 = old_to_new[i1_raw];
-        let i2 = old_to_new[i2_raw];
-        if i0 == i1 || i1 == i2 || i0 == i2 {
-            continue;
-        }
-        new_indices.push(i0);
-        new_indices.push(i1);
-        new_indices.push(i2);
-    }
-
-    // Welding collapses / moves vertices, so carry the placement / frame
-    // metadata (origin, rtc, #1474 capture) but drop instance_meta (the welded
-    // mesh no longer matches its canonical rep) via `rebuilt_like`.
-    mesh.rebuilt_like(new_positions, new_normals, new_indices)
-}
+#[path = "mesh_tjunction.rs"]
+mod tjunction;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Build a mesh from explicit triangles (each tri = 3 xyz triples).
-    fn mesh_from_tris(tris: &[[[f32; 3]; 3]]) -> Mesh {
-        let mut m = Mesh::new();
-        for (i, t) in tris.iter().enumerate() {
-            for v in t {
-                m.positions.extend_from_slice(v);
-                m.normals.extend_from_slice(&[0.0, 0.0, 1.0]);
-            }
-            let b = (i * 3) as u32;
-            m.indices.extend_from_slice(&[b, b + 1, b + 2]);
-        }
-        m
-    }
-
-    #[test]
-    fn clip_to_aabb_drops_protruding_flap_and_compacts() {
-        // Two in-bounds triangles forming a unit quad in z=0, plus one spurious
-        // "spike" flap whose apex pokes far below the host AABB (the malformed-
-        // cutter artifact): apex at y = -5 while the host is y in [0,1].
-        let mut m = mesh_from_tris(&[
-            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0]],
-            [[0.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]],
-            // spike: one vertex 5 m below the host
-            [[1.0, 1.0, 0.0], [0.0, 1.0, 0.0], [0.5, -5.0, 0.0]],
-        ]);
-        let dropped = m.clip_triangles_to_aabb([0.0, 0.0, 0.0], [1.0, 1.0, 0.0], 0.01);
-        assert_eq!(dropped, 1, "only the spike triangle should be dropped");
-        assert_eq!(m.triangle_count(), 2);
-        // Orphaned spike apex must be compacted away so bounds() is clean.
-        let (lo, hi) = m.bounds();
-        assert!(lo.y >= -0.01, "protruding apex left in positions: lo.y = {}", lo.y);
-        let _ = hi;
-        // 9 input verts (3 per tri, unshared) → after dropping the spike's 3 and
-        // compacting the orphaned apex, the 2 kept tris keep their 6 verts.
-        assert_eq!(m.positions.len() / 3, 6, "orphaned apex must be compacted out");
-        assert_eq!(m.normals.len(), m.positions.len(), "normals stay in sync");
-        // every surviving index is in range
-        assert!(m.indices.iter().all(|&i| (i as usize) < m.positions.len() / 3));
-    }
-
-    #[test]
-    fn clip_to_aabb_is_noop_when_nothing_protrudes() {
-        let tris = [
-            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0]],
-            [[0.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]],
-        ];
-        let mut m = mesh_from_tris(&tris);
-        let before_pos = m.positions.clone();
-        let before_idx = m.indices.clone();
-        let dropped = m.clip_triangles_to_aabb([0.0, 0.0, 0.0], [1.0, 1.0, 0.0], 0.01);
-        assert_eq!(dropped, 0);
-        // bit-identical: clean cuts must not perturb the frozen snapshot corpus
-        assert_eq!(m.positions, before_pos);
-        assert_eq!(m.indices, before_idx);
-    }
-
-    #[test]
-    fn clip_to_aabb_preserves_mesh_when_all_would_drop() {
-        // Degenerate guard: if EVERY triangle is outside (an upstream frame bug,
-        // not a spike), preserve the mesh rather than silently emptying it.
-        let mut m = mesh_from_tris(&[[
-            [100.0, 100.0, 0.0],
-            [101.0, 100.0, 0.0],
-            [101.0, 101.0, 0.0],
-        ]]);
-        let dropped = m.clip_triangles_to_aabb([0.0, 0.0, 0.0], [1.0, 1.0, 0.0], 0.01);
-        assert_eq!(dropped, 0);
-        assert_eq!(m.triangle_count(), 1, "mesh preserved, not emptied");
-    }
-
-    #[test]
-    fn clip_to_host_aabb_trims_reveal_overhang_on_a_large_slab_1633() {
-        // #1633: a flush-capped through-opening's reveal is extended ~0.3·depth
-        // past the host cap for a clean transversal cut, so the exact subtract
-        // leaves a reveal triangle ~0.105 m past a 0.35 m floor slab. The auto pad
-        // MUST trim it regardless of host size — the bug was that `1e-3 · diag`
-        // grew to 0.13 m on this ~130 m-diagonal slab (wider than the overhang) and
-        // let it through, while a 5 m wall's 5 mm pad trimmed the identical overhang.
-        let big = 92.0_f32; // 92 × 92 × 0.35 slab ⇒ diag ≈ 130 m ⇒ old pad ≈ 0.13 m
-        let mut m = mesh_from_tris(&[
-            // two in-bounds cap triangles (host top face at z = 0.35)
-            [[0.0, 0.0, 0.35], [big, 0.0, 0.35], [big, big, 0.35]],
-            [[0.0, 0.0, 0.35], [big, big, 0.35], [0.0, big, 0.35]],
-            // reveal-overhang sliver: apex 0.105 m above the slab top cap
-            [[40.0, 40.0, 0.35], [41.0, 40.0, 0.35], [40.5, 40.5, 0.455]],
-        ]);
-        let dropped = m.clip_triangles_to_host_aabb([0.0, 0.0, 0.0], [big, big, 0.35]);
-        assert_eq!(dropped, 1, "the 0.105 m reveal overhang must be trimmed on a large host");
-        let (_lo, hi) = m.bounds();
-        assert!(hi.z <= 0.36, "no vertex may remain above the slab top cap: hi.z = {}", hi.z);
-    }
-
-    #[test]
-    fn clip_to_host_aabb_is_byte_identical_to_1e3_diag_for_small_hosts() {
-        // The bound only changes behaviour above a 10 m diagonal; a normal wall
-        // (~5 m diag ⇒ pad = 5 mm) is untouched, so the frozen corpus is safe.
-        let tris = [
-            [[0.0, 0.0, 0.0], [3.0, 0.0, 0.0], [3.0, 4.0, 0.0]],
-            [[0.0, 0.0, 0.0], [3.0, 4.0, 0.0], [0.0, 4.0, 0.0]],
-        ];
-        let mut auto = mesh_from_tris(&tris);
-        let mut manual = mesh_from_tris(&tris);
-        let diag = (3.0_f64 * 3.0 + 4.0 * 4.0).sqrt(); // 5 m
-        let old_pad = (1.0e-3 * diag).max(5.0e-3) as f32;
-        auto.clip_triangles_to_host_aabb([0.0, 0.0, 0.0], [3.0, 4.0, 0.0]);
-        manual.clip_triangles_to_aabb([0.0, 0.0, 0.0], [3.0, 4.0, 0.0], old_pad);
-        assert_eq!(auto.positions, manual.positions);
-        assert_eq!(auto.indices, manual.indices);
-    }
-
-    #[test]
-    fn test_merge() {
-        let mut mesh1 = Mesh::new();
-        mesh1.add_vertex(Point3::new(0.0, 0.0, 0.0), Vector3::z());
-        mesh1.add_triangle(0, 1, 2);
-
-        let mut mesh2 = Mesh::new();
-        mesh2.add_vertex(Point3::new(1.0, 1.0, 1.0), Vector3::y());
-        mesh2.add_triangle(0, 1, 2);
-
-        mesh1.merge(&mesh2);
-        assert_eq!(mesh1.vertex_count(), 2);
-        assert_eq!(mesh1.triangle_count(), 2);
-    }
-
-    #[test]
-    fn test_centroid_f64() {
-        let mut mesh = Mesh::new();
-        mesh.positions = vec![0.0, 0.0, 0.0, 10.0, 10.0, 10.0, 20.0, 20.0, 20.0];
-        mesh.normals = vec![0.0; 9];
-
-        let centroid = mesh.centroid_f64();
-        assert!((centroid.x - 10.0).abs() < 0.001);
-        assert!((centroid.y - 10.0).abs() < 0.001);
-        assert!((centroid.z - 10.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_validate_indices_strips_out_of_bounds() {
-        let mut mesh = Mesh {
-            positions: vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0], // 3 vertices
-            normals: vec![],
-            indices: vec![
-                0, 1, 2, // valid
-                0, 1, 5, // invalid: vertex 5 out of bounds
-                3, 4, 5, // invalid: all out of bounds
-            ],
-            rtc_applied: false,
-            origin: [0.0; 3],
-            instance_meta: None,
-            local_bounds: None,
-            local_to_world: None,
-        };
-        mesh.validate_indices();
-        assert_eq!(mesh.indices, vec![0, 1, 2]);
-    }
-
-    #[test]
-    fn test_validate_indices_empty_positions() {
-        let mut mesh = Mesh {
-            positions: vec![],
-            normals: vec![],
-            indices: vec![0, 1, 2],
-            rtc_applied: false,
-            origin: [0.0; 3],
-            instance_meta: None,
-            local_bounds: None,
-            local_to_world: None,
-        };
-        mesh.validate_indices();
-        assert!(mesh.indices.is_empty());
-    }
-
-    #[test]
-    fn test_validate_indices_incomplete_triangle() {
-        let mut mesh = Mesh {
-            positions: vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
-            normals: vec![],
-            indices: vec![0, 1, 2, 0, 1], // trailing incomplete triangle
-            rtc_applied: false,
-            origin: [0.0; 3],
-            instance_meta: None,
-            local_bounds: None,
-            local_to_world: None,
-        };
-        mesh.validate_indices();
-        assert_eq!(mesh.indices, vec![0, 1, 2]);
-    }
-
-    fn make_unwelded_box() -> Mesh {
-        // A 1×1×1 cube emitted as triangle soup: each face has its own 4
-        // vertices (not shared with adjacent faces), so 6 faces × 4 verts
-        // = 24 vertices, 12 triangles. This is what the extrusion path
-        // produces today.
-        let mut m = Mesh::new();
-        let corners = [
-            (0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0),
-            (0.0, 0.0, 1.0), (1.0, 0.0, 1.0), (1.0, 1.0, 1.0), (0.0, 1.0, 1.0),
-        ];
-        let faces: [([usize; 4], [f32; 3]); 6] = [
-            ([0, 3, 2, 1], [0.0, 0.0, -1.0]), // bottom
-            ([4, 5, 6, 7], [0.0, 0.0, 1.0]),  // top
-            ([0, 1, 5, 4], [0.0, -1.0, 0.0]), // front
-            ([2, 3, 7, 6], [0.0, 1.0, 0.0]),  // back
-            ([0, 4, 7, 3], [-1.0, 0.0, 0.0]), // left
-            ([1, 2, 6, 5], [1.0, 0.0, 0.0]),  // right
-        ];
-        for (idx, normal) in faces {
-            let base = (m.positions.len() / 3) as u32;
-            for &i in idx.iter() {
-                let (x, y, z) = corners[i];
-                m.positions.extend_from_slice(&[x, y, z]);
-                m.normals.extend_from_slice(&normal);
-            }
-            m.indices.extend_from_slice(&[base, base + 1, base + 2]);
-            m.indices.extend_from_slice(&[base, base + 2, base + 3]);
-        }
-        m
-    }
-
-    #[test]
-    fn welded_by_position_collapses_corner_to_one_vertex() {
-        let m = make_unwelded_box();
-        // Position-only weld: all 24 input vertices map to the 8 box
-        // corners. 8 vertices, 12 triangles (no degenerates since a
-        // 1×1×1 box's corner-only mesh is non-degenerate).
-        let welded = m.welded_by_position(1e-6);
-        assert_eq!(
-            welded.vertex_count(),
-            8,
-            "position-only weld must collapse 24 face-corner duplicates to 8 box corners"
-        );
-        assert_eq!(welded.triangle_count(), 12);
-        // Averaged normal at each corner must be unit length (within f32
-        // precision); we don't pin a specific direction because three
-        // faces' normals sum to a face-diagonal direction.
-        for chunk in welded.normals.chunks_exact(3) {
-            let len_sq = chunk[0] * chunk[0] + chunk[1] * chunk[1] + chunk[2] * chunk[2];
-            assert!(
-                (len_sq - 1.0).abs() < 1e-4,
-                "welded normal must be unit length, got |n|^2 = {}",
-                len_sq
-            );
-        }
-    }
-
-    /// #1474 / B7 regression guard: a vertex-changing rebuild MUST carry the
-    /// mesh's placement/frame metadata (origin, rtc_applied, local_bounds,
-    /// local_to_world) forward and MUST drop instance_meta (the changed vertices
-    /// no longer match the canonical rep). Directly exercises `rebuilt_like` and
-    /// the two public seams that route through it (`subdivided`,
-    /// `welded_by_position`). Pure unit test — no fixture.
-    #[test]
-    fn rebuild_carries_placement_metadata_and_drops_instancing() {
-        // One triangle, placed: non-default origin/rtc + a set #1474 capture and
-        // an attached instance side-channel.
-        let mut m = mesh_from_tris(&[[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0]]]);
-        m.origin = [100.0, 200.0, 300.0];
-        m.rtc_applied = true;
-        m.local_bounds = Some([0.0, 0.0, 0.0, 1.0, 1.0, 0.0]);
-        let l2w: [f64; 16] = [
-            1.0, 0.0, 0.0, 10.0, //
-            0.0, 1.0, 0.0, 20.0, //
-            0.0, 0.0, 1.0, 30.0, //
-            0.0, 0.0, 0.0, 1.0,
-        ];
-        m.local_to_world = Some(l2w);
-        m.instance_meta = Some(InstanceMeta {
-            transform: l2w,
-            local_transform: None,
-            canonical_transform: None,
-            rep_identity: 0xDEAD_BEEF,
-            instanceable: true,
-        });
-
-        // Metadata carried; instancing dropped. Assert on every seam.
-        let via_ctor = m.rebuilt_like(vec![0.0, 0.0, 0.0], vec![0.0, 0.0, 1.0], vec![]);
-        let via_subdivide = m.subdivided(1);
-        let via_weld = m.welded_by_position(1e-6);
-
-        for (label, out) in [
-            ("rebuilt_like", &via_ctor),
-            ("subdivided", &via_subdivide),
-            ("welded_by_position", &via_weld),
-        ] {
-            assert_eq!(out.origin, [100.0, 200.0, 300.0], "{label}: origin must carry");
-            assert!(out.rtc_applied, "{label}: rtc_applied must carry");
-            assert_eq!(
-                out.local_bounds,
-                Some([0.0, 0.0, 0.0, 1.0, 1.0, 0.0]),
-                "{label}: local_bounds (#1474) must carry"
-            );
-            assert_eq!(out.local_to_world, Some(l2w), "{label}: local_to_world (#1474) must carry");
-            assert!(
-                out.instance_meta.is_none(),
-                "{label}: instance_meta must be dropped (vertices changed -> not the canonical rep)"
-            );
-        }
-    }
-
-    #[test]
-    fn welded_drops_degenerate_triangles() {
-        // A triangle whose three vertices all quantize to the same
-        // position should be dropped after welding (it collapsed to a
-        // point).
-        let mut m = Mesh::new();
-        m.positions = vec![
-            0.0, 0.0, 0.0,
-            // Two more "vertices" within position_eps of vertex 0:
-            5e-8, 0.0, 0.0,
-            0.0, 5e-8, 0.0,
-            // A real non-degenerate triangle:
-            1.0, 0.0, 0.0,
-            1.0, 1.0, 0.0,
-        ];
-        m.normals = vec![
-            0.0, 0.0, 1.0,
-            0.0, 0.0, 1.0,
-            0.0, 0.0, 1.0,
-            0.0, 0.0, 1.0,
-            0.0, 0.0, 1.0,
-        ];
-        m.indices = vec![
-            0, 1, 2,   // collapses to a point after weld at eps=1e-6
-            0, 3, 4,   // survives
-        ];
-        let welded = m.welded_by_position(1e-6);
-        assert_eq!(welded.triangle_count(), 1);
-    }
-
-    #[test]
-    fn welded_handles_empty_mesh() {
-        let m = Mesh::new();
-        let welded_pos = m.welded_by_position(1e-6);
-        assert!(welded_pos.is_empty());
-    }
-
-    #[test]
-    fn welded_strips_out_of_bound_indices() {
-        let mut m = Mesh::new();
-        m.positions = vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
-        m.normals = vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0];
-        m.indices = vec![0, 1, 2, 0, 1, 99];
-        let welded = m.welded_by_position(1e-6);
-        assert_eq!(welded.triangle_count(), 1);
-    }
-
-    #[test]
-    fn test_validate_indices_all_valid() {
-        let mut mesh = Mesh {
-            positions: vec![0.0; 12], // 4 vertices
-            normals: vec![],
-            indices: vec![0, 1, 2, 1, 2, 3],
-            rtc_applied: false,
-            origin: [0.0; 3],
-            instance_meta: None,
-            local_bounds: None,
-            local_to_world: None,
-        };
-        mesh.validate_indices();
-        assert_eq!(mesh.indices, vec![0, 1, 2, 1, 2, 3]);
-    }
-
-    // ── drop_thin_triangles / clean_degenerate ───────────────────────────
-
-    const GRID: f64 = 1.0 / 65536.0; // ≈ 15.26 µm, the kernel reconcile grid
-
-    #[test]
-    fn drop_thin_removes_collinear_sliver_keeps_real_triangle() {
-        // v0,v1,v2 are near-collinear: v2 sits 5 µm off the v0→v1 line over a
-        // 1 m span — a zero-area sliver. A second, well-formed triangle
-        // (v3,v4,v5, height 0.5 m) must survive.
-        let mut mesh = Mesh {
-            positions: vec![
-                0.0, 0.0, 0.0, // v0
-                1.0, 0.0, 0.0, // v1
-                0.5, 5.0e-6, 0.0, // v2  (5 µm off the line → sliver)
-                0.0, 0.0, 0.0, // v3
-                1.0, 0.0, 0.0, // v4
-                0.5, 0.5, 0.0, // v5  (real, 0.5 m tall)
-            ],
-            normals: vec![],
-            indices: vec![0, 1, 2, 3, 4, 5],
-            rtc_applied: false,
-            origin: [0.0; 3],
-        instance_meta: None, local_bounds: None, local_to_world: None };
-        mesh.drop_thin_triangles(GRID);
-        assert_eq!(mesh.indices, vec![3, 4, 5], "sliver dropped, real kept");
-        // Positions/normals are never touched (orphan vertices are fine).
-        assert_eq!(mesh.positions.len(), 18);
-    }
-
-    #[test]
-    fn drop_thin_removes_coincident_pair_needle() {
-        // Two vertices identical → zero area regardless of the third.
-        let mut mesh = Mesh {
-            positions: vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
-            normals: vec![],
-            indices: vec![0, 1, 2],
-            rtc_applied: false,
-            origin: [0.0; 3],
-        instance_meta: None, local_bounds: None, local_to_world: None };
-        mesh.drop_thin_triangles(GRID);
-        assert!(mesh.indices.is_empty(), "coincident-pair needle dropped");
-    }
-
-    #[test]
-    fn drop_thin_keeps_thin_but_real_triangle_just_above_grid() {
-        // Height 30 µm (> 15.26 µm grid) over a 1 m base — thin but real.
-        let mut mesh = Mesh {
-            positions: vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.5, 30.0e-6, 0.0],
-            normals: vec![],
-            indices: vec![0, 1, 2],
-            rtc_applied: false,
-            origin: [0.0; 3],
-        instance_meta: None, local_bounds: None, local_to_world: None };
-        mesh.drop_thin_triangles(GRID);
-        assert_eq!(mesh.indices, vec![0, 1, 2], "above-grid triangle kept");
-    }
-
-    #[test]
-    fn drop_thin_does_not_open_a_crack_in_a_closed_solid() {
-        // A closed tetrahedron with ONE extra degenerate sliver triangle glued
-        // along an existing edge. Dropping the sliver must leave exactly the 4
-        // real faces — i.e. it removes the sliver and nothing else, so the
-        // watertight surface is unchanged (no real face is collateral-dropped).
-        let a = [0.0f32, 0.0, 0.0];
-        let b = [1.0f32, 0.0, 0.0];
-        let c = [0.0f32, 1.0, 0.0];
-        let d = [0.0f32, 0.0, 1.0];
-        let mut pos = vec![];
-        for v in [a, b, c, d] {
-            pos.extend_from_slice(&v);
-        }
-        // sliver vertex on edge a→b, 5 µm off-line
-        pos.extend_from_slice(&[0.5, 5.0e-6, 0.0]); // index 4
-        let mut mesh = Mesh {
-            positions: pos,
-            normals: vec![],
-            indices: vec![
-                0, 1, 2, // 4 tetra faces
-                0, 1, 3, 0, 2, 3, 1, 2, 3, // (winding irrelevant for this test)
-                0, 1, 4, // the degenerate sliver along edge 0→1
-            ],
-            rtc_applied: false,
-            origin: [0.0; 3],
-        instance_meta: None, local_bounds: None, local_to_world: None };
-        mesh.drop_thin_triangles(GRID);
-        assert_eq!(
-            mesh.indices,
-            vec![0, 1, 2, 0, 1, 3, 0, 2, 3, 1, 2, 3],
-            "only the sliver dropped; the 4 closed faces are intact"
-        );
-    }
-
-    #[test]
-    fn drop_thin_skips_oob_and_fully_collapsed_without_panic() {
-        let mut mesh = Mesh {
-            positions: vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
-            normals: vec![],
-            indices: vec![
-                0, 1, 2, // valid, real
-                0, 1, 9, // out-of-bounds index → skipped
-                0, 0, 0, // fully collapsed (longest == 0) → skipped
-            ],
-            rtc_applied: false,
-            origin: [0.0; 3],
-        instance_meta: None, local_bounds: None, local_to_world: None };
-        mesh.drop_thin_triangles(GRID);
-        assert_eq!(mesh.indices, vec![0, 1, 2]);
-    }
-
-    // Sibling of the above for drop_degenerate_triangles: the bits() closure
-    // indexed positions[] unchecked before vert()'s bounds check, so an OOB index
-    // panicked. It must now drop the bad triangle without panicking.
-    #[test]
-    fn drop_degenerate_skips_oob_index_without_panic() {
-        let mut mesh = Mesh {
-            positions: vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
-            normals: vec![],
-            indices: vec![
-                0, 1, 2, // valid
-                0, 1, 9, // out-of-bounds index → would panic in bits() pre-fix
-            ],
-            rtc_applied: false,
-            origin: [0.0; 3],
-            instance_meta: None,
-            local_bounds: None,
-            local_to_world: None,
-        };
-        mesh.drop_degenerate_triangles();
-        assert_eq!(mesh.indices, vec![0, 1, 2]);
-    }
-
-    #[test]
-    fn drop_thin_is_idempotent() {
-        let mut mesh = Mesh {
-            positions: vec![
-                0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.5, 5.0e-6, 0.0, // sliver
-                0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.5, 0.5, 0.0, // real
-            ],
-            normals: vec![],
-            indices: vec![0, 1, 2, 3, 4, 5],
-            rtc_applied: false,
-            origin: [0.0; 3],
-        instance_meta: None, local_bounds: None, local_to_world: None };
-        mesh.drop_thin_triangles(GRID);
-        let once = mesh.indices.clone();
-        mesh.drop_thin_triangles(GRID);
-        assert_eq!(mesh.indices, once, "second pass is a no-op");
-    }
-
-    #[test]
-    fn clean_degenerate_uses_the_reconcile_grid() {
-        // clean_degenerate must drop a 10 µm sliver (below grid) and keep a
-        // 30 µm one (above grid).
-        let mut mesh = Mesh {
-            positions: vec![
-                0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.5, 10.0e-6, 0.0, // below grid
-                0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.5, 30.0e-6, 0.0, // above grid
-            ],
-            normals: vec![],
-            indices: vec![0, 1, 2, 3, 4, 5],
-            rtc_applied: false,
-            origin: [0.0; 3],
-        instance_meta: None, local_bounds: None, local_to_world: None };
-        mesh.clean_degenerate();
-        assert_eq!(mesh.indices, vec![3, 4, 5]);
-    }
-}
+#[path = "mesh_tests.rs"]
+mod tests;

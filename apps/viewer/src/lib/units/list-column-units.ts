@@ -15,7 +15,7 @@
  */
 
 import type { CellValue, ColumnDefinition } from '@ifc-lite/lists';
-import { measureUnit, type ProjectUnits, type ResolvedUnit } from '@ifc-lite/parser';
+import { measureUnit, type ProjectUnits } from '@ifc-lite/parser';
 import { alternativesForUnitType } from './alternatives.js';
 import { convertValue, resolveFromUnit, type LinearUnit } from './convert.js';
 import { QUANTITY_TYPE_UNIT } from './display.js';
@@ -42,6 +42,56 @@ function columnUnitKind(col: ColumnDefinition): ColumnUnitKind | undefined {
   return undefined;
 }
 
+/** IFC lets a project declare no explicit `AREAUNIT`/`VOLUMEUNIT` at all —
+ *  the file then means "derive it from `LENGTHUNIT`", squared for area and
+ *  cubed for volume (a millimetre-authored 1 m² is stored raw as `1e6`, not
+ *  `1e3`). Same fallback `quantitySiScale` (`@ifc-lite/parser`) and IDS's
+ *  `resolveMeasureScales` already implement; kept in sync by
+ *  `AREA_VOLUME_POWER`'s two entries rather than a general power lookup. */
+const AREA_VOLUME_POWER: Record<string, number> = { AREAUNIT: 2, VOLUMEUNIT: 3 };
+
+/**
+ * A model's SOURCE unit for `kind.unitType`, as a `LinearUnit`: its explicit
+ * declaration (through {@link resolveFromUnit}, so a curated affine unit like
+ * DEGREE_CELSIUS keeps its offset) when present, else — for AREAUNIT/VOLUMEUNIT
+ * only — the length unit's scale raised to the matching power. `undefined`
+ * when the model declares neither.
+ *
+ * The length-derived branch is built directly as `{scale, offset: 0}`
+ * rather than round-tripped through `resolveFromUnit` (unlike the declared
+ * branch): area/volume units are never affine, and `resolveFromUnit` picks a
+ * curated alternative by SYMBOL — `kind.defaultSymbol` ('m²'/'m³') collides
+ * with the real SI m²/m³ alternative (scale 1), which would silently discard
+ * the derived scale and read every row as already-SI. Not to be used for the
+ * TARGET side: `resolveTarget` intentionally treats "no model declares this
+ * unit-type" as "fall to the SI default", not "adopt the first model's
+ * implied unit" — the target is one fixed unit for the whole column, and its
+ * own SI-default branch already gives it a well-defined scale of 1.
+ */
+function sourceUnitFor(pu: ProjectUnits, kind: ColumnUnitKind): (LinearUnit & { symbol: string }) | undefined {
+  const declared = pu.resolvedForUnitType(kind.unitType);
+  if (declared) {
+    const lin = resolveFromUnit(kind.unitType, declared);
+    return { scale: lin.scale, offset: lin.offset, symbol: declared.symbol };
+  }
+  const power = AREA_VOLUME_POWER[kind.unitType];
+  if (power === undefined) return undefined;
+  // Derive only from a DECLARED length unit: `unitForMeasure` falls back to
+  // the SI metre, which would label a unit-less file's areas `m²` (#4833).
+  if (!pu.resolvedForUnitType('LENGTHUNIT')) return undefined;
+  const length = pu.unitForMeasure('IfcLengthMeasure');
+  if (!length) return undefined;
+  const exponent = power === 2 ? '²' : '³';
+  return { scale: length.siScale ** power, offset: 0, symbol: `${length.symbol}${exponent}` };
+}
+
+/** Resolve a model's source symbol for a typed IFC measure, including derived area/volume units. */
+export function sourceUnitSymbolForMeasure(pu: ProjectUnits, dataType: string): string | null {
+  const measure = measureUnit(dataType);
+  if (measure?.kind !== 'typed') return null;
+  return sourceUnitFor(pu, { unitType: measure.unitType, defaultSymbol: measure.defaultSymbol })?.symbol ?? null;
+}
+
 interface TargetUnit extends LinearUnit {
   symbol: string;
 }
@@ -52,6 +102,12 @@ export interface ListColumnUnitResolver {
   /** The column's target display symbol, or `null` when it isn't
    *  convertible (no quantity/measure unit semantics). */
   unitSymbol(colIndex: number): string | null;
+  /** The unit a particular model declares for a column, before conversion. */
+  sourceUnitSymbol(colIndex: number, modelId: string): string | null;
+  /** The column's target unit as a conversion target, for a value whose
+   *  source unit is NOT the model's declared one (a property's own explicit
+   *  `Unit`); `null` for a non-convertible column. */
+  targetUnit(colIndex: number): (LinearUnit & { symbol: string }) | null;
   /** Convert `rawValue` (as declared by model `modelId`) into the column's
    *  target unit. Passes through unchanged - never throws - for a
    *  non-convertible column, a non-finite/non-numeric value, or an
@@ -76,6 +132,14 @@ export function resolveListColumnUnits(
     unitSymbol(colIndex) {
       return targets[colIndex]?.symbol ?? null;
     },
+    sourceUnitSymbol(colIndex, modelId) {
+      const kind = kinds[colIndex];
+      const pu = modelUnits.get(modelId);
+      return kind && pu ? sourceUnitFor(pu, kind)?.symbol ?? null : null;
+    },
+    targetUnit(colIndex) {
+      return targets[colIndex] ?? null;
+    },
     convertCell(colIndex, rawValue, modelId) {
       const kind = kinds[colIndex];
       const target = targets[colIndex];
@@ -83,8 +147,7 @@ export function resolveListColumnUnits(
       if (typeof rawValue !== 'number' || !Number.isFinite(rawValue)) return rawValue;
       const pu = modelUnits.get(modelId);
       if (!pu) return rawValue; // unrecognized model — can't resolve its source unit safely
-      const fileUnit: ResolvedUnit = pu.resolvedForUnitType(kind.unitType) ?? { symbol: kind.defaultSymbol, siScale: 1 };
-      const from = resolveFromUnit(kind.unitType, fileUnit);
+      const from: LinearUnit = sourceUnitFor(pu, kind) ?? resolveFromUnit(kind.unitType, { symbol: kind.defaultSymbol, siScale: 1 });
       // Identity short-circuit: when the row's declared unit already equals the
       // target (single model, no override — the common case), skip the round
       // trip. `v * s / s` is NOT an FP identity for non-power-of-two scales

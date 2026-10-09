@@ -182,6 +182,32 @@ describe('matchConstraint — pattern', () => {
     expect(matchConstraint(pat('\\p{IsBasicLatin}+'), 'Hello')).toBe(true);
   });
 
+  it('evaluates XSD character-class subtraction exactly instead of dropping the exclusion (#5183)', () => {
+    // `[a-z-[aeiou]]` is "lowercase, excluding vowels". Dropping the
+    // exclusion made a consonants-only pattern accept "aeiou".
+    const consonants = pat('[a-z-[aeiou]]+');
+    expect(matchConstraint(consonants, 'aeiou')).toBe(false);
+    expect(matchConstraint(consonants, 'xyz')).toBe(true);
+    expect(matchConstraint(consonants, 'xaz')).toBe(false);
+    // Nested: a-z minus (b-y minus c) = a, c, z.
+    const nested = pat('[a-z-[b-y-[c]]]+');
+    expect(matchConstraint(nested, 'acz')).toBe(true);
+    expect(matchConstraint(nested, 'b')).toBe(false);
+    // XSD escapes in either set, and the rest of the pattern around it.
+    expect(matchConstraint(pat('W-[\\w-[\\d]]{2}'), 'W-ab')).toBe(true);
+    expect(matchConstraint(pat('W-[\\w-[\\d]]{2}'), 'W-a1')).toBe(false);
+  });
+
+  it('refuses a subtraction it cannot delimit rather than guessing (#5183)', () => {
+    expect(() => matchConstraint(pat('[a-z-[aeiou]+'), 'xyz')).toThrow(
+      /XSD character-class subtraction is not supported in JS regex/
+    );
+    // Even behind an earlier approximated construct (review on #5286).
+    expect(() => matchConstraint(pat('\\p{IsBasicLatin}[a-z-[b]'), 'Ab')).toThrow(
+      /XSD character-class subtraction is not supported in JS regex/
+    );
+  });
+
   it('anchors top-level alternation across the whole value', () => {
     // `^a|b$` would match a left-anchored "a" or right-anchored "b";
     // the matcher wraps the pattern so the alternation spans the value.
@@ -337,6 +363,140 @@ describe('matchConstraint — bounds', () => {
   it('no bounds specified accepts any number', () => {
     expect(matchConstraint(bounds({}), 999)).toBe(true);
     expect(matchConstraint(bounds({}), -999)).toBe(true);
+  });
+
+  // `unparseableFacets` is what `parseRestriction` attaches when a facet
+  // element was present in the source XML but its `@value` failed to
+  // parse (see `parser/xml-parser.test.ts` for the full XML-to-matcher
+  // round trip). At the matcher level, its mere presence must flip an
+  // otherwise-unbounded constraint from an unconditional pass to an
+  // unconditional fail — regardless of which other facets are set.
+  it('a non-empty unparseableFacets fails closed even with no other facets set', () => {
+    const c = bounds({ unparseableFacets: [{ facet: 'minInclusive', rawValue: 'abc' }] });
+    expect(matchConstraint(c, 999)).toBe(false);
+    expect(matchConstraint(c, -999)).toBe(false);
+    expect(matchConstraint(c, 0)).toBe(false);
+  });
+
+  it('a non-empty unparseableFacets fails closed even when other facets on the SAME constraint are well-formed', () => {
+    // e.g. `<xs:minInclusive value="60"/>` parsed fine but a sibling
+    // `<xs:maxInclusive value="not-a-number"/>` did not — the whole
+    // restriction is unverifiable, not "just the min half".
+    const c = bounds({
+      minInclusive: 0,
+      unparseableFacets: [{ facet: 'maxInclusive', rawValue: 'not-a-number' }],
+    });
+    expect(matchConstraint(c, 50)).toBe(false);
+  });
+
+  it('an empty unparseableFacets array behaves exactly like it being absent', () => {
+    const c = bounds({ minInclusive: 0, maxInclusive: 100, unparseableFacets: [] });
+    expect(matchConstraint(c, 50)).toBe(true);
+    expect(matchConstraint(c, -1)).toBe(false);
+  });
+});
+
+// ============================================================================
+// matchConstraint — bounds: totalDigits / fractionDigits
+//
+// Regression coverage: an `xs:restriction` carrying ONLY `totalDigits`
+// and/or `fractionDigits` (no min/max/enumeration/pattern) used to fall
+// through the parser to an empty `enumeration` constraint, which fails
+// EVERY value unconditionally — a spec-conforming value was reported
+// non-compliant (false FAIL on 100% of inputs).
+// ============================================================================
+
+describe('matchConstraint — bounds: fractionDigits / totalDigits', () => {
+  const bounds = (
+    opts: Partial<IDSBoundsConstraint>
+  ): IDSBoundsConstraint => ({
+    type: 'bounds',
+    ...opts,
+  });
+
+  it('fractionDigits — passes a value at or under the limit', () => {
+    const c = bounds({ fractionDigits: 2 });
+    expect(matchConstraint(c, '0.25')).toBe(true);
+    expect(matchConstraint(c, '0.2')).toBe(true);
+    expect(matchConstraint(c, '5')).toBe(true);
+  });
+
+  it('fractionDigits — fails a value with more fraction digits than the limit', () => {
+    expect(matchConstraint(bounds({ fractionDigits: 2 }), '0.256')).toBe(false);
+  });
+
+  it('fractionDigits — trailing zeros are not significant', () => {
+    // "1.4500" has 2 significant fraction digits (trailing zeros drop).
+    expect(matchConstraint(bounds({ fractionDigits: 2 }), '1.4500')).toBe(true);
+  });
+
+  it('totalDigits — passes a value at or under the limit', () => {
+    const c = bounds({ totalDigits: 4 });
+    expect(matchConstraint(c, '12.34')).toBe(true);
+    expect(matchConstraint(c, '0.0025')).toBe(true);
+  });
+
+  it('totalDigits — fails a value with more significant digits than the limit', () => {
+    expect(matchConstraint(bounds({ totalDigits: 4 }), '123.45')).toBe(false);
+  });
+
+  it('totalDigits — leading zeros in the integer part are not significant', () => {
+    expect(matchConstraint(bounds({ totalDigits: 2 }), '007')).toBe(true);
+  });
+
+  // XSD §4.3.11/§4.3.12: value = i × 10⁻ⁿ. `fractionDigits` is `n` (leading
+  // fraction zeros fix the magnitude, so they DO count); `totalDigits` is
+  // the digit count of `i` (leading zeros — integer part AND fraction,
+  // before the first non-zero digit — are absorbed into 10⁻ⁿ and do
+  // NOT count). The two facets disagree on a value like 0.0025: regression
+  // coverage for a totalDigits miscount that conflated the two rules.
+  it('totalDigits vs fractionDigits count leading fraction zeros differently', () => {
+    const cases: Array<[string, number, number]> = [
+      ['0.0025', 2, 4], // 0.0025 = 25 × 10⁻⁴: totalDigits 2, fractionDigits 4
+      ['0.250', 2, 2], // trailing fraction zero drops from both
+      ['100.5', 4, 1], // integer digits count fully toward totalDigits
+      ['1000', 4, 0], // trailing zeros in the INTEGER part stay significant
+      ['7', 1, 0],
+      ['0', 1, 0],
+    ];
+    for (const [value, expectedTotal, expectedFraction] of cases) {
+      // At the exact count, the facet passes; one below it, it fails.
+      expect(matchConstraint(bounds({ totalDigits: expectedTotal }), value)).toBe(true);
+      expect(matchConstraint(bounds({ totalDigits: expectedTotal - 1 }), value)).toBe(
+        false
+      );
+      expect(matchConstraint(bounds({ fractionDigits: expectedFraction }), value)).toBe(
+        true
+      );
+      if (expectedFraction > 0) {
+        expect(
+          matchConstraint(bounds({ fractionDigits: expectedFraction - 1 }), value)
+        ).toBe(false);
+      }
+    }
+  });
+
+  it('totalDigits — 0.0025 against progressively tighter limits (regression: a prior miscount reported this value as having 4 total digits, not 2)', () => {
+    expect(matchConstraint(bounds({ totalDigits: 3 }), '0.0025')).toBe(true);
+    expect(matchConstraint(bounds({ totalDigits: 2 }), '0.0025')).toBe(true);
+    expect(matchConstraint(bounds({ totalDigits: 1 }), '0.0025')).toBe(false);
+  });
+
+  it('combined totalDigits + fractionDigits', () => {
+    const c = bounds({ totalDigits: 5, fractionDigits: 2 });
+    expect(matchConstraint(c, '123.45')).toBe(true);
+    expect(matchConstraint(c, '123.456')).toBe(false); // exceeds fractionDigits
+    expect(matchConstraint(c, '12345.6')).toBe(false); // exceeds totalDigits
+  });
+
+  it('rejects a non-numeric actual value', () => {
+    expect(matchConstraint(bounds({ fractionDigits: 2 }), 'abc')).toBe(false);
+  });
+
+  it('works against a number actual value, including scientific-notation magnitudes', () => {
+    expect(matchConstraint(bounds({ fractionDigits: 2 }), 0.25)).toBe(true);
+    expect(matchConstraint(bounds({ fractionDigits: 7 }), 1e-7)).toBe(true);
+    expect(matchConstraint(bounds({ fractionDigits: 6 }), 1e-7)).toBe(false);
   });
 });
 

@@ -2,12 +2,17 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Axis-conditioning tests for `obb_penetration_depth` — mirrors the
+//! Axis-conditioning tests for `obb_penetration` — mirrors the
 //! `axis conditioning` describe block in
 //! `packages/clash/src/engine-ts/obb.test.ts` (review: #2536). Same fixtures,
 //! same tolerances, so the two kernels are pinned to the same behaviour.
 
-use super::{obb_penetration_depth, Obb};
+use super::{is_through_penetration, obb_penetration, Obb, AXIS_NOISE_ULPS, OBB_EPS};
+
+/// The MTD alone; most tests here are about the depth, not its axis.
+fn obb_penetration_depth(a: &Obb, b: &Obb) -> Option<f64> {
+    obb_penetration(a, b).map(|p| p.depth)
+}
 use crate::vec3::{cross, dot, Vec3};
 
 /// Rodrigues rotation of `v` by `angle` radians about the unit axis `w`.
@@ -118,4 +123,136 @@ fn skips_an_exactly_parallel_cross_axis_without_dividing_by_zero() {
         half: [1.0, 2.0, 3.0],
     };
     assert_eq!(obb_penetration_depth(&a, &b), Some(0.5));
+}
+
+/// Ported from the TS twin `packages/clash/src/engine-ts/obb.test.ts`
+/// ("skips a candidate axis whose overlap sits exactly at the noise bound",
+/// obb.ts:250 / obb.rs `test_axis`'s `overlap.abs() <= noise`). Solved
+/// algebraically from the production formula so the x-face candidate's
+/// overlap is an EXACT float equality with its own noise bound — not merely
+/// close: `noise = extent_sum * K` with `K = AXIS_NOISE_ULPS * f64::EPSILON`,
+/// `dist = 0` so `overlap = S := half_a[0] + half_b[0]`, and
+/// `extent_sum = S + 2*hy + 2*hz`, giving `S = (2*hy + 2*hz) * K / (1 - K)`.
+///
+/// Under the real `<=` this axis (and its cross-product duplicates) is
+/// inconclusive: it may not SEPARATE, and it contributes a depth candidate
+/// of exactly zero, which wins the minimum. A mutated `<` would instead
+/// treat the boundary axis as a genuine separating candidate and report its
+/// own overlap (`~= S`, ~7e-15), so the two remain distinguishable and this
+/// still kills that mutation — `Some(0.0)` vs `Some(~7e-15)`.
+///
+/// #5355 CHANGED THE EXPECTED VALUE, and the old one is worth recording
+/// because it was the bug in miniature: this fixture's boxes overlap by
+/// ~7e-15 along x, and the assertion used to be `Some(2.0)` — the y/z FACE
+/// EXTENT — because the unresolvable x axis was dropped from the minimum
+/// entirely. That is the same defect that reported 0.85 m of penetration
+/// for a 0.05 m curtain-wall panel resting flush against a mullion. A depth
+/// of ~0 is the honest answer for boxes that overlap by 7e-15.
+#[test]
+fn an_axis_at_the_noise_bound_cannot_separate_and_contributes_zero_depth() {
+    let hy = 1.0;
+    let hz = 1.0;
+    let k = AXIS_NOISE_ULPS * f64::EPSILON;
+    let s = (2.0 * hy + 2.0 * hz) * k / (1.0 - k);
+    let axes: [Vec3; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    let a = Obb {
+        center: [0.0, 0.0, 0.0],
+        axes,
+        half: [0.0, hy, hz],
+    };
+    let b = Obb {
+        center: [0.0, 0.0, 0.0],
+        axes,
+        half: [s, hy, hz],
+    };
+    // Sanity check the algebra actually lands exactly on the boundary before
+    // trusting the depth assertion below.
+    let extent_sum = 0.0 + hy + hz + s + hy + hz;
+    let noise = extent_sum * k;
+    assert_eq!(s, noise, "fixture must land bit-exactly on the noise bound");
+    assert_eq!(
+        obb_penetration_depth(&a, &b),
+        Some(0.0),
+        "an axis whose overlap is indistinguishable from zero is the SMALLEST \
+         depth candidate, not an absent one"
+    );
+}
+
+/// Ported from the TS twin ("does not report a through-penetration when the
+/// far side lands exactly flush", obb.ts:325 / obb.rs `pierces_along`'s
+/// `p.half[k] > r_q_k + off_k.abs() + margin(r_q_k)`). `half[0]` is built
+/// from the identical expression `pierces_along` itself evaluates, so the
+/// comparison is a bit-exact tie, not an approximation. `>` (strictly past
+/// the far face) must report no through-penetration at exact flushness; a
+/// mutated `>=` would report one.
+#[test]
+fn does_not_report_a_through_penetration_when_the_far_side_lands_exactly_flush() {
+    let r_q_k: f64 = 0.1; // wall half-thickness
+    let off_k: f64 = 0.05; // duct center offset from wall center, along the pierce axis
+    let margin = OBB_EPS * 1.0f64.max(r_q_k);
+    let half_k = r_q_k + off_k.abs() + margin;
+    let axes: [Vec3; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    let duct = Obb {
+        center: [0.0, 0.0, 0.0],
+        axes,
+        half: [half_k, 0.05, 0.05],
+    };
+    let wall = Obb {
+        center: [off_k, 0.0, 0.0],
+        axes,
+        half: [r_q_k, 5.0, 5.0],
+    };
+    assert!(
+        !is_through_penetration(&duct, &wall),
+        "exact flushness must not be reported as a through-penetration",
+    );
+}
+
+/// #5355, symptom 2 of 2: "depth is the contact-face size".
+///
+/// A curtain-wall panel (0.05 m thick) resting flush against a mullion has an
+/// x-overlap of exactly zero, which falls inside the axis noise band. That
+/// axis used to be dropped from the minimum outright, handing the MTD to the
+/// next-smallest candidate — here the y faces, overlapping by
+/// `0.75 + 0.1 = 0.85` — so a zero-volume contact reported 0.85 m of
+/// penetration, 17x the panel's own thickness.
+///
+/// Kills: restoring the bare `return true` in `test_axis`'s noise guard
+/// (0.85 instead of 0.0), and any "harden the skip into a separation"
+/// rewrite (`None` instead of `Some`).
+#[test]
+fn a_flush_face_contact_reports_zero_depth_not_a_face_extent_5355() {
+    let axes: [Vec3; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    let mullion = Obb {
+        center: [0.0, 0.0, 0.0],
+        axes,
+        half: [0.1, 0.1, 1.5],
+    };
+    // Panel spans x in [0.1, 0.15]: its -x face is exactly the mullion's +x
+    // face, so the true minimum translation distance is 0.
+    let panel = Obb {
+        center: [0.125, 0.0, 0.0],
+        axes,
+        half: [0.025, 0.75, 1.5],
+    };
+    assert_eq!(
+        obb_penetration_depth(&mullion, &panel),
+        Some(0.0),
+        "a flush contact has zero penetration depth, not the extent of the \
+         face the two share"
+    );
+
+    // The companion half: a GENUINE penetration an order of magnitude below
+    // the panel thickness must still be measured, not flattened to zero.
+    // Without this, `depth = 0.0` unconditionally would pass the assert above.
+    let pressed = Obb {
+        center: [0.125 - 1e-3, 0.0, 0.0],
+        axes,
+        half: [0.025, 0.75, 1.5],
+    };
+    let d = obb_penetration_depth(&mullion, &pressed).expect("overlapping boxes have a depth");
+    assert!(
+        (d - 1e-3).abs() < 1e-9,
+        "a real 1 mm overlap must still measure 1 mm, got {d}"
+    );
 }
