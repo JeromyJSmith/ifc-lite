@@ -27,6 +27,9 @@ pub(crate) struct Parser<'a> {
     pub(super) references: usize,
     pub(super) surfaces_seen: usize,
     pub(super) points_seen: usize,
+    /// Bytes of element paths retained by records (`max_source_path_bytes`).
+    pub(super) source_path_bytes: usize,
+    pub(super) coordinate_systems_seen: usize,
     pub(super) faces_seen: usize,
     pub(super) profile_points_seen: usize,
     pub(super) vertical_curves_seen: usize,
@@ -89,6 +92,8 @@ impl<'a> Parser<'a> {
             references: 0,
             surfaces_seen: 0,
             points_seen: 0,
+            source_path_bytes: 0,
+            coordinate_systems_seen: 0,
             faces_seen: 0,
             profile_points_seen: 0,
             vertical_curves_seen: 0,
@@ -155,6 +160,11 @@ impl<'a> Parser<'a> {
 
     pub(crate) fn header(&self) -> Option<(String, Option<LandXmlUnits>)> {
         (!self.version.is_empty()).then(|| (self.version.clone(), self.effective_units()))
+    }
+
+    /// Whether the source has declared its `<Units>` yet (#7753).
+    pub(crate) fn declares_units(&self) -> bool {
+        self.units.is_some()
     }
 
     /// #5175: a declared `<Units>` element always wins; the caller-supplied

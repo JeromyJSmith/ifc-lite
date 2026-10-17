@@ -19,13 +19,15 @@
 
 import type { IfcDataStore, IfcAttributeValue, EntityExtractor } from '@ifc-lite/parser';
 import type { MutablePropertyView } from '@ifc-lite/mutations';
-import { generateIfcGuid, type RandomSource } from '@ifc-lite/encoding';
+import { generateIfcGuid, stepStringLiteralEnd, type RandomSource } from '@ifc-lite/encoding';
 import { createSourceRefReader, decodeRange } from './source-ref-bounds.js';
 import { findLengthUnitReference, normalizeMapUnitName } from './step-map-unit.js';
 import { authoredEntityRefs, type EffectiveEntityIndex } from './effective-index.js';
 import { HAS_PROPERTY_SETS_SLOT } from './type-owned-psets.js';
 import type { IfcSchemaVersion } from './schema-converter.js';
 import { firstWrittenOwnerHistoryRef } from './schema-converter-owner-history.js';
+import { nativeSetLine, decodeNativeSetLine } from './step-native-set-record.js';
+import { frameArgs, stepRecordFrame, stepRecordHead } from './step-record-frame.js';
 import type { SourceLineMutations } from './step-exporter.js';
 
 /**
@@ -37,6 +39,16 @@ import type { SourceLineMutations } from './step-exporter.js';
  * neither of which has a pass in hand. Both readers are built by
  * `createSourceRefReader` over the same `dataStore.source`.
  */
+/**
+ * `allocateExpressId`'s bound (#7682, EXPORT-STEP-9): an id past `u32::MAX` is
+ * one no ifc-lite reader can hold, so allocating it refuses the export, as the
+ * Rust writer does, rather than write a record that cannot be read back.
+ */
+export function allocatedExpressId(id: number): number {
+  if (id > 0xffffffff) throw new RangeError(`express id ${id} cannot be allocated: the file has spent the id space`);
+  return id;
+}
+
 export interface PropertySetContext {
   readonly dataStore: IfcDataStore;
   readonly entityExtractor: EntityExtractor | null;
@@ -149,9 +161,22 @@ export function getPropertySetName(ctx: PropertySetContext, psetId: number): str
   if (entityText === null) return null;
 
   // Parse: IFCPROPERTYSET('guid',$,'Name',$,...) - Name is 3rd argument
-  const match = entityText.match(/IFCPROPERTYSET\s*\([^,]*,[^,]*,'([^']*)'/i);
-  if (!match) return null;
-  return match[1];
+  return rawThirdLiteral(entityText, /IFCPROPERTYSET\s*\([^,]*,[^,]*,'/gi);
+}
+
+/**
+ * The raw text of the literal opening where `prefix` (global, ending at the
+ * opening `'`) first matches with a literal that closes. Read whole by the
+ * shared rule, so `''` and a `\S\'` PAGE operand do not cut the name short
+ * (#7589).
+ */
+function rawThirdLiteral(entityText: string, prefix: RegExp): string | null {
+  for (const match of entityText.matchAll(prefix)) {
+    const open = match.index + match[0].length - 1;
+    const end = stepStringLiteralEnd(entityText, open);
+    if (end !== -1) return entityText.slice(open + 1, end - 1);
+  }
+  return null;
 }
 
 /**
@@ -162,9 +187,7 @@ export function getElementQuantityName(ctx: PropertySetContext, entityId: number
   if (entityText === null) return null;
 
   // Parse: IFCELEMENTQUANTITY('guid',$,'Name',...) - Name is 3rd argument
-  const match = entityText.match(/IFCELEMENTQUANTITY\s*\([^,]*,[^,]*,'([^']*)'/i);
-  if (!match) return null;
-  return match[1];
+  return rawThirdLiteral(entityText, /IFCELEMENTQUANTITY\s*\([^,]*,[^,]*,'/gi);
 }
 
 /**
@@ -174,8 +197,10 @@ export function getPropertyIdsInSet(ctx: PropertySetContext, psetId: number): nu
   const entityText = entityLineText(ctx, psetId);
   if (entityText === null) return [];
 
-  // Parse: IFCPROPERTYSET(...,(#prop1,#prop2,...)); - Last argument is properties list
-  const match = entityText.match(/\(\s*(#[^)]+)\s*\)\s*\)\s*;$/);
+  // Parse: IFCPROPERTYSET(...,(#prop1,#prop2,...)); - Last argument is properties
+  // list, read up to the record's own close (`stepRecordFrame`, #7682).
+  const frame = stepRecordFrame(entityText);
+  const match = frame === null ? null : frameArgs(entityText, frame).match(/\(\s*(#[^)]+)\s*\)\s*$/);
   if (!match) return [];
 
   const propsList = match[1];
@@ -199,6 +224,19 @@ export function getPropertyIdsInSet(ctx: PropertySetContext, psetId: number): nu
  * relation instead (#2012).
  */
 export function getTypeOwnedHasPropertySetIds(ctx: PropertySetContext, entityId: number, effective: EffectiveEntityIndex): number[] {
+  const named = ctx.mutationView?.getAttributeMutationsForEntity?.(entityId) ?? [];
+  const positional = ctx.mutationView?.getPositionalMutationsForEntity?.(entityId);
+  if (named.some(mutation => mutation.name === 'HasPropertySets') || positional?.has(HAS_PROPERTY_SETS_SLOT)) {
+    const schema = ctx.dataStore.schemaVersion;
+    const sourceSchema = schema === 'IFC2X3' || schema === 'IFC4X3' || schema === 'IFC5' ? schema : 'IFC4';
+    const line = nativeSetLine(ctx, entityId, sourceSchema, new Map(named.map(mutation => [mutation.name, mutation.value])));
+    const ids = decodeNativeSetLine(line, entityId).attributes[HAS_PROPERTY_SETS_SLOT];
+    if (ids === null) return [];
+    if (!Array.isArray(ids) || ids.some(id => typeof id !== 'number' || !Number.isSafeInteger(id) || id <= 0)) {
+      throw new Error('Current native HasPropertySets references are unreadable');
+    }
+    return ids.filter((id): id is number => typeof id === 'number');
+  }
   if (effective.isOverlayCreated(entityId)) {
     const authored = ctx.mutationView?.getNewEntity(entityId)?.attributes?.[HAS_PROPERTY_SETS_SLOT];
     return authoredEntityRefs(overlaySlotValue(ctx, entityId, HAS_PROPERTY_SETS_SLOT, authored));
@@ -275,9 +313,17 @@ function getOwnerHistoryRefOfEntity(ctx: PropertySetContext, entityId: number): 
       entityRef.byteOffset,
       entityRef.byteOffset + entityRef.byteLength
     );
-    // #ID=IFCWALL('GlobalId',#owner,...): GlobalId is a quoted STEP string
-    // (doubled '' escapes); OwnerHistory is the ref/`$` right after it.
-    const match = entityText.match(/=\s*IFC\w+\s*\(\s*'(?:[^']|'')*'\s*,\s*#(\d+)/i);
+    // #ID=IFCWALL('GlobalId',#owner,...): GlobalId is a quoted STEP string,
+    // read to its end by the shared rule (#7589); OwnerHistory follows it.
+    // The record's head (`stepRecordHead`, #7682), an `IFC\w+` type, then the literal.
+    const head = stepRecordHead(entityText);
+    const quote = head !== null && /^IFC\w+$/i.test(entityText.slice(head.typeStart, head.typeEnd))
+      ? /^\s*'/.exec(entityText.slice(head.open + 1))
+      : null;
+    const end = head !== null && quote !== null
+      ? stepStringLiteralEnd(entityText, head.open + quote[0].length)
+      : -1;
+    const match = end === -1 ? null : /^\s*,\s*#(\d+)/.exec(entityText.slice(end));
     if (match) result = `#${match[1]}`;
   }
   ctx.ownerHistory.byEntity.set(entityId, result);

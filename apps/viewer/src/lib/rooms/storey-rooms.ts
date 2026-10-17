@@ -23,14 +23,16 @@
  * room (its outline, `linkFaces`) carries that room, which Edit mode reshapes.
  */
 
-import type { MeshData } from '@ifc-lite/geometry';
-import { existingSpaceFootprintEntriesByStorey, type SpaceFootprint } from '@ifc-lite/create';
+import { CoordinateHandler, type MeshData } from '@ifc-lite/geometry';
+import { iterateEffectiveEntityIds } from '@ifc-lite/mutations';
+import { liveStoreyMembers } from '@/lib/visibility/storey-context';
+import { existingSpaceFootprintEntriesByStorey, liveEntityConforms, type SpaceFootprint } from '@ifc-lite/create';
 import type { ViewerState } from '@/store';
 import { roomFramePlanOffsets, wallRectsFromMeshes } from '@/lib/wall-rects-from-meshes';
 import { spaceWasmLoaded } from '@/lib/rooms/space-wasm';
-import { pointInPoly, polyArea, type Pt } from '@/lib/rooms/plate-geometry';
-import { linkFaces, occupancyTest, spaceMeshTriangles, type RoomLink } from './room-occupancy';
-import { buildPlate, clearRoomLayouts, DEFAULT_MIN_AREA, DEFAULT_WELD, layoutFaces, layoutVersion, readFaces, undoHead, type LayoutFace } from './room-layout';
+import { type Pt } from '@/lib/rooms/plate-geometry';
+import { occupancyTest, spaceMeshTriangles } from './room-occupancy';
+import { buildPlate, clearRoomLayouts, DEFAULT_MIN_AREA, DEFAULT_WELD, layoutFaces, layoutVersion, readFaces, undoHead } from './room-layout';
 import { floorToFloorHeight } from './floor-height';
 import { modelStoreys } from '@/lib/commands/modeling/workspace-storeys';
 import { displayedTranslation, placementFor } from '@/lib/model-placement/state';
@@ -39,22 +41,8 @@ import { fromRenderTranslation, toRenderTranslation } from '@/lib/model-placemen
 import type { CommandContext, Workplane } from '@/lib/commands/modeling/types';
 
 export type { Pt };
-
-/** Which wall face a room's outline follows: the room side, the axis, the far side. */
-export type RoomBoundary = 'inner' | 'center' | 'outer';
-
-export interface RoomCandidate extends LayoutFace {
-  /** Centreline area: the gross floor area. */
-  grossArea: number;
-  /** Inner-face area: the net floor area. */
-  netArea: number;
-  /** A point inside the face, for labels and the "already a room" test. */
-  interior: Pt;
-  /** An IfcSpace on the storey already covers this face. */
-  taken: boolean;
-  /** The existing room this face is (its outline), which layout edits reshape. */
-  room: RoomLink | null;
-}
+import { roomCandidatesFromFaces, type RoomCandidate } from '../../../../../packages/create/src/in-store/room-candidates.js';
+export { roomAt, interiorPoint, roomOutline, roomCandidatesFromFaces, type RoomCandidate, type RoomBoundary } from '../../../../../packages/create/src/in-store/room-candidates.js';
 
 /** A storey's wall, storey-local: its footprint rectangle, axis and thickness. */
 export interface LocalWall {
@@ -71,65 +59,6 @@ export type StoreyRooms =
 const WALL_TYPES = new Set(['IfcWall', 'IfcWallStandardCase']);
 /** Inset of a storey's height band, as `wallRectsFromMeshes` insets its own. */
 const BAND_MARGIN = 0.2;
-
-/** The outline a room is written with at `boundary`. */
-export function roomOutline(room: LayoutFace, boundary: RoomBoundary): Pt[] {
-  return boundary === 'inner' ? room.inner : boundary === 'outer' ? room.outer : room.centre;
-}
-
-/**
- * A point strictly inside `poly`: its vertex centroid when that is inside (a
- * convex or mildly concave room), else the middle of the widest span of the
- * horizontal line through it (an L- or U-shaped room).
- */
-export function interiorPoint(poly: readonly Pt[]): Pt {
-  const n = poly.length;
-  let cx = 0, cy = 0;
-  for (const p of poly) { cx += p[0]; cy += p[1]; }
-  cx /= n; cy /= n;
-  const ring = poly as Pt[];
-  if (pointInPoly(cx, cy, ring)) return [cx, cy];
-  const xs: number[] = [];
-  for (let i = 0, j = n - 1; i < n; j = i++) {
-    const [xi, yi] = poly[i], [xj, yj] = poly[j];
-    if ((yi > cy) !== (yj > cy)) xs.push(xi + ((cy - yi) * (xj - xi)) / (yj - yi));
-  }
-  xs.sort((a, b) => a - b);
-  let best: Pt = [cx, cy], width = -1;
-  for (let k = 0; k + 1 < xs.length; k += 2) {
-    if (xs[k + 1] - xs[k] > width) { width = xs[k + 1] - xs[k]; best = [(xs[k] + xs[k + 1]) / 2, cy]; }
-  }
-  return best;
-}
-
-/** The smallest room whose centreline outline holds `p` (a room nested in another wins). */
-export function roomAt<R extends RoomCandidate>(rooms: readonly R[], p: readonly [number, number]): R | null {
-  let hit: R | null = null;
-  for (const room of rooms) {
-    if (pointInPoly(p[0], p[1], room.centre) && (!hit || room.grossArea < hit.grossArea)) hit = room;
-  }
-  return hit;
-}
-
-/** Layout faces → candidate rooms, `taken` where `occupied`, linked to the `spaces` they are. */
-export function roomCandidatesFromFaces(
-  faces: readonly LayoutFace[],
-  occupied: (p: Pt) => boolean = () => false,
-  spaces: readonly SpaceFootprint[] = [],
-): RoomCandidate[] {
-  const withInterior = faces.map((face) => ({ ...face, interior: interiorPoint(face.inner.length >= 3 ? face.inner : face.centre) }));
-  const links = linkFaces(withInterior, spaces as { expressId: number; footprint: Pt[] }[]);
-  return withInterior.map((face) => {
-    const room = links.get(face.face) ?? null;
-    return {
-      ...face,
-      grossArea: polyArea(face.centre),
-      netArea: polyArea(face.inner),
-      taken: room !== null || occupied(face.interior),
-      room,
-    };
-  });
-}
 
 /** Wall rectangles (storey-local, 4 corners each) → candidate rooms of a fresh layout, `taken` where `occupied`. */
 export function roomCandidatesFromRects(rects: readonly Pt[][], occupied: (p: Pt) => boolean = () => false): RoomCandidate[] {
@@ -163,7 +92,9 @@ function liveMesh(s: ViewerState, modelId: string): (mesh: MeshData) => boolean 
   const view = s.mutationViews.get(modelId);
   return (mesh) => {
     const local = s.resolveGlobalIdFromModels(mesh.expressId);
-    return !(local && view?.isDeleted(local.expressId));
+    const store = s.models.get(modelId)?.ifcDataStore;
+    return !!local && local.modelId === modelId && !!store && !view?.isDeleted(local.expressId)
+      && (!mesh.ifcType || liveEntityConforms(store, local.expressId, mesh.ifcType, view));
   };
 }
 
@@ -187,17 +118,49 @@ function storeyPlan(s: ViewerState, modelId: string, storeyId: number, plane: Wo
   };
 }
 
-let wallsCache: { meshes: unknown; count: number; version: number; plane: Workplane; storeyId: number; walls: LocalWall[] } | null = null;
+/** Refresh contained products plus spanning geometry the same height-band readers use. */
+export function storeyRoomGeometryIds(s: ViewerState, modelId: string, storeyId: number, plane: Workplane): number[] {
+  const store = s.models.get(modelId)?.ifcDataStore, at = storeyPlan(s, modelId, storeyId, plane);
+  if (!store || !at) return [];
+  const view = s.mutationViews.get(modelId), ids = new Set<number>();
+  const contained = new Set(liveStoreyMembers(store, view, [storeyId]).get(storeyId) ?? []);
+  const candidates = new Set<number>();
+  for (const { expressId } of iterateEffectiveEntityIds(store, view, ['IFCWALL', 'IFCWALLSTANDARDCASE', 'IFCSPACE'])) {
+    candidates.add(expressId);
+    if (contained.has(expressId)) ids.add(expressId);
+  }
+  const coordinates = new CoordinateHandler(), live = liveMesh(s, modelId);
+  for (const mesh of at.meshes) {
+    if ((!mesh.ifcType || !WALL_TYPES.has(mesh.ifcType)) && mesh.ifcType !== 'IfcSpace') continue;
+    if (!live(mesh)) continue;
+    const bounds = coordinates.calculateBounds([mesh], Infinity);
+    if (!(bounds.max.y > at.band.lo && bounds.min.y < at.band.hi)) continue;
+    const local = s.resolveGlobalIdFromModels(mesh.expressId);
+    if (local?.modelId === modelId) ids.add(local.expressId);
+  }
+  // Native instanced-only products may have no flat CPU mesh yet. These
+  // authoritative absolute Y-up boxes use the same band before JS shifting.
+  const shiftY = at.coord?.originShift?.y ?? 0;
+  for (const [globalId, bounds] of s.models.get(modelId)?.geometryResult?.instancedGeometryAabbs ?? []) {
+    if (!(bounds.max[1] > at.band.lo + shiftY && bounds.min[1] < at.band.hi + shiftY)) continue;
+    const local = s.resolveGlobalIdFromModels(globalId);
+    if (local?.modelId === modelId && candidates.has(local.expressId)) ids.add(local.expressId);
+  }
+  return [...ids];
+}
+
+let wallsCache: { modelId: string; store: unknown; view: unknown; revision: number | undefined; meshes: unknown; count: number; version: number; plane: Workplane; storeyId: number; walls: LocalWall[] } | null = null;
 
 /** The storey's walls in its storey-local frame (the last storey's are kept: a layer asks every frame). */
 export function storeyWalls(s: ViewerState, modelId: string, storeyId: number, plane: Workplane): LocalWall[] {
   const meshes = s.models.get(modelId)?.geometryResult?.meshes;
+  const store = s.models.get(modelId)?.ifcDataStore, view = s.mutationViews.get(modelId), revision = view?.getMutationRevision();
   const c = wallsCache;
-  if (c && c.meshes === meshes && c.count === (meshes?.length ?? 0) && c.version === s.mutationVersion && c.plane === plane && c.storeyId === storeyId) {
+  if (c && c.modelId === modelId && c.store === store && c.view === view && c.revision === revision && c.meshes === meshes && c.count === (meshes?.length ?? 0) && c.version === s.mutationVersion && c.plane === plane && c.storeyId === storeyId) {
     return c.walls;
   }
   const walls = deriveStoreyWalls(s, modelId, storeyId, plane);
-  wallsCache = { meshes, count: meshes?.length ?? 0, version: s.mutationVersion, plane, storeyId, walls };
+  wallsCache = { modelId, store, view, revision, meshes, count: meshes?.length ?? 0, version: s.mutationVersion, plane, storeyId, walls };
   return walls;
 }
 
@@ -227,14 +190,15 @@ export function storeyOccupancy(s: ViewerState, modelId: string, storeyId: numbe
   return occupancyTest(storeySpaceFootprints(s, modelId, storeyId), triangles);
 }
 
-let footprintCache: { store: unknown; version: number; byStorey: Map<number, SpaceFootprint[]> } | null = null;
+let footprintCache: { store: unknown; view: unknown; revision: number | undefined; version: number; byStorey: Map<number, SpaceFootprint[]> } | null = null;
 
 /** Existing IfcSpaces on the storey with their footprint rings, storey-local. */
 export function storeySpaces(s: ViewerState, modelId: string, storeyId: number): SpaceFootprint[] {
   const store = s.models.get(modelId)?.ifcDataStore;
   if (!store) return [];
-  if (footprintCache?.store !== store || footprintCache.version !== s.mutationVersion) {
-    footprintCache = { store, version: s.mutationVersion, byStorey: existingSpaceFootprintEntriesByStorey(store, s.mutationViews.get(modelId) ?? undefined) };
+  const view = s.mutationViews.get(modelId), revision = view?.getMutationRevision();
+  if (footprintCache?.store !== store || footprintCache.view !== view || footprintCache.revision !== revision || footprintCache.version !== s.mutationVersion) {
+    footprintCache = { store, view, revision, version: s.mutationVersion, byStorey: existingSpaceFootprintEntriesByStorey(store, view) };
   }
   return footprintCache.byStorey.get(storeyId) ?? [];
 }
@@ -245,6 +209,9 @@ export function storeySpaceFootprints(s: ViewerState, modelId: string, storeyId:
 }
 
 interface CacheEntry {
+  store: unknown;
+  view: unknown;
+  revision: number | undefined;
   meshes: readonly MeshData[] | undefined;
   meshCount: number;
   mutationVersion: number;
@@ -270,8 +237,9 @@ export function storeyRooms(s: ViewerState, modelId: string, storeyId: number, p
   if (!spaceWasmLoaded()) return { status: 'loading' };
   const meshes = s.models.get(modelId)?.geometryResult?.meshes;
   const head = undoHead(s, modelId);
+  const store = s.models.get(modelId)?.ifcDataStore, view = s.mutationViews.get(modelId), revision = view?.getMutationRevision();
   const c = cached;
-  if (c && c.meshes === meshes && c.meshCount === (meshes?.length ?? 0) && c.mutationVersion === s.mutationVersion
+  if (c && c.store === store && c.view === view && c.revision === revision && c.meshes === meshes && c.meshCount === (meshes?.length ?? 0) && c.mutationVersion === s.mutationVersion
     && c.head === head && c.layouts === layoutVersion() && c.plane === plane && c.storeyId === storeyId && c.modelId === modelId && c.weld === weld && c.minArea === minArea) {
     return c.result;
   }
@@ -283,7 +251,7 @@ export function storeyRooms(s: ViewerState, modelId: string, storeyId: number, p
       rooms: roomCandidatesFromFaces(layoutFaces(s, modelId, storeyId, weld, rects, minArea), storeyOccupancy(s, modelId, storeyId, plane), storeySpaces(s, modelId, storeyId)),
       walls: rects.length,
     };
-  cached = { meshes, meshCount: meshes?.length ?? 0, mutationVersion: s.mutationVersion, head, layouts: layoutVersion(), plane, storeyId, modelId, weld, minArea, result };
+  cached = { store, view, revision, meshes, meshCount: meshes?.length ?? 0, mutationVersion: s.mutationVersion, head, layouts: layoutVersion(), plane, storeyId, modelId, weld, minArea, result };
   return result;
 }
 

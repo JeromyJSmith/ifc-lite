@@ -82,6 +82,29 @@ function animate() {
 animate();
 ```
 
+The viewer renders navigation frames at CSS resolution and restores HiDPI
+sharpness when movement settles. This reduces fill work on dense displays;
+CPU-bound scenes may see little improvement. The renderer's persistent
+`setMaxPixelRatio(ratio)` preference remains the upper bound. Pass
+`maxPixelRatio: 1` to `render()` for a single reduced-resolution frame; omit
+it for subsequent full-quality or capture frames. Invalid frame caps are
+ignored, and a frame cap cannot raise the configured maximum.
+
+`renderer.renderWithResult(options)` shares `render()`'s implementation and
+returns `true` only when that call submits a new frame without a contained
+synchronous failure. It returns `false` when the device, viewport or context
+is unavailable, or rendering fails. The existing `render()` API still returns
+void. Submission is synchronous; it does not establish GPU completion,
+asynchronous validation or image quality.
+
+Viewer captures share the normal frame's appearance and clipping options,
+and render at the configured settled resolution. The capture owns its camera
+and drawing buffer through GPU completion, presentation, and image readback;
+the navigation loop resumes afterward. Rendering another frame during those
+asynchronous waits can replace the image being exported, even at DPR1.
+Captures reject a refused render before waiting for completion or reading the
+canvas, so an earlier frame cannot stand in for the requested capture.
+
 ## Appearance triangle mapping
 
 `expandAppearanceCorners(mesh, sourceIndices, cornerUvs, targetIndices, targetCornerNormals, targetVertexCount)` binds
@@ -242,6 +265,29 @@ sectionPlane.showOutlines = true;  // polygon outlines on the cut surfaces
 sectionPlane.normal = [0.3, 0.9, 0.1];
 sectionPlane.distance = 12.5;
 ```
+
+### Several Cutting Planes
+
+`sectionPlane` stays the primary plane: it owns the preview quad, the cut cap and the cardinal slider range. Up to seven more planes go in `extraSectionPlanes` (`MAX_EXTRA_CLIP_PLANES`; any beyond that are ignored). Each is resolved by the same code as the primary one (slider range against the model bounds, building rotation, explicit normal and distance), and a fragment is kept only where **every** enabled plane keeps it. Meshes, instanced occurrences, point clouds, shadows, GPU picking and CPU raycasting all clip against the same list, so a pick can never land on geometry another plane removed. A plane with `enabled: false` clips nothing.
+
+```typescript
+renderer.render({
+  sectionPlane: { axis: 'down', position: 40, enabled: true, flipped: false },
+  extraSectionPlanes: [
+    // `id` keys the plane's cap (see below).
+    { id: 'wing', axis: 'side', position: 25, enabled: true, flipped: true },
+    { id: 'face', axis: 'front', position: 0, enabled: true, normal: [0.6, 0, 0.8], distance: 4 },
+  ],
+});
+
+// Each plane's world-space frame (anchor and rectangle) as the last frame resolved it,
+// for labels and drag handles drawn outside the canvas.
+const frames = renderer.getSectionPlaneFrames();
+```
+
+The set can change from frame to frame (seven planes, then two, then none) without re-creating anything: the planes travel in each mesh's uniform, and a mesh drawn with no extra plane takes the same path it took before the option existed.
+
+A plane's cap comes from the cut polygons you upload for it: `renderer.uploadSection2DOverlay(polygons, lines, axis, position, range, flipped, customPlane, 'wing')`, and `renderer.clearSection2DOverlay('wing')` or `renderer.clearSection2DExtraOverlays(['face'])` to release caps. A cap is clipped by every other plane, never by its own. `sectionPlane.showGizmo = false` hides only the primary plane's preview quad.
 
 ### Section Plane Visualization
 
@@ -707,6 +753,7 @@ interface RenderOptions {
   clearColor?: [number, number, number, number];
 
   // Performance
+  maxPixelRatio?: number;           // This frame only, bounded by the configured cap
   enableDepthTest?: boolean;        // deprecated: declared but never read
   enableFrustumCulling?: boolean;
   spatialIndex?: SpatialIndex;
@@ -1177,3 +1224,11 @@ turn. Always call `dispose()` in `finally`; it releases an uncommitted upload an
 leaves a committed scene owner intact. Keep the source image retained through the
 owner's model and undo history lifetimes. This API inserts native-produced geometry;
 it does not construct IFC entities or synthesize geometry from a reference image.
+
+### Glazing and sun shadows
+
+The World view and WebGPU renderer use `DEFAULT_MIN_CAST_ALPHA` from
+`@ifc-lite/renderer` as the authored material opacity floor for sun-shadow
+casting. Geometry below this floor receives shadows without blocking direct
+sunlight. Opaque window frames and walls still cast; X-Ray ghost styling does
+not change a material’s shadow-casting classification.

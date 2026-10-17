@@ -11,6 +11,8 @@
  * never touches the store, the viewer, or the DOM.
  */
 
+import { splitStepTopLevel, stepStringLiteralEnd } from '@ifc-lite/encoding';
+
 /**
  * Remove every schedule-related entity declaration from the STEP body.
  *
@@ -20,11 +22,15 @@
  *      `IfcTaskTime`, `IfcLagTime`, `IfcWorkCalendar` + its own entities).
  *   2. Drop lines whose ID is in that set OR whose entity type is one of
  *      the sometimes-schedule types (`IfcRelSequence`, `IfcRelAssignsTo-
- *      Process`, `IfcRelAssignsToControl`) OR `IfcRelNests` lines that
- *      reference any ID from step 1.
+ *      Process`, `IfcRelAssignsToControl`) and references any ID from
+ *      step 1. `IfcRelNests` and `IfcRelAssignsToProduct` are pruned
+ *      instead: schedule ids leave their RelatedObjects, and the record is
+ *      dropped only when nothing else remains.
  *
- * The IfcRelNests check prevents us from stripping cost-item/resource
- * nests, which share the entity but aren't schedule-owned.
+ * The pruning keeps cost-item/resource nests and cost items pricing a
+ * product, which share those entities but aren't schedule-owned. The
+ * serializer re-emits the task side of IfcRelAssignsToProduct (task
+ * outputs, #6749), so leaving it would point at a deleted IfcTask.
  */
 const ALWAYS_SCHEDULE_TYPES: ReadonlySet<string> = new Set([
   'IFCTASK',
@@ -123,60 +129,55 @@ function classifyScheduleStatement(
     // Relationship entity; strip only if it references a schedule id.
     return referencesAnyId(stmt.attributesText, scheduleIds) ? 'drop' : 'keep';
   }
-  if (stmt.typeUpper === 'IFCRELNESTS') {
-    return classifyRelNests(stmt.attributesText, scheduleIds);
-  }
+  const layout = PRUNED_RELATION_LAYOUTS.get(stmt.typeUpper);
+  if (layout) return classifyPrunedRelation(stmt.attributesText, scheduleIds, layout);
   return 'keep';
 }
 
-function classifyRelNests(attributesText: string, scheduleIds: ReadonlySet<number>): StripAction {
-  const attributes = splitTopLevelAttributes(attributesText);
+/** Attribute positions of a relation whose RelatedObjects may mix schedule and non-schedule ids. */
+interface PrunedRelationLayout {
+  arity: number;
+  relating: number;
+  related: number;
+}
+
+const PRUNED_RELATION_LAYOUTS: ReadonlyMap<string, PrunedRelationLayout> = new Map([
   // IfcRelNests: GlobalId, OwnerHistory, Name, Description,
   // RelatingObject, RelatedObjects.
-  if (attributes.length !== 6) {
+  ['IFCRELNESTS', { arity: 6, relating: 4, related: 5 }],
+  // IfcRelAssignsToProduct: GlobalId, OwnerHistory, Name, Description,
+  // RelatedObjects, RelatedObjectsType, RelatingProduct.
+  ['IFCRELASSIGNSTOPRODUCT', { arity: 7, relating: 6, related: 4 }],
+]);
+
+function classifyPrunedRelation(
+  attributesText: string,
+  scheduleIds: ReadonlySet<number>,
+  layout: PrunedRelationLayout,
+): StripAction {
+  const attributes = splitTopLevelAttributes(attributesText);
+  if (attributes.length !== layout.arity) {
     return referencesAnyId(attributesText, scheduleIds) ? 'drop' : 'keep';
   }
-  const relatingId = parseStepRef(attributes[4]);
+  const relatingId = parseStepRef(attributes[layout.relating]);
   if (relatingId !== undefined && scheduleIds.has(relatingId)) return 'drop';
 
-  const related = splitReferenceAggregate(attributes[5]);
+  const related = splitReferenceAggregate(attributes[layout.related]);
   if (related === undefined) {
-    return referencesAnyId(attributes[5], scheduleIds) ? 'drop' : 'keep';
+    return referencesAnyId(attributes[layout.related], scheduleIds) ? 'drop' : 'keep';
   }
   const remaining = related.filter(ref => !scheduleIds.has(ref.id));
   if (remaining.length === related.length) return 'keep';
   if (remaining.length === 0) return 'drop';
-  attributes[5] = `(${remaining.map(ref => ref.text).join(',')})`;
+  attributes[layout.related] = `(${remaining.map(ref => ref.text).join(',')})`;
   return { attributesText: `(${attributes.join(',')})` };
 }
 
 function splitTopLevelAttributes(attributesText: string): string[] {
   if (!attributesText.startsWith('(') || !attributesText.endsWith(')')) return [];
-  const inner = attributesText.slice(1, -1);
-  const attributes: string[] = [];
-  let start = 0;
-  let depth = 0;
-  let inString = false;
-  for (let i = 0; i < inner.length; i++) {
-    const c = inner[i];
-    if (inString) {
-      if (c === "'") {
-        if (inner[i + 1] === "'") i++;
-        else inString = false;
-      }
-    } else if (c === "'") {
-      inString = true;
-    } else if (c === '(') {
-      depth++;
-    } else if (c === ')') {
-      depth--;
-    } else if (c === ',' && depth === 0) {
-      attributes.push(inner.slice(start, i).trim());
-      start = i + 1;
-    }
-  }
-  attributes.push(inner.slice(start).trim());
-  return attributes;
+  // The shared quote-, nesting- and comment-aware splitter (#7785): a comma
+  // inside a `/* ... */` comment is not an attribute boundary.
+  return splitStepTopLevel(attributesText.slice(1, -1));
 }
 
 function parseStepRef(value: string): number | undefined {
@@ -185,7 +186,9 @@ function parseStepRef(value: string): number | undefined {
 }
 
 function splitReferenceAggregate(value: string): Array<{ id: number; text: string }> | undefined {
-  const trimmed = value.trim();
+  // STEP allows `/* … */` comments between tokens; a reference aggregate
+  // holds no string literals, so stripping them here is safe.
+  const trimmed = value.replace(/\/\*[\s\S]*?\*\//g, '').trim();
   if (!trimmed.startsWith('(') || !trimmed.endsWith(')')) return undefined;
   const members = trimmed.slice(1, -1).split(',');
   const refs: Array<{ id: number; text: string }> = [];
@@ -274,21 +277,15 @@ function tokenizeStepStatements(stepContent: string): StepEntityStatement[] {
     }
     i++; // past '('
     let depth = 1;
-    let inString = false;
     while (i < len && depth > 0) {
       const c = stepContent[i];
-      if (inString) {
-        if (c === "'") {
-          // Peek for escape `''`.
-          if (stepContent[i + 1] === "'") { i += 2; continue; }
-          inString = false;
-          i++;
-          continue;
-        }
-        i++;
+      if (c === "'") {
+        // The shared literal-end rule (`''`, PAGE-directive operand, #7589).
+        // A string that never closes runs to the end, as before.
+        const strEnd = stepStringLiteralEnd(stepContent, i);
+        i = strEnd < 0 ? len : strEnd;
         continue;
       }
-      if (c === "'") { inString = true; i++; continue; }
       if (c === '(') { depth++; i++; continue; }
       if (c === ')') { depth--; i++; continue; }
       i++;
@@ -319,18 +316,16 @@ function tokenizeStepStatements(stepContent: string): StepEntityStatement[] {
 function scanToStatementEnd(s: string, from: number): number {
   const len = s.length;
   let i = from;
-  let inString = false;
   while (i < len) {
     const c = s[i];
-    if (inString) {
-      if (c === "'") {
-        if (s[i + 1] === "'") { i += 2; continue; }
-        inString = false;
-      }
-      i++;
+    if (c === "'") {
+      // Header strings too (FILE_NAME, FILE_DESCRIPTION): a PAGE directive's
+      // apostrophe operand must not end the literal (#7589).
+      const end = stepStringLiteralEnd(s, i);
+      if (end < 0) return len;
+      i = end;
       continue;
     }
-    if (c === "'") { inString = true; i++; continue; }
     if (c === ';') return i + 1;
     i++;
   }
@@ -339,11 +334,16 @@ function scanToStatementEnd(s: string, from: number): number {
 
 /** True iff any `#N` token in `rest` has N in the given set. */
 function referencesAnyId(rest: string, ids: ReadonlySet<number>): boolean {
-  const refRegex = /#(\d+)/g;
+  const refRegex = /'|#(\d+)/g;
   let m: RegExpExecArray | null;
   while ((m = refRegex.exec(rest)) !== null) {
-    const n = parseInt(m[1], 10);
-    if (ids.has(n)) return true;
+    if (m[1] === undefined) {
+      // A string literal: its `#9` text is not a reference (#7589).
+      const end = stepStringLiteralEnd(rest, m.index);
+      if (end >= 0) refRegex.lastIndex = end; // unclosed: keep scanning raw, the safe side
+      continue;
+    }
+    if (ids.has(parseInt(m[1], 10))) return true;
   }
   return false;
 }

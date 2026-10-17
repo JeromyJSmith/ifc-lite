@@ -58,11 +58,20 @@ import {
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { useExportDialogOpenGuard } from '@/hooks/useExportDialogOpenGuard';
 import { useTranslation } from '@/i18n';
+import { beginActivity, discardActivity, finishActivity, updateActivity } from '@/lib/activity/activity-journal';
 
-/** What one export run produced, rendered as the result `<Alert>`. */
-export interface ExportDialogShellResult {
-  success: boolean;
-  message: string;
+/** What one export run produced, rendered as the result `<Alert>`.
+ * `warnings` are the exporter's own diagnostics, listed beneath it so a
+ * summary such as "2 warnings" never stands without its reasons (#7335).
+ */
+export type ExportDialogShellResult = { message: string; warnings?: readonly string[] } & (
+  | { success: boolean; cancelled?: false }
+  | { success: false; cancelled: true }
+);
+
+/** Register only an export's existing native cancellation authority. */
+export interface ExportDialogShellActivity {
+  registerCancellation: (controller: AbortController) => void;
 }
 
 /** State a render-prop `children` can read. */
@@ -104,7 +113,7 @@ export interface ExportDialogShellProps {
    * Return `null` when the host reports the outcome itself, e.g. the
    * modified-IFC review, which closes and hands off to a background export.
    */
-  onExport: () => Promise<ExportDialogShellResult | null>;
+  onExport: (activity: ExportDialogShellActivity) => Promise<ExportDialogShellResult | null>;
   children: ReactNode | ((state: ExportDialogShellRenderState) => ReactNode);
   /** Controlled visibility for host dialogs opened by another surface. */
   open?: boolean;
@@ -114,7 +123,7 @@ export interface ExportDialogShellProps {
   optionsClassName?: string;
   /** Content before Cancel and Export, such as an editable filename. */
   footerLeading?: ReactNode | ((state: ExportDialogShellRenderState) => ReactNode);
-  /** Details below the result alert, such as export warnings. */
+  /** Details below the result alert and its warnings, such as an uploaded asset link. */
   resultDetails?: ReactNode;
   /** Notified whenever the shell's open state actually changes (see file header). */
   onOpenStateChange?: (open: boolean) => void;
@@ -179,19 +188,33 @@ export function ExportDialogShell({
   const handleExport = useCallback(async () => {
     setResult(null);
     setIsExporting(true);
+    // The activity tray records every export this shell runs (#6925).
+    const job = beginActivity({ kind: 'export', title: 'activityTray.job.export', subject: title });
+    let recorded = false;
+    let cancellation: AbortController | undefined;
     try {
-      const outcome = await onExport();
-      if (outcome === null) return;
-      if (closeOnSuccess && outcome.success) {
+      const outcome = await onExport({ registerCancellation: controller => {
+        cancellation = controller;
+        updateActivity(job, { cancel: () => controller.abort() });
+      } });
+      recorded = true;
+      // `null`: the host reports the outcome itself (a hand-off), so the tray does not guess one.
+      if (outcome === null) { discardActivity(job); return; }
+      finishActivity(job, outcome.cancelled || cancellation?.signal.aborted ? 'cancelled' : outcome.success ? 'completed' : 'failed', outcome.success ? {} : { detail: outcome.message });
+      // A success that carries warnings stays open so its reasons are seen.
+      if (closeOnSuccess && outcome.success && !outcome.warnings?.length) {
         setResult(null);
         setOpen(false);
       } else {
         setResult(outcome);
       }
+    } catch (error) {
+      if (!recorded) finishActivity(job, cancellation?.signal.aborted ? 'cancelled' : 'failed', { detail: error instanceof Error ? error.message : String(error) });
+      throw error;
     } finally {
       setIsExporting(false);
     }
-  }, [onExport, closeOnSuccess, setOpen]);
+  }, [onExport, closeOnSuccess, setOpen, title]);
 
   const content = typeof children === 'function' ? children({ isOpen: open, isExporting }) : children;
   const leading = typeof footerLeading === 'function'
@@ -227,6 +250,18 @@ export function ExportDialogShell({
             <AlertDescription>{result.message}</AlertDescription>
           </Alert>
         )}
+        {result?.warnings?.length ? (
+          <details className="text-xs text-muted-foreground border rounded p-2">
+            <summary className="cursor-pointer select-none">
+              {t('geometryExport.shell.warningsSummary', { count: result.warnings.length })}
+            </summary>
+            <ul className="list-disc pl-4 mt-1 space-y-0.5 break-words">
+              {result.warnings.map((warning, index) => (
+                <li key={index}>{warning}</li>
+              ))}
+            </ul>
+          </details>
+        ) : null}
         {resultDetails}
       </div>
 

@@ -29,12 +29,13 @@ pub struct MetadataResponse {
     /// `u32` (#3395). Non-zero means `entity_count` is short by this many —
     /// the file declares records this response does not count.
     pub oversized_id_count: usize,
-    /// Whether the scan stopped early at a record with no terminating `;`
-    /// (an unterminated string or comment, or a truncated file — #3695).
-    /// `true` means `entity_count` covers only the bytes before that record:
-    /// a partial view of the file, not a smaller file. Reported rather than
-    /// resynced past, for the reason #3695 gives — there is no reliable byte
-    /// to resume from, and guessing risks inventing entities (#3791).
+    /// Whether the scan dropped a record with no terminating `;` of its own
+    /// (an unterminated or unescaped string, an unterminated comment, or a
+    /// truncated file — #3695, #4179, #7541).
+    /// `true` means `entity_count` is short: a partial view of the file, not
+    /// a smaller file. The scan resumes where a real boundary remains (the
+    /// record's own `)`, or for a misread quote the next declaration that
+    /// begins a line) and stops where none does (an unterminated comment).
     pub malformed_record_found: bool,
 }
 
@@ -81,8 +82,6 @@ pub enum StreamEvent {
         stats: ProcessingStats,
         /// Model metadata.
         metadata: ModelMetadata,
-        /// Cache key for the result.
-        cache_key: String,
         /// Coordinate space of the mesh vertices; the wire spelling is
         /// [`MeshCoordinateSpace`]'s.
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -120,7 +119,6 @@ mod tests {
         let event = StreamEvent::Complete {
             stats: ProcessingStats::default(),
             metadata: ModelMetadata::default(),
-            cache_key: "k".to_string(),
             mesh_coordinate_space: None,
             site_transform: None,
             building_transform: None,
@@ -154,7 +152,6 @@ mod tests {
         let event = StreamEvent::Complete {
             stats: ProcessingStats::default(),
             metadata: ModelMetadata::default(),
-            cache_key: "k".to_string(),
             mesh_coordinate_space: Some(MeshCoordinateSpace::SiteLocal),
             site_transform: Some(vec![1.0; 16]),
             building_transform: Some(vec![2.0; 16]),

@@ -10,9 +10,10 @@
 
 use crate::generated::step_log_tables::{SlotRow, NAME_LISTS, NONE, SLOT_ROWS};
 use super::lines::split_args;
+use crate::step_record_frame::{opens_record, record_frame, RecordFrame};
 use crate::step_text::escape;
 
-use super::jsval::{js_number_to_string, to_step_real};
+use super::jsval::{format_step_real, integral_token, to_step_real};
 
 /// The source schema family (`dataStore.schemaVersion`): `IFC2X3`, `IFC4`,
 /// `IFC4X3` or `IFC5`, from the first `FILE_SCHEMA` identifier that names
@@ -244,11 +245,8 @@ fn attribute_value(value: &str, current_token: &str) -> String {
         if !n.is_finite() {
             return "$".to_string();
         }
-        return if current.contains('.') || current.contains(['e', 'E']) {
-            to_step_real(n)
-        } else {
-            js_number_to_string(n)
-        };
+        let real_slot = current.contains('.') || current.contains(['e', 'E']);
+        return if !real_slot && n.fract() == 0.0 { integral_token(n) } else { format_step_real(n) };
     }
     format!("'{}'", escape(value))
 }
@@ -268,30 +266,27 @@ pub(crate) fn named_attribute(upper: &str, index: usize, value: &str, current: &
             return Some("$".to_string());
         }
         let n = super::jsval::js_to_number(&serde_json::Value::String(trimmed.to_string()));
-        return n.is_finite().then(|| to_step_real(n));
+        return to_step_real(n).ok();
     }
     Some(attribute_value(value, current))
 }
 
-/// The argument list of a record, split for by-index writes, with the byte
-/// offsets that frame it: `(open, close, args)` where `open` is the first `(`
-/// and `close` the last `);`.
-pub(crate) fn split_record(text: &str) -> Option<(usize, usize, Vec<String>)> {
-    let open = text.find('(')?;
-    let close = text.rfind(");")?;
-    if close < open {
-        return None;
-    }
-    let args = split_args(&text[open + 1..close])?;
-    Some((open, close, args))
+/// The argument list of a record, split for by-index writes, with the frame
+/// that bounds it.
+pub(crate) fn split_record(text: &str) -> Option<(RecordFrame, Vec<String>)> {
+    let frame = record_frame(text)?;
+    let args = split_args(frame.args(text))?;
+    Some((frame, args))
 }
 
-/// `argumentListScans`: a record with no argument list to find is not
-/// "unreadable"; one whose list is there and does not split is.
+/// `argumentListScans`: a line that declares no entity instance is not
+/// "unreadable"; one that does (`#N=`) and is not a whole record the frame
+/// reads (a complex instance, a non-ASCII byte in its head, no `;`), or whose
+/// list does not split, is (#7682).
 pub(crate) fn argument_list_scans(text: &str) -> bool {
-    match (text.find('('), text.rfind(");")) {
-        (Some(open), Some(close)) if close >= open => split_args(&text[open + 1..close]).is_some(),
-        _ => true,
+    match record_frame(text) {
+        Some(frame) => split_args(frame.args(text)).is_some(),
+        None => !opens_record(text),
     }
 }
 
@@ -302,7 +297,7 @@ pub(crate) fn apply_named(
     edits: &[(String, String)],
     schema: &str,
 ) -> (String, Vec<(String, String)>) {
-    let Some((open, close, mut args)) = split_record(text) else { return (text.to_string(), Vec::new()) };
+    let Some((frame, mut args)) = split_record(text) else { return (text.to_string(), Vec::new()) };
     let lookup_schema = match schema {
         "IFC2X3" | "IFC4" | "IFC4X3" => schema,
         _ => "",
@@ -325,7 +320,7 @@ pub(crate) fn apply_named(
     if !changed {
         return (text.to_string(), rejected);
     }
-    (format!("{}{}{}", &text[..=open], args.join(","), &text[close..]), rejected)
+    (frame.with_args(text, &args.join(",")), rejected)
 }
 
 /// `applyPositionalMutations`: every in-range slot is rewritten, in the order
@@ -336,7 +331,7 @@ pub(crate) fn apply_positional(
     positionals: &[(usize, serde_json::Value)],
     schema: &str,
 ) -> Result<String, super::values::Unwritable> {
-    let Some((open, close, mut args)) = split_record(text) else { return Ok(text.to_string()) };
+    let Some((frame, mut args)) = split_record(text) else { return Ok(text.to_string()) };
     let mut changed = false;
     for (index, value) in positionals {
         if *index >= args.len() {
@@ -348,5 +343,5 @@ pub(crate) fn apply_positional(
     if !changed {
         return Ok(text.to_string());
     }
-    Ok(format!("{}{}{}", &text[..=open], args.join(","), &text[close..]))
+    Ok(frame.with_args(text, &args.join(",")))
 }

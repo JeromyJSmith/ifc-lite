@@ -80,6 +80,17 @@ Available on every command:
 | `--debug` | Verbose plus stack traces on error |
 | `--log-level <level>` | `error`, `warn`, `info`, or `debug` (explicit level wins over the shorthands) |
 
+## Installation diagnostics
+
+```bash
+ifc-lite doctor
+ifc-lite doctor --json > ifclite-diagnostics.json
+```
+
+Use this report when the CLI cannot find a package or its WASM artifact. It inspects this CLI installation's declared first-party dependencies using package resolution, including ESM-only entry points, without executing those modules. Commands load on demand so a damaged IFC dependency can still be diagnosed.
+
+The JSON protocol has `reportVersion: 1`, `target: "cli-installation"`, runtime details, package versions/statuses, and a `wasm` check with binary length and SHA-256 when readable. `ok` is true only when all reported checks pass. Exit status is 0 on success and 1 on a failed check. WASM validation checks binary structure; it performs no IFC binding initialization or geometry processing. See [installation error codes](error-handling.md#installation-diagnostics).
+
 ## Commands
 
 ### `view` — 3D Viewer
@@ -586,6 +597,60 @@ Returns pass/fail summary with exit code 0 (pass) or 1 (fail).
 |------|-------------|
 | `--json` | Full validation report as JSON |
 | `--locale <lang>` | Message language: `en`, `de`, `fr` |
+
+#### IDS authoring subcommands
+
+The same command also checks, formats, compares and explains IDS files on their own, with the
+engines the IDS editor uses (`@ifc-lite/ids` audit, `@ifc-lite/ids-authoring`
+lint). No model is needed.
+
+```bash
+# Is this a valid IDS 1.0 file? (XSD shape, IFC names, restriction coherence)
+ifc-lite ids audit requirements.ids
+ifc-lite ids audit requirements.ids --json
+
+# Does it mean what the author intends? (43 IDSL-* rules)
+ifc-lite ids lint requirements.ids
+ifc-lite ids lint requirements.ids --rules IDSL-PROP-001,IDSL-VAL-001
+ifc-lite ids lint requirements.ids --severity IDSL-SPEC-008=off --fail-on warning
+
+# Canonical formatting, for readable git diffs
+ifc-lite ids fmt requirements.ids            # formatted XML to stdout
+ifc-lite ids fmt requirements.ids --check    # CI: exit 1 when the file would change
+ifc-lite ids fmt requirements.ids --write    # rewrite in place
+
+# What changed between two revisions? (exit 1 when they differ)
+ifc-lite ids diff rev-a.ids rev-b.ids
+ifc-lite ids diff rev-a.ids rev-b.ids --md > CHANGES.md
+
+# Read it in plain language
+ifc-lite ids explain requirements.ids --lang de --md
+```
+
+| Subcommand | Flags | Exit code |
+|------------|-------|-----------|
+| `audit <rules.ids>` | `--json` | 1 when the audit reports an error |
+| `lint <rules.ids>` | `--json`, `--rules C,…` (only these rules), `--severity C=error\|warning\|info\|off,…` (override per rule), `--fail-on error\|warning\|info\|never` (default `error`) | 1 when a diagnostic at or above `--fail-on` remains |
+| `fmt <rules.ids>` | `--check`, `--write` | 1 when `--check` finds a file that would change |
+| `diff <before.ids> <after.ids>` | `--json`, `--md` | 1 when the documents differ |
+| `explain <rules.ids>` | `--lang en\|de\|fr`, `--md` | 0 |
+
+Every subcommand exits **2** on a usage error, an unreadable or unparseable
+file, or a file this build cannot write without loss. `fmt` re-reads what it
+writes and refuses (exit 2, naming the values) instead of dropping content:
+the writer in this release does not yet carry some `info` fields (author,
+version, date, …) or length, digit and conjunctive restrictions.
+
+`diff` pairs specifications by identifier, then by name and applicability,
+then by similarity, and facets the same way inside a pair. A renamed
+specification or an edited requirement therefore reads as one change, not as
+a removal plus an addition.
+
+Lint output names each finding by its XML path, e.g.
+`specifications[0].requirements[0].baseName`, and marks findings that have a
+quick fix. Apply quick fixes in the IDS editor or through the MCP
+`ids_apply_ops` tool; the CLI never rewrites content on its own. Model-aware
+lint (`--model`) is not available yet.
 
 ---
 
@@ -1361,8 +1426,8 @@ Every check reports one of three outcomes, never folded together:
 - **`error`** — the check could **not** be run: an unreadable/empty/corrupt
   model, an unreadable or unparsable IDS/rules file, an IDS document
   declaring zero specifications, a rule set declaring zero rules, or a rule
-  the engine itself could not evaluate. An unevaluable check is never
-  counted as a pass.
+  or IDS specification the engine itself could not evaluate. An unevaluable
+  check is never counted as a pass, nor as a violation.
 
 The overall **verdict** is `pass` only when every declared check on every
 declared model passed. An unreadable model, an empty IDS ruleset/rule set,
@@ -1457,11 +1522,102 @@ ifc-lite flow validate audit.flow.json
 |------------|---------|
 | `run <graph> <file.ifc>` | Evaluate the graph. `--input <nodeId.param=value>` (repeatable; JSON values parse, others are strings), `--out <file>` (IFC with the run's mutations applied), `--tracking <file>` / `--no-tracking` (element sets of tracked creation nodes; default `<graph>.tracking.json` beside the graph), `--json` |
 | `describe <graph>` | Print declared inputs (with param defaults) and outputs (with value kind and access). `--json` |
+| `run ... --checkpoint <file>` | A graph with AI nodes pauses for review: the run saves a review checkpoint to `<file>`, prints the proposal and its digest, and exits **3**. A run that wrote to the model or opened a different model before pausing also needs `--out`; the resume must start from that file. `--ai-max-requests` / `--ai-max-output-tokens` set the run's AI root budget (default 12 requests, 24,000 output tokens) |
+| `review <checkpoint> --approve <digest>` / `--reject` | Approve exactly the proposal that was shown (the digest must match) or decline it. Without a flag it prints the checkpoint. `--json` |
+| `resume <graph> <file.ifc> --checkpoint <file>` | Claim an approved checkpoint once, check that the graph, `--input` values and model are the ones the pause recorded, restore every completed node without running it again (no AI request is sent for the reviewed proposal), and run what was paused. `--out`, `--next-checkpoint <file>` when the graph pauses again |
 | `validate <graph>` | Validate the document's wiring against the node registry (unknown types, missing ports, type-incompatible edges, unconnected required inputs, `inputs`/`outputs` markers that name nothing) and report each node as `ok`, `noop`, `unavailable` or `unknown` on this host. Exit 2 on any wiring problem or unrunnable node. `--json` |
+
+BCF API create-topic and create-comment nodes save a credential-free native publication intent
+before sending. CLI stores its outbox at `IFCLITE_BCF_OUTBOX_DIR`, defaulting to
+`~/.ifc-lite/bcf-outbox` when unset or empty. Keep this directory across process restarts. A lost response leaves
+an unresolved intent; rerunning the same write refuses another send. Storage failures also
+refuse the write. Payloads containing a resolved run secret are refused before persistence.
+
+```bash
+ifc-lite flow bcf list
+# Large journals: repeat with the returned nextCursor, including empty progress pages.
+ifc-lite flow bcf list --page-size 100 --after <nextCursor>
+# Check only the intent's recorded target; permission and credentials are supplied afresh.
+ifc-lite flow bcf check <entryId> --allow-host bcf.example.com --token-env BCF_TOKEN
+# Only if this read sees the full collection in the original write access scope:
+ifc-lite flow bcf check <entryId> --allow-host bcf.example.com --token-env BCF_TOKEN --confirm-full-read-access
+# Review the checked candidates, then bind the actual server GUID explicitly.
+ifc-lite flow bcf reconcile <entryId> --guid <checkedGuid>
+# Only after a complete successful check found no server objects:
+ifc-lite flow bcf confirm-absent <entryId>
+```
+
+The journal keeps every distinct receipt in immutable `v2/<hash-prefix>/<intent-digest>`
+records. It allows 256 deliberate generations per identical intent, 16 active recovery checks
+per immutable epoch, and 4096 distinct digests per each of 256 hash buckets. These limits
+refuse new work before sending; existing receipts and the final checked settlement
+remain readable. Records are bounded to 256 KiB. `list` returns an array when it fits
+one bounded page; `--page-size` returns `{entries,nextCursor?}` pages, each limited
+by row count, 5 MiB and bounded work. Listing is weakly consistent during writes.
+Do not delete capacity slots or receipts to make room: use a separately selected
+outbox only after accounting for prior unknown outcomes. An older flat journal is
+refused explicitly; preserve it and recover with its original build first.
+
+Recovery check epochs retain prior immutable files and locate the latest marker
+with bounded exponential/binary probes over safe integer identities. Validation
+reads the latest epoch and its embedded preceding proof; archived epoch bodies
+are retained as evidence, without rereading their full history. An interrupted
+check resumes the same reserved check ID with a fresh authorized read. A completed
+unavailable check at an epoch boundary permits the next explicit check in a new
+epoch, competing with settlement on the same exclusive transition. An empty new
+epoch marker preserves the preceding proof. These operations never resend a create.
+
+A sending owner is identified by machine, boot and process start, rather than PID
+existence alone. A matching live owner blocks recovery. Foreign or unverifiable
+owners require the operator to verify the sender stopped, then add
+`--confirm-owner-stopped` to `check`; this assertion is persisted and never overrides
+an observed live sender. No timeout steals ownership or authorizes an automatic retry.
+
+A native process admits at most 64 concurrent or locally completed sends whose
+outcome could not be saved. Completed durable receipts consume no local tracking
+slot. At this bound new creates refuse before any effect; checked reconciliation
+or confirmed absence releases the retained local completion. No completion
+identity is evicted to make room. Reads synchronize the visible receipt or proof's
+directory before acknowledging it; an unresolved directory-sync fault refuses
+recovery and subsequent creates without discarding the existing record.
+
+Known credentials must also be representable in the journal. A bearer matching fixed
+metadata, such as `done`, is refused before any create request. Fixed schema keys such
+as `id` and `intent` are protocol names and do not themselves block a clean write.
+If a generated receipt value matches a credential after the server accepted a write,
+success is refused and the recorded intent remains unresolved for manual checking.
+
+These recovery commands print JSON. `--token-env` names an environment variable; it never
+accepts a token value or file. `--allow-host` grants one explicit hostname. Reconciliation
+requires a candidate from the stored check, persists the receipt across restart, and never
+sends a create or retries automatically. Confirm the actual server object before choosing
+a candidate. Checks retain trim-equivalent free text as manual candidates. Server
+rewrites or omitted payload fields make unmatched objects unavailable, because
+the create protocol has no stable client marker that proves they are unrelated.
+Only a complete empty enumeration with `--confirm-full-read-access` can report absence. This check-only flag is an operator assertion that the authorized read sees the full target collection under the same access scope as the original write. A token alone cannot establish that scope, and a filtered anonymous or different-principal empty view cannot establish absence. Public anonymous checks remain supported, with the same explicit full-visibility assertion required for absence. The journal records only the proof marker, not credential or principal identity. Older markerless absence proofs remain readable but cannot release a write: perform a new asserted check. Without the assertion an empty check remains unavailable; matching candidates remain available for manual reconciliation. If the asserted complete check proves absence, `confirm-absent` explicitly releases
+the intent for a later deliberate rerun; it sends nothing itself. An unavailable,
+ambiguous or incomplete check cannot authorize that release. Changing the payload
+is a new write, not reconciliation.
 
 `run` exits 1 when any node failed; per-lane errors inside a lifted node do not fail the run
 (the lane yields `null`) and are listed under `errors` in the summary. Secrets are resolved from
 environment variables; a node that requires one the host lacks is reported as `unavailable`.
+
+AI nodes (`ai.classify`, `ai.summarize`, `ai.extract`) run only when the environment names an
+OpenAI-compatible provider: `IFC_LITE_AI_MODEL` and `IFC_LITE_AI_API_KEY` (and optionally
+`IFC_LITE_AI_BASE_URL`, default OpenRouter). `IFC_LITE_AI_STRUCTURED_OUTPUT=true`
+enables JSON Schema requests for a compatible upstream model; `false` disables
+them. Only the exact `https://api.openai.com/v1` endpoint defaults to enabled;
+other endpoints default to parser-only. These settings also apply to MCP.
+Without the required model and key the graph is refused before the model is
+opened. The key never appears in output or in a checkpoint.
+
+```bash
+ifc-lite flow run roles.flow.json model.ifc --checkpoint roles.checkpoint.json   # exit 3: paused for review
+ifc-lite flow review roles.checkpoint.json                                       # print the proposal and its digest
+ifc-lite flow review roles.checkpoint.json --approve <digest>
+ifc-lite flow resume roles.flow.json model.ifc --checkpoint roles.checkpoint.json --out roles.ifc
+```
 
 A graph with a tracked creation node (`model.addElement`) re-run on its own output updates the
 elements it made — same GlobalIds, changed geometry — and removes the ones whose lanes vanished:
@@ -1578,9 +1734,12 @@ Run `ifc-lite schema` to see the full API before writing eval expressions.
 
 ## Command Reference
 
+The `semantic` command reads JSON/SPARQL providers, generates shared profile artifacts, validates JSON or RDF, and operates an authenticated HTTPS relay. See [Headless semantic records](semantic-headless.md) for flags, result formats, credential references, and reproduction examples.
+
 <!-- BEGIN GENERATED: cli-commands -->
 | Command | Description |
 |---------|-------------|
+| `doctor` | Check CLI runtime, package versions and WASM binary |
 | `info` | Model summary (schema, entities, storeys) |
 | `query` | Query entities by type/properties/quantities |
 | `props` | All properties for a single entity |
@@ -1589,7 +1748,7 @@ Run `ifc-lite schema` to see the full API before writing eval expressions.
 | `diagnose-geometry` | CSG / opening diagnostics (failures, classification) |
 | `extract-entities` | Isolate entities into a small, viewable standalone IFC |
 | `anonymize` | Export selected objects + context as an anonymized IFC |
-| `ids` | Validate against IDS rules |
+| `ids` | Validate a model against IDS rules; audit, lint, format, diff and explain IDS files |
 | `bcf` | Work with BCF collaboration files |
 | `clash` | Detect geometric clashes between elements |
 | `create` | Create IFC elements (29 types) |
@@ -1617,5 +1776,18 @@ Run `ifc-lite schema` to see the full API before writing eval expressions.
 | `gym` | reset/step/reward environment loop (JSONL over stdin/stdout) |
 | `delivery` | Repeatable delivery check (structural + IDS + rule sets) from a saved recipe |
 | `check` | Run a .rules.json information-validation rule set (same engine as the viewer) |
-| `flow` | Evaluate a node graph headlessly |
+| `semantic` | Shared semantic profiles, SHACL and JSON/SPARQL providers |
+| `flow` | Evaluate a node graph headlessly; pause and resume reviewed AI proposals |
 <!-- END GENERATED: cli-commands -->
+
+
+A Flow graph can use `review.snapshot` with `savedAnalysisRuns` or
+`savedValidationReports` JSON params to inspect supplied historical evidence
+against the currently loaded IFC. Source binding uses actual full-source and
+columnar identity evidence without creating a mutation editor. The CLI does not
+retain native session analyses across process restarts: a call without supplied
+inputs is explicitly unsupported, and supplied provenance remains imported and
+historical with incomplete native coverage. Export the graph with those params
+and run it through the existing `ifc-lite flow run` command.
+
+Unsupported native Review mode is refused before graph effects on CLI/viewer hosts. Supplied historical parameters and Player overrides remain supported; MCP additionally supports captured native Review. Validated restored nodes are not executed or required to reacquire their former services.

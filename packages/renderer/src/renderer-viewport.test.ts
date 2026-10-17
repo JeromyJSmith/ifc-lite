@@ -46,6 +46,23 @@ describe('computeDrawingBufferSize (#5383)', () => {
     );
   });
 
+  it('follows a lower max pixel ratio, so a HiDPI screen can render at CSS pixels', () => {
+    const size = computeDrawingBufferSize(CSS_W, CSS_H, 2, 8192, 1);
+    assert.deepStrictEqual(
+      { width: size?.width, height: size?.height, pixelRatio: size?.pixelRatio },
+      { width: 927, height: 818, pixelRatio: 927 / CSS_W },
+    );
+    assert.strictEqual(computeDrawingBufferSize(400, 300, 3, 8192, 1.5)?.width, 600);
+    // A cap above the display's ratio does not upscale past it.
+    assert.strictEqual(computeDrawingBufferSize(400, 300, 1, 8192, 2)?.width, 400);
+  });
+
+  it('falls back to the default cap for a non-finite or non-positive max pixel ratio', () => {
+    for (const cap of [Number.NaN, Number.POSITIVE_INFINITY, 0, -1]) {
+      assert.strictEqual(computeDrawingBufferSize(400, 300, 3, 8192, cap)?.width, 400 * MAX_DRAWING_BUFFER_PIXEL_RATIO, `cap ${cap}`);
+    }
+  });
+
   it('lowers the ratio on BOTH axes when one would exceed the max texture dimension', () => {
     // A tall iframe at DPR 2: 9000 device px of height does not fit 8192.
     const size = computeDrawingBufferSize(1000, 4500, 2, 8192);
@@ -61,5 +78,22 @@ describe('computeDrawingBufferSize (#5383)', () => {
     assert.strictEqual(computeDrawingBufferSize(Number.NaN, 500, 2, 8192), null);
     assert.strictEqual(computeDrawingBufferSize(500, 400, Number.NaN, 8192)?.width, 500);
     assert.strictEqual(computeDrawingBufferSize(500, 400, 0, 8192)?.width, 500);
+  });
+});
+
+// #6709: navigation resolution must not become a persistent capture preference.
+describe('frame-local drawing-buffer resolution', () => {
+  it('restores configured quality for the next capture-style frame', () => {
+    assert.deepEqual(computeDrawingBufferSize(600, 400, 2, 8192, 2, 1), { width: 600, height: 400, pixelRatio: 1 });
+    assert.deepEqual(computeDrawingBufferSize(600, 400, 2, 8192, 2), { width: 1200, height: 800, pixelRatio: 2 });
+    assert.deepEqual(computeDrawingBufferSize(600, 400, 2, 8192, 1.5, 2), { width: 900, height: 600, pixelRatio: 1.5 });
+  });
+  it('preserves DPR1 and ignores invalid frame caps without bypassing the configured cap', () => {
+    for (const dpr of [1, 2]) {
+      for (const cap of [undefined, 0, -1, Infinity, NaN]) {
+        assert.deepEqual(computeDrawingBufferSize(600, 400, dpr, 8192, 1.5, cap), computeDrawingBufferSize(600, 400, dpr, 8192, 1.5));
+      }
+    }
+    assert.deepEqual(computeDrawingBufferSize(600, 400, 1, 8192, 2, 1), computeDrawingBufferSize(600, 400, 1, 8192, 2));
   });
 });

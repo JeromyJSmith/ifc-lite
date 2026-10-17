@@ -38,6 +38,10 @@ pub fn parse_landxml_pipe_networks_with_cancel(
     if input.len() > limits.max_bytes {
         return Err(error(Code::InputTooLarge, "input exceeds byte limit"));
     }
+    // #5175 / EDGE-LXPARSE-7 (#7693): refuse a bad override token before
+    // any XML is read. The validated token is applied from `limits` when the
+    // root units are resolved (`effective_root_units`).
+    crate::semantics::resolve_assumed_units(limits)?;
     let input = normalize_encoding(input, limits, cancelled)?;
     preflight_xml_tokens(&input, limits, cancelled)?;
     let mut parser = PipeParser::new(limits, cancelled, true);
@@ -117,6 +121,10 @@ impl<'a> PipeParser<'a> {
             }
             Event::End(end) => self.end(Some(end.name().as_ref().as_bytes())),
             Event::Text(text) => self.text(text.as_ref().as_bytes()),
+            // #7680: a reference in text arrives as its own event.
+            Event::GeneralRef(reference) => {
+                self.text(crate::xml::general_ref_source(&reference).as_bytes())
+            }
             Event::CData(text) => self.cdata(text.as_ref().as_bytes()),
             Event::DocType(_) => Err(error(Code::DtdForbidden, "DOCTYPE is not allowed")),
             _ => Ok(()),

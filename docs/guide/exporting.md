@@ -39,14 +39,48 @@ upload token stays in memory and is cleared when the dialog closes; it is never
 saved to browser storage or sent to analytics.
 
 IFC4 and IFC4X3 uploads use the canonical compatibility exporter after applying
-edits. It normalizes map units to metres and moves supported uniform map rotation
-and scale into product placements and mapped Body representations. This preserves
-physical map coordinates, project units, properties and authored shape data;
-ordinary IFC downloads retain their original coordinate representation. IFC2X3
+edits. It normalizes map units to metres. When the physical scale is one, supported
+map rotation and translation move into the original root `IfcLocalPlacement`
+frames; child placements, representations, openings and fills retain their
+original relationships. Cesium ion evaluates `IfcLinearPlacement` without a
+transformed `PlacementRelTo`, so each linear placement is written as the
+equivalent `IfcLocalPlacement` (same parent, its resolved curve frame); a linear
+placement without `PlacementRelTo` is refused. Other supported uniform scales (for
+example the UTM 0.9996) give every product a fresh root placement and wrap its
+representations in a uniformly scaled mapped representation, under stricter
+ownership checks. Linear placements are resolved for that root and then
+bypassed, with or without `PlacementRelTo`; one whose `IfcAxis2PlacementLinear`
+sets `Axis` or `RefDirection` is refused. Besides Body geometry, curve-only
+representations such as an alignment's `Axis` or a `FootPrint` are carried
+through scaled; other non-Body representations are refused. Alignment layout
+parameters (segment lengths and start points) are not rewritten, so tools that
+rebuild an alignment from them rather than from its `Axis` curve are off by the
+map scale factor (0.04% at 0.9996). Type geometry that no occurrence
+instantiates gets the same scale at type level. An instance placed in the
+exported file, with an identity mapping target or one written in the exported
+coordinates, lands on the authored map coordinates; a target copied with a
+translation from the original file is off by that translation times one minus
+the scale. A type map nested inside another such map, or too deeply nested to
+leave room for the type-level wrapper and an instance, is refused.
+These transformations preserve
+physical map coordinates, project units, properties and authored shape data.
+Ordinary IFC downloads retain their original coordinate representation.
+Cesium ion applies a geoid only for vertical CRS codes it recognises, such as
+`EPSG:3855` (EGM2008 height), and treats other heights as ellipsoidal. A
+recognized `VerticalDatum` name (`EVRS2007` or `EGM2008`, including an
+optional `height` suffix and parenthesized `WGS84`/`WGS 1984`) is uploaded as
+`EPSG:3855`, which places sea-level heights on Cesium terrain to within the
+named datum's offset from EGM2008 (typically decimetres). Explicit EPSG codes
+and ellipsoidal datum names are uploaded as authored. Unrecognized names,
+including local project-zero datums, are preserved; this compatibility option
+does not infer a geoid height from arbitrary free text.
+Cesium ion currently tiles `IfcSectionedSolidHorizontal` sweeps (for example
+girders and pavement along an alignment) without their full alignment
+geometry, with or without this compatibility export. IFC2X3
 uploads keep their source schema and edits without an implicit upgrade.
 
 Unsupported coordinate consumers, ambiguous units or export warnings stop the
-upload before network transfer. For a model without georeferencing, set its
+upload before network transfer, and the dialog lists each reason. For a model without georeferencing, set its
 location in Cesium ion. No undocumented heading or placement override is sent.
 A successful upload starts tiling; follow the asset link to check its progress.
 
@@ -60,6 +94,13 @@ retain their images.
 The integration follows the [Cesium ion upload API](https://cesium.com/learn/ion/ion-upload-rest/)
 and adapts the MPL-2.0 upload feature from
 [GeoBIM's published IFClite fork](https://github.com/christof2304/ifc-lite/releases/tag/geobim-2026-09-24).
+
+Cesium uploads can be cancelled from their dialog or the status-bar Activity
+tray. The tray records **Cancelled** after native work drains; any already
+created remote asset remains available for inspection. A later retry has its
+own cancellation authority. Deviation CSV exports also appear in Activity and
+can be cancelled before the file is downloaded. Writers without a native abort
+contract offer no Activity Cancel action.
 
 ### Placement acceptance evidence
 
@@ -167,6 +208,7 @@ flowchart LR
         Parquet["Apache Parquet"]
         JSON["JSON-LD"]
         CSV["CSV"]
+        LandXML["LandXML (terrain)"]
     end
 
     subgraph Uses["Use Cases"]
@@ -175,6 +217,7 @@ flowchart LR
         Analytics["Data Analytics"]
         Linked["Linked Data"]
         Spreadsheet["Spreadsheets"]
+        Civil["Civil / Survey Tools"]
     end
 
     GLBIn --> Viewer
@@ -183,6 +226,7 @@ flowchart LR
     IFC --> Parquet --> Analytics
     IFC --> JSON --> Linked
     IFC --> CSV --> Spreadsheet
+    IFC --> LandXML --> Civil
 ```
 
 ## glTF / GLB Export
@@ -209,7 +253,14 @@ await saveFile('model.glb', glb);
 
 // Or, if you already meshed the model, skip the re-mesh:
 const result = await gp.process(bytes);
-const glb2 = gp.exportGlbFromMeshes(result.meshes, /* includeMetadata */ true);
+const glb2 = gp.exportGlbFromMeshes(
+  result.meshes,
+  /* includeMetadata */ true,
+  /* lit */ true,
+  /* emissive */ false,
+  // The frame the meshes sit in, so a georeferenced model lands at its world position.
+  renderFrameWorldMatrix(result.coordinateInfo), // from '@ifc-lite/geometry/world-frame'
+);
 ```
 
 `exportGlb` always emits a single binary **GLB** (`model/gltf-binary`). Per-element
@@ -425,7 +476,20 @@ asked for a subset the entire model.
 With `includeQuantities`, each entity additionally carries `ifc:hasQuantitySets`
 (`ifc:IfcElementQuantity` nodes with typed `ifc:IfcQuantity...` entries).
 
+Document PDF exports appear in the status-bar Activity tray while the native
+writer runs. Their rows record completion, missing-content warnings or failure.
+The PDF writer has no native abort contract, so its row offers no Cancel action.
+
 ## CSV Export
+
+The web viewer’s entities, properties, quantities and spatial hierarchy CSV commands
+share the same handler across the ribbon, command palette and mobile toolbar.
+They export the active model with pending native edits applied. In a federation,
+the Activity subject and existing export toast state that other loaded models
+are excluded. Each invocation has its own Activity row; Completed follows browser
+publication and Failed records writer or publication errors. Exports can finish
+after their initiating controls close. The Rust CSV writer has no abort contract,
+so these rows offer no Cancel action. An unavailable source creates no job.
 
 Export tabular data for spreadsheet applications:
 
@@ -458,7 +522,9 @@ await saveFile('spatial.csv', spatialCsv);
 
 The `entities` mode emits the fixed columns
 `expressId,globalId,name,type,description,objectType,hasGeometry`; with
-`includeProperties`, each property becomes a flattened `Pset_Prop` column:
+`includeProperties`, each property becomes a flattened `Pset_Prop` column.
+Two sets can flatten to the same name (`Pset_A` + `B_C` and `Pset_A_B` + `C`);
+the later column then gets a ` (2)` suffix so no two columns merge:
 
 ```csv
 expressId,globalId,name,type,description,objectType,hasGeometry,Pset_WallCommon_IsExternal,Pset_WallCommon_FireRating
@@ -553,26 +619,63 @@ if (compatibleMap.stats.warnings.length) {
 await saveFile('compatible-map.ifc', compatibleMap.content);
 ```
 
-Canonical Rust resolves the emitted model after edits. It moves uniform map
-rotation and scale into absolute logical product placements and `IfcMappedItem`
-Body representations, preserving physical map coordinates, logical placement
-origins, GUIDs, properties, and authored project/property units. The coordinate
-operation then retains only project-to-metre unit conversion. If rotation and
-physical scale are already neutral, placements and geometry remain untouched.
+Canonical Rust resolves the emitted model after edits. A rigid map rotation
+with exactly unit physical scale moves into the original `IfcLocalPlacement`
+roots. Child placements and all representation records remain intact, including
+Body, Axis, FootPrint, Box, annotations, opening/fill relationships and supported
+endpoint-local connection geometry. Root frames are cloned, so shared geometry
+points and directions are not mutated. TrueNorth directions, including the
+implicit +Y default, rotate into the new engineering frame using cloned metadata.
+This metadata adjustment covers the coordinate-operation context and contexts
+reachable from represented products. Unused definition contexts retain their
+original TrueNorth and representation records.
 
-The supported subset has one map conversion, one project, an identity 3D context,
-SI metre-based project units, local 3D placements, and Body representations.
-Type representation maps must be reachable from an actual product Body;
-orphan mapped items do not authorize uninstantiated type geometry.
-Body mapped paths with 31 or more existing wrappers are refused atomically: the
-new wrapper and terminal leaf must both fit the canonical submesh depth limit,
-so normalization preserves per-leaf styles as well as aggregate geometry.
-Voids/fills, annotations, alignment/grid/structural coordinate consumers,
-nonuniform scale, nonidentity contexts, ambiguous representation ownership,
-and malformed units or placements cause atomic refusal: no geometry patches
-are applied and warnings explain the limitation. Inspect warnings before
-sending the result to another service. Synchronous export rejects this option.
-Ordinary exports preserve their existing coordinate structure and bytes.
+TrueNorth, when provided, must have exactly two direction ratios under the
+IFC4/IFC4X3 `North2D` constraint. Malformed metadata is refused atomically;
+the ordinary edited IFC content is retained without normalization patches.
+
+Non-unit uniform physical scale uses absolute logical product placements and
+scaled `IfcMappedItem` representations: Body geometry, plus curve-only
+representations such as an alignment's `Axis` or a `FootPrint`. Both paths
+preserve physical map coordinates, logical placement origins, GUIDs, properties
+and authored units. The remaining coordinate operation retains only
+project-to-metre conversion. Exactly neutral rotation/physical scale preserves
+the original operation and geometry; machine-epsilon sine roundoff with exact
+neutral cosine/scale also remains untouched.
+
+Both paths require one map conversion, one project, SI metre-based project units,
+validated `IfcLocalPlacement` or `IfcLinearPlacement` chains and identity 3D
+engineering contexts. Alignments and linear placements are supported on both
+paths. The rigid path writes each reached linear placement as the equivalent
+`IfcLocalPlacement` and refuses one without `PlacementRelTo`. The scaled path
+composes the product's world frame through the chain, so it accepts linear
+placements with or without a parent. It refuses one it cannot resolve, and one
+whose `IfcAxis2PlacementLinear` sets `Axis` or `RefDirection`. The rigid path
+also accepts identity 3D sibling contexts explicitly declared by that same
+project, preserving the common Model/Plan engineering frame. Foreign contexts,
+unknown placement or connection-geometry consumers, malformed metadata and
+grid/structural consumers refuse atomically with explanatory warnings.
+Represented products without placements are refused.
+
+The scaled path additionally requires unambiguous representation ownership. A
+type map no product instantiates is wrapped at type level with the same scale:
+it keeps its ID and owner, and its authored origin and representation move into
+a scaled inner map. An instance with an identity mapping target, or a target
+written in the exported coordinates, then lands on the authored map
+coordinates; a target copied with a translation from the original file does
+not. Such a map nested inside another one is refused, because it would be
+scaled twice, as is one whose mapped nesting leaves no room for both the
+type-level wrapper and an instance. The scaled path carries annotations, but refuses
+voids/fills, shape aspects, non-Body representations with surface items (for
+example annotation fills or bounding boxes) and other coordinate consumers it
+cannot preserve. Its added wrapper requires fewer
+than 31 existing mapped levels. The rigid path adds no wrapper: 31 mapped levels
+can retain their original per-leaf styles; cycles, excessive depth and reference
+work are still refused. Nonuniform scale remains unsupported.
+
+Inspect warnings before sending the result to another service. Synchronous
+export rejects this option. Ordinary exports preserve their existing coordinate
+structure and bytes.
 
 #### Which schema identifier is written
 
@@ -816,6 +919,8 @@ ifc-lite export model.ifc --format usd --out model.usda
 
 One-call from the Rust-backed processor: `GeometryProcessor.exportUsd(bytes)` returns the
 `.usda` bytes (`null` before `init()`). The MCP tool is `export_usd` (`{ model_id?, file_path }`).
+A model with no render geometry has nothing to put on the stage, so the export fails with
+`NO_RENDER_GEOMETRY` (match it with `isNoRenderGeometryError`), as GLB and OBJ export do.
 Geometry that lives outside the spatial tree (opening elements, type-product meshes) is placed
 under a synthetic `Unassigned` prim rather than dropped, and each mesh carries its placement as a
 `double3 xformOp:translate` so georeferenced models keep full precision. The layer's
@@ -825,6 +930,49 @@ occlude the default render. Repeated mapped geometry (façade panels, MEP fittin
 authored once as a referenced `class Mesh` prototype under `/World/Prototypes` and each occurrence
 references it with a per-occurrence transform — a file-size win that keeps every occurrence a
 distinct, queryable prim.
+
+## LandXML (terrain) Export
+
+An authored IFC terrain triangulation can be exported as a LandXML 1.2 TIN surface. In the
+viewer, select the terrain of one model and choose **LandXML (terrain)** in the export menu or
+the command palette. The selection is checked with the real exporter first. The dialog then
+offers the units, the decimal places and a name per surface, and the file downloads as
+`<model>_terrain.xml`.
+
+From code, pass the express ids of the selected `IfcGeographicElement` or `IfcSite` products:
+
+```typescript
+import { terrainRefusalReason } from '@ifc-lite/geometry';
+
+const terrainIds = new Uint32Array([1234]); // express ids, one <Surface> each
+try {
+  // Every option is optional: metres, 6 decimals and the IFC names by default.
+  const terrain = gp.exportLandXmlTerrain(bytes, terrainIds, {
+    linearUnit: 'usSurveyFoot', // or 'metre' | 'internationalFoot'
+    decimals: 3,
+    surfaceNames: { 1234: 'Existing ground' },
+  }); // null before init()
+  if (terrain) {
+    await saveFile('model_terrain.xml', terrain.xml);
+    console.log(terrain.crsName, terrain.surfaces.map((s) => `${s.name}: ${s.faces} faces`));
+  }
+} catch (error) {
+  const reason = terrainRefusalReason(error); // null for anything but a refusal
+  if (reason === null) throw error;
+  console.warn(`Terrain not exported: ${reason}`);
+}
+```
+
+Each product's `IfcTriangulatedFaceSet` is copied as authored, never re-triangulated. Its
+vertices go through the product placement and the `IfcMapConversion` of the representation's
+context, and are written as northing, easting, elevation in the chosen unit (US survey feet write
+heights in international feet; both units are declared). The header `date` and `time` are the
+export time in UTC; pass `now` in the options to fix them. Missing or ambiguous
+georeferencing refuses the export with a `TERRAIN_REFUSED:` error instead of guessing a CRS, unit
+or scale. The mapping table and the full list of refusals are in the
+[LandXML guide](landxml.md#ifc-terrain-landxml). The map conversion is interpreted the same way
+as in [map units](#map-units-for-interoperability) and
+[map rotation and scale](#map-rotation-and-scale-for-interoperability).
 
 ## Other Formats via GeometryProcessor
 
@@ -1107,3 +1255,11 @@ compression, external resources, mirrored repeat and UV sets beyond
 `TEXCOORD_0` stop import with a diagnostic rather than produce an untextured
 success. Images use the existing inventory limits (32 MiB per encoded image,
 8192 px maximum edge, 16 megapixels per image).
+
+### Editing quantity sets owned by a type
+
+Default-history `MutablePropertyView.setQuantity` edits on an `IfcTypeObject` subtype save the replacement `IfcElementQuantity` in the type's `HasPropertySets`. A type is never placed in `IfcRelDefinesByProperties.RelatedObjects`. When another type shares the original definition, it retains that definition. Untouched physical quantity members retain their native IDs and attributes, including complex quantities; edited scalar members retain their source description, native unit reference and Formula when those fields were not edited. Unrelated property sets, including one with the same name as a quantity set, keep their ownership. Ordinary occurrence quantity edits continue to use `IfcRelDefinesByProperties`.
+
+Type-owned quantity edits preserve an existing explicit native unit when no replacement or removal is requested. A change of quantity dimension refuses export when that retained unit is incompatible with the new IFC measure type. Explicit unit removal remains intentional; compatible same-dimension edits preserve the native unit.
+
+New type-owned scalar quantity members with explicit unit intent must resolve a native unit reference before export. The new-member resolver currently supports assigned Length units; an unassigned requested Length unit or an explicit unit of another quantity dimension refuses instead of saving the value in implicit project units. This applies both to new type-owned sets and members copied into existing type-owned sets; ordinary occurrence serialization retains its existing contract. Adding the first scalar member to a native complex-only set is associated with that set through its source GlobalId, and its opaque members remain unchanged. Like every edited type-owned quantity set, the saved copy receives a fresh GlobalId, so look up the edited set on the type's `HasPropertySets` rather than by the source GlobalId. An edited native definition without a readable GlobalId is unavailable to the current reader and refuses export; an unchanged source definition is not made unreadable merely by lacking export identity.

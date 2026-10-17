@@ -9,9 +9,17 @@ use nalgebra::Matrix4;
 use serde::Serialize;
 
 #[path = "step_map_transform_preflight.rs"]
-mod preflight;
+pub(crate) mod preflight;
 #[path = "step_map_transform_writer.rs"]
 mod writer;
+#[path = "step_map_rigid.rs"]
+mod rigid;
+#[path = "step_map_rigid_ownership.rs"]
+mod rigid_ownership;
+#[path = "step_map_rigid_contexts.rs"]
+mod rigid_contexts;
+#[path = "step_map_context_metadata.rs"]
+mod context_metadata;
 
 /// A complete replacement or newly allocated STEP entity. IDs let the host
 /// exporter settle its existing modification ledger without counting edits twice.
@@ -95,21 +103,27 @@ pub fn plan_map_conversion_normalization(content: &[u8]) -> Result<MapConversion
         if !scale.is_finite() || scale <= 0.0 || !affine.iter().all(|value| value.is_finite()) {
             return Err("map similarity is not positive and finite".into());
         }
-        // Exact neutral test: even a tiny authored rotation can move a distant
-        // point. Keep offsets on the map conversion when no geometry work is needed.
-        if scale == 1.0 && geo.x_axis_abscissa == 1.0 && geo.x_axis_ordinate == 0.0 {
+        // Zero-angle exporters can retain a sine roundoff (for example cos(PI/2)).
+        // Recognize only machine-precision direction noise; physical scale and
+        // cosine stay exact. Preserve the authored operation, including the tiny
+        // ordinate and offsets: this returns no patches, not a snapped transform.
+        if scale == 1.0 && geo.x_axis_abscissa == 1.0 && geo.x_axis_ordinate.abs() <= f64::EPSILON {
             return Ok(MapConversionNormalizationPlan::default());
         }
         let context = operation.get_ref(0).ok_or("map SourceCRS is missing")?;
-        preflight::model(&records, context, &mut decoder)?;
+        if scale == 1.0 {
+            return rigid::plan(&records, &ids, map, context, unit, &affine, &mut decoder);
+        }
+        let type_maps = preflight::model(&records, context, &mut decoder)?;
         let router = GeometryRouter::with_scale(unit);
         let mut plan = MapConversionNormalizationPlan::default();
         let mut output = writer::Writer::new(&records)?;
         let inverse_scale = Matrix4::new_nonuniform_scaling(&nalgebra::Vector3::repeat(1.0 / scale));
         let mut shapes = BTreeMap::new();
+        let mut validated = std::collections::HashSet::new();
         for record in records.iter().filter(|record| record.kind.is_subtype_of(IfcType::IfcProduct)) {
             let product = decoder.decode_by_id(record.id).map_err(|error| error.to_string())?;
-            preflight::placement(&product, &mut decoder)?;
+            preflight::placement(&product, &router, &mut validated, &mut decoder)?;
             let matrix = router.resolve_scaled_placement_strict(&product, &mut decoder)
                 .map_err(|error| error.to_string())?;
             let mut placement = Matrix4::from_column_slice(&matrix);
@@ -131,12 +145,26 @@ pub fn plan_map_conversion_normalization(content: &[u8]) -> Result<MapConversion
             let record = &records[*ids.get(shape_id).ok_or("ProductDefinitionShape record is absent")?];
             plan.replacements.push(writer::replace(record, &[(2, writer::refs(&mapped))])?);
         }
+        // Type geometry no product instantiates gets the same similarity at
+        // type level: the map keeps its ID and owner, its authored origin and
+        // representation move into a scaled inner map, so an instantiation
+        // T yields T*S*O*g, the logical frame's view of the authored T*O*g.
+        for map_id in type_maps {
+            let record = &records[*ids.get(&map_id).ok_or("type map record is absent")?];
+            let origin = crate::step_text::attribute_of(record.line, 0).ok_or("type map MappingOrigin is invalid")?.trim().to_string();
+            let rep_id = decoder.decode_by_id(map_id).map_err(|error| error.to_string())?.get_ref(1).ok_or("type map has no MappedRepresentation")?;
+            let rep = &records[*ids.get(&rep_id).ok_or("type map representation record is absent")?];
+            let wrapped = output.scaled_wrapper(rep, &origin, scale)?;
+            let identity = output.identity_frame()?;
+            plan.replacements.push(writer::replace(record, &[(0, format!("#{identity}")), (1, format!("#{wrapped}"))])?);
+        }
         let mut edits = vec![(2, "0.".into()), (3, "0.".into()), (4, "0.".into()),
             (5, "1.".into()), (6, "0.".into()), (7, writer::real(unit)?)];
         if map.kind == IfcType::IfcMapConversionScaled {
             edits.extend([(8, "1.".into()), (9, "1.".into()), (10, "1.".into())]);
         }
         plan.replacements.push(writer::replace(map, &edits)?);
+        context_metadata::transform_north(&records, &ids, &std::collections::HashSet::from([context]), &affine, &mut decoder, &mut output, &mut plan)?;
         plan.new_entities = output.finish();
         Ok(plan)
     };
@@ -149,3 +177,11 @@ pub fn plan_map_conversion_normalization(content: &[u8]) -> Result<MapConversion
 #[cfg(test)]
 #[path = "step_map_transform_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "step_map_rigid_tests.rs"]
+mod rigid_tests;
+
+#[cfg(test)]
+#[path = "step_map_rigid_fixture_tests.rs"]
+mod rigid_fixture_tests;

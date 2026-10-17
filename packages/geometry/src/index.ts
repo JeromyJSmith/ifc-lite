@@ -34,7 +34,8 @@ export { mergeGeometryDiagnostics } from './diagnostics.js';
 export type { HbjsonStats } from './hbjson-stats.js'; // consumed by the CLI + viewer energy-export UI
 
 // Typed export-failure contract (fail-closed empty exports, mirrors Rust ExportError).
-export { NO_RENDER_GEOMETRY, isNoRenderGeometryError } from './export-errors.js';
+export { NO_RENDER_GEOMETRY, isNoRenderGeometryError, TERRAIN_REFUSED, terrainRefusalReason } from './export-errors.js';
+export type { LandXmlTerrainExport, LandXmlTerrainExportOptions, LandXmlTerrainSurface } from './landxml-terrain-export.js';
 
 // The index-parallel layouts the geometry-hash pass emits — six values per id
 // for the world box (#1891), one for the proved volume (#1993) — shared with
@@ -57,6 +58,11 @@ export { type StallPhase, type StallPhaseHandle } from './stall-phase.js';
 // opened so the download overlaps think time instead of blocking first
 // geometry. The host app decides when (idle / intent) and affordability.
 export { prewarmSharedWasmModule } from './wasm-shared-module.js';
+export { prewarmGeometryWorkers, releaseWarmGeometryWorkers, warmGeometryWorkerPoolStats } from './warm-pool.js'; // #7036
+export { prewarmMainThreadEngine } from './main-engine-init.js';
+export type { GeometryWorkerPoolStats } from './geometry-worker-pool.js';
+// `__IFC_LITE_*` flag bindings the host reads; the viewer registry spreads these (#6962).
+export { GEOMETRY_PERF_FLAG_BINDINGS } from './perf-flags.js';
 // Stale-deployment WASM-asset detection (#1363). The host app subscribes to
 // WASM_ASSET_UNAVAILABLE_EVENT and uses `isWasmAssetUnavailableError` to
 // reload onto the deployment; `notifyIfWasmAssetUnavailable` stays internal.
@@ -98,12 +104,15 @@ import { GEOM_CLASS_OCCURRENCE, geometryClassOf } from './geometry-class.js';
 import { createPlatformBridge, isTauri, type GeometryStats as PlatformGeometryStats, type IPlatformBridge } from './platform-bridge.js';
 import type { GeometryResult, MeshData, CoordinateInfo, GridAxis, TessellationQuality, KmzAltitudeMode, SimplifyMeshesResult } from './types.js';
 import type { HbjsonStats } from './hbjson-stats.js';
+import type { LandXmlTerrainExport, LandXmlTerrainExportOptions } from './landxml-terrain-export.js';
 
 // Extracted sub-modules
 import { getStreamingBatchSize, convertMeshCollectionToBatch, withBuildingRotation } from './geometry-coordinate.js';
 import { resolveRtcFrame, type RtcFrame } from './rtc-frame.js';
 import { streamNativeGeometry } from './geometry-native.js';
-import { processParallel } from './geometry-parallel.js';
+import { processParallel, type ProcessParallelOptions } from './geometry-parallel.js';
+import { getWarmGeometryWorkerPool } from './warm-pool.js';
+import { acquireWasmStreamingOperation } from './wasm-streaming-guard.js';
 import type { StallPhaseHandle } from './stall-phase.js';
 import type { ByteStreamingPrePassResult } from './byte-streaming-prepass-result.js';
 import { buildPrePassWithFinishes } from './style-finishes.js';
@@ -150,23 +159,6 @@ export interface GeometryProcessorOptions {
    * exporters/drawings leave it off so their geometry stays full fidelity.
    */
   skipSmallCuts?: boolean;
-}
-
-let activeWasmStreamingOperation: string | null = null;
-
-function acquireWasmStreamingOperation(operation: string): () => void {
-  if (activeWasmStreamingOperation) {
-    throw new Error(
-      `GeometryProcessor ${operation} cannot start while ${activeWasmStreamingOperation} is still running. ` +
-      'Wait for the active stream to finish, or cancel it before starting another geometry operation.',
-    );
-  }
-  activeWasmStreamingOperation = operation;
-  return () => {
-    if (activeWasmStreamingOperation === operation) {
-      activeWasmStreamingOperation = null;
-    }
-  };
 }
 
 /**
@@ -770,7 +762,7 @@ export class GeometryProcessor {
     /** Opt in to hung-call recovery; see `ProcessParallelOptions.hungJobTimeoutMs` (#4884). */
     hungJobTimeoutMs?: number,
     /** See `ProcessParallelOptions.stallPhaseHandle` (#4902). */
-    stallPhaseHandle?: StallPhaseHandle,
+    stallPhaseHandle?: StallPhaseHandle, trace?: ProcessParallelOptions['trace'], // #6956
   ): AsyncGenerator<StreamingGeometryEvent> {
     // Initialize if needed
     if (!this.bridge?.isInitialized()) {
@@ -782,7 +774,7 @@ export class GeometryProcessor {
       sourceFingerprint,
       signal,
       hungJobTimeoutMs,
-      stallPhaseHandle,
+      stallPhaseHandle, trace,
       // Issue #540: forward the merge-layers preference snapshotted
       // at construction time. processParallel posts `set-merge-layers`
       // to every spawned worker right after `init`.
@@ -801,6 +793,8 @@ export class GeometryProcessor {
       skipSmallCuts: this.skipSmallCuts,
       wasmUrls,
       workerCountOverride,
+      // #7036: lease warm workers when the `warmPool` experiment is enabled.
+      workerPool: getWarmGeometryWorkerPool() ?? undefined,
     });
   }
 
@@ -856,6 +850,7 @@ export class GeometryProcessor {
       hungJobTimeoutMs?: number;
       /** See `ProcessParallelOptions.stallPhaseHandle` (#4902); parallel path only. */
       stallPhaseHandle?: StallPhaseHandle;
+      trace?: ProcessParallelOptions['trace']; // load trace, parallel path only (#6956)
     } = {}
   ): AsyncGenerator<StreamingGeometryEvent> {
     const sizeThreshold = options.sizeThreshold ?? 2 * 1024 * 1024; // Default 2MB
@@ -929,7 +924,7 @@ export class GeometryProcessor {
           options.sourceFingerprint,
           options.signal,
           options.hungJobTimeoutMs,
-          options.stallPhaseHandle,
+          options.stallPhaseHandle, options.trace,
         );
       } else {
         yield* this.processStreaming(buffer, options.entityIndex, batchConfig, options.sharedRtcOffset);
@@ -1116,7 +1111,8 @@ export class GeometryProcessor {
 
   /** Rust domain exporters return bytes to avoid V8 string-size limits; decode
    * text with TextDecoder. They return null before init(). `isolated`:
-   * undefined selects all; an empty array hides every mesh. Keep distinct. */
+   * undefined selects all; an empty array hides every mesh. Keep distinct.
+   * No written mesh throws `NO_RENDER_GEOMETRY`, as `exportGlb` does. */
   exportObj(
     buffer: Uint8Array,
     includeNormals = true,
@@ -1205,7 +1201,8 @@ export class GeometryProcessor {
     return this.bridge.exportIfcx(buffer, onlyKnownProperties, pretty);
   }
 
-  /** Export OpenUSD (`.usda` ASCII) — a real Z-up USD stage (geometry-backed). */
+  /** Export OpenUSD (`.usda` ASCII) — a real Z-up USD stage (geometry-backed).
+   * No render geometry throws `NO_RENDER_GEOMETRY`, as `exportGlb` does. */
   exportUsd(buffer: Uint8Array): Uint8Array | null {
     if (!this.bridge?.isInitialized()) return null;
     return this.bridge.exportUsd(buffer);
@@ -1223,9 +1220,9 @@ export class GeometryProcessor {
    * standard PBR materials that shade from normals; `false` ⇒ flat
    * `KHR_materials_unlit` (the historical look — #1321). `emissive` self-illuminates
    * each material at its base colour (core glTF `emissiveFactor`) so renderers with
-   * no ambient/IBL — Google Earth — don't render it near-black (#1427).
-   */
-  exportGlbFromMeshes(meshes: MeshData[], includeMetadata = false, lit = true, emissive = false): Uint8Array | null {
+   * no ambient/IBL — Google Earth — don't render it near-black (#1427). `worldMatrix` =
+   * `renderFrameWorldMatrix(coordinateInfo)`: restored on the GLB root (#7734). */
+  exportGlbFromMeshes(meshes: MeshData[], includeMetadata = false, lit = true, emissive = false, worldMatrix?: ArrayLike<number>): Uint8Array | null {
     if (!this.bridge?.isInitialized()) return null;
     let totalV = 0;
     let totalI = 0;
@@ -1259,7 +1256,7 @@ export class GeometryProcessor {
       io += m.indices.length;
     }
     return this.bridge.exportGlbFromMeshes(
-      positions, normals, indices, vertexCounts, indexCounts, colors, origins, expressIds, includeMetadata, lit, emissive,
+      positions, normals, indices, vertexCounts, indexCounts, colors, origins, expressIds, includeMetadata, lit, emissive, worldMatrix,
     );
   }
 
@@ -1470,6 +1467,11 @@ export class GeometryProcessor {
   /** Export the `IfcSpace` volumes in `buffer` as Honeybee HBJSON. Null if not initialized. */
   exportHbjson(buffer: Uint8Array, name: string): Uint8Array | null {
     return this.bridge?.isInitialized() ? this.bridge.exportHbjson(buffer, name) : null;
+  }
+
+  /** Export terrain products (express ids) as LandXML 1.2. Null if not initialized; a refusal throws `TERRAIN_REFUSED:`. */
+  exportLandXmlTerrain(buffer: Uint8Array, productIds: Uint32Array, options: LandXmlTerrainExportOptions = {}): LandXmlTerrainExport | null {
+    return this.bridge?.isInitialized() ? this.bridge.exportLandXmlTerrain(buffer, productIds, options) : null;
   }
 
   /** Like {@link exportHbjson}; also returns `HbjsonStats`. Null if not initialized. */

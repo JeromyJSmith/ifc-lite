@@ -3,18 +3,19 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import '@/test/setup-dom.js';
-import { afterEach, it } from 'node:test';
+import { after, afterEach, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { act } from 'react';
 import { IfcParser } from '@ifc-lite/parser';
 import type { GeometryResult } from '@ifc-lite/geometry';
-import { advance, cleanup, mouseDown, render } from '@/test/render.js';
+import { advance, cleanup, mouseDown, render, waitFor } from '@/test/render.js';
 import { fixtureModel, fixtureModels } from '@/test/store-fixture.js';
 import { useViewerStore } from '@/store';
 import { usePlacementGeorefContext } from '@/lib/geo/placement-georef-runtime';
 import { PlacementPanel } from './placement/PlacementPanel.js';
 import { ViewportContainer } from './ViewportContainer.js';
+import { fieldTelemetry } from '@/lib/perf/fieldTelemetryLoader.js';
 
 // #6569 / #6572: metadata is available independently of map/solar visibility.
 // Small IFC input reproduces the reporter's Allplan map conversion. To rerun
@@ -60,6 +61,11 @@ function ContextReadout() {
   }) : 'absent'}</output>;
 }
 
+// The mounted welcome card reports its drop target to field telemetry, which
+// arms the 30 s `viewer_boot` deadline; disarm it so it does not hold this
+// test process open after the last test.
+after(() => fieldTelemetry?.resetFieldEventsForTests());
+
 afterEach(cleanup);
 
 for (const count of [0, 1, 2]) {
@@ -89,6 +95,8 @@ for (const count of [0, 1, 2]) {
       const tab = panel.querySelector('[role="tab"][data-state="inactive"]');
       assert.ok(tab, 'Georeference tab is available');
       mouseDown(tab, { button: 0 });
+      await waitFor(() => /Drag the plane and height handle/.test(panel.textContent ?? ''),
+        'projected georeference controls resolve with Map off');
       assert.match(panel.textContent ?? '', /Drag the plane and height handle/, 'georeference controls shown with Map off');
       assert.doesNotMatch(panel.textContent ?? '', /No georeferenced model/i);
       assert.equal(readout.textContent, JSON.stringify({

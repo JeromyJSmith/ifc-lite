@@ -32,7 +32,7 @@ import type { Mutation } from '@ifc-lite/mutations';
 import type { Tool } from './types.js';
 import { entityTargetSchema } from './entity-target-schema.js';
 import { entityCreate } from './entity-create.js';
-import { findByGlobalId, okResult, resolveModel } from './util.js';
+import { findByGlobalId, fmtInt, okResult, resolveModel, withScanHint } from './util.js';
 import type { HeadlessLikeBackend } from '../headless-backend.js';
 import { ToolErrorCode, ToolExecutionError } from '../errors.js';
 import { resolveSafePath } from '../safe-path.js';
@@ -41,6 +41,11 @@ import { propertyValueTypeOf } from '@ifc-lite/sdk';
 import { undoPendingMutations } from './mutation-undo.js';
 import { hostedPlaceTools } from './hosted-place.js';
 import { joinWallsTool } from './wall-join.js';
+import { hostedEditTool } from './hosted-edit.js';
+import { copyElementsTools } from './copy-elements.js';
+import { physicalEditTool } from './physical-edit.js';
+import { roomCommandTool } from './room-command.js';
+import { designPlaceTools } from './design-place.js';
 
 interface MutationContext {
   m: ReturnType<typeof resolveModel>;
@@ -239,7 +244,7 @@ const mutationBatch: Tool = {
       entity_create: entityCreate,
       entity_delete: entityDelete,
     };
-    const results: Array<{ tool: string; ok: boolean; result?: unknown; error?: string }> = [];
+    const results: Array<{ tool: string; ok: boolean; result?: unknown; error?: string; hint?: string }> = [];
     for (let i = 0; i < ops.length; i++) {
       const op = ops[i];
       try {
@@ -264,7 +269,13 @@ const mutationBatch: Tool = {
         if (out.isError) results.push({ tool: op.tool, ok: false, error: (out.structuredContent?.message as string) ?? 'failed' });
         else results.push({ tool: op.tool, ok: true, result: out.structuredContent });
       } catch (err) {
-        results.push({ tool: op.tool, ok: false, error: err instanceof Error ? err.message : String(err) });
+        // The dispatcher never sees a sub-tool's error, so the scan hint is
+        // added here too (#7610).
+        const hinted = err instanceof ToolExecutionError ? withScanHint(err, ctx, input.model_id as string | undefined) : undefined;
+        results.push({
+          tool: op.tool, ok: false, error: err instanceof Error ? err.message : String(err),
+          ...(hinted?.hint ? { hint: hinted.hint } : {}),
+        });
       }
       ctx.progress.report((i + 1) / ops.length, `Step ${i + 1}/${ops.length}`, ops.length);
     }
@@ -337,7 +348,7 @@ const modelSave: Tool = {
     const content = m.bim.export.ifc(undefined, { schema: schema as 'IFC2X3' | 'IFC4' | 'IFC4X3' }); // no ref list: whole model (#4738)
     const text = typeof content === 'string' ? content : new TextDecoder().decode(content);
     await writeFile(filePath, text, 'utf-8');
-    return okResult(`Wrote ${text.length.toLocaleString()} bytes to ${filePath}.`, {
+    return okResult(`Wrote ${fmtInt(text.length)} bytes to ${filePath}.`, {
       filePath,
       bytes: text.length,
       schema,
@@ -347,6 +358,11 @@ const modelSave: Tool = {
 
 export const mutationTools: Tool[] = [
   ...hostedPlaceTools,
+  ...designPlaceTools,
+  hostedEditTool,
+  ...copyElementsTools,
+  physicalEditTool,
+  roomCommandTool,
   joinWallsTool,
   entitySetProperty,
   entityDeleteProperty,

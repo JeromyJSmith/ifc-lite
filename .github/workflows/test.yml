@@ -97,14 +97,20 @@ permissions:
   # The no-op `edited` probe and replay read this head's check runs
   # (scripts/ci-verdict-replay.mjs). Read-only.
   checks: read
+  # The push-replay probe lists the artifacts of this PR's earlier Test runs
+  # (scripts/ci-push-replay.mjs). Read-only.
+  actions: read
 
 # Force JavaScript actions onto Node 24. GitHub deprecated Node 20 for
 # actions in late 2025 and will flip the default in June 2026. Setting
 # this opts us in early so the deprecation warning doesn't show up on
-# every run, and it covers actions like jetli/wasm-pack-action that
-# haven't shipped a Node-24-native release yet.
+# every run, and it covers any third-party action that hasn't shipped a
+# Node-24-native release yet.
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # Recorded-provider browser journeys (including the revert oracle) need a
+  # selectable model. Their requests are intercepted; this grants no API key.
+  VITE_LLM_FREE_MODELS: openai/gpt-4o-mini
 
 jobs:
   # Path filter — emits booleans the downstream jobs use as `if:` gates.
@@ -132,11 +138,14 @@ jobs:
       docs: ${{ steps.all.outputs.docs || steps.filter.outputs.docs }}
       agents_md: ${{ steps.all.outputs.agents_md || steps.filter.outputs.agents_md }}
       license_headers: ${{ steps.all.outputs.license_headers || steps.filter.outputs.license_headers }}
+      perf_ratchet: ${{ steps.all.outputs.perf_ratchet || steps.filter.outputs.perf_ratchet }}
       # `true` only for a title/body `edited` of a head that already has a
       # completed aggregate verdict. Every lane then skips (no filter output
       # above is `true`) and the aggregate replays the verdict. See the
       # `edited` trigger comment at the top of this file.
       noop: ${{ steps.noop.outputs.noop || 'false' }}
+      replay: ${{ steps.pushreplay.outputs.replay || 'false' }}
+      replay_run: ${{ steps.pushreplay.outputs.replay_run || '' }}
       # `true` when the WASM source is byte-identical to the published release
       # tag, so `build` can fetch the prebuilt bundle instead of compiling
       # wasm32. See the `build` job and scripts/ci-wasm-prebuilt-eligible.sh.
@@ -210,12 +219,46 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: node scripts/ci-verdict-replay.mjs --probe
+      # THE PUSH REPLAY, both halves (scripts/ci-push-replay.mjs). A PR run
+      # records the exact tree it tests -- GitHub records neither the merge
+      # commit nor its tree -- as an artifact NAMED for the tree. A push to
+      # main whose squash commit has that exact tree, from a GREEN run of the
+      # merged PR's final head, skips the lanes that run already executed:
+      # measured, 57 of 97 merges re-tested an identical tree. The paths
+      # filter below still runs, so the push-only lanes (rust-full, census,
+      # CSG gates) and the always-on plato-check and rust-semver still run and
+      # are judged; the aggregate re-verifies the recorded run. A merge that
+      # touches Cargo/toolchain/workflow files never replays: those key caches
+      # only a push to main writes.
+      - name: Record the tree this PR run tests
+        id: tree
+        if: github.event_name == 'pull_request' && steps.noop.outputs.noop != 'true'
+        run: |
+          tree=$(git rev-parse 'HEAD^{tree}')
+          mkdir -p "$RUNNER_TEMP/tested-tree"
+          echo "$tree" > "$RUNNER_TEMP/tested-tree/tree"
+          echo "tree=$tree" >> "$GITHUB_OUTPUT"
+      - name: Upload the tested tree
+        if: steps.tree.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tested-tree-${{ steps.tree.outputs.tree }}
+          path: ${{ runner.temp }}/tested-tree/
+          retention-days: 14
+          if-no-files-found: error
+      - name: Probe for a push of an already-tested tree
+        id: pushreplay
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: node scripts/ci-push-replay.mjs --probe
       # A merge-queue batch is validated as a whole: declare every area changed
       # so all lanes run. paths-filter is a pull_request/push tool and has no
       # PR to diff on merge_group.
       - if: github.event_name == 'merge_group'
         id: all
-        run: for k in rust frontend geometry python plato docs agents_md license_headers; do echo "$k=true" >> "$GITHUB_OUTPUT"; done
+        run: for k in rust frontend geometry python plato docs agents_md license_headers perf_ratchet; do echo "$k=true" >> "$GITHUB_OUTPUT"; done
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         if: github.event_name != 'merge_group' && steps.noop.outputs.noop != 'true'
         id: filter
@@ -285,6 +328,7 @@ jobs:
               - 'packages/**'
               - 'rust/**'
               - 'server/**'
+              - 'shared/ai/**'
               - 'tests/**'
               - 'tools/**'
               # The gate's own source and its scanned `scripts/` tree, one
@@ -325,6 +369,10 @@ jobs:
               # whoever touches the frontend next. Add it here when you add it.
               - 'apps/viewer/**'
               - 'apps/viewer-embed/**'
+              - 'apps/cloud-service/**'
+              - 'apps/report-service/**'
+              - 'apps/autodesk-exchange-worker/**'
+              - 'apps/autodesk-service/**'
               # `examples/*` is a pnpm-workspace member and is now a lint target
               # (scripts/check-lint-ran.mjs). Without it here, an examples-only
               # PR leaves `frontend` false, the Lint job never runs, and the new
@@ -333,6 +381,9 @@ jobs:
               - 'examples/**'
               - 'packages/**'
               - 'tests/e2e/**'
+              # Perf tools consume benchmark helpers; the CI path-coverage mirror
+              # reads every tracked benchmark input, so all must trigger Node tests.
+              - 'tests/benchmark/**'
               - 'playwright.config.ts'
               # The relay handlers and their tests. `bun run test:api` runs in this
               # job, so without these a PR touching ONLY the relay skips the one
@@ -340,6 +391,7 @@ jobs:
               # never fire, which is the failure this filter block already warns
               # about twice above.
               - 'server/**'
+              - 'shared/ai/**'
               - 'api/**'
               - 'tests/api/**'
               # `bun run test:integration` runs THIS EXACT FILE in the Node tests
@@ -394,6 +446,13 @@ jobs:
               # (scripts/README-vercel-cost.md).
               - 'rust-major-offset.json'
               - 'tests/models/manifest.json'
+              # The path-coverage regression harness mirrors tracked evidence,
+              # and conservative gate inputs include the committed archive tree.
+              - 'tests/evidence/**'
+              # The AI evaluation gates (scripts/ai-eval) read the corpus,
+              # recordings, label sheets and study records: an edit to any of
+              # them must run the gates that validate them.
+              - 'tests/ai-eval/**'
               - '.github/workflows/test.yml'
               # scripts/generate-coverage-ledger.mjs and its test read these
               # two paths directly (the sample fixture set and the generated
@@ -451,28 +510,45 @@ jobs:
               - 'packages/clash/src/math/generated/**'
               - 'scripts/generate-plato-clash.mjs'
               - '.github/workflows/test.yml'
+            # The perf-ratchet ceilings (#6959). Its own output so that the
+            # daily lowering bot's PR, which touches ONLY
+            # tests/perf-ratchets/*.json, runs `build` (which measures) and the
+            # `perf-ratchet` gate without dragging the nine-job frontend lane
+            # along. Its scripts are under `scripts/**`, which `frontend`
+            # already carries.
+            perf_ratchet:
+              - 'tests/perf-ratchets/**'
+              - 'scripts/perf-ratchet/**'
+              # The native-instructions measurer (#6982) runs these.
+              - 'scripts/perf/instructions.sh'
+              - 'scripts/perf/instructions-report.mjs'
+              - '.github/workflows/test.yml'
             docs:
               - 'docs/**'
               - 'mkdocs.yml'
-              # The docs-site job installs from it (#4912).
               - 'requirements-docs.txt'
               - 'README.md'
-              - 'packages/*/README.md'
-              # The two SOURCES `scripts/docs/generate-docs-sections.mjs`
-              # regenerates its sections from. They belong in `docs` rather
-              # than `frontend` on purpose: `docs` reaches the freshness check
-              # through the Docs-checks job -- one free ubuntu-latest runner,
-              # three node scripts, no build artifact and no Depot -- which is
-              # the CHEAPEST job that runs this gate. `frontend` would drag a
-              # landing-copy edit through build + typecheck + lint + the viewer
-              # shards for no added signal. Coverage holds either way: when a
-              # PR also touches frontend/rust, Docs checks skips itself and
-              # Node tests runs the same `--check`. PR #1817 changed only
-              # apps/landing/bench-data.json, and BOTH lanes skipped.
               - 'apps/landing/**'
               - 'tests/benchmark/baseline.json'
+              # TypeDoc consumes every public declaration entry and the tooling
+              # that builds it. Reference generation must run on API changes.
+              - 'packages/**'
+              - 'shared/ai/**'
+              - 'package.json'
+              - 'bun.lock'
+              - 'tsconfig*.json'
+              - 'turbo.json'
               - 'scripts/docs/**'
+              - 'scripts/lib/public-entrypoints.mjs'
+              - 'scripts/consumer/packed-packages.mjs'
+              - 'scripts/lib/is-main-entry.mjs'
+              - 'scripts/lib/shipped-target.*'
+              - 'scripts/*worker-urls.*'
+              - 'scripts/run-build-wasm.mjs'
+              - 'scripts/build-wasm.sh'
               - '.github/workflows/test.yml'
+              - '.github/workflows/docs.yml'
+              - '.github/actions/setup-docs-api/**'
 
       # Decide whether `build` can skip the from-source wasm32 compile. The
       # probe emits `true` only when the WASM source is byte-identical to the
@@ -490,7 +566,7 @@ jobs:
   build:
     name: Build packages + WASM
     needs: changes
-    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.frontend == 'true'
+    if: (needs.changes.outputs.rust == 'true' || needs.changes.outputs.frontend == 'true' || needs.changes.outputs.perf_ratchet == 'true') && needs.changes.outputs.replay != 'true'
     # Keep all routine CI on GitHub's free standard runner. This public repo's
     # previous 4-vCPU Depot path consumed the Developer plan's included minutes
     # in a few days; the prebuilt bundle remains a speed optimization only.
@@ -512,7 +588,7 @@ jobs:
           bun-version: 1.4.2
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 26
 
@@ -603,8 +679,29 @@ jobs:
       - name: Build packages
         run: bun run build
 
+      # Perf ratchet, `bundle` family (#6959). `bun run build` above already
+      # built the engine wasm and the viewer's dist/ (turbo builds apps/*
+      # too), so this only reads them: no second build. It MEASURES here and
+      # the `perf-ratchet` job JUDGES, so a ceiling breach goes red on its own
+      # check instead of failing `build` and skipping every lane that needs it.
+      # continue-on-error for the same reason: a measurer fault uploads no
+      # artifact, and `perf-ratchet` then fails on the missing download.
+      - name: Measure perf-ratchet bundle family
+        id: perf-ratchet-measure
+        continue-on-error: true
+        run: node scripts/perf-ratchet/measure-bundle.mjs --out "$RUNNER_TEMP/perf-ratchet/bundle.json"
+
+      - name: Upload perf-ratchet measurements
+        if: steps.perf-ratchet-measure.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: perf-ratchet-measured
+          path: ${{ runner.temp }}/perf-ratchet/
+          retention-days: 7
+          if-no-files-found: error
+
       - name: Upload build artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: build-output
           # `packages/*/pkg` covers `wasm/pkg`, which downstream
@@ -613,6 +710,36 @@ jobs:
             packages/*/dist
             packages/*/wasm
             packages/*/pkg
+          retention-days: 1
+          if-no-files-found: error
+
+      # Keep a separate root so build-output still extracts into packages/.
+      # Recipe tests execute the compiled scripts from the same shared build.
+      - name: Upload example builds
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: example-build-output
+          path: examples/*/dist
+          retention-days: 1
+          if-no-files-found: error
+
+      # The viewer app `bun run build` just produced (turbo builds apps/* too, via
+      # the viewer's own `build` script, so the __tla chunk-await guard has
+      # already run over exactly these files). viewer-e2e serves it with
+      # `vite preview` instead of rebuilding it per shard: measured 3.6 min x 4
+      # shards of `bun run build:e2e`, which with no turbo cache on the runner
+      # rebuilt every package the viewer depends on before the vite build.
+      # PR-only because viewer-e2e is.
+      - name: Upload viewer app build
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: viewer-dist
+          path: apps/viewer/dist
+          # upload-artifact skips dotfiles by default, and the real app ships
+          # one: public/.well-known/microsoft-identity-association.json. The
+          # E2E shards must serve the exact build, not a filtered copy of it.
+          include-hidden-files: true
           retention-days: 1
           if-no-files-found: error
 
@@ -642,7 +769,7 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.2
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 26
       # The codegen freshness gate regenerates the public Rust IfcType files
@@ -651,16 +778,21 @@ jobs:
       # lane, but make its formatter dependency explicit rather than relying
       # on a runner image incidental.
       - name: Install Rust formatter for codegen freshness
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-05
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master 2026-05
         with:
           toolchain: stable
           components: rustfmt
       - run: bun install --frozen-lockfile
       - name: Download build artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: build-output
           path: packages
+      - name: Download example builds
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: example-build-output
+          path: examples
       # #4079 taught scripts/lib/revert-oracle-python.mjs to route a changed
       # `test_*.py` / `*_test.py` ANYWHERE in the repo (routing is
       # marker-based — `pythonTestOwner` walks up to the nearest project
@@ -676,15 +808,21 @@ jobs:
       # them as silent skips instead of the real assertions the oracle needs
       # to revert against.
       # #6267: a changed Playwright spec can be the witness, measured in a real
-      # browser. Only then are fixtures provisioned; the oracle itself decides
-      # whether the browser runs at all (not when a cheaper test observes).
+      # browser. Manifest fixtures are provisioned for every oracle runner;
+      # the optional browser encoder is installed only for these specs. The
+      # oracle decides whether a browser runs (not when a cheaper test observes).
       - name: Detect changed Playwright specs
         id: browser
         run: |
-          if git diff --name-only --diff-filter=d origin/main...HEAD -- 'tests/e2e/*.spec.ts' 'tests/e2e/**/*.spec.ts' | grep -q .; then
+          if git diff --name-only --diff-filter=d origin/main...HEAD -- 'tests/e2e/*.spec.ts' 'tests/e2e/**/*.spec.ts' 'tests/benchmark/frames/*.spec.ts' | grep -q .; then
             echo "needed=true" >> "$GITHUB_OUTPUT"
           else
             echo "needed=false" >> "$GITHUB_OUTPUT"
+          fi
+          if git diff --name-only --diff-filter=d origin/main...HEAD -- 'tests/benchmark/frames/*.spec.ts' | grep -q .; then
+            echo "frames=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "frames=false" >> "$GITHUB_OUTPUT"
           fi
       - name: Provision optional revert-oracle runner toolchains
         uses: ./.github/actions/setup-revert-oracle
@@ -692,6 +830,22 @@ jobs:
           python: ${{ needs.changes.outputs.python == 'true' && 'full' || 'none' }}
           rust: ${{ needs.changes.outputs.rust }}
           browser: ${{ steps.browser.outputs.needed }}
+      - name: Install frame observer browser
+        if: steps.browser.outputs.frames == 'true'
+        run: bun x playwright install --with-deps chromium-headless-shell
+      # #7495: report integration witnesses must run against real durable
+      # services on BOTH oracle sides. Missing prerequisites are not evidence.
+      - name: Detect changed report integration witnesses
+        id: report-integration
+        run: |
+          if git diff --name-only --diff-filter=d origin/main...HEAD -- 'apps/report-service/test/integration.test.ts' 'apps/report-service/test/*.integration.test.ts' | grep -q .; then
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Provision report integration witnesses
+        if: steps.report-integration.outputs.needed == 'true'
+        uses: ./.github/actions/setup-report-integration
       - name: Prove the changed tests observe the production change
         # `&&` binds tighter than `||`: python is tested first so a PR that
         # changes both keeps the wheel builds' 85 minutes (which also covers
@@ -702,12 +856,280 @@ jobs:
           # Same as the viewer-e2e lane: GPU-dependent assertions skip on the
           # runner's SwiftShader device, and a skip never counts as observation.
           E2E_GPU_STRICT: '0'
-        run: node scripts/check-test-revert-oracle.mjs --base origin/main --ci --json
+        run: |
+          oracle_args=(--base origin/main --ci --json)
+          # #7495: deleting the newly introduced report service prevents test
+          # collection. Its initial qualification instead removes ONLY the
+          # approved NDA digest check: wrong-digest acceptance must turn RED.
+          # All changed tests still run on both sides; once agreement.ts is on
+          # main, the ordinary whole-change revert resumes automatically.
+          if git diff --name-only --diff-filter=A origin/main...HEAD -- apps/report-service/src/agreement.ts | grep -Fxq 'apps/report-service/src/agreement.ts'; then
+            oracle_args+=(--mutation apps/report-service/test/fixtures/approved-digest.oracle.patch)
+          # The initial publication transport adds modules imported by its
+          # witnesses. Keep them loadable while disabling ONLY refusal of an
+          # existing durable intent: a restarted worker must expose a second
+          # real POST. Every changed test still runs on both oracle sides.
+          # Once publication.ts is on main, normal whole-change revert resumes.
+          elif git diff --name-only --diff-filter=A origin/main...HEAD -- apps/report-service/src/publication.ts | grep -Fxq 'apps/report-service/src/publication.ts'; then
+            oracle_args+=(--mutation apps/report-service/test/fixtures/publication-intent.oracle.patch)
+          # Keep new report UI imports available while removing recovery,
+          # busy-dismissal and completed-source identity safeguards. Mounted
+          # and real-storage assertions turn red; every changed test still runs.
+          # Once the dialog is on main, ordinary whole-change revert resumes.
+          elif git diff --name-only --diff-filter=A origin/main...HEAD -- apps/viewer/src/components/error-report/ErrorReportDialog.tsx | grep -Fxq 'apps/viewer/src/components/error-report/ErrorReportDialog.tsx'; then
+            oracle_args+=(--mutation tests/evidence/model-reports-7495/publication-hold.oracle.patch)
+          # New reviewed-destination/comment modules must remain importable.
+          # Restore unsafe author attribution, omit durable pre-POST intent and
+          # accept a forged target MAC; actual behavioral assertions turn red.
+          # All changed tests run on both sides. Once comments are on main,
+          # the ordinary whole-change revert resumes automatically.
+          elif git diff --name-only --diff-filter=A origin/main...HEAD -- apps/report-service/src/github-comments.ts | grep -Fxq 'apps/report-service/src/github-comments.ts'; then
+            oracle_args+=(--mutation apps/report-service/test/fixtures/issue-binding.oracle.patch)
+          # Keep the new quarantine module loadable while removing historical
+          # NDA refusal and complete-scan requirements. Real PostgreSQL/S3
+          # lifecycle assertions must fail; every changed test runs both sides.
+          # Once quarantine is on main, ordinary whole-change revert resumes.
+          elif git diff --name-only --diff-filter=A origin/main...HEAD -- apps/report-service/src/public-quarantine.ts | grep -Fxq 'apps/report-service/src/public-quarantine.ts'; then
+            oracle_args+=(--mutation apps/report-service/test/fixtures/public-quarantine.oracle.patch)
+          # Keep the new receipt module and its URL-helper export loadable.
+          # Reverse the original public UI behavior and scoped receipt guards;
+          # all changed tests still run on both sides, with no skipped witness.
+          # Ordinary whole-change inversion resumes once this module is on main.
+          elif git diff --name-only --diff-filter=A origin/main...HEAD -- apps/viewer/src/components/error-report/PublicModelReceipt.tsx | grep -Fxq 'apps/viewer/src/components/error-report/PublicModelReceipt.tsx'; then
+            oracle_args+=(--mutation tests/evidence/model-reports-7495/public-receipt-composite.oracle.patch)
+          # Keep the new Node-tests shard script importable while removing ONLY
+          # its two guarantees: the catch-all's exclusion of pinned packages
+          # (a suite would run twice) and the refusal of a stale pinned name (a
+          # suite would run nowhere). The partition and refusal assertions turn
+          # RED. Once the script is on main, ordinary whole-change revert resumes.
+          elif git diff --name-only --diff-filter=A origin/main...HEAD -- scripts/ci-node-test-shards.mjs | grep -Fxq 'scripts/ci-node-test-shards.mjs'; then
+            oracle_args+=(--mutation tests/evidence/ci-node-test-shards/partition.oracle.patch)
+          # Keep the new push-replay probe importable while removing ONLY its
+          # two guards: the exact-tree match (any green run would replay) and
+          # the main-only-cache blockers. The main-moved and blocker assertions
+          # turn RED. Once the script is on main, whole-change revert resumes.
+          elif git diff --name-only --diff-filter=A origin/main...HEAD -- scripts/ci-push-replay.mjs | grep -Fxq 'scripts/ci-push-replay.mjs'; then
+            oracle_args+=(--mutation tests/evidence/ci-push-replay/tree-equality.oracle.patch)
+          # Keep the new viewer shard selector importable while removing ONLY
+          # its two guarantees: least-loaded placement of measured files (all
+          # land in shard 0, the rest run nothing) and the hash fallback for
+          # unmeasured files. Partition, balance and fallback assertions turn
+          # RED. Once the script is on main, ordinary whole-change revert resumes.
+          elif git diff --name-only --diff-filter=A origin/main...HEAD -- scripts/viewer-test-shards.mjs | grep -Fxq 'scripts/viewer-test-shards.mjs'; then
+            oracle_args+=(--mutation tests/evidence/ci-viewer-test-shards/selection.oracle.patch)
+          # #7673: the new large-stack geometry pool module carries its own
+          # tests, so a whole-file revert deletes them (INCONCLUSIVE). Keep the
+          # module and remove ONLY the large worker stack: the deep par_iter
+          # job then overflows and its child-process test turns RED. Once
+          # geometry_pool.rs is on main, ordinary whole-change revert resumes.
+          elif git diff --name-only --diff-filter=A origin/main...HEAD -- rust/processing/src/geometry_pool.rs | grep -Fxq 'rust/processing/src/geometry_pool.rs'; then
+            oracle_args+=(--mutation tests/evidence/geometry-pool-7673/stack-size.oracle.patch)
+          # #7676: the upload admission change adds ApiError::UploadTimeout, which
+          # its tests name, so a whole-change revert cannot compile them
+          # (INCONCLUSIVE). Keep the type and break ONLY the behaviour: the
+          # stall/trickle deadline and its idle cap never fire, the decode and
+          # the hash run on the async worker, the admission guard stays in the
+          # handler instead of riding them, the stream's data-model fill takes
+          # a second slot, and corrupt gzip/.ifcZIP streams answer 500. Once
+          # upload.rs is on main, ordinary whole-change revert resumes.
+          elif git diff --name-only --diff-filter=A origin/main...HEAD -- apps/server/src/routes/parse/upload.rs | grep -Fxq 'apps/server/src/routes/parse/upload.rs'; then
+            oracle_args+=(--mutation tests/evidence/upload-admission-7676/behaviour.oracle.patch)
+          # #7675: the untrusted-size bounds change public return types
+          # (ColumnarEntityIndex constructors, MaterialLayerIndex::from_flat),
+          # so a whole revert stops the changed callers compiling
+          # (INCONCLUSIVE). Keep the types and remove ONLY the bounds: the
+          # bounded error text, the u32 span refusal, the axis-0 layer-count
+          # refusal and the LandXML path budget, ordinal scope and counted
+          # warning; their tests turn RED. Once untrusted_sizes_7675.rs is on
+          # main, ordinary whole-change revert resumes.
+          elif git diff --name-only --diff-filter=A origin/main...HEAD -- rust/core/tests/untrusted_sizes_7675.rs | grep -Fxq 'rust/core/tests/untrusted_sizes_7675.rs'; then
+            oracle_args+=(--mutation tests/evidence/untrusted-sizes-7675/rust-crates.oracle.patch)
+          # #7676: the cache-read policy adds AdmissionGuard::into_resident,
+          # Admission::acquire_resident and the DiskCache::lookup family, which
+          # its tests name, so a whole-change revert cannot compile them
+          # (INCONCLUSIVE). Keep them and break ONLY the behaviour: a drained
+          # response gives its bytes back early, a cache read ignores the RSS
+          # breaker, eviction ignores the write time (a same-content repair is
+          # evicted) or the blob's return, an upload charge never grows to the
+          # stored size or grows before the replay gate, and two routes drop
+          # Content-Length. Once
+          # cache_entry.rs is on main, ordinary whole-change revert resumes.
+          elif git diff --name-only --diff-filter=A origin/main...HEAD -- apps/server/src/services/cache_entry.rs | grep -Fxq 'apps/server/src/services/cache_entry.rs'; then
+            oracle_args+=(--mutation tests/evidence/cache-policy-7676/behaviour.oracle.patch)
+          # engine-wasm-brotli: decoding fragmented LandXML metadata records
+          # moves to record_wire.rs (new module + new test), so a whole-change
+          # revert cannot compile its test (INCONCLUSIVE). Keep the module and
+          # break ONLY the decode: an unknown record name stops reporting the
+          # serde `unknown variant` refusal. Once record_wire.rs is on main,
+          # ordinary whole-change revert resumes.
+          elif git diff --name-only --diff-filter=A origin/main...HEAD -- rust/landxml/src/stream/record_wire.rs | grep -Fxq 'rust/landxml/src/stream/record_wire.rs'; then
+            oracle_args+=(--mutation tests/evidence/wasm-size-landxml-wire/wire-decode.oracle.patch)
+          # #7689: the tessellated index rule adds two modules (core's
+          # fast_parse_indices.rs, geometry's tessellated/indices.rs) that the
+          # changed tests import, so a whole-file revert does not compile
+          # (INCONCLUSIVE). Keep them and restore ONLY the old behaviours: `0`
+          # read as vertex 1, PnIndex ignored on IfcTriangulatedFaceSet and
+          # compacted on IfcPolygonalFaceSet, `Closed = $` oriented by the
+          # triangulated processor, noise flips of planar sheets and the
+          # case-sensitive OUTER test. Once indices.rs is on main, ordinary
+          # whole-change revert resumes.
+          elif git diff --name-only --diff-filter=A origin/main...HEAD -- rust/geometry/src/processors/tessellated/indices.rs | grep -Fxq 'rust/geometry/src/processors/tessellated/indices.rs'; then
+            oracle_args+=(--mutation tests/evidence/tessellation-indices-7689/index-rule.oracle.patch)
+          # #7682: keep the new STEP-writer modules, StepStats fields and the TS
+          # allocatedExpressId export loadable while disabling ONLY the guards the
+          # changed tests pin (value/name/id-reuse refusals, the id-space refusal,
+          # appended-record conversion, last-record-wins, the property counter).
+          # Once step_ids.rs is on main, ordinary whole-change revert resumes.
+          elif git diff --name-only --diff-filter=A origin/main...HEAD -- rust/export/src/step_ids.rs | grep -Fxq 'rust/export/src/step_ids.rs'; then
+            oracle_args+=(--mutation tests/evidence/step-writer-7682/appended-record-guards.oracle.patch)
+          # #7675: the material-row budget travels as DataModel.refused and
+          # the complex-property walks share ifc_lite_core::limits'
+          # ComplexPropertyBudget, which the changed tests construct, so a
+          # whole revert cannot compile them (INCONCLUSIVE). Keep the types and
+          # break ONLY the behaviour: material rows are never charged, the
+          # walk's byte budget restarts per property (Rust and TS), a bare
+          # budget marker is charged, the TS store pass is redone per call, a
+          # cut level's values/members are unmarked and rules read a name past
+          # it as absent, the output allowance is 4 bytes per input byte and
+          # every repeat listing is walked afresh, the server reads an
+          # unnamed nested member as no value, a repeated set id is read at
+          # every record (server and TS), the TS entity index resolves a duplicated id
+          # to its first match, a refusal maps to 500, the stream's
+          # recorded refusal is never read, and the data-model section
+          # lengths go unchecked; their tests turn RED. Once the shared vector's TS test is on main,
+          # whole revert resumes.
+          elif git diff --name-only --diff-filter=A origin/main...HEAD -- packages/parser/test/complex-property-budget.test.ts | grep -Fxq 'packages/parser/test/complex-property-budget.test.ts'; then
+            oracle_args+=(--mutation tests/evidence/untrusted-sizes-7675/server-budgets.oracle.patch)
+          # #7683: the PR deletes schema_pad.rs with its #[path] test file and
+          # adds schema_plan.rs, so a whole-change revert cannot build the Rust
+          # --lib runners (only the TS twin was observed). Keep every new item
+          # and disable ONLY the pinned behaviour: the alignment proxy's kept
+          # attributes, the two-way prefix trim/pad, the dropped-value counter,
+          # TS's IFC2X3 fail-closed and the merged span folds / last-wins index.
+          # Once schema_plan.rs is on main, ordinary whole-change revert resumes.
+          elif git diff --name-only --diff-filter=A origin/main...HEAD -- rust/export/src/schema_plan.rs | grep -Fxq 'rust/export/src/schema_plan.rs'; then
+            oracle_args+=(--mutation tests/evidence/schema-convert-7683/schema-convert.oracle.patch)
+          # #7678: the input-admission tests name the new typed token, the
+          # lossless decode and the refused-element counter, so a whole-change
+          # revert cannot compile them. Keep that API and disable ONLY the
+          # behaviour: admit every overflowing REAL, accept an unusable unit
+          # factor, keep an overflowing ePSet offset, pass non-finite outline
+          # triangles, normalise a zero extrusion direction, pass a point list
+          # that narrows to infinity, read merged storey elevations with
+          # str::parse, mesh against an unusable length unit and never count
+          # a refused element; their tests turn RED. Once the test file is on
+          # main, ordinary whole-change revert resumes.
+          elif git diff --name-only --diff-filter=A origin/main...HEAD -- rust/processing/tests/issue_7678_nonfinite_input.rs | grep -Fxq 'rust/processing/tests/issue_7678_nonfinite_input.rs'; then
+            oracle_args+=(--mutation tests/evidence/input-admission-7678/admission.oracle.patch)
+          # #7695: the empty-export rule changes five public return types to
+          # Result (export_obj, export_usd, export_gltf_streaming...), so a
+          # whole-change revert stops the changed Rust tests compiling
+          # (INCONCLUSIVE). Keep the types and disable ONLY the rule: the shared
+          # require_render_geometry never refuses, countUsdMeshes counts the
+          # /World Xform, and the CLI, MCP and viewer stop mapping
+          # NO_RENDER_GEOMETRY to their messages. Once empty_export_parity.rs is
+          # on main, ordinary whole-change revert resumes.
+          elif git diff --name-only --diff-filter=A origin/main...HEAD -- rust/export/tests/empty_export_parity.rs | grep -Fxq 'rust/export/tests/empty_export_parity.rs'; then
+            oracle_args+=(--mutation tests/evidence/empty-exports-7695/refusal.oracle.patch)
+          # #7737: keep the new semver-baseline module loadable (a whole-change
+          # revert deletes it under the gate's tests) while removing ONLY the
+          # rebuild-from-tag fallback and the NO_VERDICT output excerpt; the
+          # fallback and excerpt assertions turn RED. Once the module is on
+          # main, ordinary whole-change revert resumes.
+          elif git diff --name-only --diff-filter=A origin/main...HEAD -- scripts/lib/semver-baseline.mjs | grep -Fxq 'scripts/lib/semver-baseline.mjs'; then
+            oracle_args+=(--mutation tests/evidence/semver-baseline-7737/fallback.oracle.patch)
+          # #7679: the non-finite output policy turns to_step_real into a
+          # Result and adds step_integer / integral_token and the Python
+          # finite_json module, which the changed tests call, so a whole-change
+          # revert cannot compile them (INCONCLUSIVE). Keep every item and
+          # restore ONLY the old behaviour: a non-finite REAL written as `0.`,
+          # every number an INTEGER, any KMZ placement accepted, the Python
+          # probe passing NaN, and the TS twin's toStepReal / toStepInteger.
+          # Once finite_json.rs is on main, ordinary whole-change revert resumes.
+          # #7772: the new `math` home carries its own tests, and the changed
+          # clash tests name `math::v3`, so a whole-change revert cannot load
+          # them (INCONCLUSIVE). Keep the module and break ONLY the contracts
+          # the tests pin: the `canonical` tie rule (clash parity), the
+          # `normalize` threshold, the conjugation's `+ 0.0` sign-of-zero fold
+          # and the affine-inverse finiteness refusal. Once math/mod.rs is on
+          # main, ordinary whole-change revert resumes.
+          elif git diff --name-only --diff-filter=A origin/main...HEAD -- rust/geometry/src/math/mod.rs | grep -Fxq 'rust/geometry/src/math/mod.rs'; then
+            oracle_args+=(--mutation tests/evidence/math-home-7772/behaviour.oracle.patch)
+          elif git diff --name-only --diff-filter=A origin/main...HEAD -- rust/python/src/finite_json.rs | grep -Fxq 'rust/python/src/finite_json.rs'; then
+            oracle_args+=(--mutation tests/evidence/export-nonfinite-7679/behaviour.oracle.patch)
+          # #7777: the micro-homes PR adds ifc_lite_core::{guid, hash, fmt_num}, which
+          # its changed tests import, so a whole-change revert cannot compile them
+          # (INCONCLUSIVE). Keep the modules and disable ONLY pinned behaviour: the
+          # GlobalId first-char rule and leading window, the placeholder offset, the
+          # FNV-1a prime, ContentHash framing and the word-wise mix step. Once
+          # rust/core/src/guid.rs is on main, ordinary whole-change revert resumes.
+          elif git diff --name-only --diff-filter=A origin/main...HEAD -- rust/core/src/guid.rs | grep -Fxq 'rust/core/src/guid.rs'; then
+            oracle_args+=(--mutation tests/evidence/micro-homes-7777/behaviour.oracle.patch)
+          # #7686: the planar-face triangulation adds `quad_split_3d` and
+          # `triangulate_planar_face`, which the changed unit tests call, so a
+          # whole-change revert cannot compile them (INCONCLUSIVE). Keep every
+          # item and restore ONLY the old behaviour: the 0-2 quad diagonal and
+          # first-edges quad normal, the outer-fan fallback over failed holes,
+          # unreadable bounds dropped instead of refusing the face, and
+          # SameSense flipping planar faces (brep and structural). Once
+          # planar_tests.rs is on main,
+          # ordinary whole-change revert resumes.
+          elif git diff --name-only --diff-filter=A origin/main...HEAD -- rust/geometry/src/processors/brep/planar_tests.rs | grep -Fxq 'rust/geometry/src/processors/brep/planar_tests.rs'; then
+            oracle_args+=(--mutation tests/evidence/geometry-planar-7686/behaviour.oracle.patch)
+          # #7787 #7795 #7755: the cap triangulator's hole hygiene and the
+          # orienter's nesting test are new modules the changed unit tests
+          # call, so a whole-change revert cannot compile them (INCONCLUSIVE).
+          # Keep every module and restore ONLY the old behaviour: holes handed
+          # to earcut unchecked (no dedupe, no overlap refusal; the old touch
+          # tolerance), every closed shell wound outward, a hard-coded 0-2 quad
+          # fan, an outer-loop fan over failed holes and an uncounted dangling
+          # corner in the tessellated polygon path, every refused face counted
+          # as IfcAdvancedFace, and an unbudgeted refined CDT build. Once
+          # hole_overlap.rs is on main,
+          # ordinary whole-change revert resumes.
+          elif git diff --name-only --diff-filter=A origin/main...HEAD -- rust/geometry/src/triangulation/hole_overlap.rs | grep -Fxq 'rust/geometry/src/triangulation/hole_overlap.rs'; then
+            oracle_args+=(--mutation tests/evidence/geometry-planar-7795/behaviour.oracle.patch)
+          # #7696: the new ifc-lite-testkit crate is what every migrated test now
+          # calls, so a whole-change revert deletes it and none of them compile
+          # (INCONCLUSIVE). Keep the crate and disable ONLY the
+          # IFC_LITE_REQUIRE_FIXTURES gate: a missing or LFS-pointer fixture
+          # skips even when CI demands it, which is the #2802 failure mode; the
+          # gate tests (including the env-wiring child run) turn RED. Once
+          # fixtures.rs is on main, ordinary whole-change revert resumes.
+          elif git diff --name-only --diff-filter=A origin/main...HEAD -- rust/testkit/src/fixtures.rs | grep -Fxq 'rust/testkit/src/fixtures.rs'; then
+            oracle_args+=(--mutation tests/evidence/testkit-7696/gate.oracle.patch)
+          # #7780: F3e-0a adds `SchemaVersion::attribute` and exports
+          # `SchemaVersion`/`AttrSlot`, which the changed tests import, so a
+          # whole-change revert cannot compile them (REVERT-BROKE-BUILD). Keep the
+          # API and disable ONLY pinned behaviour: the AGGREGATE and OPTIONAL flag
+          # decode, ASCII case-folding of attribute names and the non-ASCII entity
+          # guard. Once rust/core/src/attribute_slot.rs is on main, ordinary
+          # whole-change revert resumes.
+          elif git diff --name-only --diff-filter=A origin/main...HEAD -- rust/core/src/attribute_slot.rs | grep -Fxq 'rust/core/src/attribute_slot.rs'; then
+            oracle_args+=(--mutation tests/evidence/slot-lookup-7780/behaviour.oracle.patch)
+          fi
+          node scripts/check-test-revert-oracle.mjs "${oracle_args[@]}"
+          # #7512: observe cleanup independently of scoped admission/schema.
+          # Keep the admitted pin valid, then reverse ONLY cleanup deferral:
+          # the paused real transfer's object must be deleted and turn RED.
+          # The ordinary whole-change oracle above remains mandatory.
+          # Once public-release.ts is on main, ordinary reverts resume alone.
+          if git diff --name-only --diff-filter=A origin/main...HEAD -- apps/report-service/src/public-release.ts | grep -Fxq 'apps/report-service/src/public-release.ts'; then
+            node scripts/check-test-revert-oracle.mjs --base origin/main --ci --json \
+              --only apps/report-service/src/public-release.ts \
+              --mutation apps/report-service/test/fixtures/admitted-copy-cleanup.oracle.patch \
+              --test apps/report-service/test/public-delivery.integration.test.ts
+          fi
+      - name: Remove owned report oracle prerequisites
+        if: always() && steps.report-integration.outputs.needed == 'true'
+        uses: ./.github/actions/setup-report-integration
+        with:
+          state: stop
 
   typecheck:
     name: Typecheck
     needs: [changes, build]
-    if: needs.changes.outputs.frontend == 'true'
+    if: (needs.changes.outputs.frontend == 'true') && needs.changes.outputs.replay != 'true'
     # tsc is not CPU-bound; the free 2-core runner is fine and costs nothing.
     runs-on: ${{ (vars.SELF_HOSTED_CI == 'true' && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false && !contains(github.event.pull_request.labels.*.name, 'ci:hosted')))) && fromJSON('["self-hosted","linux","x64","ifclite"]') || 'ubuntu-latest' }}
     timeout-minutes: 12
@@ -720,25 +1142,32 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.2
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 26
       - run: bun install --frozen-lockfile
       - name: Download build artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: build-output
           path: packages
-      - run: bun run typecheck
+      # `typecheck:ci`, not `typecheck`: the turbo `typecheck` task
+      # `dependsOn: ["^build"]`, and with no turbo cache on the runner that
+      # REBUILT 56 packages here (measured: 126 tasks for 65 typechecks, ~7 min)
+      # -- the exact dists the artifact above already holds, from the same
+      # commit. `--only` typechecks against the artifact instead, the same move
+      # node-tests made for `test`. A dist missing from the artifact fails tsc
+      # loudly; it cannot pass vacuously.
+      - run: bun run typecheck:ci
 
   lint:
     name: Lint
     needs: [changes, build]
-    if: needs.changes.outputs.frontend == 'true'
+    if: (needs.changes.outputs.frontend == 'true') && needs.changes.outputs.replay != 'true'
     # Two gates, both free-runner: oxlint over the source (no compile), and the
     # unused-locals ratchet (scripts/check-unused-locals.mjs), which needs the
     # built dist below because it type-checks each package. Before #2603 this
-    # lane ran NOTHING: the root script was `pnpm -r lint` and no package
+    # lane ran NOTHING: the root script was `bun run -r lint` and no package
     # defined one, so it passed in 20s having checked nothing, and dead imports
     # shipped through it.
     runs-on: ${{ (vars.SELF_HOSTED_CI == 'true' && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false && !contains(github.event.pull_request.labels.*.name, 'ci:hosted')))) && fromJSON('["self-hosted","linux","x64","ifclite"]') || 'ubuntu-latest' }}
@@ -757,7 +1186,7 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.2
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 26
       - run: bun install --frozen-lockfile
@@ -767,7 +1196,7 @@ jobs:
       # unmeasurable, and the ratchet fails closed. (It was written assuming
       # "lint needs no dist", which is true of eslint and false of this.)
       - name: Download build artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: build-output
           path: packages
@@ -785,7 +1214,7 @@ jobs:
       - name: Check changeset-bump gate regressions
         run: node --test scripts/check-changeset-bump.test.mjs
 
-  # The viewer's own suite, split out of `node-tests` AND sharded eight ways.
+  # The viewer's own suite, split out of `node-tests` across sixteen shards.
   #
   # Measured, not guessed. Splitting it out of node-tests took that lane from
   # a 25:00 timeout to 5:32 SUCCESS, so everything except the viewer costs five
@@ -798,12 +1227,33 @@ jobs:
   # 2:29, 2:01, 1:50 against a 25 minute cap, at FOUR shards over 521 files.
   # The suite had grown to 803 files by 2026-09-11 and the four shards were
   # measured at 5.6-8.2 min on hosted runners, on the frontend PR's critical
-  # path; EIGHT shards (CI redesign, step 4) halves the per-shard file count
-  # back to roughly the size the timings above were recorded at. Membership
+  # path; EIGHT shards (CI redesign, step 4) halved the per-shard file count
+  # then. The suite now needs sixteen shards (see #7360 below). Membership
   # is a hash of the path (below), so going 4 -> 8 reassigns files exactly
   # once and then stays stable.
   #
-  # Shard membership is a hash of the file PATH, not its index in the sorted
+  # Shard membership is by MEASURED DURATION first, path hash second
+  # (scripts/viewer-test-shards.mjs, tested by viewer-test-shards.test.mjs).
+  # Measured on three green main runs (2026-10-14): the hash split the
+  # same ~10,470 s of tests into shards of 336-900 s, and the slowest was
+  # always shard 4 (876-900 s): the content, not the runner. So every file in
+  # apps/viewer/test-durations.json is bin-packed (greedy LPT, ties by path)
+  # across the 16 shards, ~654 s of measured work each. The packing is a
+  # function of the manifest alone, so adding or deleting a test file still
+  # moves no other file; a file the manifest does not list takes the path
+  # hash below, so a new file always runs in exactly one shard. Runner speed
+  # still varies run to run (one job ran 1.7x its files' median), which no
+  # assignment can remove.
+  #
+  # Refresh the manifest when shard times drift apart, from two or three
+  # green runs (per-file times are median-combined):
+  #   node scripts/refresh-viewer-test-durations.mjs --run <id> --run <id>
+  # It needs `gh` and reads the `Viewer tests (shard n)` job logs; how TAP
+  # timestamps are attributed to files is in scripts/lib/viewer-test-durations.mjs.
+  # Changing the shard count below falls every file back to the hash until
+  # the manifest is refreshed for the new count.
+  #
+  # The fallback hash is of the file PATH, not its index in the sorted
   # list. With `NR % n` every file after an added or removed test moves to a
   # different shard: measured, adding ONE file reassigned 534 of 534. Two
   # things that breaks. A flaky file wanders between shards, and "shard 1
@@ -862,13 +1312,15 @@ jobs:
   viewer-tests:
     name: Viewer tests (shard ${{ matrix.shard }})
     needs: [changes, build]
-    if: needs.changes.outputs.frontend == 'true' || needs.changes.outputs.rust == 'true'
+    if: (needs.changes.outputs.frontend == 'true' || needs.changes.outputs.rust == 'true') && needs.changes.outputs.replay != 'true'
     runs-on: ${{ (vars.SELF_HOSTED_CI == 'true' && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false && !contains(github.event.pull_request.labels.*.name, 'ci:hosted')))) && fromJSON('["self-hosted","linux","x64","ifclite"]') || 'ubuntu-latest' }}
     timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+        # #7360 qualification: 2,180 files outgrew eight serial shards.
+        # Keep the 25-minute cap and run every path exactly once.
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -878,12 +1330,12 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.2
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 26
       - run: bun install --frozen-lockfile
       - name: Download build artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: build-output
           path: packages
@@ -917,42 +1369,24 @@ jobs:
       #    build (53s of "✓ built in 53.43s") which its tests do not need. The
       #    sibling dists the tests DO need come from the downloaded artifact.
       #
-      # `TEST_SHARDS`/`TEST_SHARD` select the files whose path hash lands in
-      # this shard (see apps/viewer's test script). Unset, the script takes
-      # every file, so a local `bun run test` is unchanged. The split is exact:
-      # every path hashes to exactly one of the eight residues, so nothing is
-      # dropped or run twice (521 files split 130+131+130+130 at four).
+      # `TEST_SHARDS`/`TEST_SHARD` select this shard's files (apps/viewer's
+      # test script pipes its file list through scripts/viewer-test-shards.mjs,
+      # see above). Unset, the script takes every file, so a local `bun run test`
+      # is unchanged. The split is exact: a manifest file is packed into one
+      # shard and any other path hashes to exactly one of the 16 residues, so
+      # nothing is dropped or run twice; an empty selection fails the step.
       - run: bun run --filter=@ifc-lite/viewer run test
         env:
-          TEST_SHARDS: '8'
+          TEST_SHARDS: '16'
           TEST_SHARD: ${{ matrix.shard }}
 
-  node-tests:
-    name: Node tests
+  node-guards:
+    name: Node guards
     needs: [changes, build]
-    if: needs.changes.outputs.frontend == 'true' || needs.changes.outputs.rust == 'true'
-    # Free runner — vitest consumes the prebuilt artifact; not compile-bound.
-    # 25 min: the job also runs the previously dark ifcx/renderer suites and
-    # the integration harness now; 18 min left no headroom (timed out at the
-    # integration step on a cold-ish run).
-    #
-    # 25 stopped being enough on 2026-08-21 and the lane timed out on MAIN.
-    #
-    # DISAMBIGUATION RULE, because this cost hours: a timed-out lane reports as
-    # `cancelled`, the SAME word a supersession gets. Nothing in the API
-    # distinguishes them. Separate them by DURATION against `timeout-minutes` —
-    # 25m16s, 25m18s and 25m19s against a 25 minute cap are timeouts. Also note
-    # turbo BUFFERS a task's output until the task ends, so a task that never
-    # finishes prints nothing and reads as a hang rather than as slowness.
-    #
-    # The viewer suite now runs in its own concurrent job (`viewer-tests`)
-    # rather than at the tail of this one. Raising the cap was rejected: it
-    # went 18 -> 25 once already for this reason, and buys time rather than
-    # headroom.
-    #
-    # If this lane needs attention again, `@ifc-lite/provenance` is the next
-    # target: it alone spent 396s of the run that exposed this, with single
-    # tests at 87s and 38s.
+    if: (needs.changes.outputs.frontend == 'true' || needs.changes.outputs.rust == 'true') && needs.changes.outputs.replay != 'true'
+    # #7530: guards/scripts took about nine minutes before the serial package
+    # suites used another sixteen, exhausting the unchanged 25-minute budget.
+    # Give each workload its own runner and budget; keep every existing check.
     runs-on: ${{ (vars.SELF_HOSTED_CI == 'true' && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false && !contains(github.event.pull_request.labels.*.name, 'ci:hosted')))) && fromJSON('["self-hosted","linux","x64","ifclite"]') || 'ubuntu-latest' }}
     timeout-minutes: 25
     steps:
@@ -974,12 +1408,12 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.2
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 26
       - run: bun install --frozen-lockfile
       - name: Download build artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: build-output
           path: packages
@@ -999,10 +1433,19 @@ jobs:
       # then made every fixture-gated test skip silently and report ok.
       - name: Verify fixtures
         run: bun run fixtures:check
+      - name: Verify packed developer workflows
+        run: bun run test:packed
       - name: Check test wiring
         run: node scripts/check-test-wiring.mjs
       - name: Check export completion calls
         run: node scripts/check-export-event-calls.mjs
+      # AI evaluation corpus (#6928): fingerprints, privacy scan, recordings,
+      # label sheets and study records; then the release invariants over the
+      # recorded corpus. Replay through the viewer runs in the viewer suite.
+      - name: Check AI evaluation manifest
+        run: node scripts/ai-eval/check-ai-eval-manifest.mjs
+      - name: Check AI evaluation release invariants
+        run: node scripts/ai-eval/check-ai-eval-invariants.mjs
       # Executable proof the wiring gate cannot pass vacuously — the failure
       # mode it exists to catch is exactly the one it could have itself. Its
       # first fixture reconstructs #3062's pre-wiring state (a gate script and
@@ -1089,6 +1532,14 @@ jobs:
         run: node --test scripts/check-refwalk-guards.test.mjs scripts/lib/refwalk-classify.test.mjs
       - name: Check for unguarded entity-reference walks
         run: node scripts/check-refwalk-guards.mjs
+      # #7674: a comparator built on `partial_cmp` is not a total order on NaN,
+      # and a Rust >= 1.81 sort may panic on it -- an abort in the wasm worker.
+      # Every production `partial_cmp` use needs an allowlist row. Its own
+      # tests run first so a broken detector fails rather than reads clean.
+      - name: Check float sort comparator gate's own tests
+        run: node --test scripts/check-float-sort-comparators.test.mjs
+      - name: Check for non-total float sort comparators
+        run: node scripts/check-float-sort-comparators.mjs
       # #5236: a raw base-store enumeration in a live query/write can return a
       # tombstoned entity or miss one created in the mutation overlay. The
       # parser test pins the detector; the gate ratchets the scoped callers.
@@ -1096,6 +1547,16 @@ jobs:
         run: node --test scripts/check-raw-entity-enumeration.test.mjs
       - name: Check for new raw entity enumeration
         run: node scripts/check-raw-entity-enumeration.mjs
+      # #6962: perf toggles live in one registry (apps/viewer/src/lib/perf/
+      # flags.ts). The lint fails on a ramp more than four weeks past its
+      # introducedAt, a flag with no owner or removal condition, and any
+      # production `__IFC_LITE_*` global read outside the registry and the
+      # shared reader. Its own tests run first so a broken detector fails here
+      # rather than report a clean tree.
+      - name: Check perf-flag lint's own tests
+        run: node --test scripts/check-perf-flags.test.mjs
+      - name: Check perf-flag registry and global-read ratchet
+        run: node scripts/check-perf-flags.mjs
       # AGENTS.md has asked for TypeScript modules under ~400 lines since long
       # before this gate existed, and self-policing left 312 files over the
       # line. A convention with no gate ratchets the wrong way: the allowlist
@@ -1422,6 +1883,13 @@ jobs:
       - name: Check RTC frame gate regressions
         run: node --test scripts/check-rtc-frame-copies.test.mjs
 
+      # No two tracked paths may differ only in case: such a pair collapses on
+      # Windows/macOS/WSL-/mnt/c checkouts and breaks typecheck and build (#6978).
+      - name: Check for case-colliding tracked paths
+        run: node scripts/check-path-case-collisions.mjs
+      - name: Check case-collision gate regressions
+        run: node --test scripts/check-path-case-collisions.test.mjs
+
       # `scripts/lib/vitest-timeout-audit.mjs` (#2948) replaced
       # `audit-test-timeouts.mjs`, which was deleted in the same change rather
       # than left beside it: two hand-written JS/TS lexers for one question is
@@ -1636,8 +2104,9 @@ jobs:
       # scripts/docs/ joined it for the same reason in #3200 - the catch-all is
       # per-DIRECTORY, so it goes blind on the next subdirectory anyone adds.
       # scripts/xmatch/ joined with its first test file (#4955, PR-6).
+      # scripts/ids-conformance/ joined with the IDS conformance dashboard (IDS-125).
       - name: Run every scripts/ test file (glob catch-all)
-        run: node --test scripts/*.test.mjs scripts/lib/*.test.mjs scripts/fixtures/*.test.mjs scripts/docs/*.test.mjs scripts/review/*.test.mjs scripts/review/lib/*.test.mjs scripts/perf/*.test.mjs scripts/xmatch/*.test.mjs
+        run: node --test scripts/*.test.mjs scripts/lib/*.test.mjs scripts/fixtures/*.test.mjs scripts/docs/*.test.mjs scripts/review/*.test.mjs scripts/review/lib/*.test.mjs scripts/perf/*.test.mjs scripts/perf-ratchet/*.test.mjs scripts/xmatch/*.test.mjs scripts/ai-eval/*.test.mjs scripts/ai-eval/lib/*.test.mjs scripts/ai-eval/ids/*.test.mjs scripts/ids-conformance/*.test.mjs scripts/ids-conformance/lib/*.test.mjs scripts/ids-conformance/lib/adapters/*.test.mjs
       # Committed codegen output (packages/codegen/generated/**,
       # packages/parser/src/generated/**, packages/data/src/ifc-schema/
       # generated/**) had no CI freshness gate at all — a generator bug fixed
@@ -1648,14 +2117,6 @@ jobs:
       # rebuilds it (fast, single package) otherwise.
       - name: Check codegen output freshness
         run: bun run check:codegen-sync
-      # `IFC2X3_ENTITY_NAMES` (#5116) is the Rust schema converter's "does
-      # this type have any representation at all in IFC2X3" table, generated
-      # from the same TS entity table the TypeScript converter's
-      # `attrNameTable('IFC2X3')` reads. Check it here for the same reason as
-      # the rooted-type table above: a schema refresh could otherwise leave
-      # the committed Rust table stale while CI stays green.
-      - name: Check IFC2X3 entity-name table freshness
-        run: node scripts/generate-ifc2x3-entity-names.mjs --check
       # The IFC2X3 required-slot table both schema converters read on a
       # downgrade (#4714) is generated from the EXPRESS-derived IFC2X3 registry
       # into BOTH languages. Check it here so a schema refresh cannot leave one
@@ -1716,8 +2177,11 @@ jobs:
       # schema NAMES resolves — a `tsReturn` of `BimClash.Nope` fails here
       # (#2422). No build needed: the .d.ts is self-contained and the templates
       # import nothing.
-      # Scoped package: `bun run --filter` exits 1 when nothing matches, so a
-      # filter that stops resolving fails this gate instead of skipping it.
+      # Scoped name + `--fail-if-no-match`: an unmatched pnpm filter prints
+      # "No projects matched the filters" and exits 0, so a filter that stops
+      # resolving would turn this gate green without running it. That is the
+      # same "cannot fail" shape as the `skipLibCheck` default this step was
+      # already fixed for, so it is closed here rather than left to luck.
       - name: Check sandbox script templates typecheck
         run: bun run --filter=@ifc-lite/viewer --fail-if-no-match check:templates
       # Docs upkeep guards (cheap, no build/fixtures needed — the doc-sample
@@ -1741,6 +2205,74 @@ jobs:
         run: node scripts/generate-coverage-ledger.mjs --check
       - name: Check coverage ledger gate regressions
         run: node --test scripts/generate-coverage-ledger.test.mjs
+
+  node-tests:
+    name: Node tests (shard ${{ matrix.shard }}/4)
+    needs: [changes, build]
+    if: (needs.changes.outputs.frontend == 'true' || needs.changes.outputs.rust == 'true') && needs.changes.outputs.replay != 'true'
+    # #7530: run package and real-WASM/integration suites independently of the
+    # guard workload. Both jobs consume the same verified build and fixtures,
+    # retain the 25-minute limit, and are judged by the required aggregate.
+    runs-on: ${{ (vars.SELF_HOSTED_CI == 'true' && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false && !contains(github.event.pull_request.labels.*.name, 'ci:hosted')))) && fromJSON('["self-hosted","linux","x64","ifclite"]') || 'ubuntu-latest' }}
+    timeout-minutes: 25
+    # SHARDED, because this one job was the frontend PR's whole critical path:
+    # measured on 72 green PR runs, Node tests p50 19.5 min against Build 5.9
+    # and every other lane under 12.5. Inside the job, `turbo test
+    # --concurrency=1` (#7471, below) runs 65 package suites ONE AT A TIME
+    # (1,142 s on the run measured), and three packages were 45% of that:
+    # mcp 210 s, cli 193 s, create 110 s. Splitting across runners keeps the
+    # one-suite-at-a-time rule inside each runner, so no deadline sees more
+    # contention than before; the shards just run side by side.
+    #
+    # Shards 1-3 are PINNED package lists (bin-packed to ~285 s each from that
+    # run); shard 4 is EVERYTHING ELSE, computed as an exclusion of the pinned
+    # lists. So a new package can never fall between shards: it lands in 4 by
+    # default. See scripts/ci-node-test-shards.mjs.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          lfs: false
+          persist-credentials: false
+          # Preserve the original checkout contract in both split jobs.
+          fetch-depth: 0
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+      - run: bun install --frozen-lockfile
+      - name: Download build artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: build-output
+          path: packages
+      - name: Download example builds
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: example-build-output
+          path: examples
+      - name: Cache test fixtures
+        id: fixtures-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: tests/models
+          key: ci-fixtures-${{ runner.os }}-${{ hashFiles('tests/models/manifest.json') }}
+      - name: Fetch fixtures
+        if: steps.fixtures-cache.outputs.cache-hit != 'true'
+        run: bun run fixtures
+
+      # Unconditional — this is the point of the step. The fetch above is
+      # gated on a cache miss, so on a cache hit nothing had ever confirmed the
+      # restored tree still matches the manifest. A partial or corrupted cache
+      # then made every fixture-gated test skip silently and report ok.
+      - name: Verify fixtures
+        run: bun run fixtures:check
       # The viewer suite runs in its OWN job (`viewer-tests`) rather than here.
       # One job was running all 47 packages' tests in sequence, and the viewer
       # alone needs more than the remainder of the budget: on the run that
@@ -1760,20 +2292,34 @@ jobs:
       # Every test runs against that artifact's dist/ exactly as before; only
       # the redundant rebuild is gone.
       #
-      # `--concurrency=4`: without the build edges, `--only` lets turbo start
-      # every package's suite at once (default 10 tasks) on a 4-vCPU runner;
-      # each vitest then forks its own workers, and wall-clock-sensitive
-      # tests started tripping their 5 s default (bcf XSD conformance,
-      # timing-ladder's "100x more expensive" ladder, parser's 65536-name
-      # scan). One task per core keeps the no-rebuild win without the
-      # contention that the sequential build graph used to prevent.
-      - run: bun x turbo test --only --concurrency=4 --filter=!@ifc-lite/viewer --filter=!@ifc-lite/provenance
+      # Vitest creates its own worker pool inside each package task. On the
+      # four-core runner, overlapping four pools still exceeded unchanged 5 s
+      # deadlines in unrelated parser and IDS invariants (#7471). Run one
+      # package suite at a time; its own worker pool may use the runner.
+      # Keep the artifact-only path, package selectors, tests and deadlines.
+      # The shard -> package mapping, and the refusal of a pinned name that no
+      # longer matches a workspace package, live in the script (tested by
+      # scripts/ci-node-test-shards.test.mjs, which proves the four shards
+      # partition the real workspace). Assigned, not piped, so a refusal
+      # fails this step under `bash -e` instead of running turbo unfiltered.
+      - name: Package tests (shard ${{ matrix.shard }}/4)
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          filters_txt=$(node scripts/ci-node-test-shards.mjs --shard "$SHARD")
+          mapfile -t filters <<<"$filters_txt"
+          echo "turbo filters: ${filters[*]}"
+          bun x turbo test --only --concurrency=1 "${filters[@]}"
+      # The root-level suites below are not turbo packages, so the package
+      # split above cannot reach them. They run once, on the catch-all shard.
       - name: Integration tests (parse → quantities → export)
+        if: matrix.shard == 4
         # Step-scoped timeout: a hung harness must fail fast here, not
         # silently consume the whole job budget.
         timeout-minutes: 5
         run: bun run test:integration
       - name: API route tests (relay handlers)
+        if: matrix.shard == 4
         # `tests/api/**` was reachable only by running `bun run test:api` by hand,
         # so the Dalux relay's path allowlist and node allowlist - the guards
         # that stop an unauthenticated public endpoint becoming an open proxy -
@@ -1782,6 +2328,7 @@ jobs:
         timeout-minutes: 5
         run: bun run test:api
       - name: WASM contract tests (real processGeometryBatch boundary)
+        if: matrix.shard == 4
         run: bun run test:wasm-contract
       # The snap cache reconstructs model edges from the mesher's per-triangle
       # segments, so its correctness depends on geometry the unit fixtures can
@@ -1790,6 +2337,7 @@ jobs:
       # reported length is the whole run, the cache does not move when triangle
       # emission order does -- the #2388 failure class). Issue #2199.
       - name: Snap edge reconstruction (real wasm pipeline)
+        if: matrix.shard == 4
         run: bun run test:snap-edges
 
   # `@ifc-lite/provenance` alone. Measured (CI redesign, step 4): its
@@ -1804,7 +2352,7 @@ jobs:
   provenance-tests:
     name: Provenance tests
     needs: [changes, build]
-    if: needs.changes.outputs.frontend == 'true' || needs.changes.outputs.rust == 'true'
+    if: (needs.changes.outputs.frontend == 'true' || needs.changes.outputs.rust == 'true') && needs.changes.outputs.replay != 'true'
     runs-on: ${{ (vars.SELF_HOSTED_CI == 'true' && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false && !contains(github.event.pull_request.labels.*.name, 'ci:hosted')))) && fromJSON('["self-hosted","linux","x64","ifclite"]') || 'ubuntu-latest' }}
     # 353 s for the one file, ~6.5 min for the package on a hosted runner; 15
     # leaves headroom without hiding a hang for long.
@@ -1818,12 +2366,12 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.2
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 26
       - run: bun install --frozen-lockfile
       - name: Download build artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: build-output
           path: packages
@@ -1835,7 +2383,7 @@ jobs:
   # regressions — unit suites mock the WASM boundary and the Rust tests
   # exercise a different mesh pipeline (#858/#957).
   viewer-e2e:
-    name: Viewer E2E smoke (${{ matrix.shard }}/2)
+    name: Viewer E2E smoke (${{ matrix.shard }}/4)
     needs: [changes, build]
     # PR-only: see the `push:` trigger comment. The post-merge run repeats the
     # cheap unit lanes that catch cross-PR collisions, not the whole matrix.
@@ -1846,7 +2394,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2]
+        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1856,12 +2404,12 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.2
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 26
       - run: bun install --frozen-lockfile
       - name: Download build artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: build-output
           path: packages
@@ -1881,27 +2429,31 @@ jobs:
       # then made every fixture-gated test skip silently and report ok.
       - name: Verify fixtures
         run: bun run fixtures:check
-      # Package dists come from the build artifact; the wasm build
-      # soft-skips (no wasm-pack on this runner) and reuses the artifact
-      # runtime, so this is just the vite build of the app.
-      # The viewer's own `build` script runs scripts/check-tla-chunk-await.mjs
-      # over the emitted dist/assets, so this step enforces the __tla guard
-      # too. It lives in the build script rather than here because the #2243
-      # white screen reached users through Vercel, and a CI-only gate does not
-      # run there: vercel-build.sh -> turbo build --filter -> this same script.
-      # `build:e2e` is also what the revert oracle runs before each side of a
-      # Playwright-spec measurement (#6267), so the two lanes build the same way.
-      - name: Build viewer app (also runs the __tla chunk-await guard)
-        run: bun run build:e2e
+      # The app under test is the one the `build` job built, not a rebuild.
+      # That build ran the viewer's own `build` script (vite build, then
+      # scripts/check-tla-chunk-await.mjs over the emitted dist/assets), so the
+      # __tla guard still gates this commit -- in `build`, where a failure also
+      # stops every lane that needs it. The guard lives in the build script
+      # rather than in a CI step because the #2243 white screen reached users
+      # through Vercel, and a CI-only gate does not run there. The revert
+      # oracle still builds with `build:e2e` (#6267): it needs a build per side
+      # of its measurement, which a single artifact cannot give it.
+      - name: Download viewer app build
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: viewer-dist
+          path: apps/viewer/dist
       # No browser download: the CI project uses channel:'chrome' (the
       # runner's preinstalled Chrome) because Playwright's headless
       # shell has a broken WebGPU device under software rendering.
+      - name: Install Playwright video encoder
+        run: bun x playwright install ffmpeg
       - name: Run E2E smoke
         # E2E_GPU_STRICT=0: the runner's SwiftShader WebGPU device is
         # unstable under load (drops mid-upload), so GPU-dependent
         # assertions (pick pass, screenshot density, GPU-error
         # strictness) skip here and run in the local headed project
-        # (bun run test:e2e). The CPU-side pipeline assertions — mesh
+        # (pnpm test:e2e). The CPU-side pipeline assertions — mesh
         # count through real WASM, data-store population, model
         # registration, section-plane store contract — still gate.
         env:
@@ -1909,11 +2461,21 @@ jobs:
         # The test command must end before the 20-minute job limit so its
         # failure summary and test-results artifact survive a slow/hung test.
         # The list reporter also names completed tests while the job runs.
-        run: timeout --signal=INT --kill-after=30s 13m bun run test:e2e:ci --shard=${{ matrix.shard }}/2 --reporter=list
+        run: timeout --signal=INT --kill-after=30s 13m bun run test:e2e:ci --shard=${{ matrix.shard }}/4 --reporter=list
+      - name: Upload assistant browser evidence
+        if: always() && hashFiles('test-results/**/assistant-*.png', 'test-results/*assistant-context*/video.webm') != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: assistant-browser-evidence-${{ matrix.shard }}
+          path: |
+            test-results/**/assistant-*.png
+            test-results/*assistant-context*/video.webm
+          if-no-files-found: error
+          retention-days: 3
       - name: Upload E2E failure context
         # Playwright's error-context.md / traces for the failed tests only.
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-test-results-${{ matrix.shard }}
           path: test-results/
@@ -1932,7 +2494,7 @@ jobs:
   rust-tests:
     name: Rust tests
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: (needs.changes.outputs.rust == 'true') && needs.changes.outputs.replay != 'true'
     # Standard GitHub runners keep routine Rust validation out of Depot's
     # metered pool. The longer cap accommodates a cold GitHub cache restore.
     runs-on: ${{ (vars.SELF_HOSTED_CI == 'true' && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false && !contains(github.event.pull_request.labels.*.name, 'ci:hosted')))) && fromJSON('["self-hosted","linux","x64","ifclite"]') || 'ubuntu-latest' }}
@@ -1957,7 +2519,13 @@ jobs:
       - name: Cargo cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          prefix-key: ci-rust
+          # `-o1-lt`: the test steps below build at opt-level 1 with line-tables
+          # debug info via step env,
+          # which rust-cache's key cannot see. Under the old key main would
+          # never save the opt-level-1 tree (rust-cache skips the save when the
+          # key exists), so every PR would compile cold: measured 14m49s on
+          # #7573 vs 5m45s warm. A new prefix lets main seed it once.
+          prefix-key: ci-rust-o1-lt
           shared-key: main
           save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'merge_group' }}
       - name: Cache test fixtures
@@ -1993,13 +2561,71 @@ jobs:
       # That wasm32 leg runs on its own schedule in determinism.yml.
       - name: Clippy (lint gate)
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # G6 (#7672): a dependency a member declares but its sources never name is
+      # compile time and supply-chain surface for nothing (XCUT-17 found seven).
+      # cargo-machete is a text scan, so it needs no build and runs in seconds.
+      # A dependency that is only there for a feature or a macro goes in that
+      # crate's `[package.metadata.cargo-machete] ignored`, with a reason.
+      # Prebuilt binary, pinned like cargo-nextest below (not `cargo install`).
+      - name: Install cargo-machete
+        uses: taiki-e/install-action@7d7411b181173c48350233b3f42241a9ccc6aa2b # cargo-machete (snapshot pinned 2026-10)
+      - name: Unused dependencies (cargo machete)
+        run: cargo machete
+      # cargo-nextest, not `cargo test`, for the test binaries. Measured on a
+      # green PR run: `cargo test --workspace` was 26 min, of which compile was
+      # 5m45s and the remaining ~20 min was ~290 test binaries run ONE AFTER
+      # ANOTHER -- libtest parallelises only inside a binary, so every binary
+      # waits for the slowest test of the one before it (export's unit tests
+      # 379 s, scan_segmentation_cylinders 252 s, scan_cylinder_acceptance
+      # 136 s ...). nextest schedules every test of every binary on one pool.
+      # Same tests, same `--workspace` selection, same `#[ignore]` handling;
+      # each test gets its own process, which is stricter, not looser, about
+      # state leaking between tests. Profile in .config/nextest.toml.
+      #
+      # OPT-LEVEL 1 for the test build, measured on #7573's first run: with
+      # nextest scheduling every test on one pool the lane was STILL 26 min,
+      # because the 4 cores were saturated by tests that are slow only because
+      # they run unoptimised -- one export alignment test 501 s, two more
+      # 200+ s, ~15 processing scan tests 60-127 s each (summary: 4578 tests,
+      # 1187 s wall). Release (what ships, incl. the wasm) is opt-level 3, so
+      # this moves the tests TOWARDS production codegen, not away from it.
+      # `debug-assertions` and `overflow-checks` are separate profile keys and
+      # stay ON (dev defaults); Rust never enables fast-math, so float results
+      # are unchanged. Step-scoped env, not Cargo.toml: local builds and
+      # clippy are untouched. Per-package overrides in Cargo.toml
+      # (ifc-lite-geometry at 3) still win.
+      #
+      # DEBUG INFO: line tables only. Measured warm on main's cache, the
+      # opt-level-1 compile of the 10 workspace crates was 10m45s (5m45s at
+      # opt-level 0). Full DWARF is a known large share of an optimised
+      # build; the cold-vs-cold comparison on the introducing PR (14m49s at
+      # full debug info) is the measurement.
+      # Panics and backtraces still name file and line; what goes is variable
+      # inspection in a debugger, which nobody does on a CI runner.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@f360235162158ca4526b07999d99c38ade05a414 # cargo-nextest (snapshot pinned 2026-10)
       - name: Rust tests
         # Fixtures are fetched above (Fetch fixtures / Cache test fixtures),
         # so a missing one here is fixture drift, not a legitimate local skip
         # (rust/export/src/test_support.rs) — make that a hard failure.
         env:
           IFC_LITE_REQUIRE_FIXTURES: "1"
-        run: cargo test --workspace
+          CARGO_PROFILE_DEV_OPT_LEVEL: "1"
+          CARGO_PROFILE_TEST_OPT_LEVEL: "1"
+          CARGO_PROFILE_DEV_DEBUG: line-tables-only
+          CARGO_PROFILE_TEST_DEBUG: line-tables-only
+        run: cargo nextest run --workspace --profile ci
+      # nextest does not run doctests; `cargo test --workspace` did. Run them
+      # here so the lane's coverage is exactly what it was. Same profile env,
+      # so the libraries built above are reused rather than rebuilt.
+      - name: Rust doctests
+        env:
+          IFC_LITE_REQUIRE_FIXTURES: "1"
+          CARGO_PROFILE_DEV_OPT_LEVEL: "1"
+          CARGO_PROFILE_TEST_OPT_LEVEL: "1"
+          CARGO_PROFILE_DEV_DEBUG: line-tables-only
+          CARGO_PROFILE_TEST_DEBUG: line-tables-only
+        run: cargo test --workspace --doc
 
       # The feature legs (parquet-bos, csg_manifold_gate, csg_capture, the
       # all-features clippy) run in `rust-full` below -- OFF the PR lane,
@@ -2072,6 +2698,12 @@ jobs:
           IFC_LITE_REQUIRE_FIXTURES: "1"
         run: cargo test -p ifc-lite-export --features parquet-bos
 
+      # rust/python is excluded from the workspace (its own lockfile), so
+      # `cargo test --workspace` never runs its unit tests (finite_json, rebar
+      # schedule, ...) and the wheel workflow only runs pytest (#7770).
+      - name: Rust tests (rust/python, outside the workspace)
+        run: cargo test --manifest-path rust/python/Cargo.toml
+
       - name: Clippy (parquet-bos feature)
         run: cargo clippy -p ifc-lite-export --features parquet-bos --all-targets -- -D warnings
 
@@ -2126,6 +2758,17 @@ jobs:
       # today and not something to introduce in a hotfix.
       - name: Rust tests (csg_capture feature)
         run: cargo test -p ifc-lite-geometry --features csg_capture
+
+      # #6537 diagnostic work must be tested with its opt-in counters present.
+      # Default workspace tests only exercise the unchanged ring geometry.
+      - name: Rust tests (opening work counters)
+        run: cargo test -p ifc-lite-geometry --features opening-perf-trace --lib csg::consolidate::ring_ops::tests
+
+      - name: Rust tests (opening work diagnostic output guard)
+        run: cargo test -p ifc-lite-processing --features opening-perf-trace --example opening_work_probe
+
+      - name: Clippy (canonical opening work diagnostic)
+        run: cargo clippy -p ifc-lite-processing --features opening-perf-trace --example opening_work_probe -- -D warnings
 
   # Geometry watertightness / triangulation-invariance census.
   #
@@ -2221,7 +2864,7 @@ jobs:
       # fixture corpus locally. Re-blessing is now: download, replace the golden.
       - name: Upload the census rows
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: watertightness-census-rows
           path: target/watertightness_census.run.tsv
@@ -2378,7 +3021,7 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.2
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 26
       # The scalar codemod imports the repo's own pinned typescript package;
@@ -2413,7 +3056,7 @@ jobs:
   docs-checks:
     name: Docs checks (docs-only PRs)
     needs: changes
-    if: needs.changes.outputs.docs == 'true' && needs.changes.outputs.frontend != 'true' && needs.changes.outputs.rust != 'true'
+    if: (needs.changes.outputs.docs == 'true' && needs.changes.outputs.frontend != 'true' && needs.changes.outputs.rust != 'true') && needs.changes.outputs.replay != 'true'
     # Free runner - three node scripts, not compute-bound.
     runs-on: ${{ (vars.SELF_HOSTED_CI == 'true' && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false && !contains(github.event.pull_request.labels.*.name, 'ci:hosted')))) && fromJSON('["self-hosted","linux","x64","ifclite"]') || 'ubuntu-latest' }}
     timeout-minutes: 10
@@ -2426,7 +3069,7 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.2
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 26
       - run: bun install --frozen-lockfile
@@ -2448,8 +3091,8 @@ jobs:
   docs-site:
     name: Docs site build (mkdocs --strict)
     needs: changes
-    if: needs.changes.outputs.docs == 'true'
-    # Free runner - a pure-Python static site build, not compute-bound.
+    if: (needs.changes.outputs.docs == 'true') && needs.changes.outputs.replay != 'true'
+    # Build declarations and the searchable reference before MkDocs; no Rust setup is needed.
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -2457,6 +3100,8 @@ jobs:
         with:
           lfs: false
           persist-credentials: false
+      - name: Generate searchable public API reference
+        uses: ./.github/actions/setup-docs-api
       # Seconds, no Python: names the page and the fix before the full build.
       - name: Every docs page is in the nav or declared not_in_nav
         run: node scripts/docs/check-mkdocs-nav.mjs
@@ -2510,7 +3155,7 @@ jobs:
       # high enough: >=1.93.0 needed, got 1.93.0-nightly"). The gate invokes it
       # as `cargo +stable semver-checks`, so this only has to exist.
       - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-05
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master 2026-05
         with:
           toolchain: stable
 
@@ -2526,9 +3171,11 @@ jobs:
           shared-key: main
           save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'merge_group' }}
 
-      # No `bun install`: the gate imports only node builtins,
-      # scripts/lib/crates-io.mjs and scripts/lib/cargo-semver-checks.mjs, and
-      # both of those import only node builtins too.
+      # No `bun install`: the gate imports only node builtins and repo libs
+      # (crates-io, cargo-semver-checks, semver-baseline, rust-major-offset,
+      # rust-internal-deps) that import only node builtins too. A baseline
+      # crates.io can no longer resolve (#7737) is rebuilt from its release
+      # tag, which the script fetches itself: this shallow checkout has none.
       - name: Check crate semver against crates.io
         run: node scripts/check-rust-semver.mjs
 
@@ -2544,7 +3191,7 @@ jobs:
   agents-md:
     name: AGENTS.md ratchet
     needs: changes
-    if: needs.changes.outputs.agents_md == 'true'
+    if: (needs.changes.outputs.agents_md == 'true') && needs.changes.outputs.replay != 'true'
     runs-on: ${{ (vars.SELF_HOSTED_CI == 'true' && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false && !contains(github.event.pull_request.labels.*.name, 'ci:hosted')))) && fromJSON('["self-hosted","linux","x64","ifclite"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
@@ -2552,7 +3199,7 @@ jobs:
         with:
           lfs: false
           persist-credentials: false
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 26
       - name: Check AGENTS.md size and line length
@@ -2582,7 +3229,7 @@ jobs:
   license-headers:
     name: MPL license headers
     needs: changes
-    if: needs.changes.outputs.license_headers == 'true'
+    if: (needs.changes.outputs.license_headers == 'true') && needs.changes.outputs.replay != 'true'
     runs-on: ${{ (vars.SELF_HOSTED_CI == 'true' && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false && !contains(github.event.pull_request.labels.*.name, 'ci:hosted')))) && fromJSON('["self-hosted","linux","x64","ifclite"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
@@ -2590,7 +3237,7 @@ jobs:
         with:
           lfs: false
           persist-credentials: false
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 26
       - name: Check the license-header classifier's own regressions
@@ -2598,10 +3245,142 @@ jobs:
       - name: Check every source file declares MPL-2.0
         run: node scripts/add-license-headers.mjs --check
 
+  # NATIVE INSTRUCTION CEILINGS (#6982, charter #6954): the `native-instructions`
+  # family. perf_probe runs single-threaded under callgrind on AC20-FZK-Haus
+  # (~6 s of callgrind; the rest of this job is the cargo build and valgrind
+  # install). Instruction counts are deterministic (run-to-run <= 1e-6) and
+  # track kernel/parse changes of ~0.1%, so `perf-ratchet` gates them at 0.05%.
+  # ISSUE_129 (~2.5 min under callgrind) is measured only by the daily
+  # perf-ratchet-lower.yml. Like `build`, this job only MEASURES; `perf-ratchet`
+  # judges, so a breach goes red there and the aggregate sees both.
+  native-instructions:
+    name: Native instruction counts
+    needs: changes
+    if: (needs.changes.outputs.rust == 'true' || needs.changes.outputs.perf_ratchet == 'true') && needs.changes.outputs.replay != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          lfs: false
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+      - name: Setup Rust (pinned by rust-toolchain.toml)
+        run: rustup show
+      # instructions.sh builds into target/phase-markers (its own CARGO_TARGET_DIR),
+      # so that is the directory the cache must hold.
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          prefix-key: ci-native-ir
+          shared-key: main
+          workspaces: ". -> target/phase-markers"
+          save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'merge_group' }}
+      - name: Install valgrind
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends valgrind
+      - name: Fetch the FZK-Haus fixture
+        run: node scripts/fixtures/fetch-fixtures.mjs ara3d/AC20-FZK-Haus.ifc
+      - name: Measure perf-ratchet native-instructions family
+        run: node scripts/perf-ratchet/measure-native-instructions.mjs --set small --out "$RUNNER_TEMP/perf-ratchet-native/native-instructions.json"
+      - name: Upload native-instructions measurement
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: perf-ratchet-measured-native
+          path: ${{ runner.temp }}/perf-ratchet-native/
+          if-no-files-found: error
+
+  # PERF RATCHET (#6959): measured values against the committed ceilings in
+  # tests/perf-ratchets/<family>.json. A value above ceiling + tolerance fails;
+  # improvements are reported, and perf-ratchet-lower.yml lowers the ceilings
+  # once they are on main. Raising a ceiling is a human PR that edits the JSON
+  # and says why (docs/guide/performance.md, "Perf ratchet ceilings").
+  # Measurement happens in `build` (see the step there); this job only judges,
+  # so it needs no install and no build of its own.
+  perf-ratchet:
+    name: Perf ratchet ceilings
+    needs: [changes, build, native-instructions]
+    # An explicit status predicate permits skipped native measurements and retires
+    # cancelled runs (#7247). Failed measurements remain red in the aggregate.
+    if: >-
+      !cancelled() && needs.build.result == 'success'
+      && (needs.native-instructions.result == 'success' || needs.native-instructions.result == 'skipped')
+      && (needs.changes.outputs.rust == 'true' || needs.changes.outputs.frontend == 'true' || needs.changes.outputs.perf_ratchet == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      # The sticky report comment (issues/comments endpoint on the PR).
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          lfs: false
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+      # Fails the job when `build` produced no measurement: a gate that cannot
+      # find its input is red, never a skipped comparison.
+      - name: Download perf-ratchet measurements
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: perf-ratchet-measured
+          path: ${{ runner.temp }}/perf-ratchet
+      - name: Download native-instructions measurement
+        if: needs.native-instructions.result == 'success'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: perf-ratchet-measured-native
+          path: ${{ runner.temp }}/perf-ratchet
+      # The summary is written before the exit status is returned, so the
+      # table that explains a failure is never lost to `bash -e`.
+      - name: Check measured values against committed ceilings
+        run: |
+          set +e
+          node scripts/perf-ratchet/perf-ratchet.mjs check \
+            --measured-dir "$RUNNER_TEMP/perf-ratchet" \
+            --markdown "$RUNNER_TEMP/perf-ratchet-report.md"
+          status=$?
+          set -e
+          [ -f "$RUNNER_TEMP/perf-ratchet-report.md" ] && cat "$RUNNER_TEMP/perf-ratchet-report.md" >> "$GITHUB_STEP_SUMMARY"
+          exit $status
+      # Sticky comment, posted when the check fails and kept current after:
+      # once a red report exists it is updated on every run (to green too),
+      # so a fixed PR never shows a stale failure. A clean PR that never
+      # failed gets no comment. Best-effort: fork PRs get a read-only token
+      # and the step summary above carries the same report.
+      - name: Comment perf-ratchet report on PR
+        if: always() && github.event_name == 'pull_request'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          CHECK_OUTCOME: ${{ job.status }}
+        run: |
+          # Only this workflow's own comment is ever updated: a contributor
+          # comment quoting the marker must not capture the report.
+          marker='<!-- perf-ratchet-report -->'
+          body_file="$RUNNER_TEMP/perf-ratchet-report.md"
+          if [ ! -s "$body_file" ]; then
+            printf '%s\n\n%s\n' "$marker" \
+              'The perf-ratchet check produced no report: the measurement was missing or the check crashed. See the job log.' \
+              > "$body_file"
+          fi
+          existing=$(gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" --paginate \
+            --jq "[.[] | select(.user.login == \"github-actions[bot]\" and (.body | contains(\"$marker\"))) | .id] | first // empty" | head -n1)
+          if [ -n "$existing" ]; then
+            gh api --method PATCH "repos/${{ github.repository }}/issues/comments/${existing}" -F body=@"$body_file"
+          elif [ "$CHECK_OUTCOME" != "success" ]; then
+            gh api --method POST "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" -F body=@"$body_file"
+          fi
+
   test:
     name: Build + WASM + Rust + Node
-    needs: [changes, build, revert-oracle, typecheck, lint, node-tests, provenance-tests, viewer-tests, viewer-e2e, rust-tests, rust-full, rust-semver, geometry-census, csg-accept-gates, plato-check, docs-checks, docs-site, agents-md, license-headers]
-    if: always()
+    needs: [changes, build, revert-oracle, typecheck, lint, node-guards, node-tests, provenance-tests, viewer-tests, viewer-e2e, rust-tests, rust-full, rust-semver, geometry-census, csg-accept-gates, plato-check, docs-checks, docs-site, agents-md, license-headers, native-instructions, perf-ratchet]
+    # Preserve failed/skipped dependency judgement, but retire cancelled workflows (#7247).
+    if: ${{ !cancelled() }}
     # Free runner — the gate just inspects upstream job results.
     runs-on: ${{ (vars.SELF_HOSTED_CI == 'true' && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.draft == false && !contains(github.event.pull_request.labels.*.name, 'ci:hosted')))) && fromJSON('["self-hosted","linux","x64","ifclite"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
@@ -2624,6 +3403,23 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: node scripts/ci-verdict-replay.mjs --replay
+      # PUSH REPLAY: the lanes a green PR run of this exact tree already ran
+      # skipped, and `skipped` passes the map below, so first re-read that run
+      # and refuse unless it is still green for this tree. The map then judges
+      # every lane that did run, push-only ones included.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.changes.outputs.replay == 'true'
+        with:
+          lfs: false
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Verify the replayed PR run
+        if: needs.changes.outputs.replay == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          REPLAY_RUN: ${{ needs.changes.outputs.replay_run }}
+        run: node scripts/ci-push-replay.mjs --verify --run "$REPLAY_RUN"
       - name: Gate on dependencies
         if: needs.changes.outputs.noop != 'true'
         run: |
@@ -2638,6 +3434,7 @@ jobs:
             [revert-oracle]="${{ needs.revert-oracle.result }}"
             [typecheck]="${{ needs.typecheck.result }}"
             [lint]="${{ needs.lint.result }}"
+            [node-guards]="${{ needs.node-guards.result }}"
             [node-tests]="${{ needs.node-tests.result }}"
             [provenance-tests]="${{ needs.provenance-tests.result }}"
             [viewer-tests]="${{ needs.viewer-tests.result }}"
@@ -2652,6 +3449,8 @@ jobs:
             [docs-site]="${{ needs.docs-site.result }}"
             [agents-md]="${{ needs.agents-md.result }}"
             [license-headers]="${{ needs.license-headers.result }}"
+            [native-instructions]="${{ needs.native-instructions.result }}"
+            [perf-ratchet]="${{ needs.perf-ratchet.result }}"
           )
           fail=0
           for j in "${!results[@]}"; do

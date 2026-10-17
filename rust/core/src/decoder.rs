@@ -106,6 +106,17 @@ pub struct EntityDecoder<'a> {
     /// Declared `FILE_SCHEMA`, resolved on first use (see `schema_layout`).
     schema_version_cache: Option<Option<crate::generated::schema_registry::SchemaVersion>>,
     grid_axis_index: Arc<GridAxisIndex>,
+    /// Input admission (#7678): `false` (the default) reads a record that
+    /// holds a REAL `f64` cannot represent as before, the literal as a signed
+    /// infinity, which every data-model reader relies on; `true` (geometry
+    /// decoders only) refuses it. See [`Self::with_strict_reals`].
+    strict_reals: bool,
+    /// Distinct records refused by input admission, for the refusal
+    /// counters: a refused record is never cached, so a re-read must not count
+    /// it twice. A `Mutex` (touched only on a refusal) so the `&self`
+    /// [`Self::decode_at_uncached`] can record too while the decoder stays
+    /// `Sync` and `RefUnwindSafe`.
+    refused_reals: std::sync::Mutex<rustc_hash::FxHashSet<u32>>,
 }
 
 impl<'a> EntityDecoder<'a> {
@@ -129,6 +140,8 @@ impl<'a> EntityDecoder<'a> {
             styled_item_index: std::sync::OnceLock::new(),
             schema_version_cache: None,
             grid_axis_index: Arc::default(),
+            strict_reals: false,
+            refused_reals: std::sync::Mutex::default(),
         }
     }
 
@@ -152,6 +165,8 @@ impl<'a> EntityDecoder<'a> {
             styled_item_index: std::sync::OnceLock::new(),
             schema_version_cache: None,
             grid_axis_index: Arc::default(),
+            strict_reals: false,
+            refused_reals: std::sync::Mutex::default(),
         }
     }
 
@@ -175,6 +190,8 @@ impl<'a> EntityDecoder<'a> {
             styled_item_index: std::sync::OnceLock::new(),
             schema_version_cache: None,
             grid_axis_index: Arc::default(),
+            strict_reals: false,
+            refused_reals: std::sync::Mutex::default(),
         }
     }
 
@@ -213,15 +230,89 @@ impl<'a> EntityDecoder<'a> {
             return Ok(entity_arc.as_ref().clone());
         }
 
-        // Convert tokens to AttributeValues
+        let (entity, unrepresentable) = self.admit(id, ifc_type, &tokens)?;
+        // A record holding an unrepresentable real is never cached, so a
+        // strict read of the same id still refuses it.
+        if !unrepresentable {
+            self.cache.insert(id, Arc::new(entity.clone()));
+        }
+        Ok(entity)
+    }
+
+    /// Convert a parsed record's tokens and apply input admission (#7678):
+    /// a strict decoder refuses a record holding a
+    /// [`crate::parser::Token::UnrepresentableReal`]. Returns whether it held
+    /// one, so the caller keeps such a record out of the cache and a strict
+    /// read of the same id on another path still refuses it.
+    ///
+    /// An object definition (a product, a type, a spatial element) is admitted
+    /// even when strict: it carries references and descriptive measures (a
+    /// door's `OverallHeight`, a site's `RefElevation`), never geometry, so
+    /// refusing it would lose a finite mesh for a value nothing draws.
+    #[inline]
+    fn admit(
+        &self, id: u32, ifc_type: crate::IfcType, tokens: &[crate::parser::Token<'_>],
+    ) -> Result<(DecodedEntity, bool)> {
+        let mut unrepresentable = false;
         let attributes = tokens
             .iter()
-            .map(|token| AttributeValue::from_token(token))
+            .map(|token| AttributeValue::from_token_noting(token, &mut unrepresentable))
             .collect();
+        if unrepresentable
+            && self.strict_reals
+            && !ifc_type.is_subtype_of(crate::IfcType::IfcObjectDefinition)
+        {
+            return Err(self.refuse_record(id));
+        }
+        Ok((DecodedEntity::new(id, ifc_type, attributes), unrepresentable))
+    }
 
-        let entity = DecodedEntity::new(id, ifc_type, attributes);
-        self.cache.insert(id, Arc::new(entity.clone()));
-        Ok(entity)
+    /// Refuse geometry input (#7678): a geometry decoder (the native
+    /// pipeline's jobs, the wasm mesh pre-pass, symbolic extraction) refuses
+    /// every record that holds a REAL `f64` cannot represent, with
+    /// [`Error::UnrepresentableReal`], instead of reading it as an infinity.
+    /// The default stays lossless, so a decoder that is missed behaves as
+    /// before rather than silently losing data.
+    pub fn with_strict_reals(mut self) -> Self {
+        self.strict_reals = true;
+        self
+    }
+
+    /// Whether this decoder refuses unrepresentable reals.
+    pub fn strict_reals(&self) -> bool {
+        self.strict_reals
+    }
+
+    /// [`Self::decode_by_id`] read losslessly whatever the mode, for the one
+    /// geometry seam that must still see the infinity (D14, see
+    /// `ifc_lite_geometry::processors::helpers`). Not cached when it holds one.
+    pub fn decode_by_id_lossless(&mut self, entity_id: u32) -> Result<DecodedEntity> {
+        let strict = std::mem::replace(&mut self.strict_reals, false);
+        let entity = self.decode_by_id(entity_id);
+        self.strict_reals = strict;
+        entity
+    }
+
+    /// Count and return the refusal of record `id` (#7678). For a geometry
+    /// reader that refuses a value outside the decoder, such as an `f32`
+    /// coordinate-list fast path or a value that narrows to infinity, so the
+    /// refusal reaches the refused-element counter like a decode refusal.
+    pub fn refuse_record(&self, id: u32) -> Error {
+        self.refused_reals.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(id);
+        Error::UnrepresentableReal(id)
+    }
+
+    /// How many records this decoder has refused under input admission
+    /// (#7678). A geometry job that sees this move refused input.
+    pub fn refused_real_records(&self) -> u64 {
+        self.refused_record_ids().len() as u64
+    }
+
+    /// The distinct record ids this decoder has refused (#7678), so callers
+    /// that combine several decoders count each record once.
+    pub fn refused_record_ids(&self) -> Vec<u32> {
+        let ids = self.refused_reals.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        ids.iter().copied().collect()
     }
 
     /// Decode the entity in `[start, end)` **without** touching the cache.
@@ -236,11 +327,7 @@ impl<'a> EntityDecoder<'a> {
     /// `decode_at`, only without the cache side effect.
     pub fn decode_at_uncached(&self, start: usize, end: usize) -> Result<DecodedEntity> {
         let (id, ifc_type, tokens) = self.parse_at(start, end, "decode_at_uncached")?;
-        let attributes = tokens
-            .iter()
-            .map(|token| AttributeValue::from_token(token))
-            .collect();
-        Ok(DecodedEntity::new(id, ifc_type, attributes))
+        self.admit(id, ifc_type, &tokens).map(|(entity, _)| entity)
     }
 
     /// Shared full-record validation and existing error context. The returned
@@ -261,16 +348,11 @@ impl<'a> EntityDecoder<'a> {
         }
         let line = &self.content[start..end];
         parse_entity(line).map_err(|e| {
-            // Add bounded, lossy debug info without requiring the source to be UTF-8.
+            // `e` is already bounded (offset, nom kind and a short context, see
+            // `entity_parse_error`, #7675). Add the record's head, lossily, so
+            // the source need not be UTF-8.
             let cut = line.len().min(100);
-            Error::parse(
-                0,
-                format!(
-                    "Failed to parse entity: {:?}, input: {:?}",
-                    e,
-                    String::from_utf8_lossy(&line[..cut])
-                ),
-            )
+            Error::parse(0, format!("{e}, input: {:?}", String::from_utf8_lossy(&line[..cut])))
         })
     }
 
@@ -368,9 +450,19 @@ impl<'a> EntityDecoder<'a> {
             }
         }
 
-        let scale = match project_id {
-            Some(pid) => crate::units::extract_length_unit_scale(self, pid).unwrap_or(1.0),
-            None => 1.0,
+        // #7678: a lossless (data) decoder keeps main's value; a strict
+        // (geometry) one counts an unusable declared factor and returns 1.0
+        // only as a tolerance basis: every geometry path that meshes refuses
+        // the unit itself (`LengthUnit::for_geometry`).
+        let scale = match project_id.map(|pid| crate::units::resolve_length_unit(self, pid)) {
+            Some(Ok(unit)) => match unit.unusable_factor {
+                Some(factor) if self.strict_reals => {
+                    let _counted = self.refuse_record(factor);
+                    1.0
+                }
+                _ => unit.scale,
+            },
+            _ => 1.0,
         };
         self.length_unit_scale_cache = Some(scale);
         scale
@@ -464,10 +556,9 @@ impl<'a> EntityDecoder<'a> {
         if let Some(arc) = self.cache.get(&id) {
             return Ok(Arc::clone(arc));
         }
-        let _ = self.decode_at(start, end)?;
-        Ok(Arc::clone(self.cache.get(&id).ok_or_else(|| {
-            Error::parse(0, "decode_at didn't populate cache".to_string())
-        })?))
+        let entity = self.decode_at(start, end)?;
+        // A lossless read of a refused record is deliberately left uncached.
+        Ok(self.cache.get(&id).map(Arc::clone).unwrap_or_else(|| Arc::new(entity)))
     }
     /// Get raw bytes for an entity (for direct/fast parsing)
     /// Returns the full entity line including type and attributes
@@ -633,29 +724,15 @@ impl<'a> EntityDecoder<'a> {
             return None;
         }
 
-        // Check if this is an outer bound by looking for "OUTER" in the type name
-        // IFCFACEOUTERBOUND vs IFCFACEBOUND
-        // The type name is between '=' and '('
-        let mut is_outer = false;
-        let mut i = eq_pos + 1;
-        // Look for "OUTER" pattern (must check for the full word, not just 'O')
-        while i + 4 < len && bytes[i] != b'(' {
-            if bytes[i] == b'O'
-                && bytes[i + 1] == b'U'
-                && bytes[i + 2] == b'T'
-                && bytes[i + 3] == b'E'
-                && bytes[i + 4] == b'R'
-            {
-                is_outer = true;
-                break;
-            }
-            i += 1;
-        }
-        // Continue to find the '(' if we haven't already
-        while i < len && bytes[i] != b'(' {
-            i += 1;
-        }
-        if i >= len {
+        // IFCFACEOUTERBOUND vs IFCFACEBOUND, under STEP's case-insensitive
+        // keyword rule (#4497): a CamelCase `IfcFaceOuterBound` is an outer
+        // bound too (#7689, CORE-11). Trivia (whitespace and `/* ... */`)
+        // may sit on either side of the keyword (#3789), so it is skipped,
+        // not sliced into the name.
+        let start = skip_step_trivia(bytes, eq_pos + 1)?;
+        let (is_outer, end) = face_bound_keyword(bytes, start);
+        let mut i = skip_step_trivia(bytes, end)?;
+        if bytes.get(i) != Some(&b'(') {
             return None;
         }
 
@@ -706,6 +783,27 @@ impl<'a> EntityDecoder<'a> {
 
         Some((loop_id, orientation, is_outer))
     }
+}
+
+/// Whether the keyword at `bytes[start..]` is `IFCFACEOUTERBOUND` under
+/// `keyword_eq`'s rule (ASCII case fold), and where it ends.
+///
+/// This runs once per face bound of every faceted brep, so the uppercase
+/// spellings every exporter writes are matched with one prefix compare; any
+/// other spelling falls back to scanning the keyword and folding its case.
+#[inline]
+fn face_bound_keyword(bytes: &[u8], start: usize) -> (bool, usize) {
+    const OUTER: &[u8] = b"IFCFACEOUTERBOUND";
+    const INNER: &[u8] = b"IFCFACEBOUND";
+    let rest = &bytes[start..];
+    let is_ident = |b: &u8| b.is_ascii_alphanumeric() || *b == b'_';
+    for (spelling, outer) in [(OUTER, true), (INNER, false)] {
+        if rest.starts_with(spelling) && !rest.get(spelling.len()).is_some_and(is_ident) {
+            return (outer, start + spelling.len());
+        }
+    }
+    let len = rest.iter().position(|b| !is_ident(b)).unwrap_or(rest.len());
+    (rest[..len].eq_ignore_ascii_case(OUTER), start + len)
 }
 
 /// Parse cartesian point coordinates inline from raw bytes

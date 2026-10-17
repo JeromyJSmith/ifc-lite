@@ -150,8 +150,8 @@ export function splitJobs(text) {
   return jobs.map((j) => ({ id: j.id, text: j.lines.join('\n') }));
 }
 
-// Not path filters: `noop` (the no-op `edited` probe, scripts/ci-verdict-replay.mjs) says nothing about paths, so a job gated on it alone still reads as "every path".
-const NON_FILTER_OUTPUTS = new Set(['noop']);
+// Not path filters: `noop` (the no-op `edited` probe, scripts/ci-verdict-replay.mjs) and `replay`/`replay_run` (the push replay, scripts/ci-push-replay.mjs) say nothing about paths, so a job gated on them alone still reads as "every path".
+const NON_FILTER_OUTPUTS = new Set(['noop', 'replay', 'replay_run']);
 
 /**
  * The filter outputs that must be `true` for a job to run, read off its `if:`.
@@ -271,9 +271,9 @@ function inPrSeen(lines, onAt) {
  *   - `join(ROOT, 'tests', 'benchmark', 'baseline.json')` and the same shape
  *     with any root identifier
  *
- * A literal only survives if it resolves to something that EXISTS in the repo,
- * which is what keeps prose and non-path strings out. `exists` is injected so
- * this stays pure.
+ * A literal only survives if it EXISTS in the repo and (#7026) is spelled as the
+ * repo spells it: `'Deploy'` resolves to `deploy/` where the filesystem folds
+ * case, and is not a path. Both predicates are injected so this stays pure.
  */
 /**
  * Not a repo INPUT even though it resolves: the tree root, its parent (every
@@ -293,8 +293,8 @@ function normalise(p) {
  */
 const escapesRepo = (p) => p.split('/').includes('..');
 
-export function deriveInputs(source, exists) {
-  const found = new Set();
+export function deriveInputs(source, onDisk, spelledExactly = () => true) {
+  const found = new Set(), exists = (p) => onDisk(p) && spelledExactly(p);
 
   for (const m of source.matchAll(/\bjoin\(\s*([A-Za-z_$][\w$]*)\s*,\s*([^)]*)\)/g)) {
     const args = m[2];

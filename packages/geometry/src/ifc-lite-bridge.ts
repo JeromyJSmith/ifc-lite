@@ -13,9 +13,10 @@ import type { KmzAltitudeMode, TessellationQuality } from './types.js';
 import type { RtcFrame } from './rtc-frame.js';
 import type { HbjsonStats } from './hbjson-stats.js';
 import * as energyExport from './energy-export-bridge.js';
+import { callExportLandXmlTerrain, type LandXmlTerrainExport, type LandXmlTerrainExportOptions } from './landxml-terrain-export.js';
 import type { GeometryDiagnostics } from './diagnostics.js';
 import type { ExtrusionDefinitions, SweptDiskDescriptions } from './analytic-descriptions.js';
-import { getStartedSharedWasmModule } from './wasm-shared-module.js';
+import { initMainThreadEngine } from './main-engine-init.js';
 import {
   isWasmRuntimeTrap,
   notifyWasmRuntimeUnrecoverable,
@@ -167,32 +168,15 @@ export class IfcLiteBridge {
         const wasmPath: string = requireFromHere.resolve('@ifc-lite/wasm/ifc-lite_bg.wasm');
         wasmInitArg = (await nodeFs.readFile(wasmPath)) as BufferSource;
       }
-      // Reuse the shared compiled module when some other consumer (an idle
-      // prewarm, or the N-worker pool on an earlier load) already fetched this
-      // binary — passing the `WebAssembly.Module` skips the network entirely and
-      // skips a redundant compile of the same ~3.9 MB. `getStartedSharedWasmModule`
-      // never *starts* a compile, so when nothing else did, this path is exactly
-      // what it was before: wasm-bindgen fetches from import.meta.url itself.
-      // Node is excluded — it hands over bytes it read off disk.
-      const sharedModule = wasmInitArg ? null : await (getStartedSharedWasmModule() ?? null);
-
-      // Browser: init() with no arg fetches from import.meta.url. Node: pass the
-      // bytes via the modern object form ({ module_or_path }) to avoid the
-      // deprecated positional-bytes signature.
-      //
-      // Wrapped in `initWasmWithRetry` (issue #1903) so one blip on the ~1.3 MB
-      // (brotli) engine download no longer kills the whole load. This was the
-      // only self-fetching `init()` in the app WITHOUT the retry both workers
-      // already use, and it is the one a first-time visitor hits first — a
-      // returning visitor has the binary in the immutable `/assets/*` cache.
-      // `isTransientWasmLoadError` gates the retry, so a corrupt/invalid module
-      // still fails fast; the shared-module and Node paths pass a prebuilt
-      // `Module`/bytes and cannot be transient, so they never retry.
-      const initArg = wasmInitArg ?? sharedModule ?? undefined;
-      await initWasmWithRetry(
-        () => init(initArg ? { module_or_path: initArg } : undefined),
-        { label: 'ifc-lite-bridge' },
-      );
+      // Raw package resolution and Node's supplied bytes retain their paths; the
+      // browser path joins the realm's one main-thread init (#7036), which a host
+      // may already have started when the load was requested.
+      if (wasmInitArg) {
+        const bytes = wasmInitArg;
+        await initWasmWithRetry(async () => { await init({ module_or_path: bytes }); }, { label: 'ifc-lite-bridge' });
+      } else {
+        await initMainThreadEngine();
+      }
 
       // The WASM bundle has no in-WASM thread pool; rayon `par_iter()`
       // (e.g. FacetedBrep preprocessing) runs sequentially on the main
@@ -441,6 +425,7 @@ export class IfcLiteBridge {
   /**
    * Export the render geometry in `content` as a Wavefront OBJ string.
    * `isolated`: `undefined` ⇒ no filter; empty `Uint32Array` ⇒ active but matching nothing.
+   * Throws `NO_RENDER_GEOMETRY` when no mesh is written.
    */
   exportObj(
     content: Uint8Array,
@@ -566,7 +551,8 @@ export class IfcLiteBridge {
     );
   }
 
-  /** Export OpenUSD (`.usda` ASCII) — a real Z-up USD stage (geometry-backed). */
+  /** Export OpenUSD (`.usda` ASCII) — a real Z-up USD stage (geometry-backed).
+   * Throws `NO_RENDER_GEOMETRY` for a model with no render geometry. */
   exportUsd(content: Uint8Array): Uint8Array {
     return this.runExport('exportUsd', content, (api) => api.exportUsd(content));
   }
@@ -592,6 +578,12 @@ export class IfcLiteBridge {
   /**
    * Assemble a GLB from already-produced meshes (flattened parallel arrays) — no
    * re-meshing. Used by the viewer, which already holds the meshes on the GPU.
+   *
+   * `worldMatrix` is the frame the meshes were baked in (#7734): 16 finite
+   * numbers, a column-major 4x4 in IFC Z-up metres with `world = M * baked`
+   * (`renderFrameWorldMatrix` in `@ifc-lite/geometry/world-frame`). The GLB root
+   * carries it so a georeferenced model exports where the from-bytes export
+   * puts it. Omit it for a model that was not shifted.
    */
   exportGlbFromMeshes(
     positions: Float32Array,
@@ -605,6 +597,7 @@ export class IfcLiteBridge {
     includeMetadata: boolean,
     lit = true,
     emissive = false,
+    worldMatrix?: ArrayLike<number>,
   ): Uint8Array {
     if (!this.ifcApi) {
       throw new Error('IFC-Lite not initialized. Call init() first.');
@@ -612,6 +605,7 @@ export class IfcLiteBridge {
     try {
       return this.ifcApi.exportGlbFromMeshes(
         positions, normals, indices, vertexCounts, indexCounts, colors, origins, expressIds, includeMetadata, lit, emissive,
+        worldMatrix ? Float64Array.from(worldMatrix) : undefined,
       );
     } catch (error) {
       log.error('Failed to exportGlbFromMeshes', error, { operation: 'exportGlbFromMeshes' });
@@ -714,6 +708,11 @@ export class IfcLiteBridge {
     return this.runExport('exportHbjsonWithStats', content, (api) =>
       energyExport.callExportHbjsonWithStats(api, content, name),
     );
+  }
+
+  /** IFC terrain → LandXML 1.2; see `landxml-terrain-export.ts`. Refusals throw `TERRAIN_REFUSED:`. */
+  exportLandXmlTerrain(content: Uint8Array, productIds: Uint32Array, options: LandXmlTerrainExportOptions): LandXmlTerrainExport {
+    return this.runExport('exportLandXmlTerrain', content, (api) => callExportLandXmlTerrain(api, content, productIds, options));
   }
 
   /** DFJSON (Dragonfly) export; see `energy-export-bridge.ts` for the contract. */

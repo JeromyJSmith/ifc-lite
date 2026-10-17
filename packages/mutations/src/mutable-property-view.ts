@@ -14,11 +14,11 @@
 
 import { registerCooperativeOverlay } from './cooperative-overlay-access.js';
 import type { PropertyTable, PropertySet, Property, QuantitySet, Quantity } from '@ifc-lite/data';
-import { findQuantityInBaseSets } from './base-qset-lookup.js';
+import { quantityHistoryBefore } from './quantity-history-before.js';
 import { computeSetClaims, mutatedMembersForInstance } from './same-name-set-claims.js';
 import { encodeNonFiniteNumbers, decodeNonFiniteNumbers } from './nonfinite-json.js';
 import { PropertyValueType, QuantityType } from '@ifc-lite/data';
-import type { IfcAttributeValue, PropertyValue, PropertyMutation, QuantityMutation, AttributeMutation, EntityTypeMutation, Mutation, NewEntity, EffectiveChange } from './types.js';
+import type { IfcAttributeValue, PropertyValue, PropertyMutation, QuantityMutation, EntityTypeMutation, Mutation, NewEntity, EffectiveChange } from './types.js';
 import { propertyKey, quantityKey, attributeKey, generateMutationId } from './types.js';
 import { collectEffectiveChanges, type AttributeExtractor } from './effective-changes.js';
 import { applyMutationsBatch } from './apply-mutations.js';
@@ -34,7 +34,7 @@ export type { AttributeExtractor } from './effective-changes.js';
 export type PropertyExtractor = (entityId: number) => Array<{
   name: string;
   globalId?: string;
-  properties: Array<{ name: string; type: number; value: unknown; values?: string[]; unit?: string; unitSiScale?: number; dataType?: string; structure?: Property['structure'] }>;
+  properties: Array<{ name: string; type: number; value: unknown; values?: string[]; unit?: string; unitSiScale?: number; unitSiOffset?: number; dataType?: string; structure?: Property['structure'] }>;
 }>;
 
 /**
@@ -53,7 +53,7 @@ export class MutablePropertyView extends MutableOverlayState {
     super();
     this.baseTable = baseTable;
     this.modelId = modelId;
-    registerCooperativeOverlay(this, {
+    registerCooperativeOverlay(this, { modelId,
       capture: () => this.overlayState(),
       matches: snapshot => this.matchesOverlayState(snapshot),
       publish: snapshot => this.restoreOverlayState(snapshot),
@@ -140,28 +140,6 @@ export class MutablePropertyView extends MutableOverlayState {
     return this.nextAllocatedId + 1;
   }
 
-  private setAttributeMutation(entityId: number, key: string, mutation: AttributeMutation): void {
-    this.attributeMutations.set(key, mutation);
-    let bucket = this.attributeKeysByEntity.get(entityId);
-    if (!bucket) {
-      bucket = new Set();
-      this.attributeKeysByEntity.set(entityId, bucket);
-    }
-    bucket.add(key);
-  }
-
-  private deleteAttributeMutation(entityId: number, key: string): boolean {
-    const removed = this.attributeMutations.delete(key);
-    if (removed) {
-      const bucket = this.attributeKeysByEntity.get(entityId);
-      if (bucket) {
-        bucket.delete(key);
-        if (bucket.size === 0) this.attributeKeysByEntity.delete(entityId);
-      }
-    }
-    return removed;
-  }
-
   /**
    * Set an on-demand property extractor function
    * This is used when properties are extracted lazily from the source buffer
@@ -234,6 +212,7 @@ export class MutablePropertyView extends MutableOverlayState {
           ...(prop.structure ? { structure: prop.structure } : {}),
           ...(prop.unit ? { unit: prop.unit } : {}),
           ...(prop.unitSiScale !== undefined ? { unitSiScale: prop.unitSiScale } : {}),
+          ...(prop.unitSiOffset !== undefined ? { unitSiOffset: prop.unitSiOffset } : {}),
           dataType: prop.dataType,
         })),
       }));
@@ -289,6 +268,7 @@ export class MutablePropertyView extends MutableOverlayState {
           // An edit that names its own unit replaces the explicit scale too;
           // one that keeps the property's unit keeps its scale.
           ...((mutation.unit === undefined || mutation.unit === prop.unit) && prop.unitSiScale !== undefined ? { unitSiScale: prop.unitSiScale } : {}),
+          ...((mutation.unit === undefined || mutation.unit === prop.unit) && prop.unitSiOffset !== undefined ? { unitSiOffset: prop.unitSiOffset } : {}),
           dataType: mutation.dataType ?? prop.dataType,
         }),
         prop => prop,
@@ -709,9 +689,11 @@ export class MutablePropertyView extends MutableOverlayState {
 
   /**
    * Get all quantity sets with mutations applied. The optional provider
-   * reads an external base store without changing this live view.
+   * reads an external base store without changing this live view. Native
+   * exporters may opt into empty instances to retain a deleted last member
+   * as an ownership removal; ordinary quantity displays omit them.
    */
-  getQuantitiesForEntity(entityId: number, baseProvider?: (baseId: number) => QuantitySet[]): QuantitySet[] {
+  getQuantitiesForEntity(entityId: number, baseProvider?: (baseId: number) => QuantitySet[], includeEmptyInstances = false): QuantitySet[] {
     const result: QuantitySet[] = [];
     const seenQsets = new Set<string>();
 
@@ -740,19 +722,19 @@ export class MutablePropertyView extends MutableOverlayState {
           name: q.name,
           type: mutation.quantityType ?? q.type,
           value: mutation.value ?? q.value,
-          unit: mutation.unit ?? q.unit,
+          unit: mutation.unitRemoved ? undefined : mutation.unit ?? q.unit,
         }),
         q => q,
         (name, mutation) => ({
           name,
           type: mutation.quantityType ?? QuantityType.Count,
           value: mutation.value ?? 0,
-          unit: mutation.unit,
+          unit: mutation.unit ?? undefined,
         }),
       );
 
-      if (mutatedQuantities.length > 0) {
-        result.push({ name: qset.name, quantities: mutatedQuantities });
+      if (mutatedQuantities.length > 0 || includeEmptyInstances) {
+        result.push({ name: qset.name, globalId: qset.globalId, quantities: mutatedQuantities });
       }
     }
 
@@ -831,13 +813,22 @@ export class MutablePropertyView extends MutableOverlayState {
     quantName: string,
     value: number,
     qType: QuantityType = QuantityType.Count,
-    unit?: string,
+    unit?: string | null,
     skipHistory: boolean = false,
   ): Mutation {
     const key = quantityKey(entityId, qsetName, quantName);
+    const baseQsets = this.getBaseQuantitiesForEntity(entityId);
+
+    const before = quantityHistoryBefore(
+      this.quantityMutations.get(key), baseQsets,
+      this.newQsets.get(entityId)?.get(qsetName)?.quantities.find(q => q.name === quantName),
+      qsetName, quantName,
+    );
+
+    const unitRemoved = unit === null || (unit === undefined && this.quantityMutations.get(key)?.unitRemoved === true);
+    const effectiveUnit = unit === undefined ? before.oldUnit ?? undefined : unit ?? undefined;
 
     // Check if qset exists
-    const baseQsets = this.getBaseQuantitiesForEntity(entityId);
     const qsetExistsInBase = baseQsets.some(q => q.name === qsetName);
     const qsetExistsInNew = this.newQsets.get(entityId)?.has(qsetName);
 
@@ -849,58 +840,42 @@ export class MutablePropertyView extends MutableOverlayState {
       }
       entityQsets.set(qsetName, {
         name: qsetName,
-        quantities: [{ name: quantName, type: qType, value, unit }],
+        quantities: [{ name: quantName, type: qType, value, unit: effectiveUnit }],
       });
     } else if (qsetExistsInNew) {
       const entityQsets = this.newQsets.get(entityId)!;
       const qset = entityQsets.get(qsetName)!;
       const idx = qset.quantities.findIndex(q => q.name === quantName);
       if (idx >= 0) {
-        qset.quantities[idx] = { name: quantName, type: qType, value, unit };
+        qset.quantities[idx] = { name: quantName, type: qType, value, unit: effectiveUnit };
       } else {
-        qset.quantities.push({ name: quantName, type: qType, value, unit });
+        qset.quantities.push({ name: quantName, type: qType, value, unit: effectiveUnit });
       }
-    }
-
-    // Get old value for undo and to determine CREATE vs UPDATE. An overlay
-    // mutation (a prior edit this session) wins; otherwise fall back to the
-    // base quantity's own value — `qsetExistsInBase` alone is not enough,
-    // since a *new* quantity name can be added to an already-existing qset.
-    // Without the base-value fallback, the first edit of an existing base
-    // quantity reported `oldValue: null` (UPDATE_QUANTITY with nothing to
-    // restore), which is exactly the null the viewer's undo handler treats
-    // as "nothing to revert to" — undo silently did nothing (#2297 shape).
-    const existingMutation = this.quantityMutations.get(key);
-    let oldValue: number | null;
-    let isUpdate: boolean;
-    if (existingMutation) {
-      oldValue = existingMutation.value ?? null;
-      isUpdate = true;
-    } else {
-      const baseQuantity = findQuantityInBaseSets(baseQsets, qsetName, quantName);
-      oldValue = baseQuantity ? baseQuantity.value : null;
-      isUpdate = baseQuantity !== undefined;
     }
 
     this.setQuantityMutation(entityId, key, {
       operation: 'SET',
       value,
       quantityType: qType,
-      unit,
+      unit: effectiveUnit,
+      unitRemoved,
     });
 
     const mutation: Mutation = {
       id: generateMutationId(),
-      type: isUpdate ? 'UPDATE_QUANTITY' : 'CREATE_QUANTITY',
+      type: before.isUpdate ? 'UPDATE_QUANTITY' : 'CREATE_QUANTITY',
       timestamp: Date.now(),
       modelId: this.modelId,
       entityId,
       psetName: qsetName,
       propName: quantName,
-      oldValue: oldValue as PropertyValue,
+      oldValue: before.oldValue,
+      oldQuantityType: before.oldQuantityType,
+      oldUnit: before.oldUnit,
       newValue: value,
       quantityType: qType,
-      unit,
+      unit: effectiveUnit,
+      unitRemoved,
     };
 
     if (!skipHistory) {
@@ -1021,6 +996,7 @@ export class MutablePropertyView extends MutableOverlayState {
     }
     const oldValue = entityMap.has(index) ? entityMap.get(index)! : null;
     entityMap.set(index, value);
+    this.markOverlayChanged();
 
     const mutation: Mutation = {
       id: generateMutationId(),
@@ -1052,7 +1028,7 @@ export class MutablePropertyView extends MutableOverlayState {
   removePositionalMutation(entityId: number, index: number): void {
     const entityMap = this.positionalAttrMutations.get(entityId);
     if (!entityMap) return;
-    entityMap.delete(index);
+    if (entityMap.delete(index)) this.markOverlayChanged();
     if (entityMap.size === 0) {
       this.positionalAttrMutations.delete(entityId);
     }
@@ -1118,6 +1094,7 @@ export class MutablePropertyView extends MutableOverlayState {
     const baseType = existing?.oldType ?? oldType ?? newEntity?.type;
     const prevEffective = existing?.newType ?? baseType;
 
+    this.markOverlayChanged();
     this.typeMutations.set(entityId, {
       newType: trimmed,
       oldType: baseType,
@@ -1159,7 +1136,7 @@ export class MutablePropertyView extends MutableOverlayState {
    * to roll back.
    */
   removeTypeMutation(entityId: number): void {
-    this.typeMutations.delete(entityId);
+    if (this.typeMutations.delete(entityId)) this.markOverlayChanged();
   }
 
   // ---------------------------------------------------------------------------
@@ -1180,15 +1157,18 @@ export class MutablePropertyView extends MutableOverlayState {
     // STEP exporter upper-cases at write time — but `NewEntity.type` no
     // longer mangles `IfcColumn` into `IFCCOLUMN` for downstream consumers.
     const expressId = ++this.nextAllocatedId;
+    const creationId = generateMutationId();
     const entity: NewEntity = {
       expressId,
       type: type.trim(),
       attributes: attributes.slice(),
+      creationId,
     };
     this.newEntities.set(expressId, entity);
+    this.markOverlayChanged();
 
     this.mutationHistory.push({
-      id: generateMutationId(),
+      id: creationId,
       type: 'CREATE_ENTITY',
       timestamp: Date.now(),
       modelId: this.modelId,
@@ -1221,6 +1201,7 @@ export class MutablePropertyView extends MutableOverlayState {
   deleteEntity(expressId: number): boolean {
     if (this.newEntities.has(expressId)) {
       this.newEntities.delete(expressId);
+      this.markOverlayChanged();
       // Both sets are needed: `tombstones` is what the unified isDeleted() /
       // getEffectiveEntityIndex() answer from (#2036), while
       // `forgottenCreatedEntities` is what collectEffectiveChanges()'s row
@@ -1247,6 +1228,7 @@ export class MutablePropertyView extends MutableOverlayState {
     }
     if (this.tombstones.has(expressId)) return false;
     this.tombstones.add(expressId);
+    this.markOverlayChanged();
     this.mutationHistory.push({
       id: generateMutationId(),
       type: 'DELETE_ENTITY',
@@ -1281,7 +1263,9 @@ export class MutablePropertyView extends MutableOverlayState {
    * entities are restored via a separate path (`restoreNewEntity`).
    */
   restoreFromTombstone(expressId: number): boolean {
-    return this.tombstones.delete(expressId);
+    const removed = this.tombstones.delete(expressId);
+    if (removed) this.markOverlayChanged();
+    return removed;
   }
 
   /**
@@ -1296,11 +1280,12 @@ export class MutablePropertyView extends MutableOverlayState {
    */
   setEntityAlias(overlayId: number, sourceId: number | null): void {
     if (sourceId === null) {
-      this.entityAliases.delete(overlayId);
+      if (this.entityAliases.delete(overlayId)) this.markOverlayChanged();
       return;
     }
     if (sourceId === overlayId) return;
     this.entityAliases.set(overlayId, sourceId);
+    this.markOverlayChanged();
   }
 
   /** Read the alias for a given overlay id, or null if none. */
@@ -1326,6 +1311,7 @@ export class MutablePropertyView extends MutableOverlayState {
    */
   restoreNewEntity(entity: NewEntity): void {
     this.newEntities.set(entity.expressId, entity);
+    this.markOverlayChanged();
     // `deleteEntity` both tombstones an overlay-created entity (for the
     // unified isDeleted() / getEffectiveEntityIndex() answer) and forgets it
     // (for collectEffectiveChanges()'s row filter), so the inverse has to
@@ -1533,6 +1519,7 @@ export class MutablePropertyView extends MutableOverlayState {
    * Remove a quantity mutation (used by undo for newly created quantities)
    */
   removeQuantityMutation(entityId: number, qsetName: string, quantName?: string): void {
+    this.markOverlayChanged();
     if (quantName) {
       const key = quantityKey(entityId, qsetName, quantName);
       this.deleteQuantityMutation(entityId, key);
@@ -1585,12 +1572,12 @@ export class MutablePropertyView extends MutableOverlayState {
   }
 
   /**
-   * Get all mutations applied to this view
+   * Get journal mutations from an optional append-only cursor (default: all)
    */
-  getMutations(): Mutation[] {
-    return [...this.mutationHistory];
+  getMutations(since = 0): Mutation[] {
+    return this.mutationHistory.slice(since);
   }
-
+  getMutationCount(): number { return this.mutationHistory.length; }
   /**
    * Get mutations for a specific entity
    */
@@ -1794,6 +1781,7 @@ export class MutablePropertyView extends MutableOverlayState {
    * Clear all mutations (reset to base state)
    */
   clear(): void {
+    this.markOverlayChanged();
     this.propertyMutations.clear();
     this.quantityMutations.clear();
     this.propertyKeysByEntity.clear();
@@ -1822,6 +1810,7 @@ export class MutablePropertyView extends MutableOverlayState {
    * without exposing them publicly.
    */
   applyMutations(mutations: Mutation[]): void {
+    if (mutations.length) this.markOverlayChanged();
     applyMutationsBatch(
       this,
       mutations,

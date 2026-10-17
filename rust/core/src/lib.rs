@@ -62,6 +62,7 @@
 //! - **Entity scanning**: ~650 MB/s with SIMD acceleration
 //! - **Number parsing**: 10x faster than std using [lexical-core](https://docs.rs/lexical-core)
 
+pub mod attribute_slot;
 pub mod columnar_index;
 pub mod compatibility;
 pub mod decoder;
@@ -69,7 +70,10 @@ pub mod dense_index;
 pub mod error;
 pub mod express_id;
 pub mod fast_parse;
+pub mod fmt_num;
 pub mod generated;
+pub mod guid;
+pub mod hash;
 pub mod georef;
 pub mod limits;
 pub mod model_bounds;
@@ -86,7 +90,8 @@ pub mod units;
 #[path = "schema_registry_tests.rs"]
 mod schema_registry_tests;
 
-pub use columnar_index::{ColumnLengthMismatch, ColumnarEntityIndex};
+pub use attribute_slot::{AttrKind, AttrSlot};
+pub use columnar_index::{ColumnLengthMismatch, ColumnarEntityIndex, SpanBeyondU32};
 pub use compatibility::{is_exporter_stratum_alias, EXPORTER_STRATUM_ALIASES};
 pub use decoder::{build_entity_index, EntityDecoder, EntityIndex, GridAxisIndex};
 pub use dense_index::DenseEntityIndex;
@@ -96,17 +101,18 @@ pub use fast_parse::{
     extract_entity_refs_from_list, extract_entity_type_name,
     extract_face_indices_from_entity, extract_first_entity_ref, parse_coordinates_direct,
     parse_indices_direct, process_triangulated_faceset_direct, should_use_fast_path, FastMeshData,
+    INVALID_INDEX,
 };
 pub use generated::{
     attribute_names_for_schema, entity_info_for_schema, is_subtype_of_for_schema, IfcType,
-    SchemaEntityInfo, UnknownIfcType, IFC_TYPES,
+    SchemaEntityInfo, SchemaVersion, UnknownIfcType, IFC_TYPES,
 };
 pub use georef::{GeoRefExtractor, GeoRefSource, GeoReference};
 pub use limits::{RtcVerdict, MAX_MAPPED_ITEM_DEPTH, MAX_PLACEMENT_DEPTH};
 pub use model_bounds::{scan_model_bounds, scan_placement_bounds, ModelBounds};
 pub use parser::{
     declared_schema_bounded, entity_count, find_keyword, keyword_ends_with, keyword_eq, keyword_starts_with,
-    nth_attribute_is_present, oversized_id_report, parse_entity, report_malformed_records,
+    nth_attribute_is_present, oversized_id_report, parse_entity, parse_step_real, report_malformed_records,
     report_oversized_ids, report_scan_diagnostics, set_report_sink, skip_step_comment,
     EntityScanner, StepListItems, Token,
 };
@@ -123,5 +129,6 @@ pub use step_encoding::decode_ifc_string;
 pub use streaming::{parse_stream, ParseEvent, StreamConfig};
 pub use units::{
     extract_length_unit_scale, extract_plane_angle_to_radians, get_si_prefix_multiplier,
+    resolve_length_unit, LengthUnit,
     try_extract_length_unit_scale, try_extract_plane_angle_to_radians,
 };

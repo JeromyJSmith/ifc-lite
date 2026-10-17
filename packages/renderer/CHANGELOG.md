@@ -1,5 +1,98 @@
 # @ifc-lite/renderer
 
+## 6.4.0
+
+### Minor Changes
+
+- [#7566](https://github.com/LTplus-AG/ifc-lite/pull/7566) [`d18b452`](https://github.com/LTplus-AG/ifc-lite/commit/d18b452bba5abaf9fa2c60105db40f4caf2c05bb) Thanks [@louistrue](https://github.com/louistrue)! - Export the existing material-alpha floor for shadow casting so World-view glazing uses the same policy as the WebGPU renderer.
+
+## 6.3.3
+
+### Patch Changes
+
+- [#7548](https://github.com/LTplus-AG/ifc-lite/pull/7548) [`8f37748`](https://github.com/LTplus-AG/ifc-lite/commit/8f377482d8b394241a29ea986e8dc259ab6fa298) Thanks [@louistrue](https://github.com/louistrue)! - Restore CPU-backed streaming fragments after device loss before resuming the existing pending queue. Keep replacement devices private until restoration commits, reject changed source ownership, and record opt-in categorical recovery outcomes.
+
+## 6.3.2
+
+### Patch Changes
+
+- [#7484](https://github.com/LTplus-AG/ifc-lite/pull/7484) [`f57c67b`](https://github.com/LTplus-AG/ifc-lite/commit/f57c67bb72483396223c6e04b5a910b930433ac9) Thanks [@louistrue](https://github.com/louistrue)! - Release newly allocated symbolic fill and line buffers when upload or ownership registration fails. The viewer also contains sibling symbolic upload failures and retries retained CPU overlays on graphics-device recovery.
+
+## 6.3.1
+
+### Patch Changes
+
+- [#7505](https://github.com/LTplus-AG/ifc-lite/pull/7505) [`aaae237`](https://github.com/LTplus-AG/ifc-lite/commit/aaae237bf49ffc452c6962d44094c57b8cbfe1ce) Thanks [@louistrue](https://github.com/louistrue)! - Refuse zoom steps outside the supported camera coordinate envelope while preserving the last usable pose and reverse zoom.
+
+- [#7506](https://github.com/LTplus-AG/ifc-lite/pull/7506) [`e296053`](https://github.com/LTplus-AG/ifc-lite/commit/e2960537766a7e8232f383ed1c4395c760b6c0bb) Thanks [@louistrue](https://github.com/louistrue)! - Return no selection when GPU device loss invalidates a completed pick readback, releasing pending buffers exactly once while preserving live-device errors.
+
+- [#7496](https://github.com/LTplus-AG/ifc-lite/pull/7496) [`7bb49aa`](https://github.com/LTplus-AG/ifc-lite/commit/7bb49aa004417f9a2a115f11bf7786716d496954) Thanks [@louistrue](https://github.com/louistrue)! - Reject point and rectangle selection while the camera is outside the supported coordinate envelope, including readbacks that complete after camera invalidation. Picking resumes when the camera returns to a supported pose.
+
+- [#7504](https://github.com/LTplus-AG/ifc-lite/pull/7504) [`41e8fb4`](https://github.com/LTplus-AG/ifc-lite/commit/41e8fb44d8d542fa60d0f9ecbe3585a49e7efb6e) Thanks [@louistrue](https://github.com/louistrue)! - Selecting or hovering an element with an IFC surface texture now tints it solidly instead of z-fighting the texture in patches ([#7503](https://github.com/LTplus-AG/ifc-lite/issues/7503)). The highlight copy was built in the model's colour-batch frame, but textured geometry draws its raw positions against its own origin and is never quantized, so the copy landed a few f32 ulps off the surface it covers. Highlight and hover copies of textured pieces are now built in the textured drawable's own frame and are bit-coincident with it.
+
+## 6.3.0
+
+### Minor Changes
+
+- [#7479](https://github.com/LTplus-AG/ifc-lite/pull/7479) [`90c40f4`](https://github.com/LTplus-AG/ifc-lite/commit/90c40f410bc0fd5203a55892c013827d796624f9) Thanks [@louistrue](https://github.com/louistrue)! - Add optional count-based streaming GPU upload slices for structural benchmark cohorts; preserve the timed upload policy by default.
+
+### Patch Changes
+
+- Updated dependencies [[`9f03019`](https://github.com/LTplus-AG/ifc-lite/commit/9f03019ca64237a2a0805bf2b47031de317b706e), [`7cb1fa4`](https://github.com/LTplus-AG/ifc-lite/commit/7cb1fa4ed4140e383de4626306cd8932bcff1711)]:
+  - @ifc-lite/load-trace@0.3.0
+  - @ifc-lite/geometry@7.8.1
+
+## 6.2.0
+
+### Minor Changes
+
+- [#6711](https://github.com/LTplus-AG/ifc-lite/pull/6711) [`cf4e0b9`](https://github.com/LTplus-AG/ifc-lite/commit/cf4e0b912ffd050f9da943811f6d3abec87f5265) Thanks [@louistrue](https://github.com/louistrue)! - Add a frame-local RenderOptions.maxPixelRatio cap that preserves the renderer's persistent resolution preference for subsequent idle and capture renders.
+  
+  Add Renderer.renderWithResult on the shared render path so captures can reject skipped or contained-failure frames before reading the canvas. Preserve the existing void Renderer.render contract.
+
+### Patch Changes
+
+- [#7389](https://github.com/LTplus-AG/ifc-lite/pull/7389) [`e94652b`](https://github.com/LTplus-AG/ifc-lite/commit/e94652baed2cc8c8ef2e179396ad5d002c0c4024) Thanks [@louistrue](https://github.com/louistrue)! - Bound point-pick depth readback to a single GPU sample, sharing the ID staging buffer and releasing per-pick resources after mapping. Release point and rectangle readback buffers when encoding, submission or mapped-range access fails. Also retire all pending readbacks on picker teardown and discard results from a destroyed or replaced picker.
+  
+  Reject stale viewport selections and hover readbacks after pointer, viewer-state or lifecycle changes, and dispatch the latest hover position when movement stops inside the throttle interval.
+
+- [#7169](https://github.com/LTplus-AG/ifc-lite/pull/7169) [`7e2fcec`](https://github.com/LTplus-AG/ifc-lite/commit/7e2fcec5063d2aaf3ac9d7b2e66c714a965e155a) Thanks [@louistrue](https://github.com/louistrue)! - Add opt-in per-pass GPU timestamp samples with bounded readback ownership and cancellation during device loss. Pending maps prevent query-buffer reuse; configuration and recovery advance timing resource epochs.
+
+## 6.1.0
+
+### Minor Changes
+
+- [#6880](https://github.com/LTplus-AG/ifc-lite/pull/6880) [`ee14750`](https://github.com/LTplus-AG/ifc-lite/commit/ee1475098b4727c7e7d6243ec446a4ddebc0acea) Thanks [@louistrue](https://github.com/louistrue)! - Point-cloud chunks can be appended under a key and removed individually ([#6869](https://github.com/LTplus-AG/ifc-lite/issues/6869)): `Renderer.appendPointCloudChunk(handle, chunk, key)` and `Renderer.removePointCloudChunk(handle, key)`. A keyed chunk gets its own snap index, so removing it frees its GPU buffers and takes its points out of measurement snapping while the rest of the asset stays. View-dependent COPC streaming uses this to stream octree nodes in and out of one asset.
+
+- [#6910](https://github.com/LTplus-AG/ifc-lite/pull/6910) [`3b758c9`](https://github.com/LTplus-AG/ifc-lite/commit/3b758c990d2971e6bb6ad4df93dd2e9e0afcb959) Thanks [@louistrue](https://github.com/louistrue)! - Attribute each scan row of the Deviation CSV to the scan's own model ([#6887](https://github.com/LTplus-AG/ifc-lite/issues/6887)). In a federation where a streamed scan (LAS, LAZ, E57, PLY, PCD, PTS, XYZ or COPC) was not model 0, its row named model 0 and left GlobalId, Name and IfcClass empty. The panel now resolves the row's model and entity from the asset's federated id alone, and the viewer binds every streamed scan to its federated id and model index once the model is registered, so picks and `readDeviationDistances()` / `readDeviationAssetStats()` report the scan's model index instead of 0. `Renderer.relabelPointCloudAsset` takes an optional `modelIndex` for that binding.
+
+- [#6877](https://github.com/LTplus-AG/ifc-lite/pull/6877) [`459b77b`](https://github.com/LTplus-AG/ifc-lite/commit/459b77b48ff1ba39a1f2519f7dfc572ae343b508) Thanks [@louistrue](https://github.com/louistrue)! - Add summary statistics to the BIM ↔ scan deviation analysis ([#6872](https://github.com/LTplus-AG/ifc-lite/issues/6872)). The renderer exports `computeDeviationStatistics` and the sliced, abortable `computeDeviationStatisticsAsync`, `countWithinToleranceAsync`, `deviationHistogramAsync` and `summarizeDeviationAssetsAsync`, plus `Renderer.readDeviationDistances()`, which reads every computed point's signed distance into one array grouped by scan asset. Percentiles are exact, by a radix select that copies nothing, and the async variants yield to the event loop every few milliseconds. Statistics cover mean, mean and RMS of |d|, standard deviation, exact P50/P95/P99 and max of |d|, the share within a tolerance, points at the compute clip, and a histogram over the colour ramp's range. `DeviationAssetStats` gains a `statistics` field. The viewer's Deviation panel shows these figures with a tolerance input and a ramp-coloured histogram, and its CSV export reports them per scan asset with a pooled row for several assets.
+
+- [#7006](https://github.com/LTplus-AG/ifc-lite/pull/7006) [`272ebd8`](https://github.com/LTplus-AG/ifc-lite/commit/272ebd8615d038dc20dd8aec4e3bb88d1acf9fa7) Thanks [@louistrue](https://github.com/louistrue)! - Load tracing (`?perfTrace=1`) now covers the parser worker and the post-stream phases. `@ifc-lite/load-trace` adds `createWorkerPhaseTrace` for spans inside one long worker handler. `WorkerParser.parseColumnar` takes an optional `trace` and records `parser.worker` with the worker's `parser.parse`, `parser.entityIndexWait`, `parser.wasmInit`, per-phase `columnar.*`, `parser.spatialReady.serialize` and `parser.transport.serialize` spans under it, plus the main-thread `parser.hydrate`. `Scene.flushPending` and `Scene.finalizeStreamingAsync` take an optional trailing `trace` and record `scene.flushPending` and `scene.finalize` (with `scene.finalize.regroup`). The viewer records streaming batches, camera fit and refit, queue drain, instanced shard decode/upload, the first placed BVH build and the first tier-1 search index on the load that produced them. With tracing off every call site stays a no-op.
+
+- [#6933](https://github.com/LTplus-AG/ifc-lite/pull/6933) [`259c272`](https://github.com/LTplus-AG/ifc-lite/commit/259c27292e621762cf6d29c2e33b3e0376a08c2b) Thanks [@louistrue](https://github.com/louistrue)! - `Renderer.getPointCloudPlacement(handle)` returns a copy of a point cloud's exact float64 placement (import alignment and manual placement composed). `getPointCloudTransform` is the float32 GPU copy and rounds map-grid translations (LV95, UTM) by centimetres, so CPU code that maps scan coordinates into the world must use the new getter.
+
+- [#6658](https://github.com/LTplus-AG/ifc-lite/pull/6658) [`b235d3a`](https://github.com/LTplus-AG/ifc-lite/commit/b235d3a96e7ec87ff3b8ce74f9707f2bb3f303c9) Thanks [@hughevans](https://github.com/hughevans)! - Add `Renderer.setMaxPixelRatio(ratio)`, which caps the drawing buffer's device-pixel ratio below the default of 2. Since the drawing buffer follows the display's device pixels, a large viewport on a 2x screen fills four times the pixels it did at CSS resolution, and on a large model that fill is what limits the frame rate. An app can now choose CSS resolution, or anything between, for the frame rate. A non-finite or non-positive ratio falls back to the default.
+
+### Patch Changes
+
+- [#6885](https://github.com/LTplus-AG/ifc-lite/pull/6885) [`f271a0c`](https://github.com/LTplus-AG/ifc-lite/commit/f271a0c581258eb5f5e4f18f9aff1eb9ac9e9da0) Thanks [@louistrue](https://github.com/louistrue)! - Preserve pending GPU picks when viewport synchronization repeats the existing camera aspect ratio. Reject asynchronous picks after actual CSS viewport changes, including proportional resizes that keep the aspect ratio unchanged.
+
+- [#7414](https://github.com/LTplus-AG/ifc-lite/pull/7414) [`a58be10`](https://github.com/LTplus-AG/ifc-lite/commit/a58be102be99c6effab42b22c9311fd233edd820) Thanks [@louistrue](https://github.com/louistrue)! - Under `?perfTrace=1`, count GPU devices created, non-teardown device losses and uncaptured errors (`gpu.devices`, `gpu.deviceLost`, `gpu.uncapturedErrors`), so benchmark samples that lost their device and re-uploaded the scene can be flagged. Tracing off, the device is untouched as before.
+
+- [#6991](https://github.com/LTplus-AG/ifc-lite/pull/6991) [`8b81320`](https://github.com/LTplus-AG/ifc-lite/commit/8b813203997c0b3b21cc724c4f820ad83b9b4cf3) Thanks [@louistrue](https://github.com/louistrue)! - Main-thread health and structural counters ([#6957](https://github.com/LTplus-AG/ifc-lite/issues/6957)), all off unless load tracing is on (`?perfTrace=1`, benchmark runs). `@ifc-lite/load-trace` adds a realm-wide counter registry (`perfCounters`, `perfCount`, `perfTally`, `countCopy`) whose per-load deltas, plus every counter a worker posts back, land on `LoadTraceSnapshot.counters` / `.workerCounters`; a `long-animation-frame` / `longtask` monitor (`startFrameMonitor`) summarised per load and per innermost span as `.mainThread`; `accountWorkerMessages`, one wrapper counting a worker's messages, estimated structured-clone bytes, transferred and shared bytes per direction; and `meterTypedArrayArgs`, which counts the typed-array bytes handed to a wasm API object. The geometry pool, parser, scan and cache-compression workers go through that wrapper, geometry workers meter their wasm ingress and flush counters before the pre-pass worker is terminated, the renderer counts GPU buffer creations, uploaded bytes, `mergeGeometry` calls and finalize rebuilds, and the viewer counts store writes and notifications, full source copies and the per-append model-index re-spread. With tracing off each call site is one boolean test and every wrapper returns its target unchanged.
+
+- [#6734](https://github.com/LTplus-AG/ifc-lite/pull/6734) [`a0fe0e6`](https://github.com/LTplus-AG/ifc-lite/commit/a0fe0e684b07b213ab22b72461cedeacccc7edf3) Thanks [@louistrue](https://github.com/louistrue)! - Orthographic views no longer draw surfaces more than 2.5 cm behind a face in front of it. The per-entity anti-z-fighting depth nudge scaled with depth across the whole scene range, moving surfaces by decimetres on large sites. In orthographic projection it is now bounded to 2.5 cm and never moves a vertex across the near or far plane, and annotation lines and text are lifted above it. On kilometre-scale sites a few coplanar faces whose entities rank close together can swap at grazing angles; ordinary sites rank coplanar faces as before. Perspective rendering is unchanged.
+
+- [#7117](https://github.com/LTplus-AG/ifc-lite/pull/7117) [`5e87f28`](https://github.com/LTplus-AG/ifc-lite/commit/5e87f28dc594d5917befd8e5c105538d74a4f820) Thanks [@louistrue](https://github.com/louistrue)! - Compare selection and hover masks against the scene's depth at matching MSAA samples, so close occluders do not show through visible outlines.
+
+- [#6664](https://github.com/LTplus-AG/ifc-lite/pull/6664) [`b82c290`](https://github.com/LTplus-AG/ifc-lite/commit/b82c29053df5d0f48b514cf2fa6e3682b9b896db) Thanks [@hughevans](https://github.com/hughevans)! - X-Ray context ghosts (`ghostExceptIds`) draw with a lighter fragment stage. A ghost keeps the main shader's discards, flat face normal and diffuse light rig, and skips the specular term, cast shadows, the selection tint and the entity colour override, none of which show at the ghost alpha. Blended geometry gets no hidden-surface removal, so every ghosted layer under a pixel paid for that shading: on a large architectural model, orbiting with one storey solid and the rest ghosted drops from about 70 ms to about 15 ms a frame. Transparency overrides, selected and excepted ids, and natively translucent materials keep the full shader. The ghost pipeline is built on first use and validated asynchronously; until it lands, or if it fails, ghosts draw as before.
+
+- [#6659](https://github.com/LTplus-AG/ifc-lite/pull/6659) [`3f83b6f`](https://github.com/LTplus-AG/ifc-lite/commit/3f83b6f39e4348b0c8ead0544f94d18be8e63e06) Thanks [@hughevans](https://github.com/hughevans)! - Camera inertia runs on the `deltaTime` passed to `Camera.update` instead of on frames. The inertia loop spent and damped each channel once per frame, so the same drag coasted further on a slow frame and stopped sooner on a 120 Hz display: a half-second orbit coasted half as far at 120 Hz and about 1.5 times as far at 30 fps as at 60 Hz. A 60 Hz tick behaves exactly as before. A missing or malformed `deltaTime` counts as one 60 Hz frame, and a tick after a stall spends at most 100 ms of coast.
+- Updated dependencies [[`62634ad`](https://github.com/LTplus-AG/ifc-lite/commit/62634ada5a9738590f0546ae4157ec04f8ab9aa3), [`91337ca`](https://github.com/LTplus-AG/ifc-lite/commit/91337cad6306d88b7ad1256b0f637039a19e9573), [`4dce848`](https://github.com/LTplus-AG/ifc-lite/commit/4dce848d025f78ae9394276a7124205aba879dde), [`272ebd8`](https://github.com/LTplus-AG/ifc-lite/commit/272ebd8615d038dc20dd8aec4e3bb88d1acf9fa7), [`8b81320`](https://github.com/LTplus-AG/ifc-lite/commit/8b813203997c0b3b21cc724c4f820ad83b9b4cf3), [`fd1f8f5`](https://github.com/LTplus-AG/ifc-lite/commit/fd1f8f52fabbde0ecee4d6a5c15635293ff1a15e), [`8570465`](https://github.com/LTplus-AG/ifc-lite/commit/8570465acd2f68ef9b6f6e180d86af4636f52454), [`6364658`](https://github.com/LTplus-AG/ifc-lite/commit/6364658991cbdce5070cdde97e4cdf42a074acf7), [`ae15f9d`](https://github.com/LTplus-AG/ifc-lite/commit/ae15f9dbd01459690e8551ec8ccc62cec94e4f59), [`2a3a7d6`](https://github.com/LTplus-AG/ifc-lite/commit/2a3a7d633a6c9b49c1fa1f58f398c78d90982657), [`17e3f19`](https://github.com/LTplus-AG/ifc-lite/commit/17e3f195f52586529539c3cb9bef844dcd82b5fa), [`04e8c67`](https://github.com/LTplus-AG/ifc-lite/commit/04e8c6752778a444628507478b381ad920979fa6), [`2278072`](https://github.com/LTplus-AG/ifc-lite/commit/2278072a762255f0fb2a2d5131167c2ead7af344)]:
+  - @ifc-lite/load-trace@0.2.0
+  - @ifc-lite/geometry@7.8.0
+
 ## 6.0.1
 
 ### Patch Changes

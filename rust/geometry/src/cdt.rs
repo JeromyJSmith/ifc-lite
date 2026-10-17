@@ -102,6 +102,43 @@ const MAX_ASPECT: f64 = 7.0;
 /// Absolute iteration cap on the refinement loop (independent of the budget).
 const MAX_REFINE_ITERS: usize = 20_000;
 
+/// Work budget for building the CDT of [`triangulate_refined`], in progress
+/// steps (one per input segment and point, per legalization step, per
+/// constraint-recovery flip and per 64 triangles that flip's rescan visits):
+/// linear in the input. Constraint recovery is an O(T) rescan per flip with a
+/// 100 000-flip guard PER SEGMENT, so without it a hostile ring costs
+/// `segments * 100 000 * T`. Realistic many-hole faces spend 200 to 500 steps
+/// per point (a 5,000-hole 64-gon grid: 94M for 320k points). Past it the CDT
+/// is abandoned and the caller ear-clips, unrefined but valid (#7787).
+fn build_work_budget(points: usize) -> u64 {
+    (1u64 << 22).saturating_add((points as u64).saturating_mul(2048))
+}
+
+/// [`Cdt::build_from`] under [`build_work_budget`]; `None` past it, as for
+/// any CDT the builder declines.
+fn build_within_budget(points: Vec<P2>, segments: &[(usize, usize)], steiner_cap: usize) -> Option<Cdt> {
+    let budget = build_work_budget(points.len());
+    build_with_budget(points, segments, steiner_cap, budget)
+}
+
+fn build_with_budget(
+    points: Vec<P2>,
+    segments: &[(usize, usize)],
+    steiner_cap: usize,
+    budget: u64,
+) -> Option<Cdt> {
+    let (mut calls, mut spent) = (0u32, 0u64);
+    let mut step = || {
+        crate::progress::tick_strided(&mut calls, 0xFFF);
+        spent += 1;
+        if spent > budget {
+            return Err(crate::terrain_cdt::TerrainCdtError::WorkLimitExceeded);
+        }
+        Ok(())
+    };
+    Cdt::build_from_with_progress_mode(points, segments, steiner_cap, false, &mut step).ok().flatten()
+}
+
 type P2 = [f64; 2];
 const NONE: usize = usize::MAX;
 
@@ -111,17 +148,7 @@ fn p2(p: &Point2<f64>) -> P2 {
 }
 
 /// Exact orientation sign of `(a, b, c)`: `+1` CCW, `-1` CW, `0` collinear.
-#[inline]
-fn orient(a: P2, b: P2, c: P2) -> i32 {
-    let d = geometry_predicates::orient2d(a, b, c);
-    if d > 0.0 {
-        1
-    } else if d < 0.0 {
-        -1
-    } else {
-        0
-    }
-}
+use crate::geom2d::orientation as orient;
 
 /// Exact in-circle sign: `> 0` when `d` is strictly inside the circumcircle of
 /// the CCW triangle `(a, b, c)`.
@@ -232,7 +259,14 @@ impl Cdt {
     /// add Steiner points and replace a segment with its two halves, then
     /// rebuild cleanly from scratch — no fragile in-place mutation).
     fn build_from(points: Vec<P2>, segments: &[(usize, usize)], steiner_cap: usize) -> Option<Cdt> {
-        Self::build_from_with_progress_mode(points, segments, steiner_cap, false, &mut || Ok(()))
+        // The progress callback never cancels here; it only forwards a strided
+        // heartbeat for a host waiting on one long triangulation.
+        let mut calls = 0u32;
+        let mut heartbeat = || {
+            crate::progress::tick_strided(&mut calls, 0xFFF);
+            Ok(())
+        };
+        Self::build_from_with_progress_mode(points, segments, steiner_cap, false, &mut heartbeat)
             .ok()
             .flatten()
     }
@@ -1341,7 +1375,7 @@ fn refine_to_fixpoint(points: Vec<P2>, segments: Vec<(usize, usize)>) -> Option<
     let n_input = points.len();
     let max_steiner = (n_input * 3).max(32);
     let mut steiner = 0usize;
-    let mut cdt = Cdt::build_from(points, &segments, max_steiner.min(MAX_REFINE_ITERS))?;
+    let mut cdt = build_within_budget(points, &segments, max_steiner.min(MAX_REFINE_ITERS))?;
 
     cdt.start_refinement(COS_MIN_ANGLE);
     while steiner < max_steiner.min(MAX_REFINE_ITERS) {
@@ -1353,6 +1387,9 @@ fn refine_to_fixpoint(points: Vec<P2>, segments: Vec<(usize, usize)>) -> Option<
             return None; // Steiner insertion tripped a topology invariant — ear-clip fallback
         }
         steiner += 1;
+        if steiner & 0x3FF == 0 {
+            crate::progress::tick();
+        }
     }
     Some(cdt)
 }

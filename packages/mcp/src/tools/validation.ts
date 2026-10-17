@@ -12,19 +12,18 @@
  */
 
 import { readFile } from 'node:fs/promises';
-import { parseIDS, validateIDS, createTranslationService, type IDSValidationReport, type IFCDataAccessor, type SupportedLocale } from '@ifc-lite/ids';
+import { parseIDS, validateIDS, createTranslationService, type IDSValidationReport, type SupportedLocale } from '@ifc-lite/ids';
 import { IFC_ENTITY_NAMES, iterateEffectiveEntities } from '@ifc-lite/data';
 import { getInheritanceChainAcrossSchemas } from '@ifc-lite/parser';
-import { foldedTypeCounts, pendingMutationsField, pendingOverlay, stepText } from '../overlay.js';
-import { effectiveSourceIds, pendingEntityMembership } from '../effective-entity-membership.js';
-import { isProductType } from '../backend-query.js';
+import { foldedTypeCounts, pendingMutationsField, pendingOverlay, stepText, effectiveSourceIds, pendingEntityMembership, isProductType } from '@ifc-lite/sdk/headless';
 import { EntityNode } from '@ifc-lite/query';
 import type { Tool } from './types.js';
-import { okResult, resolveModel } from './util.js';
+import { fmtInt, okResult, resolveModel } from './util.js';
 import { ToolErrorCode, ToolExecutionError } from '../errors.js';
 import { resolveSafePath } from '../safe-path.js';
 import type { ToolContext } from '../context.js';
 import { buildIdsAccessor } from './ids-accessor.js';
+import { nativeReviewModel, reviewCaptures, reviewAccess } from './review-captures.js';
 import { buildDropCensusIssues, dropCensusJson } from './drop-census-issues.js';
 
 const idsValidate: Tool = {
@@ -50,25 +49,35 @@ const idsValidate: Tool = {
     // call (built lazily, #4857's pattern); `buildIdsAccessor` passes
     // `undefined` on to `createDataAccessor` for that same-shape null, which
     // is the byte-identical no-visibility-view path (#5184).
-    const accessor = buildIdsAccessor(m.store, m.backend.getMutationView() ?? undefined) as IFCDataAccessor;
+    const accessor = buildIdsAccessor(m.store, m.backend.getMutationView() ?? undefined);
     const locale = (input.locale as SupportedLocale | undefined) ?? 'en';
-    const report = await validateIDS(
-      idsDoc,
-      accessor,
-      { modelId: m.id, schemaVersion: m.store.schemaVersion, entityCount: m.store.entityCount },
-      {
-        translator: createTranslationService(locale),
-        onProgress: (p) => {
-          ctx.progress.report(p.percentage / 100, `Validating ${p.phase} (${p.specificationIndex + 1}/${p.totalSpecifications})`, 100);
+    const captures = reviewCaptures(ctx);
+    const capture = await captures.begin('ids', xml, [nativeReviewModel(m)], reviewAccess(ctx, 'validate').models, reviewAccess(ctx, 'validate').allowed, ctx.signal);
+    try {
+      if (ctx.signal.aborted) throw new DOMException('Validation aborted', 'AbortError');
+      const report = await validateIDS(
+        idsDoc,
+        accessor,
+        { modelId: m.id, schemaVersion: m.store.schemaVersion, entityCount: m.store.entityCount },
+        {
+          translator: createTranslationService(locale),
+          onProgress: (p) => {
+            ctx.progress.report(p.percentage / 100, `Validating ${p.phase} (${p.specificationIndex + 1}/${p.totalSpecifications})`, 100);
+          },
         },
-      },
-    );
+      );
 
-    const summary = summarizeIdsReport(report);
-    return okResult(
-      `IDS: ${summary.passedSpecifications}/${summary.totalSpecifications} specs passed; ${summary.failedEntities} entity failures.`,
-      { summary, report },
-    );
+      if (ctx.signal.aborted) throw new DOMException('Validation aborted', 'AbortError');
+      captures.finish(capture, report);
+      const summary = summarizeIdsReport(report);
+      return okResult(
+        `IDS: ${summary.passedSpecifications}/${summary.totalSpecifications} specs passed; ${summary.failedEntities} entity failures.`,
+        { summary, report },
+      );
+    } catch (error) {
+      captures.abandon(capture, ctx.signal.aborted ? 'aborted' : 'producer-failed');
+      throw error;
+    }
   },
 };
 
@@ -79,7 +88,7 @@ const idsValidate: Tool = {
  * the previous arrangement let `ids_explain` read arbitrary paths in
  * restricted stdio deployments.
  */
-async function loadIdsXml(
+export async function loadIdsXml(
   input: Record<string, unknown>,
   ctx: ToolContext,
 ): Promise<string> {
@@ -282,7 +291,7 @@ const modelAudit: Tool = {
     if (unnamed > 0) {
       issues.push({
         severity: 'warning', category: 'data-quality', rule: 'has-name', entityCount: unnamed,
-        message: `${unnamed.toLocaleString()} of ${totalProducts.toLocaleString()} entities have no Name attribute.`,
+        message: `${fmtInt(unnamed)} of ${fmtInt(totalProducts)} entities have no Name attribute.`,
       });
     }
 

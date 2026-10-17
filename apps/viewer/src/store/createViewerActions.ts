@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import { clearLoadReport } from '../lib/error-reports/context';
 /** Cross-slice viewer actions. Domain state stays in its owning slice; this
  * composition seam preserves reset side effects and workspace routing. */
 import type { StateCreator } from 'zustand';
@@ -12,11 +13,14 @@ import { trackPanelOpened, type PanelOpenSource } from './uiTelemetry.js';
 import { invalidateVisibleBasketCache } from './basketVisibleSet.js';
 import { SIDEBAR_PANEL_FLAGS } from './store-sync.js';
 import { viewerTeardown } from './teardown-registry.js';
-import { clearLastSectionMode } from './slices/sectionSlice.js';
 import { DEFAULT_CONTROLS_MODE } from './slices/cameraSlice.js';
 import { endClashScenePresentation, type ClashSceneTeardown } from '@/lib/clash/visibility-ownership';
 
+import { readCurrentSymbolicParseCensus, type SymbolicParseCensus } from './symbolic-parse-observer.js';
+
 export interface ViewerActions {
+  /** Passive private perf observer; refuses incomplete parses without starting work. */
+  readSymbolicParseOutcomes: () => SymbolicParseCensus;
   resetViewerState: () => void;
   /**
    * Open one right-side analysis panel and close the others, so the chosen
@@ -59,9 +63,11 @@ export interface ViewerActions {
 }
 
 export const createViewerActions: StateCreator<ViewerState, [], [], ViewerActions> = (...args) => ({
+  readSymbolicParseOutcomes: () => readCurrentSymbolicParseCensus(args[1]()),
   // Reset all viewer state when loading new file
   // Note: Does NOT clear models - use clearAllModels() for that
   resetViewerState: () => {
+    clearLoadReport();
     invalidateVisibleBasketCache();
     const [set, get] = args;
     // Drop the persisted "last section mode" (localStorage, survives closing
@@ -73,7 +79,6 @@ export const createViewerActions: StateCreator<ViewerState, [], [], ViewerAction
     // time the section tool was opened (#2939). It stays HERE, not in that
     // contribution: writing localStorage is a side effect, and a teardown is
     // pure.
-    clearLastSectionMode();
     // Measurements (#2641 review): the slice owns the full list of its own
     // fields to clear on a model switch — see resetAllMeasurementState's doc
     // comment (measurementSlice.ts) for why this must not be a field list

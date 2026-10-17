@@ -41,9 +41,10 @@ on:
         # Backfill lever: a plain dispatch only produces 1-day artifacts, so
         # before this input existed a release missing an archive (issue
         # #2619, v1.16.6 shipped without the win32-x64 zip) could not be
-        # repaired self-service. Supplying an existing v* tag uploads the
-        # rebuilt archives to that release and re-verifies its assets.
-        description: 'Existing release tag (e.g. v1.16.6) to upload the built archives to; leave empty for artifacts only'
+        # repaired self-service. Supplying an existing server-v* (or legacy
+        # v*) tag uploads the rebuilt archives to that release and re-verifies
+        # its assets.
+        description: 'Existing release tag (e.g. server-v2.0.1, or legacy v1.16.6) to upload the built archives to; leave empty for artifacts only'
         required: false
         type: string
         default: ''
@@ -62,8 +63,8 @@ jobs:
   validate-server-binaries:
     name: Validate Server Binary (${{ matrix.target }})
     # Changesets emits a release event for every scoped package. Only the
-    # v-prefixed product release should spend runners validating server bins.
-    if: github.event_name != 'release' || startsWith(github.event.release.tag_name, 'v')
+    # server-bin release (`server-v*`) should spend runners validating server bins.
+    if: github.event_name != 'release' || startsWith(github.event.release.tag_name, 'server-v')
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     strategy:
@@ -103,7 +104,7 @@ jobs:
         # target std was only ever installed for `stable`, never for the
         # nightly that actually runs, so those targets need std rebuilt from
         # source instead of relying on a prebuilt one that was never fetched.
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-05
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master 2026-05
         with:
           toolchain: stable
           targets: ${{ matrix.rust-target }}
@@ -208,7 +209,7 @@ jobs:
     name: Validate Server Binary (${{ matrix.target }})
     if: >-
       github.event_name != 'pull_request'
-      && (github.event_name != 'release' || startsWith(github.event.release.tag_name, 'v'))
+      && (github.event_name != 'release' || startsWith(github.event.release.tag_name, 'server-v'))
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     strategy:
@@ -250,7 +251,7 @@ jobs:
         # target std was only ever installed for `stable`, never for the
         # nightly that actually runs, so those targets need std rebuilt from
         # source instead of relying on a prebuilt one that was never fetched.
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-05
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master 2026-05
         with:
           toolchain: stable
           targets: ${{ matrix.rust-target }}
@@ -344,13 +345,14 @@ jobs:
 
   release-server-binaries:
     name: Release Server Binary (${{ matrix.target }})
-    # Only build + upload server binaries for version-tagged releases (e.g.
-    # `v2.1.9`). Without this filter every published release fires this job,
-    # so non-version tags like `fixtures-v1` end up with stray server
-    # tarballs uploaded to the wrong release. Manual `workflow_dispatch`
-    # is still allowed for ad-hoc rebuilds.
+    # Only build + upload server binaries for server-bin releases,
+    # `server-v<version>`. Without this filter every published release fires
+    # this job, so tags like `fixtures-v1` or a root `v*` release end up with
+    # stray server tarballs uploaded to the wrong release (#6900: the root and
+    # server-bin once shared `v*`). Manual `workflow_dispatch` is still allowed
+    # for ad-hoc rebuilds and for backfilling a legacy `v*` server release.
     if: |
-      (github.event_name == 'release' && startsWith(github.event.release.tag_name, 'v'))
+      (github.event_name == 'release' && startsWith(github.event.release.tag_name, 'server-v'))
       || github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
@@ -423,7 +425,7 @@ jobs:
         # target std was only ever installed for `stable`, never for the
         # nightly that actually runs, so those targets need std rebuilt from
         # source instead of relying on a prebuilt one that was never fetched.
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-05
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master 2026-05
         with:
           toolchain: stable
           targets: ${{ matrix.rust-target }}
@@ -572,7 +574,7 @@ jobs:
 
       - name: Upload Build Artifact
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ifc-lite-server-${{ matrix.target }}
           path: |
@@ -703,7 +705,7 @@ jobs:
     if: |
       always()
       && (
-        (github.event_name == 'release' && startsWith(github.event.release.tag_name, 'v'))
+        (github.event_name == 'release' && startsWith(github.event.release.tag_name, 'server-v'))
         || (github.event_name == 'workflow_dispatch' && inputs.upload-to-tag != '')
       )
     runs-on: ubuntu-latest

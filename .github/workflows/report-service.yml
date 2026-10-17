@@ -1,0 +1,147 @@
+name: Model report storage integration
+
+on:
+  pull_request:
+    paths:
+      - 'apps/report-service/**'
+      - 'apps/viewer/src/components/error-report/**'
+      - 'apps/viewer/src/services/error-reports/**'
+      - 'packages/report-contract/**'
+      - '.github/workflows/report-service.yml'
+      - '.github/actions/setup-report-integration/**'
+      - 'bun.lock'
+  workflow_dispatch:
+    inputs:
+      scanner_max_model:
+        description: Run the selected exact 1 GiB real-scanner qualification
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: report-storage-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  storage-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - name: Provision real report integration prerequisites
+        uses: ./.github/actions/setup-report-integration
+      - name: Real database and multipart storage qualification
+        run: bun run test --filter=@ifc-lite/report-service --filter=@ifc-lite/report-contract --concurrency=1 --env-mode=loose
+      - name: Remove owned report integration prerequisites
+        if: always()
+        uses: ./.github/actions/setup-report-integration
+        with:
+          state: stop
+
+  real-scanner:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      REPORT_REQUIRE_SCANNER: 'true'
+      REPORT_SCANNER_MAX_MODEL: ${{ github.event_name == 'workflow_dispatch' && inputs.scanner_max_model && 'true' || 'false' }}
+      REPORT_SCANNER_SIGNATURE_DIRECTORY: /tmp/ifclite-scanner-signatures
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - uses: ./.github/actions/setup-report-integration
+      - name: Build scanner and fetch its public authoring-tool fixture
+        run: |
+          bun run build --filter=@ifc-lite/report-service... --concurrency=1
+          bun run fixtures ara3d/AC20-FZK-Haus.ifc
+      - name: Prepare pinned engine and fresh signed databases without model access
+        run: |
+          scanner_image="$(node --input-type=module -e 'import {SCANNER_IMAGE} from "./apps/report-service/dist/scanner-sandbox.js"; process.stdout.write(SCANNER_IMAGE)')"
+          docker pull "$scanner_image"
+          bun x tsx apps/report-service/scripts/scan-public-once.ts update-signatures
+      - name: Real engine, database and storage qualification
+        run: bun run test --filter=@ifc-lite/report-service --filter=@ifc-lite/report-contract --concurrency=1 --env-mode=loose
+      - name: Remove owned report fixtures
+        if: always()
+        uses: ./.github/actions/setup-report-integration
+        with:
+          state: stop
+      - name: Remove scanner signature fixture
+        if: always()
+        run: rm -rf -- "$REPORT_SCANNER_SIGNATURE_DIRECTORY"
+
+  mounted-public-ui:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - uses: ./.github/actions/setup-wasm-build
+        with:
+          cache-prefix: report-public-ui-wasm
+      - name: Root Turbo viewer dependency graph and test-source typecheck
+        run: bun run typecheck
+      - name: Provision real report integration prerequisites
+        uses: ./.github/actions/setup-report-integration
+      - name: Fetch bounded authentic reporter IFC for mounted HTTP qualification
+        shell: bash
+        run: |
+          set -euo pipefail
+          report_ui_fixture="$RUNNER_TEMP/report-public-ui.ifc"
+          curl --fail --silent --show-error --location --max-time 30 --max-filesize 65536 \
+            https://github.com/user-attachments/files/33384683/out_visible.ifc.txt -o "$report_ui_fixture"
+          test "$(wc -c < "$report_ui_fixture")" -eq 22701
+          echo "cc6fbbf632c2779891e485c3297d437b1d8555448934b8c8b5a3cce5326553a2  $report_ui_fixture" | sha256sum --check --status
+          echo "REPORT_TEST_PUBLIC_UI_IFC_FILE=$report_ui_fixture" >> "$GITHUB_ENV"
+      - name: Mounted reporting UI through real handler, database and multipart storage
+        env:
+          REPORT_TEST_PUBLIC_UI: 'true'
+          TEST_PATTERN: '(PublicModelSharing.http|PublicModelReceipt.race|PublicModelReceipt.concurrent)'
+        run: bun run test --filter=@ifc-lite/viewer --concurrency=2 --env-mode=loose
+      - name: Isolate stale public receipt behavior with the original implementation
+        run: |
+          if git diff --name-only --diff-filter=A origin/main...HEAD -- apps/viewer/src/components/error-report/PublicModelReceipt.tsx | grep -Fxq 'apps/viewer/src/components/error-report/PublicModelReceipt.tsx'; then
+            node scripts/check-test-revert-oracle.mjs --base origin/main --ci --json --only apps/viewer/src/components/error-report/PublicModelReceipt.tsx --mutation tests/evidence/model-reports-7495/public-receipt-race.oracle.patch --test apps/viewer/src/components/error-report/PublicModelReceipt.race.test.tsx
+          elif git diff --name-only --diff-filter=M origin/main...HEAD -- apps/viewer/src/components/error-report/PublicModelReceipt.tsx | grep -Fxq 'apps/viewer/src/components/error-report/PublicModelReceipt.tsx'; then
+            node scripts/check-test-revert-oracle.mjs --base origin/main --ci --json --only apps/viewer/src/components/error-report/PublicModelReceipt.tsx --test apps/viewer/src/components/error-report/PublicModelReceipt.race.test.tsx --test apps/viewer/src/components/error-report/PublicModelReceipt.concurrent.test.tsx
+          else
+            echo 'Public receipt is on main: ordinary whole-change inversion resumes; historical receipt inverse not applied.'
+          fi
+      - name: Prove restored public receipt controls pass
+        env:
+          TEST_PATTERN: '(PublicModelReceipt.race|PublicModelReceipt.concurrent)'
+        run: bun run test --filter=@ifc-lite/viewer --concurrency=2 --env-mode=loose --force
+      - name: Remove owned report integration prerequisites
+        if: always()
+        uses: ./.github/actions/setup-report-integration
+        with:
+          state: stop

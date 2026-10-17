@@ -2,9 +2,12 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 import type { SavedComparison } from '../compare/savedComparisonSchema';
+import { isSavedComparisonChart } from '../charts/comparison-source';
 import { savedReportBlock, type SavedValidationReport } from '../validation/reports/history';
-import { DOCUMENT_VERSION, validateDocumentSpec, type DocumentSpec, type DocumentBlock, type IdsReportBlock } from './types';
-import { freshBlockId, freshDocumentId, freshListCopyId } from './persistence';
+import { DOCUMENT_VERSION, migrateDocumentSpec, validateDocumentSpec, type DocumentSpec, type DocumentBlock, type IdsReportBlock } from './types';
+import { setBlockTitleFields } from './block-title';
+import { copyDocumentBlock, freshBlockId, freshDocumentId } from './persistence';
+import { detachAiProvenance } from './ai-report-types';
 import { literalTemplateText } from './bindings';
 
 export type DocumentReportResult =
@@ -33,9 +36,13 @@ export interface BuildReportDocumentOptions {
 }
 
 /** Validate the saved template against enabled jobs before any model loading starts. */
-export function validateReportDocumentTemplate(template: DocumentSpec,
+export function validateReportDocumentTemplate(saved: DocumentSpec,
   mappings: readonly DocumentResultMapping[], jobs: readonly DocumentMappingJob[],
 ): string[] {
+  // A workflow carries its template as it was saved, so an older format version is upgraded
+  // here exactly as a saved document is on load (#6548); validating it as-is refused every
+  // template saved before a format bump.
+  const template = migrateDocumentSpec(saved) as DocumentSpec;
   const errors = validateDocumentSpec(template).map((error) => `${error.path} ${error.message}`);
   if (errors.length) return errors;
   const byJob = new Map<string, DocumentMappingJob>();
@@ -68,7 +75,7 @@ export function validateReportDocumentTemplate(template: DocumentSpec,
     if (block.kind === 'table' && block.source.kind === 'validation') {
       errors.push(`Live validation table ${block.id} must be replaced with a mapped validation report block`);
     }
-    if (block.kind === 'chart' && (block.chart.source === 'ids' || block.chart.source === 'compare')) {
+    if (block.kind === 'chart' && (block.chart.source === 'ids' || (block.chart.source === 'compare' && !isSavedComparisonChart(block.chart)))) {
       errors.push(`Live ${block.chart.source} chart ${block.id} cannot use workflow evidence; use a mapped report block`);
     }
   }
@@ -105,7 +112,10 @@ function resultBlock(result: DocumentReportResult, presentation?: DocumentBlock)
     if (presentation && presentation.kind !== 'ids-report') throw new Error(`Block ${presentation.id} requires a validation report block`);
     return { ...structuredClone(result.snapshot), id,
       variant: presentation?.variant ?? result.snapshot.variant ?? 'compact', benchmarks: presentation?.benchmarks ?? result.snapshot.benchmarks ?? true,
-      ...(presentation?.title !== undefined ? { title: presentation.title } : {}),
+      ...((presentation?.specificationsOnly ?? result.snapshot.specificationsOnly) !== undefined ? { specificationsOnly: presentation?.specificationsOnly ?? result.snapshot.specificationsOnly } : {}),
+      ...(presentation ? setBlockTitleFields(presentation) : {}),
+      ...(presentation?.scale !== undefined ? { scale: presentation.scale } : {}),
+      ...(presentation?.showStamp !== undefined ? { showStamp: presentation.showStamp } : {}),
     };
   }
   if (presentation && (presentation.kind !== 'table' || presentation.source.kind !== 'comparison')) {
@@ -117,7 +127,7 @@ function resultBlock(result: DocumentReportResult, presentation?: DocumentBlock)
 
 /** Job order is input order; an IDS job with N results expands adjacent report blocks. */
 export function buildReportDocument(options: BuildReportDocumentOptions): DocumentSpec {
-  const { template, mappings = [], results } = options;
+  const { mappings = [], results } = options;
   if (results.length === 0) throw new Error('A report document requires at least one completed result');
   const identities = new Set<string>();
   for (const result of results) {
@@ -128,11 +138,12 @@ export function buildReportDocument(options: BuildReportDocumentOptions): Docume
       throw new Error(`Job ${result.jobId} contains execution errors`);
     }
   }
-  if (!template) return { version: DOCUMENT_VERSION, id: freshDocumentId(), name: options.name ?? 'Workflow report',
+  if (!options.template) return { version: DOCUMENT_VERSION, id: freshDocumentId(), name: options.name ?? 'Workflow report',
     page: { size: 'A4', orientation: 'portrait' }, blocks: [...defaultCover(options), ...results.map((result) => resultBlock(result))] };
   const jobs = [...new Map(results.map((result) => [result.jobId, { jobId: result.jobId, kind: result.kind }])).values()];
-  const errors = validateReportDocumentTemplate(template, mappings, jobs);
+  const errors = validateReportDocumentTemplate(options.template, mappings, jobs);
   if (errors.length) throw new Error(`Invalid document template: ${errors.join('; ')}`);
+  const template = migrateDocumentSpec(options.template) as DocumentSpec;
   const byBlock = new Map(mappings.map((mapping) => [mapping.blockId, mapping]));
   const blocks: DocumentBlock[] = [];
   for (const block of template.blocks) {
@@ -147,14 +158,13 @@ export function buildReportDocument(options: BuildReportDocumentOptions): Docume
       if (block.kind === 'ids-report' || (block.kind === 'table' && block.source.kind === 'comparison')) {
         throw new Error(`Report block ${block.id} requires a result mapping`);
       }
-      const copy = structuredClone(block);
-      copy.id = freshBlockId();
-      if (copy.kind === 'table' && copy.source.kind === 'list') copy.source.list.id = freshListCopyId();
-      if (copy.kind === 'chart') copy.chart.id = freshBlockId();
-      blocks.push(copy);
+      blocks.push(detachAiProvenance(copyDocumentBlock(block)));
     }
   }
-  return { ...structuredClone(template), id: freshDocumentId(), name: options.name ?? template.name, blocks };
+  // An AI report used as a template keeps its text, never its old evidence record (#6918).
+  const layout = structuredClone(template);
+  delete layout.aiReport;
+  return { ...layout, id: freshDocumentId(), name: options.name ?? template.name, blocks };
 }
 
 /** Convenience for library-backed automation callers; result IDs are library evidence IDs. */

@@ -28,6 +28,29 @@ renderer.requestRender();
 
 `loadGeometry()` accepts a `GeometryResult` from `@ifc-lite/geometry` or a raw `MeshData[]`. The renderer keeps geometry in GPU buffers; subsequent `requestRender()` calls coalesce into a single frame.
 
+Camera zoom refuses a step that would move the eye or target outside the renderer's supported source-coordinate envelope (±1,000,000,000 metres per axis). The previous pose, cursor anchor and orbit pivot remain intact, so reversing the gesture works. If another control has already moved outside the envelope, zoom may recover incrementally: each accepted step must strictly reduce the largest absolute eye/target coordinate until the pose is supported again. This applies to ordinary, cursor-anchored, fast, surface and inertial zoom. Orthographic zoom keeps its existing scale behavior while its cursor translation observes the same coordinate boundary.
+
+## Inspect GPU pass timing
+
+Timestamp queries are opt-in. Enable them before rendering, then read resolved
+samples after frames have submitted:
+
+```typescript
+renderer.setGpuFrameTiming(true);
+renderer.render();
+const timing = renderer.getGpuFrameTiming();
+console.log(timing.mode, timing.frames);
+```
+
+`gpu-queries` samples report each render pass in milliseconds. `unsupported`
+means the actual device lacks timestamp queries; no CPU or queue-completion
+value is substituted. Readback is asynchronous, so the first snapshot can be
+empty. Frames arriving during a pending map are skipped, and the bounded sample
+history reports overwritten frames. Errors and resource epochs identify invalid
+or interrupted captures. Device loss clears old samples before observers run;
+recovery preserves the opt-in setting and starts a new epoch. Disable with
+`renderer.setGpuFrameTiming(false)` to release the timing resources.
+
 ## Recover from GPU device loss
 
 ```typescript
@@ -45,8 +68,13 @@ renderer.onDeviceLost(async () => {
 scene in place, preserving the `Renderer`, camera, IFC geometry, model
 placements, visibility, selection and colour overrides. Concurrent calls share
 one attempt. It returns a typed failure instead of presenting an incomplete
-scene when CPU geometry has been released, streaming has not settled, cold
-geometry cannot be restored, or public `addMesh()` content has no CPU source.
+scene when CPU geometry has been released, a finalizer or authoring transaction
+is active, cold geometry cannot be restored, or public `addMesh()` content has
+no CPU source. Retained streaming fragments are rebuilt from their CPU owners;
+the pending queue resumes from its existing cursor only after recovery commits.
+Frame and stream-end consumers cannot access the staged replacement device.
+Clearing or replacing the source during an awaited recovery refuses that attempt
+without consuming the new load's queue. Append-only pending arrivals are retained.
 Point clouds, reference images and transient overlay layers are reported in
 `omissions` when they must be reloaded by the host.
 

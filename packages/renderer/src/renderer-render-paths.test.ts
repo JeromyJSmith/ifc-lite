@@ -37,6 +37,7 @@ async function requireColorTable() {
     MAP_READ: 1, MAP_WRITE: 2, COPY_SRC: 4, COPY_DST: 8, INDEX: 16,
     VERTEX: 32, UNIFORM: 64, STORAGE: 128, INDIRECT: 256, QUERY_RESOLVE: 512,
 };
+(globalThis as Record<string, unknown>).GPUMapMode = { READ: 1, WRITE: 2 };
 (globalThis as Record<string, unknown>).GPUTextureUsage = {
     COPY_SRC: 1, COPY_DST: 2, TEXTURE_BINDING: 4, STORAGE_BINDING: 8, RENDER_ATTACHMENT: 16,
 };
@@ -67,6 +68,7 @@ interface Harness {
     stats: {
         push: number;
         pop: number;
+        submissions: number;
         /** vertex buffer bound at slot 0 when each drawIndexed fired */
         draws: unknown[];
         createdBuffers: FakeBuffer[];
@@ -100,6 +102,8 @@ interface Harness {
         encodeThrows: boolean;
         /** make queue.submit() throw after the color readback has been encoded */
         submitThrows: boolean;
+        /** #6881: faults after a Picker owns transient readback buffers. */
+        pickFault: 'id-copy' | 'depth-encode' | 'depth-copy' | 'finish' | 'mapped-range' | null;
         /** make popErrorScope() reject (device lost while scope pending) */
         popRejects: boolean;
         /**
@@ -121,27 +125,36 @@ interface Harness {
     settle(): Promise<void>;
     /** number of `mapAsync` calls currently parked (deferMaps) */
     pendingMaps(): number;
+    loseDevice(): void;
     /** complete every parked map: resolve it, or reject it with `reason` */
     settlePendingMaps(reason?: unknown): void;
 }
 
 const OPAQUE_PIPELINE = { label: 'opaque' };
 const TRANSPARENT_PIPELINE = { label: 'transparent' };
+const GHOST_PIPELINE = { label: 'ghost' };
 
 function makeHarness(): Harness {
-    const stats: Harness['stats'] = { push: 0, pop: 0, draws: [], createdBuffers: [], mapAsync: 0, writes: [], commands: [], passes: [], createdTextures: 0, textures: [], destroyedTextures: [], boundColorTables: [] };
+    const stats: Harness['stats'] = { push: 0, pop: 0, submissions: 0, draws: [], createdBuffers: [], mapAsync: 0, writes: [], commands: [], passes: [], createdTextures: 0, textures: [], destroyedTextures: [], boundColorTables: [] };
     const knobs: Harness['knobs'] = {
         textureMode: 'texture', encodeThrows: false, submitThrows: false, popRejects: false, gpuDead: false,
-        deferMaps: false,
+        deferMaps: false, pickFault: null,
     };
+    let loseDevice!: () => void;
+    const lost = new Promise<void>((resolve) => { loseDevice = resolve; });
     const parkedMaps: { resolve: () => void; reject: (e: unknown) => void }[] = [];
 
-    const makeBuffer = (desc: { size: number }): FakeBuffer => {
+    const makeBuffer = (desc: { size: number; usage?: number }): FakeBuffer => {
         const buf: FakeBuffer & { _ab: ArrayBuffer } = {
             size: desc.size,
             destroyed: 0,
             _ab: new ArrayBuffer(desc.size),
-            getMappedRange() { return this._ab; },
+            getMappedRange() {
+                if (knobs.pickFault === 'mapped-range' && ((desc.usage ?? 0) & GPUBufferUsage.MAP_READ)) {
+                    throw new Error('boom mapped range');
+                }
+                return this._ab;
+            },
             mapAsync() {
                 stats.mapAsync++;
                 // Same failure mode as the browser: a map issued against a dead
@@ -199,7 +212,20 @@ function makeHarness(): Harness {
                     return pass;
                 };
             }
-            if (prop === 'finish') return () => ({});
+            if (prop === 'copyTextureToBuffer') return () => {
+                if (knobs.pickFault === 'id-copy') throw new Error('boom ID copy');
+            };
+            if (prop === 'copyBufferToBuffer') return () => {
+                if (knobs.pickFault === 'depth-copy') throw new Error('boom depth copy');
+            };
+            if (prop === 'beginComputePass') return () => {
+                if (knobs.pickFault === 'depth-encode') throw new Error('boom depth encode');
+                return pass;
+            };
+            if (prop === 'finish') return () => {
+                if (knobs.pickFault === 'finish') throw new Error('boom encoder finish');
+                return {};
+            };
             return () => undefined;
         },
     });
@@ -216,12 +242,13 @@ function makeHarness(): Harness {
         },
         writeTexture() { /* no-op */ },
         copyExternalImageToTexture() { /* no-op */ },
-        submit() { if (knobs.submitThrows) throw new Error('boom on submit'); },
+        submit() { if (knobs.submitThrows) throw new Error('boom on submit'); stats.submissions++; },
         onSubmittedWorkDone() { return Promise.resolve(); },
     };
     const fakeGpuDevice = new Proxy({} as Record<string | symbol, unknown>, {
         get(_t, prop) {
             switch (prop) {
+                case 'lost': return lost;
                 case 'limits': return { maxTextureDimension2D: 8192, maxBufferSize: 256 * 1024 * 1024 };
                 case 'queue': return queue;
                 case 'pushErrorScope': return () => { stats.push++; };
@@ -247,6 +274,7 @@ function makeHarness(): Harness {
                 // Picker builds real pipelines in its constructor and binds
                 // through the auto layout, so both arms must return objects.
                 case 'createShaderModule': return () => ({});
+                case 'createComputePipeline':
                 case 'createRenderPipeline': return () => ({ getBindGroupLayout: () => ({}) });
                 // Destroying a device also completes every map still pending
                 // against it — with an AbortError, exactly as Chromium does.
@@ -299,6 +327,7 @@ function makeHarness(): Harness {
                     // Stable identities so a test can tell which pipeline drew what.
                     case 'getPipeline': return () => OPAQUE_PIPELINE;
                     case 'getTransparentPipeline': return () => TRANSPARENT_PIPELINE;
+                    case 'getGhostPipeline': return () => GHOST_PIPELINE;
                     case 'setEntityColorTableBuffer': return (buffer: unknown) => { stats.boundColorTables.push(buffer); };
                     default: return () => ({});
                 }
@@ -321,6 +350,7 @@ function makeHarness(): Harness {
             await Promise.resolve();
         },
         pendingMaps() { return parkedMaps.length; },
+        loseDevice() { knobs.gpuDead = true; loseDevice(); },
         settlePendingMaps(reason?: unknown) {
             for (const m of parkedMaps.splice(0)) {
                 if (reason === undefined) m.resolve(); else m.reject(reason);
@@ -368,6 +398,51 @@ function seedBatches(h: Harness): { grey: BatchedMesh; red: BatchedMesh } {
     const red = batches.find((b) => b.expressIds.includes(3))!;
     return { grey, red };
 }
+
+describe('canonical render submission result (#6709)', () => {
+    it('reports a new submitted frame while preserving render() void behavior', () => {
+        const h = makeHarness();
+        assert.strictEqual(h.renderer.renderWithResult({ visualEnhancement: { enabled: false } }), true);
+        assert.strictEqual(h.stats.submissions, 1, 'the actual render body reached queue.submit');
+        assert.strictEqual(h.renderer.render({ visualEnhancement: { enabled: false } }), undefined);
+        assert.strictEqual(h.stats.submissions, 2, 'the void API uses that same render body');
+    });
+
+    for (const failure of ['uninitialized', 'pipeline', 'collapsed', 'texture', 'encode', 'submit'] as const) {
+        it(`reports ${failure} refusal instead of claiming the previous submission`, async () => {
+            const h = makeHarness();
+            h.render();
+            assert.strictEqual(h.stats.submissions, 1, 'seed one genuine canonical submission');
+            if (failure === 'uninitialized') h.renderer['device'].destroy();
+            if (failure === 'pipeline') h.renderer['pipeline'] = null;
+            if (failure === 'collapsed') h.renderer.getCanvas().getBoundingClientRect = () => ({ width: 0, height: 0 } as DOMRect);
+            if (failure === 'texture') h.knobs.textureMode = 'null';
+            if (failure === 'encode') h.knobs.encodeThrows = true;
+            if (failure === 'submit') h.knobs.submitThrows = true;
+            const warn = mock.method(console, 'warn', () => {});
+            try {
+                assert.strictEqual(h.renderer.renderWithResult({ visualEnhancement: { enabled: false } }), false);
+                await h.settle();
+                assert.strictEqual(h.stats.submissions, 1, 'no new command buffer was submitted');
+                assert.strictEqual(h.stats.push, h.stats.pop, 'existing validation scope ownership is preserved');
+            } finally { warn.mock.restore(); }
+        });
+    }
+
+    it('contains pre-encoding restoration failure and recovers through the same path', () => {
+        const h = makeHarness();
+        const restore = mock.method(sceneOf(h), 'restoreAllEvicted', () => { throw new RangeError('controlled restoration failure'); });
+        const warn = mock.method(console, 'warn', () => {});
+        try {
+            assert.strictEqual(h.renderer.renderWithResult({ restoreEvictedForCapture: true }), false);
+            assert.strictEqual(h.stats.submissions, 0);
+            assert.strictEqual(h.renderer.getDiagnostics().errors, 1, 'the existing containment reports the error');
+            restore.mock.restore();
+            assert.strictEqual(h.renderer.renderWithResult({ visualEnhancement: { enabled: false } }), true);
+            assert.strictEqual(h.stats.submissions, 1);
+        } finally { restore.mock.restore(); warn.mock.restore(); }
+    });
+});
 
 describe('render() error-scope balance', () => {
     it('pops the scope on a null-current-texture frame', async () => {
@@ -879,7 +954,7 @@ describe('drawables outside the RTE eye envelope (#6128)', () => {
         h.renderer['pickingManager'].setPicker(picker);
 
         assert.strictEqual(await h.renderer.pick(10, 10), null);
-        assert.strictEqual(h.stats.mapAsync, 2, 'the pick pass ran to its readback');
+        assert.strictEqual(h.stats.mapAsync, 1, 'the pick pass ran to its combined readback (#6881)');
         assert.deepStrictEqual(await h.renderer.pickRect(0, 0, 8, 8), new Set());
     });
 
@@ -930,7 +1005,7 @@ describe('pick path survives a dead GPU device (#1901)', () => {
         // Resolves null because the stub reads back a zeroed sample (no hit);
         // the readback COUNT is what proves the pass ran, not the value.
         assert.strictEqual(await h.renderer.pick(10, 10), null);
-        assert.strictEqual(h.stats.mapAsync, 2, 'pick() maps the colour + depth readbacks');
+        assert.strictEqual(h.stats.mapAsync, 1, 'pick() maps the combined ID/depth readback (#6881)');
 
         h.stats.mapAsync = 0;
         assert.deepStrictEqual(await h.renderer.pickRect(0, 0, 8, 8), new Set());
@@ -1035,6 +1110,28 @@ describe('pick path survives the device dying mid-readback (#1901)', () => {
         return { inflight };
     }
 
+    for (const kind of ['point', 'rectangle'] as const) {
+        it(`suppresses a completed-map result after device loss and releases exactly once: ${kind} (#6881)`, async () => {
+            const h = makeHarness();
+            const picker = installPicker(h);
+            const before = h.stats.createdBuffers.length;
+            const { inflight } = await park(h, () => kind === 'point'
+                ? picker.pick(0, 0, 64, 64, [], new Float32Array(16))
+                : picker.pickRect(0, 0, 8, 8, 64, 64, [], new Float32Array(16)));
+            // Native Chromium can complete the map, then invalidate the range
+            // before its consumer resumes. Delivery remains parked here.
+            h.knobs.pickFault = 'mapped-range';
+            h.loseDevice();
+            await Promise.resolve();
+            h.settlePendingMaps();
+            assert.deepStrictEqual(await inflight, kind === 'point' ? null : new Set());
+            const owned = h.stats.createdBuffers.slice(before);
+            assert.strictEqual(owned.length, kind === 'point' ? 3 : 1);
+            picker.destroy();
+            for (const buffer of owned) assert.strictEqual(buffer.destroyed, 1);
+        });
+    }
+
     it('pick() parked on mapAsync when destroy() lands resolves null, not AbortError', async () => {
         const h = makeHarness();
         installPicker(h);
@@ -1074,12 +1171,115 @@ describe('pick path survives the device dying mid-readback (#1901)', () => {
         // microtask turns to reach mapAsync than we spun, destroy() lands
         // before submit and both settle via the ENTRY guard, never exercising
         // the overlapping-in-flight release this case exists to cover.
-        // Two picks x (colour + depth) = 4 parked readbacks.
-        assert.strictEqual(h.pendingMaps(), 4, 'both picks must be parked on their readbacks');
+        // #6881: each pick maps one staging buffer containing both ID and depth.
+        assert.strictEqual(h.pendingMaps(), 2, 'both picks must be parked on their readbacks');
         h.renderer.destroy();
         const settled = await Promise.allSettled([first, second]);
         assert.deepStrictEqual(settled.map((s) => s.status), ['fulfilled', 'fulfilled']);
     });
+
+    for (const path of ['point', 'rectangle'] as const) {
+        it(`direct ${path} teardown rejects completed old data (#6881 lifecycle)`, async () => {
+            const h = makeHarness();
+            const picker = installPicker(h);
+            const before = h.stats.createdBuffers.length;
+            const { inflight } = await park(h, () => path === 'point'
+                ? picker.pick(0, 0, 64, 64, [], new Float32Array(16))
+                : picker.pickRect(0, 0, 0, 0, 64, 64, [], new Float32Array(16)));
+            const owned = h.stats.createdBuffers.slice(before);
+            // Stated byte-layout input, not a GPU oracle: instanced ID 123 at
+            // staging byte zero. A map completed before destroy may be delivered
+            // afterwards without rejecting (e.g. a delayed promise continuation).
+            new Uint32Array(owned[0].getMappedRange())[0] = 0x40000000 | 123;
+            h.settlePendingMaps();
+            picker.destroy(); // lands before the awaiting continuation resumes
+            assert.deepEqual(await inflight, path === 'point' ? null : new Set());
+            assert.ok(owned.every(buffer => buffer.destroyed === 1),
+                'every transient resource must still be released exactly once');
+        });
+    }
+
+    for (const path of ['point', 'rectangle'] as const) {
+        it(`direct ${path} teardown releases all overlapping pending readbacks (#6881 lifecycle)`, async () => {
+            const h = makeHarness();
+            const picker = installPicker(h);
+            const before = h.stats.createdBuffers.length;
+            const start = () => path === 'point'
+                ? picker.pick(0, 0, 64, 64, [], new Float32Array(16))
+                : picker.pickRect(0, 0, 0, 0, 64, 64, [], new Float32Array(16));
+            const first = await park(h, start);
+            const mapsPerCall = h.pendingMaps();
+            const second = await park(h, start);
+            const owned = h.stats.createdBuffers.slice(before);
+            assert.equal(h.pendingMaps(), mapsPerCall * 2, 'both calls reached the async boundary');
+            assert.ok(owned.length >= 2, 'both calls allocated owned readbacks');
+            picker.destroy();
+            const releasedBeforeDelivery = owned.every(buffer => buffer.destroyed === 1);
+            // Drain even the failing baseline: never leave parked fixture work.
+            h.settlePendingMaps();
+            await Promise.all([first.inflight, second.inflight]);
+            assert.ok(releasedBeforeDelivery, 'destroy releases without waiting for promise delivery');
+            assert.ok(owned.every(buffer => buffer.destroyed === 1), 'late finally must not double-release');
+        });
+    }
+
+    it('point-pick transient allocation stays bounded across viewport sizes (#6881)', async () => {
+        for (const [width, height] of [[64, 64], [1292, 1047]]) {
+            const h = makeHarness();
+            const picker = installPicker(h);
+            const before = h.stats.createdBuffers.length;
+            const { inflight } = await park(h, () => picker.pick(0, 0, width, height, [], new Float32Array(16)));
+            const owned = h.stats.createdBuffers.slice(before);
+            assert.ok(owned.reduce((bytes, buffer) => bytes + buffer.size, 0) <= 268,
+                'point picking must not allocate a viewport-sized depth readback');
+            h.settlePendingMaps();
+            await inflight;
+            assert.ok(owned.every(buffer => buffer.destroyed === 1), 'all per-pick resources are released once');
+            picker.destroy();
+        }
+    });
+
+    for (const fault of ['id-copy', 'depth-encode', 'depth-copy', 'finish', 'submit', 'mapped-range'] as const) {
+        it(`point-pick releases every owned buffer when ${fault} fails (#6881)`, async () => {
+            const h = makeHarness();
+            const picker = installPicker(h);
+            const before = h.stats.createdBuffers.length;
+            if (fault === 'submit') h.knobs.submitThrows = true;
+            else h.knobs.pickFault = fault;
+            try {
+                await assert.rejects(picker.pick(0, 0, 64, 64, [], new Float32Array(16)), /boom/);
+                const owned = h.stats.createdBuffers.slice(before);
+                assert.strictEqual(owned.length, fault === 'id-copy' ? 1 : 3,
+                    'fault must occur after the expected transient allocations');
+                assert.strictEqual(h.stats.mapAsync, fault === 'mapped-range' ? 1 : 0,
+                    'fault must occur at the requested encoding or mapped-read boundary');
+                assert.ok(owned.every(buffer => buffer.destroyed === 1),
+                    'every transient buffer must be released exactly once on propagation');
+            } finally {
+                picker.destroy();
+            }
+        });
+    }
+
+    for (const fault of ['id-copy', 'finish', 'submit', 'mapped-range'] as const) {
+        it(`rectangle-pick releases its staging buffer when ${fault} fails (#6881)`, async () => {
+            const h = makeHarness();
+            const picker = installPicker(h);
+            const before = h.stats.createdBuffers.length;
+            if (fault === 'submit') h.knobs.submitThrows = true;
+            else h.knobs.pickFault = fault;
+            try {
+                await assert.rejects(picker.pickRect(0, 0, 8, 8, 64, 64, [], new Float32Array(16)), /boom/);
+                const owned = h.stats.createdBuffers.slice(before);
+                assert.strictEqual(owned.length, 1, 'rectangle fault must reach its staging allocation');
+                assert.strictEqual(h.stats.mapAsync, fault === 'mapped-range' ? 1 : 0,
+                    'fault must occur at the requested encoding or mapped-read boundary');
+                assert.strictEqual(owned[0].destroyed, 1, 'staging must be released exactly once');
+            } finally {
+                picker.destroy();
+            }
+        });
+    }
 
     it('a REAL readback fault still propagates — the catch is not a blanket swallow', async () => {
         const h = makeHarness();
@@ -1109,7 +1309,7 @@ describe('pick path survives the device dying mid-readback (#1901)', () => {
         await assert.rejects(inflight, /already mapped/);
 
         const readbacks = h.stats.createdBuffers.slice(before);
-        assert.strictEqual(readbacks.length, 2, 'pick() allocates the colour + depth readbacks');
+        assert.strictEqual(readbacks.length, 3, 'pick() owns staging, coordinates and depth output (#6881)');
         for (const buf of readbacks) {
             assert.ok(buf.destroyed > 0, 'a readback buffer survived the rethrow — leaked');
         }
@@ -1149,8 +1349,8 @@ describe('Picker.pick maps a real readback onto the picked item (#2985)', () => 
         for (let i = 0; i < 5; i++) await Promise.resolve();
         assert.ok(h.pendingMaps() > 0, 'the pick must be parked on its readbacks');
 
-        // The colour readback is the pick's only 256-byte buffer (the depth one
-        // is a full image); `pick` reads texel 0 of it as a u32.
+        // The combined ID/depth readback is the pick's only 256-byte buffer;
+        // `pick` reads texel 0 of it as a u32 (#6881).
         const colour = h.stats.createdBuffers.slice(before).filter((b) => b.size === 256);
         assert.strictEqual(colour.length, 1, 'expected exactly one colour readback');
         new Uint32Array(colour[0].getMappedRange())[0] = 1; // mesh 0, written as index + 1
@@ -1402,6 +1602,30 @@ describe('X-Ray fades the entity, not its colour batch (#4129)', () => {
         assert.ok(!h.stats.draws.includes(grey.vertexBuffer));
         assertAlpha(h, subBatchFor(h, [1]).uniformBuffer, DEFAULT_GHOST_ALPHA);
         assertAlpha(h, subBatchFor(h, [2]).uniformBuffer, 1);
+    });
+
+    it('draws context ghosts with the ghost pipeline, and an X-Ray override with the transparent one', () => {
+        const h = makeHarness();
+        const { red } = seedBatches(h);
+        const pipelineOfDraw = (vertexBuffer: GPUBuffer): unknown => {
+            let pipeline: unknown = null;
+            let draw = 0;
+            for (const c of h.stats.commands) {
+                if (c.op === 'setPipeline') pipeline = c.pipeline;
+                if (c.op === 'drawIndexed' && h.stats.draws[draw++] === vertexBuffer) return pipeline;
+            }
+            return undefined;
+        };
+
+        h.render({ ghostExceptIds: new Set([2]) });
+        assert.strictEqual(pipelineOfDraw(subBatchFor(h, [1]).vertexBuffer), GHOST_PIPELINE, 'the ghosted batchmate');
+        assert.strictEqual(pipelineOfDraw(red.vertexBuffer), GHOST_PIPELINE, 'a wholly ghosted batch');
+        assert.strictEqual(pipelineOfDraw(subBatchFor(h, [2]).vertexBuffer), OPAQUE_PIPELINE, 'the excepted entity');
+
+        h.stats.commands.length = 0;
+        h.stats.draws.length = 0;
+        h.render({ transparencyOverrides: new Map([[1, 0.18]]) });
+        assert.strictEqual(pipelineOfDraw(subBatchFor(h, [1]).vertexBuffer), TRANSPARENT_PIPELINE, 'an override keeps full shading');
     });
 
     it('re-splits when the X-Ray set changes and frees the clones when it clears', () => {

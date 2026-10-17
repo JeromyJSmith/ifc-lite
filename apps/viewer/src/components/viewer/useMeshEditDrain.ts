@@ -34,10 +34,12 @@ import type { MeshData } from '@ifc-lite/geometry';
 import { useViewerStore } from '@/store';
 import { watchModelUnloads } from '@/lib/remesh/remesh-service';
 import { runGpuUpload } from './gpu-upload-guard';
+import { geometryMeshKey } from './geometry-mesh-key';
 
 export interface MeshEditDrainParams {
   rendererRef: MutableRefObject<Renderer | null>;
   isInitialized: boolean;
+  gpuRecoveryEpoch?: number;
   isStreaming: boolean;
   geometry: MeshData[] | null;
   pendingMeshRemovals: Set<number> | null;
@@ -46,14 +48,16 @@ export interface MeshEditDrainParams {
   /** The main geometry effect's bookkeeping, advanced past a drained edit. */
   lastGeometryLengthRef: MutableRefObject<number>;
   lastGeometryRef: MutableRefObject<MeshData[] | null>;
+  geometryReplacementVersion: number;
+  lastReplacementVersionRef: MutableRefObject<number>;
   processedMeshIdsRef: MutableRefObject<Set<string>>;
 }
 
 export function useMeshEditDrain(params: MeshEditDrainParams): void {
   const {
-    rendererRef, isInitialized, isStreaming, geometry,
+    rendererRef, isInitialized, gpuRecoveryEpoch = 0, isStreaming, geometry,
     pendingMeshRemovals, clearPendingMeshRemovals, pruneGeometryMeshes,
-    lastGeometryLengthRef, lastGeometryRef, processedMeshIdsRef,
+    lastGeometryLengthRef, lastGeometryRef, processedMeshIdsRef, geometryReplacementVersion, lastReplacementVersionRef,
   } = params;
   const pendingMeshEdits = useViewerStore((s) => s.pendingMeshEdits);
   const clearPendingMeshEdits = useViewerStore((s) => s.clearPendingMeshEdits);
@@ -98,7 +102,7 @@ export function useMeshEditDrain(params: MeshEditDrainParams): void {
       renderer.requestRender();
     }
     clearPendingMeshRemovals();
-  }, [pendingMeshRemovals, isInitialized, clearPendingMeshRemovals, pruneGeometryMeshes]);
+  }, [pendingMeshRemovals, isInitialized, gpuRecoveryEpoch, clearPendingMeshRemovals, pruneGeometryMeshes]);
 
   // ─── Re-meshed elements (replaceEntityMeshes) ─────────────────────────
   useEffect(() => {
@@ -116,7 +120,13 @@ export function useMeshEditDrain(params: MeshEditDrainParams): void {
     // left to remove); it also retires an instanced occurrence of the id,
     // whose re-mesh arrives as flat geometry.
     scene.removeMeshesForEntities(ids);
-    const fresh = geometry.filter((mesh) => ids.has(mesh.expressId));
+    const fresh: MeshData[] = [];
+    const freshKeys: string[] = [];
+    geometry.forEach((mesh, index) => {
+      if (!ids.has(mesh.expressId)) return;
+      fresh.push(mesh);
+      freshKeys.push(geometryMeshKey(mesh, index));
+    });
     const uploaded = runGpuUpload('appendToBatches:mesh-edits', () => {
       if (fresh.length > 0) scene.appendToBatches(fresh, device, pipeline, false);
       else if (scene.hasPendingBatches()) scene.rebuildPendingBatches(device, pipeline);
@@ -126,8 +136,13 @@ export function useMeshEditDrain(params: MeshEditDrainParams): void {
     if (!uploaded) return;
 
     if (renderedTickRef.current === since && useViewerStore.getState().geometryUpdateTick === tick) {
+      // Camera fitting can still scan the same-length source after this drain.
+      // Claim only the parts whose upload succeeded, using the same source-slot
+      // identity as the main effect; neither item IDs nor coordinates dedupe parts.
+      for (const key of freshKeys) processedMeshIdsRef.current.add(key);
       lastGeometryLengthRef.current = geometry.length;
       lastGeometryRef.current = geometry;
+      lastReplacementVersionRef.current = geometryReplacementVersion;
     } else {
       // Something else changed the geometry since the main effect last ran: fall back to
       // the main effect's rebuild-keeping-camera (its shrink branch).
@@ -137,7 +152,7 @@ export function useMeshEditDrain(params: MeshEditDrainParams): void {
     renderer.clearCaches();
     renderer.requestRender();
     clearPendingMeshEdits();
-  }, [pendingMeshEdits, geometry, isInitialized, isStreaming, clearPendingMeshEdits]);
+  }, [pendingMeshEdits, geometry, geometryReplacementVersion, isInitialized, gpuRecoveryEpoch, isStreaming, clearPendingMeshEdits]);
 
   // Declared AFTER the edit drain, so that drain still reads the tick of the
   // previous committed render, the one the main effect last consumed.

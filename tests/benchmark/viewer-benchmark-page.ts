@@ -3,7 +3,25 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import { Page, ConsoleMessage } from '@playwright/test';
-import { waitForMetadataRenderReadiness } from './metadata-render-readiness.js';
+import { probeMetadataRenderTrace, waitForMetadataRenderReadiness, type LoadTraceProbe } from './metadata-render-readiness.js';
+import {
+  countersFromLoadTrace,
+  metricsFromLoadTrace,
+  settleKey,
+  type LoadCounters,
+  SPAN_METRIC_KEYS,
+  type LoadTraceSnapshotJson,
+} from './load-trace-metrics.js';
+import { requireTimingUploads } from '../../scripts/lib/benchmark-upload-mode.mjs';
+
+/** Where the viewer publishes its span tree under `?perfTrace=1` (apps/viewer/src/lib/perf/loadTrace.ts). */
+const LOAD_TRACE_GLOBAL = '__IFC_LITE_LOAD_TRACE__';
+
+/** Geometry workers the benchmark pins by default (#6957); `VIEWER_BENCHMARK_GEOM_WORKERS` overrides. */
+export const DEFAULT_GEOM_WORKERS = 4;
+
+/** Which source each span-capable metric came from on this run (#6956). */
+export type MetricSource = 'span' | 'none';
 
 export interface ViewerBenchmarkMetrics {
   // Wall-clock total time (what users actually experience)
@@ -47,6 +65,13 @@ export interface ViewerBenchmarkMetrics {
   instancedContributionCulled: number | null;
 }
 
+/** In-memory file for `setInputFiles` (Playwright's own payload shape). */
+export interface BenchmarkFilePayload {
+  name: string;
+  mimeType: string;
+  buffer: Buffer;
+}
+
 export class ViewerBenchmarkPage {
   private page: Page;
   private consoleLogs: string[] = [];
@@ -54,6 +79,10 @@ export class ViewerBenchmarkPage {
   private loadStartTime: number = 0;
   private loadEndTime: number = 0;
   private cacheMode: string;
+  private loadTrace: LoadTraceSnapshotJson | null = null;
+  private metricSources: Partial<Record<string, MetricSource>> = {};
+  private geomWorkers: number | null = null;
+  private uploadMode: 'timed' | 'count' = 'timed';
 
   /**
    * Defaults to the same port `playwright.config.ts` serves on. It used to be a
@@ -106,12 +135,20 @@ export class ViewerBenchmarkPage {
     });
   }
 
-  async setup() {
+  /**
+   * `query` (#6993 native count driver): navigate to exactly `${origin}/${query}`
+   * and let the viewer's own URL flags configure the load. No init-script
+   * global and no `VIEWER_BENCHMARK_*` override is applied in that mode, so a
+   * global can never shadow the literal query (flags read a global first).
+   * The upload mode and worker count are read back from the query itself.
+   */
+  async setup(options: { query?: string } = {}) {
     // Capture all console logs
     this.page.on('console', (msg: ConsoleMessage) => {
       const text = msg.text();
       this.consoleLogs.push(text);
     });
+    if (options.query !== undefined) return this.setupExactQuery(options.query);
 
     // Optional adaptive-batch-sizing override for sweeping the watchdog↔
     // throughput knob (#1097). Set VIEWER_BENCHMARK_BATCH_SIZING to a JSON
@@ -126,7 +163,7 @@ export class ViewerBenchmarkPage {
           (globalThis as unknown as { __IFC_LITE_BATCH_SIZING?: unknown }).__IFC_LITE_BATCH_SIZING = c;
         }, cfg);
         console.log(`[Benchmark] batch sizing override: ${batchSizingEnv}`);
-      } catch (e) {
+      } catch {
         console.warn(`[Benchmark] invalid VIEWER_BENCHMARK_BATCH_SIZING: ${batchSizingEnv}`);
       }
     }
@@ -142,7 +179,7 @@ export class ViewerBenchmarkPage {
           (globalThis as unknown as { __IFC_LITE_VISIBILITY_FILTER?: unknown }).__IFC_LITE_VISIBILITY_FILTER = c;
         }, f);
         console.log(`[Benchmark] visibility filter: ${visFilterEnv}`);
-      } catch (e) {
+      } catch {
         console.warn(`[Benchmark] invalid VIEWER_BENCHMARK_VISIBILITY_FILTER: ${visFilterEnv}`);
       }
     }
@@ -259,8 +296,36 @@ export class ViewerBenchmarkPage {
       console.warn(`[Benchmark] invalid VIEWER_BENCHMARK_QUANTIZED (expected "1" or "0"): ${quantEnv}`);
     }
 
+    // #6956: turn on the viewer's load tracer so metrics and load completion
+    // come exclusively from its span tree (window.__IFC_LITE_LOAD_TRACE__).
+    await this.page.addInitScript(() => {
+      (globalThis as unknown as { __IFC_LITE_PERF_TRACE?: number }).__IFC_LITE_PERF_TRACE = 1;
+    });
+
+    const uploadEnv = process.env.VIEWER_BENCHMARK_GPU_UPLOADS;
+    if (uploadEnv !== undefined && uploadEnv !== '0' && uploadEnv !== '1') {
+      throw new Error('VIEWER_BENCHMARK_GPU_UPLOADS must be "1" (count cohort) or "0" (timing cohort).');
+    }
+    this.uploadMode = uploadEnv === '1' ? 'count' : 'timed';
+    if (this.uploadMode === 'count') {
+      await this.page.addInitScript((pinSizing) => {
+        const realm = globalThis as unknown as { __IFC_LITE_BENCHMARK_UPLOADS?: number; __IFC_LITE_BATCH_SIZING?: unknown };
+        realm.__IFC_LITE_BENCHMARK_UPLOADS = 1;
+        if (pinSizing) realm.__IFC_LITE_BATCH_SIZING = { targetMs: 8000, minJobs: 64, maxJobs: 64 };
+      }, process.env.VIEWER_BENCHMARK_BATCH_SIZING === undefined);
+    }
+
+    // #6957: pin the geometry worker count so structural counters (messages,
+    // copies, uploads) compare across runs and machines. `auto` keeps the
+    // engine heuristic; `?geomWorkers=` is the viewer's own override.
+    const workersEnv = process.env.VIEWER_BENCHMARK_GEOM_WORKERS ?? String(DEFAULT_GEOM_WORKERS);
+    this.geomWorkers = /^([1-9]|1[0-6])$/.test(workersEnv) ? Number(workersEnv) : null;
+    if (this.geomWorkers === null && workersEnv !== 'auto') {
+      console.warn(`[Benchmark] invalid VIEWER_BENCHMARK_GEOM_WORKERS (expected 1-16 or "auto"): ${workersEnv}`);
+    }
+
     // Navigate to viewer app
-    await this.page.goto(this.origin);
+    await this.page.goto(this.geomWorkers === null ? this.origin : `${this.origin}/?geomWorkers=${this.geomWorkers}`);
     
     // Wait for app to be ready (file input exists but is hidden, so check for existence)
     await this.page.waitForSelector('input[type="file"]', { state: 'attached', timeout: 30000 });
@@ -277,7 +342,25 @@ export class ViewerBenchmarkPage {
     }
   }
 
-  async loadFile(filePath: string, waitForStart = true) {
+  private async setupExactQuery(query: string) {
+    const params = new URLSearchParams(query.startsWith('?') ? query.slice(1) : '');
+    if (!query.startsWith('?') || params.get('perfTrace') !== '1') {
+      throw new Error(`An exact benchmark query must start with "?" and enable perfTrace=1: ${query}`);
+    }
+    const uploads = params.get('perf.benchmarkUploads');
+    if (uploads !== null && uploads !== '0' && uploads !== '1') throw new Error(`perf.benchmarkUploads must be 0 or 1: ${uploads}`);
+    this.uploadMode = uploads === '1' ? 'count' : 'timed';
+    const workers = params.get('geomWorkers');
+    this.geomWorkers = workers !== null && /^([1-9]|1[0-6])$/.test(workers) ? Number(workers) : null;
+    await this.page.goto(`${this.origin}/${query}`);
+    await this.page.waitForSelector('input[type="file"]', { state: 'attached', timeout: 30000 });
+  }
+
+  /**
+   * `file` is a path, or a payload for a browser that cannot open this
+   * machine's paths (Windows Chrome over `connectOverCDP` from WSL).
+   */
+  async loadFile(file: string | BenchmarkFilePayload, waitForStart = true) {
     // Find the file input (there are two, use the one in ViewportContainer)
     const fileInput = this.page.locator('input[type="file"]').first();
 
@@ -285,124 +368,76 @@ export class ViewerBenchmarkPage {
     this.loadStartTime = Date.now();
 
     // Upload file
-    await fileInput.setInputFiles(filePath);
+    await fileInput.setInputFiles(file);
 
     // Wait for file loading to start (check for file name in logs)
     if (waitForStart) await this.page.waitForTimeout(1000);
   }
 
   /**
-   * Check 2D content when available; WebGPU fallback establishes only canvas allocation
+   * Canvas allocation only. This used to sample pixels through
+   * `getContext('2d')`, but the viewport canvas exists before the renderer
+   * claims it, and a canvas holding a 2D context returns null for
+   * `getContext('webgpu')` from then on: the renderer failed with "Failed to
+   * get WebGPU context", and that run measured no GPU work at all (draw
+   * calls, uploads, the #6957 GPU counters).
+   * Pixels of a WebGPU canvas cannot be read back from here anyway.
    */
   private async checkCanvasHasContent(): Promise<boolean> {
     try {
-      const hasContent = await this.page.evaluate(() => {
+      return await this.page.evaluate(() => {
         const canvas = document.querySelector('canvas');
-        if (!canvas) return false;
-        
-        // Check if canvas has non-zero dimensions
-        if (canvas.width === 0 || canvas.height === 0) return false;
-        
-        // Try to sample a few pixels to see if there's actual content
-        const ctx = canvas.getContext('2d', { willReadFrequently: true });
-        if (ctx) {
-          const imageData = ctx.getImageData(
-            Math.floor(canvas.width / 2),
-            Math.floor(canvas.height / 2),
-            10, 10
-          );
-          // Check if any pixels have non-background colors
-          for (let i = 0; i < imageData.data.length; i += 4) {
-            const r = imageData.data[i];
-            const g = imageData.data[i + 1];
-            const b = imageData.data[i + 2];
-            // Not pure background gray (128, 128, 128 or similar)
-            if (Math.abs(r - g) > 5 || Math.abs(g - b) > 5 || r > 200 || r < 50) {
-              return true;
-            }
-          }
-        }
-        
-        // For WebGPU, we can't easily read pixels, so just check dimensions
-        return canvas.width > 0 && canvas.height > 0;
+        return !!canvas && canvas.width > 0 && canvas.height > 0;
       });
-      return hasContent;
     } catch {
       return false;
     }
   }
 
+  /**
+   * One cold sample as `scripts/perf/browser-cold-ab.mts` drives it: upload at
+   * once, then wait for metadata + geometry + renderer finalize + canvas. The
+   * cold A/B calls only this, so its tracing setup (`setup()`) and readiness
+   * logic (`waitForMetadataRenderReadiness`) are this page's own, never a copy (#7032).
+   */
+  async loadUntilReady(filePath: string, timeoutMs: number) {
+    requireTimingUploads({ environment: { uploadMode: this.uploadMode } });
+    await this.loadFile(filePath, false);
+    await this.waitForCompletion(timeoutMs, true);
+    requireTimingUploads({ environment: { uploadMode: this.getUploadMode() } });
+  }
+
+  /**
+   * The count-cohort twin of `loadUntilReady` (#6993): same upload and same
+   * metadata + geometry + renderer-finalize readiness, but it REQUIRES count
+   * uploads, and its result is structural counters, never a timing.
+   * `loadUntilReady` keeps refusing count mode for its timing callers.
+   */
+  async loadUntilCountReady(file: string | BenchmarkFilePayload, timeoutMs: number) {
+    if (this.uploadMode !== 'count') {
+      throw new Error('loadUntilCountReady needs a count-upload setup (perf.benchmarkUploads=1 or VIEWER_BENCHMARK_GPU_UPLOADS=1)');
+    }
+    await this.loadFile(file, false);
+    await this.waitForCompletion(timeoutMs, true);
+  }
+
   async waitForCompletion(timeoutMs: number = 600000, requireMetadataRender = false) {
+    const startTime = Date.now();
+    this.loadEndTime = await waitForMetadataRenderReadiness({
+      trace: () => this.probeLoadTrace(), logs: () => this.consoleLogs,
+      canvasReady: () => this.checkCanvasHasContent(), now: () => Date.now(),
+      pause: () => this.page.waitForTimeout(100), timeoutMs,
+      completionMode: requireMetadataRender ? 'metadata-render' : 'load-root',
+    });
+    this.metrics.renderCompleteMs = this.loadEndTime - this.loadStartTime;
+    this.metrics.canvasHasContent = true;
     if (requireMetadataRender) {
-      this.loadEndTime = await waitForMetadataRenderReadiness({
-        logs: () => this.consoleLogs, canvasReady: () => this.checkCanvasHasContent(),
-        now: () => Date.now(), pause: () => this.page.waitForTimeout(100), timeoutMs,
-      });
-      this.metrics.metadataRenderReadyMs = this.loadEndTime - this.loadStartTime;
-      this.metrics.renderCompleteMs = this.metrics.metadataRenderReadyMs;
-      this.metrics.canvasHasContent = true;
+      this.metrics.metadataRenderReadyMs = this.metrics.renderCompleteMs;
+      await this.refreshLoadTrace();
       this.parseMetrics();
       return;
     }
-    const startTime = Date.now();
-    let renderCompleteTime: number | null = null;
-
-    // Wait for completion signals in console logs AND actual rendering
-    while (Date.now() - startTime < timeoutMs) {
-      // Check if we have all key completion signals
-      const hasStreamingComplete = this.consoleLogs.some(log =>
-        log.includes('[useIfc] Geometry streaming complete')
-      );
-      const hasDataModelComplete = this.consoleLogs.some(log =>
-        log.includes('[useIfc] Data model parsing complete') ||
-        log.includes('[ColumnarParser] Parsed')
-      );
-      const hasTotalLoadTime = this.consoleLogs.some(log =>
-        log.includes('[useIfc] TOTAL LOAD TIME')
-      );
-      const hasUnifiedSummary = this.consoleLogs.some(log =>
-        log.includes('[useIfc]') && log.includes('meshes') && log.includes('first:') && log.includes('total:')
-      );
-      // Primary-path definitive end-of-load marker (current viewer format):
-      //   [ifc-lite] <file> (327.0MB) → 39146 meshes, 12345k verts in 11.9s
-      const hasFinalSummary = this.consoleLogs.some(log =>
-        /\[ifc-lite\].*→\s*\d[\d,]*\s*meshes.*in\s*[\d.]+s/.test(log)
-      );
-
-      // Check canvas has actual content
-      const canvasReady = await this.checkCanvasHasContent();
-
-      if (
-        (hasStreamingComplete && hasDataModelComplete && hasTotalLoadTime)
-        || hasUnifiedSummary
-        || hasFinalSummary
-        || (hasStreamingComplete && hasDataModelComplete)
-      ) {
-        // Record when we see completion in logs
-        if (!renderCompleteTime) {
-          renderCompleteTime = Date.now();
-        }
-        
-        // Wait for canvas to actually have content (GPU flush)
-        if (canvasReady) {
-          this.loadEndTime = Date.now();
-          this.metrics.canvasHasContent = true;
-          // Additional wait for any pending GPU operations
-          await this.page.waitForTimeout(200);
-          break;
-        }
-      }
-
-      // Wait a bit before checking again
-      await this.page.waitForTimeout(100);
-    }
-
-    // Time from load start until the canvas actually showed content (the
-    // Playwright-observed render completion, distinct from the app's own
-    // totalWallClockMs log).
-    if (renderCompleteTime && this.loadEndTime) {
-      this.metrics.renderCompleteMs = this.loadEndTime - this.loadStartTime;
-    }
+    await this.page.waitForTimeout(200);
 
     // Best-effort wait for the steady-state render-stats line — it fires
     // after the scene settles (queue drain + fragment finalize), which is
@@ -417,17 +452,73 @@ export class ViewerBenchmarkPage {
       await this.page.waitForTimeout(250);
     }
 
-    // Parse metrics from console logs
+    // The span tree is the only timing source.
+    await this.refreshLoadTrace();
     this.parseMetrics();
+  }
+
+  /**
+   * #6957: wait until the load's structural counters stop moving, then keep
+   * that snapshot for `getLoadCounters`. The load's root span ends before the
+   * renderer has drained its upload queue (and, under SwiftShader, before the
+   * renderer even starts), so counters read at completion would cut work off
+   * at a timing-dependent point. Timing metrics are untouched: they were taken
+   * from the completion snapshot. Stable = unchanged over `quietPolls` polls.
+   * Resolves false when the counters were still moving at `maxMs`.
+   */
+  async settleLoadCounters({ pollMs = 250, quietPolls = 6, maxMs = 30_000 } = {}): Promise<boolean> {
+    const deadline = Date.now() + maxMs;
+    let last = '';
+    let quiet = 0;
+    for (;;) {
+      await this.refreshLoadTrace();
+      const key = settleKey(this.loadTrace);
+      quiet = key === last ? quiet + 1 : 0;
+      last = key;
+      if (quiet >= quietPolls) return true;
+      if (Date.now() >= deadline) {
+        console.warn(`[Benchmark] structural counters still moving after ${maxMs} ms; recording the latest snapshot`);
+        return false;
+      }
+      await this.page.waitForTimeout(pollMs);
+    }
+  }
+
+  /**
+   * The latest load's completion state, reduced inside the page so a poll
+   * copies a few span names rather than the tree (#6979). Null when the page
+   * exposes no trace yet (or at all: a viewer built before #6977).
+   */
+  private async probeLoadTrace(): Promise<LoadTraceProbe | null> {
+    return probeMetadataRenderTrace(this.page);
+  }
+
+  /** Pull the latest load's span tree out of the page (null when tracing is unavailable). */
+  async refreshLoadTrace(): Promise<void> {
+    try {
+      this.loadTrace = await this.page.evaluate(
+        (key: string) => {
+          const api = (globalThis as unknown as Record<string, { latest?: () => unknown } | undefined>)[key];
+          return (api?.latest?.() ?? null) as LoadTraceSnapshotJson | null;
+        },
+        LOAD_TRACE_GLOBAL,
+      );
+    } catch (err) {
+      throw new Error('Cannot read required benchmark load-trace span tree (#7005)', { cause: err });
+    }
+  }
+
+  /** Timing values come only from the load trace; console counts remain diagnostic. */
+  private applySpanMetrics() {
+    const span = metricsFromLoadTrace(this.loadTrace);
+    for (const key of SPAN_METRIC_KEYS) {
+      this.metrics[key] = span[key] ?? null;
+      this.metricSources[key] = span[key] === undefined ? 'none' : 'span';
+    }
   }
 
   private parseMetrics() {
     const logs = this.consoleLogs.join('\n');
-    
-    // Calculate wall-clock total time
-    if (this.loadStartTime > 0 && this.loadEndTime > 0) {
-      this.metrics.totalWallClockMs = this.loadEndTime - this.loadStartTime;
-    }
     
     // Log color update status
     const colorLogs = this.consoleLogs.filter(log => 
@@ -437,160 +528,30 @@ export class ViewerBenchmarkPage {
       console.log('[Benchmark] Color updates:', colorLogs);
     }
 
-    // Model open time
-    const modelOpenMatch = logs.match(/\[useIfc\] Model opened at (\d+)ms/);
-    if (modelOpenMatch) {
-      this.metrics.modelOpenMs = parseInt(modelOpenMatch[1], 10);
-    }
-
-    // First batch timing
-    const firstBatchMatch = logs.match(/\[useIfc\] (?:Native )?Batch #1: (\d+) meshes, wait: (\d+)ms/);
-    if (firstBatchMatch) {
-      this.metrics.firstBatchMeshes = parseInt(firstBatchMatch[1], 10);
-      this.metrics.firstBatchWaitMs = parseInt(firstBatchMatch[2], 10);
+    // Count-only diagnostics remain available without parsing any timing values.
+    // The first logged worker batch supplies only its mesh count; timestamps
+    // are neither parsed nor used to order diagnostic records.
+    const firstBatch = logs.match(/\[useIfc\] (?:Native )?Batch #1: (\d+) meshes/)
+      ?? logs.match(/\[stream\] worker\[\d+\] first batch @ [^\n]*?\((\d+) meshes\)/);
+    if (firstBatch) {
+      this.metrics.firstBatchMeshes = Number(firstBatch[1]);
       this.metrics.firstBatchNumber = 1;
     }
-
-    // Current stream logs report first batches per worker instead:
-    //   [stream] worker[0] first batch @ 90ms (106 meshes)
-    // The earliest of them is the first geometry to arrive — the same
-    // stream-latency quantity the legacy "Batch #1 … wait: Xms" line measured
-    // (epoch is the stream start rather than the file load; the baseline is
-    // CI-recorded against the same parse, so comparisons stay like-for-like).
-    if (this.metrics.firstBatchWaitMs === null || this.metrics.firstBatchWaitMs === undefined) {
-      const workerFirstBatches = [
-        ...logs.matchAll(/\[stream\] worker\[\d+\] first batch @ (\d+)ms \((\d+) meshes\)/g),
-      ];
-      if (workerFirstBatches.length > 0) {
-        const earliest = workerFirstBatches.reduce((a, b) =>
-          parseInt(a[1], 10) <= parseInt(b[1], 10) ? a : b
-        );
-        this.metrics.firstBatchWaitMs = parseInt(earliest[1], 10);
-        this.metrics.firstBatchMeshes = parseInt(earliest[2], 10);
-        this.metrics.firstBatchNumber = 1;
-      }
+    const stream = logs.match(/\[useIfc\] Geometry streaming complete: (\d+) batches, (\d+) meshes/);
+    if (stream) {
+      this.metrics.totalBatches = Number(stream[1]);
+      this.metrics.totalMeshes = Number(stream[2]);
     }
-
-    const firstAppendMatch = logs.match(/\[useIfc\] (?:Native )?first appendGeometryBatch for .*?: (\d+)ms/i);
-    if (firstAppendMatch) {
-      this.metrics.firstAppendGeometryBatchMs = parseInt(firstAppendMatch[1], 10);
-    }
-
-    const firstVisibleMatch = logs.match(/\[useIfc\] (?:Native )?first visible geometry for .*?: (\d+)ms/i);
-    if (firstVisibleMatch) {
-      this.metrics.firstVisibleGeometryMs = parseInt(firstVisibleMatch[1], 10);
-    }
-
-    // Geometry streaming complete
-    const streamingCompleteMatch = logs.match(
-      /\[useIfc\] Geometry streaming complete: (\d+) batches, (\d+) meshes/
-    );
-    if (streamingCompleteMatch) {
-      this.metrics.totalBatches = parseInt(streamingCompleteMatch[1], 10);
-      this.metrics.totalMeshes = parseInt(streamingCompleteMatch[2], 10);
-    }
-
-    const streamCompleteMatch = logs.match(/\[useIfc\] (?:Native )?Stream complete for .*?: (\d+)ms/i);
-    if (streamCompleteMatch) {
-      this.metrics.streamCompleteMs = parseInt(streamCompleteMatch[1], 10);
-    }
-
-    // WASM wait time
-    const wasmWaitMatch = logs.match(/Total wait \(WASM\): (\d+)ms/);
-    if (wasmWaitMatch) {
-      this.metrics.wasmWaitMs = parseInt(wasmWaitMatch[1], 10);
-    }
-
-    // JS process time
-    const jsProcessMatch = logs.match(/Total process \(JS\): (\d+)ms/);
-    if (jsProcessMatch) {
-      this.metrics.jsProcessMs = parseInt(jsProcessMatch[1], 10);
-    }
-
-    // Calculate geometry streaming total time (from first batch to complete)
-    if (this.metrics.streamCompleteMs !== null && this.metrics.streamCompleteMs !== undefined) {
-      this.metrics.geometryStreamingMs = this.metrics.streamCompleteMs;
-    } else if (this.metrics.wasmWaitMs !== null && this.metrics.wasmWaitMs !== undefined) {
-      this.metrics.geometryStreamingMs = this.metrics.wasmWaitMs;
-    }
-
-    // Entity scan time
-    const fastScanMatch = logs.match(/\[IfcParser\] Fast scan: (\d+) entities in (\d+)ms/);
-    if (fastScanMatch) {
-      this.metrics.entityCount = parseInt(fastScanMatch[1], 10);
-      this.metrics.entityScanMs = parseInt(fastScanMatch[2], 10);
-    }
-
-    // Data model parse time
-    const dataModelMatch = logs.match(/\[ColumnarParser\] Parsed (\d+) entities in (\d+)ms/);
-    if (dataModelMatch) {
-      this.metrics.dataModelEntityCount = parseInt(dataModelMatch[1], 10);
-      this.metrics.dataModelParseMs = parseInt(dataModelMatch[2], 10);
-    }
-
-    const metadataStartMatch = logs.match(/\[useIfc\] (?:Native )?(?:metadata|Data model) (?:parse|parsing) start for .*?: (\d+)ms/i);
-    if (metadataStartMatch) {
-      this.metrics.metadataStartMs = parseInt(metadataStartMatch[1], 10);
-    }
-
-    const spatialReadyMatch = logs.match(/\[useIfc\] (?:Native )?(?:spatial tree|Spatial tree) ready for .*? at (\d+)ms/i);
-    if (spatialReadyMatch) {
-      this.metrics.spatialReadyMs = parseInt(spatialReadyMatch[1], 10);
-    }
-
-    const metadataCompleteMatch = logs.match(/\[useIfc\] (?:Native )?(?:metadata|Data model) (?:parse|parsing) complete for .*?: (\d+)ms/i);
-    if (metadataCompleteMatch) {
-      this.metrics.metadataCompleteMs = parseInt(metadataCompleteMatch[1], 10);
-    }
-
-    const metadataFailedMatch = logs.match(/\[useIfc\] (?:Native )?(?:metadata|Data model) (?:parse|parsing) failed for .*?: (\d+)ms/i);
-    if (metadataFailedMatch) {
-      this.metrics.metadataFailedMs = parseInt(metadataFailedMatch[1], 10);
-    }
-
-    // File size and read time
-    const fileSizeMatch = logs.match(/\[useIfc\] File: .+?, size: ([\d.]+)MB, read in (\d+)ms/);
-    if (fileSizeMatch) {
-      this.metrics.fileSizeMB = parseFloat(fileSizeMatch[1]);
-      this.metrics.fileReadMs = parseInt(fileSizeMatch[2], 10);
-    } else {
-      // Fallback for old format
-      const oldFileSizeMatch = logs.match(/\[useIfc\] File: .+?, size: ([\d.]+)MB/);
-      if (oldFileSizeMatch) {
-        this.metrics.fileSizeMB = parseFloat(oldFileSizeMatch[1]);
-      }
-    }
-    
-    // Fallback for newer compact log format:
-    // [useIfc] ✓ file.ifc (2.4MB) → 244 meshes, 643k vertices | first: 107ms, total: 275ms
-    const compactSummaryMatch = logs.match(
-      /\[useIfc\].*?\(([\d.]+)MB\)\s+→\s+(\d+)\s+meshes.*?\|\s+first:\s+(\d+)ms,\s+total:\s+(\d+)ms/
-    );
-    if (compactSummaryMatch) {
-      this.metrics.fileSizeMB = this.metrics.fileSizeMB ?? parseFloat(compactSummaryMatch[1]);
-      this.metrics.totalMeshes = this.metrics.totalMeshes ?? parseInt(compactSummaryMatch[2], 10);
-      this.metrics.firstBatchWaitMs = this.metrics.firstBatchWaitMs ?? parseInt(compactSummaryMatch[3], 10);
-      this.metrics.totalWallClockMs = this.metrics.totalWallClockMs ?? parseInt(compactSummaryMatch[4], 10);
-      // Newer log format omits a dedicated model-open event; keep assertion-compatible fallback.
-      this.metrics.modelOpenMs = this.metrics.modelOpenMs ?? this.metrics.firstBatchWaitMs ?? null;
-    }
-
-    // Total load time from app (most accurate measure of user experience)
-    const totalLoadMatch = logs.match(/\[useIfc\] TOTAL LOAD TIME.*?: (\d+)ms/);
-    if (totalLoadMatch) {
-      this.metrics.totalWallClockMs = parseInt(totalLoadMatch[1], 10);
-    }
-
-    // Current primary-path final summary carries the app's own measured total:
-    //   [ifc-lite] <file> (327.0MB) → 39146 meshes, 12345k verts in 11.9s
-    // Prefer it over the test's wall-clock (excludes Playwright polling jitter).
-    const finalSummaryMatch = logs.match(
-      /\[ifc-lite\].*?\(([\d.]+)MB\)\s*→\s*([\d,]+)\s*meshes.*?in\s*([\d.]+)s/
-    );
-    if (finalSummaryMatch) {
-      this.metrics.fileSizeMB = this.metrics.fileSizeMB ?? parseFloat(finalSummaryMatch[1]);
-      this.metrics.totalMeshes = this.metrics.totalMeshes ?? parseInt(finalSummaryMatch[2].replace(/,/g, ''), 10);
-      this.metrics.totalWallClockMs = Math.round(parseFloat(finalSummaryMatch[3]) * 1000);
+    const scan = logs.match(/\[IfcParser\] Fast scan: (\d+) entities/);
+    if (scan) this.metrics.entityCount = Number(scan[1]);
+    const parsed = logs.match(/\[ColumnarParser\] Parsed (\d+) entities/);
+    if (parsed) this.metrics.dataModelEntityCount = Number(parsed[1]);
+    const file = logs.match(/\[useIfc\] File: .+?, size: ([\d.]+)MB/);
+    if (file) this.metrics.fileSizeMB = Number(file[1]);
+    const summary = logs.match(/\[(?:ifc-lite|useIfc)\].*?\(([\d.]+)MB\)\s*→\s*([\d,]+)\s*meshes/);
+    if (summary) {
+      this.metrics.fileSizeMB ??= Number(summary[1]);
+      this.metrics.totalMeshes ??= Number(summary[2].replace(/,/g, ''));
     }
 
     // Steady-state render stats (issue #1682), emitted post-settle by
@@ -612,6 +573,8 @@ export class ViewerBenchmarkPage {
         this.metrics.instancedContributionCulled = parseInt(renderStatsMatch[8], 10);
       }
     }
+
+    this.applySpanMetrics();
   }
 
   getMetrics(): ViewerBenchmarkMetrics {
@@ -649,6 +612,28 @@ export class ViewerBenchmarkPage {
       instancedFrustumCulled: this.metrics.instancedFrustumCulled ?? null,
       instancedContributionCulled: this.metrics.instancedContributionCulled ?? null,
     };
+  }
+
+  /** The raw span tree of the measured load, or null when the page exposed none. */
+  getLoadTrace(): LoadTraceSnapshotJson | null {
+    return this.loadTrace;
+  }
+
+  /**
+   * #6957: the measured load's structural counters, its long-frame summary
+   * and the pinned worker count (null = engine heuristic), or null counters
+   * when the viewer recorded none.
+   */
+  getLoadCounters(): { geomWorkers: number | null; counters: LoadCounters | null } {
+    return { geomWorkers: this.geomWorkers, counters: countersFromLoadTrace(this.loadTrace) };
+  }
+
+  getUploadMode(): 'timed' | 'count' {
+    return this.uploadMode === 'count' || this.loadTrace?.spans.some((span) => span.attrs?.uploadMode === 'count') ? 'count' : 'timed';
+  }
+
+  getMetricSources(): Partial<Record<string, MetricSource>> {
+    return { ...this.metricSources };
   }
 
   getConsoleLogs(): string[] {

@@ -23,7 +23,7 @@
  * The SECOND test below covers the other ordering — the one an earlier
  * version of this file did NOT: the WASM parse landing while `#4159`'s hash
  * is STILL resolving. A fixture that lets the hash resolve on the very first
- * `flush()` (before the fake WASM worker is ever released) can never put the
+ * decision wait (before the fake WASM worker is ever released) can never put the
  * restore through its `'pending'`-branch WAIT at all — mutating that branch
  * away passed anyway. `fileWithHeldHash` exists to make that ordering
  * deterministic rather than incidental.
@@ -41,10 +41,11 @@ import { useDrawing2DPersistence, hasPersistedMarkupEntryFor } from './useDrawin
 import { useDrawingMarkupRestoreOnLoad, __resetDrawingMarkupRestoreForTests } from './useDrawingMarkupRestoreOnLoad.js';
 import { __setOverlayWorkerFactoryForTest } from '@/lib/overlay-parse/index.js';
 import { createEmptyFlatSymbolic } from '@/lib/overlay-parse/symbolic-flat.js';
-import { __resetSymbolicAnnotationsCacheForTests } from './symbolic-parse-cache.js';
+import { __resetSymbolicAnnotationsCacheForTests, getParseFor } from './symbolic-parse-cache.js';
+import { waitFor } from '@/test/render.js';
 import { loadDrawing2DEntry, saveDrawing2DEntry, clearAllDrawing2DEntries } from '@/store/slices/drawing2DSlice.persistence.js';
 import { getDefaultDrawing2DState } from '@/store/slices/drawing2DSlice.js';
-import { computeFullSourceHashFromBlob } from '@/utils/sourceContentHash.js';
+import { placementSourceIdentity } from '@/lib/model-placement/source-identity';
 
 const DEFAULTS = getDefaultDrawing2DState().drawing2DDisplayOptions;
 const TAGGED_ANNOTATION_ID = 50;
@@ -84,23 +85,25 @@ function fileWithBytes(seed: number, name: string): File {
 }
 
 /**
- * A `File` whose `arrayBuffer()` — the step `computeFullSourceHashFromBlob`
- * awaits before it can hash anything — does not resolve until `release()` is
+ * A `File` whose slice reads — the step the placement identity (#7035)
+ * awaits before it can hash anything — do not resolve until `release()` is
  * called. This is what lets a test hold #4159's hash computation at
  * `'pending'` on purpose, independent of how many ticks anything else takes,
  * so a scenario ("the IFC parse finishes before the hash resolves") that
  * would otherwise depend on incidental timing between a real SHA-256 digest
  * and a fake worker reply becomes deterministic instead. Deliberately does
  * NOT touch either hook under test — it only ever calls the SAME `File` API
- * (`arrayBuffer()`) `computeFullSourceHashFromBlob` already calls.
+ * (`slice().arrayBuffer()`) the identity pass already calls.
  */
 function fileWithHeldHash(seed: number, name: string): { file: File; release: () => void } {
   const bytes = new Uint8Array(256).map((_, i) => (i + seed) % 256);
   const file = new File([bytes], name, { type: 'application/octet-stream' });
   let resolveGate!: () => void;
   const gate = new Promise<void>((resolve) => { resolveGate = resolve; });
-  const realArrayBuffer = file.arrayBuffer.bind(file);
-  file.arrayBuffer = () => gate.then(realArrayBuffer);
+  const realSlice = file.slice.bind(file);
+  Object.defineProperty(file, 'slice', {
+    value: (start?: number, end?: number) => ({ arrayBuffer: () => gate.then(() => realSlice(start, end).arrayBuffer()) }),
+  });
   return { file, release: () => resolveGate() };
 }
 
@@ -155,28 +158,17 @@ async function mount(): Promise<void> {
   await act(async () => { root!.render(<Probe />); });
 }
 
-async function flush(): Promise<void> {
-  await act(async () => {
-    await new Promise((r) => setTimeout(r, 0));
-    await new Promise((r) => setTimeout(r, 0));
-  });
-}
-
 /**
- * Keep flushing until `done()` holds, bounded. The positive assertion at the
- * end of the "parse finishes FIRST" test sits behind a released hash gate:
- * `arrayBuffer()` -> `crypto.subtle.digest` -> the localStorage lookup -> the
- * deferred restore. Two macrotask ticks cover that chain on an idle machine,
- * but a loaded CI runner (it failed on Viewer tests shard 1 of #4330 and #4503
- * on 2026-09-11 with `0 !== 1`) can need more. The NEGATIVE assertions keep
- * the fixed two-tick flush: "nothing happened yet" cannot be waited for.
+ * Wait until the fake worker's parse reply has landed in the parse cache.
+ * The cache notifies its listeners (the IFC restore's `tryRestoreDrawingMarkup`)
+ * synchronously as it stores the result, so once this holds the restore has
+ * made its decision. That is the positive signal the NEGATIVE assertions
+ * below need: a fixed two-tick flush could end before the reply was even
+ * processed on a loaded runner, and "nothing was restored" would then pass
+ * without the precedence ever being exercised.
  */
-async function settleUntil(done: () => boolean, budgetMs = 2000): Promise<void> {
-  const deadline = Date.now() + budgetMs;
-  do {
-    await flush();
-    if (done()) return;
-  } while (Date.now() < deadline);
+async function parseLanded(store: IfcDataStore): Promise<void> {
+  await waitFor(() => getParseFor(store) !== undefined, 'the annotation parse lands in the cache');
 }
 
 beforeEach(() => {
@@ -198,7 +190,7 @@ afterEach(async () => {
 describe('localStorage (#4159) vs IFC-embedded (#4170) markup restore precedence', () => {
   it('does not resurrect stale IFC-embedded markup once localStorage has already resolved (even to an empty saved entry)', async () => {
     const file = fileWithBytes(7, 'both-sources.ifc');
-    const hash = (await computeFullSourceHashFromBlob(file))!;
+    const hash = (await placementSourceIdentity(file))!;
     const store = await parseFixture();
     const model: FederatedModel = {
       id: 'model-precedence',
@@ -233,9 +225,12 @@ describe('localStorage (#4159) vs IFC-embedded (#4170) markup restore precedence
     await mount();
     await act(async () => { useViewerStore.getState().setActiveModel('model-precedence'); });
 
-    // Let localStorage's restore resolve FIRST — its hash is a fast,
-    // in-memory computation over a 256-byte file, well within these ticks.
-    await flush();
+    // Let localStorage's restore resolve FIRST. The key is derived from a
+    // slice read and two digests (#7035), which no fixed number of ticks
+    // bounds, so wait for the decision itself: while it is still pending the
+    // assertions below would pass without the precedence ever being decided.
+    await waitFor(() => hasPersistedMarkupEntryFor(model.id) !== 'pending', "localStorage's restore decision");
+    const decidedBeforeParse = hasPersistedMarkupEntryFor(model.id);
     assert.deepEqual(
       useViewerStore.getState().measure2DResults,
       [],
@@ -244,8 +239,11 @@ describe('localStorage (#4159) vs IFC-embedded (#4170) markup restore precedence
 
     // NOW let the IFC-embedded restore's WASM parse land.
     await act(async () => { release(); });
-    await flush();
+    await parseLanded(store);
 
+    // Checked after the held parse is released, so a failure here cannot
+    // leave the fake worker's reply pending.
+    assert.equal(decidedBeforeParse, true, 'localStorage\'s decision was settled before the parse landed, and it found the saved entry');
     assert.deepEqual(
       useViewerStore.getState().measure2DResults,
       [],
@@ -262,10 +260,10 @@ describe('localStorage (#4159) vs IFC-embedded (#4170) markup restore precedence
       assert.equal(hasPersistedMarkupEntryFor(model.id), 'pending', 'invalidates before effects run');
     });
     // The same parsed annotation geometry is already in the overlay cache.
-    await flush();
+    await parseLanded(replacementStore);
     assert.deepEqual(useViewerStore.getState().measure2DResults, []);
     await act(async () => { replacement.release(); });
-    await settleUntil(() => useViewerStore.getState().measure2DResults.length === 1);
+    await waitFor(() => useViewerStore.getState().measure2DResults.length === 1, "the replacement file's embedded markup restores");
     assert.equal(useViewerStore.getState().measure2DResults[0]?.distance, 5);
   });
 
@@ -301,7 +299,7 @@ describe('localStorage (#4159) vs IFC-embedded (#4170) markup restore precedence
     // `arrayBuffer()` is still gated by `held`, so `hasPersistedMarkupEntryFor`
     // must still be reporting `'pending'` at this point.
     await act(async () => { release(); });
-    await flush();
+    await parseLanded(store);
     assert.deepEqual(
       useViewerStore.getState().measure2DResults,
       [],
@@ -312,7 +310,7 @@ describe('localStorage (#4159) vs IFC-embedded (#4170) markup restore precedence
     // file, so the decision is "no saved entry" — the deferred IFC restore
     // may finally proceed.
     await act(async () => { held.release(); });
-    await settleUntil(() => useViewerStore.getState().measure2DResults.length === 1);
+    await waitFor(() => useViewerStore.getState().measure2DResults.length === 1, 'the deferred IFC-embedded restore runs');
     const state = useViewerStore.getState();
     assert.equal(
       state.measure2DResults.length,

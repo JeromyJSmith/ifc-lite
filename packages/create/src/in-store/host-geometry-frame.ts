@@ -46,7 +46,7 @@ export function pointOf(reader: GeometryEntityReader, ref: unknown, type = 'IFCC
 
 export function unit(v: Vec3): Vec3 | null {
   const len = Math.hypot(v[0], v[1], v[2]);
-  return len > 1e-12 ? [v[0] / len, v[1] / len, v[2] / len] : null;
+  return Number.isFinite(len) && len > 1e-12 ? [v[0] / len, v[1] / len, v[2] / len] : null;
 }
 
 /** IfcAxis2Placement2D: Position is optional on a profile; Location is required. */
@@ -90,6 +90,8 @@ export function applyFrame(f: Frame3, p: Vec3): Vec3 {
   ];
 }
 
+const finiteFrame = (frame: Frame3): boolean => [frame.o, frame.x, frame.y, frame.z].every(v => v.every(Number.isFinite));
+
 const IDENTITY_FRAME3: Frame3 = { o: [0, 0, 0], x: [1, 0, 0], y: [0, 1, 0], z: [0, 0, 1] };
 
 export function transformBounds(bounds: HostBounds, frame: Frame3): HostBounds {
@@ -116,7 +118,7 @@ export function inverseFrame(f: Frame3): Frame3 {
 
 /** Full 3D local-placement chain, including the opening's rotated frame.
  * Missing references, cycles and excessive acyclic chains are unreadable. */
-export function placementInAncestor(reader: AnchorEntityReader, placementId: number, ancestorId: number): Frame3 | null {
+export function placementInAncestor(reader: GeometryEntityReader, placementId: number, ancestorId: number | null): Frame3 | null {
   let frame = IDENTITY_FRAME3;
   let id: number | null = placementId;
   const visited = new Set<number>();
@@ -129,9 +131,46 @@ export function placementInAncestor(reader: AnchorEntityReader, placementId: num
     const own = axis3d(reader, axisId);
     if (!own) return null;
     frame = composeFrame(own, frame);
-    id = refId(placement.attributes[0]);
+    if (!finiteFrame(frame)) return null;
+    const parent = placement.attributes[0];
+    // #7328: an explicit unreadable parent is not an omitted world root.
+    if (parent !== null && parent !== undefined && refId(parent) === null) return null;
+    id = refId(parent);
   }
   return id === ancestorId ? frame : null;
+}
+
+/** Express one local placement in another's full 3D frame. Only the branches
+ * below their common ancestor need readable frames; the shared ancestor
+ * cancels, as it does in the canonical planar storey reader (#6232). */
+export function placementRelativeTo(reader: GeometryEntityReader, placementId: number, referenceId: number): Frame3 | null {
+  const parent = (id: number): number | null | undefined => {
+    const entity = reader.entity(id);
+    if (entity?.type.toUpperCase() !== 'IFCLOCALPLACEMENT') return undefined;
+    const value = entity.attributes[0];
+    return value === null || value === undefined ? null : refId(value) ?? undefined;
+  };
+  const referenceChain = new Set<number>();
+  let id: number | null | undefined = referenceId;
+  while (id !== null && id !== undefined && !referenceChain.has(id)) {
+    if (referenceChain.size >= 10_000) return null;
+    referenceChain.add(id);
+    id = parent(id);
+  }
+  const referenceReachesRoot = id === null;
+  const visited = new Set<number>();
+  id = placementId;
+  while (id !== null && id !== undefined && !referenceChain.has(id)) {
+    if (visited.size >= 10_000 || visited.has(id)) return null;
+    visited.add(id);
+    id = parent(id);
+  }
+  if (id === undefined || (id === null && !referenceReachesRoot)) return null;
+  const own = placementInAncestor(reader, placementId, id);
+  const reference = placementInAncestor(reader, referenceId, id);
+  if (!own || !reference) return null;
+  const relative = composeFrame(inverseFrame(reference), own);
+  return finiteFrame(relative) ? relative : null;
 }
 
 /** Subcontexts inherit CoordinateSpaceDimension from ParentContext. */

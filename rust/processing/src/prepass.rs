@@ -323,6 +323,15 @@ pub struct UnitScales {
     pub plane_angle_to_radians: f64,
     /// The `IFCPROJECT` express id the scales were resolved from, when found.
     pub project_id: Option<u32>,
+    /// The unusable length-unit factor geometry must refuse (#7678); `length_unit_scale` is then data-only.
+    pub length_unit_refused: Option<u32>,
+}
+
+impl UnitScales {
+    /// The geometry scale: 1.0 for a refused unit, a finite placeholder no mesh uses (#7678).
+    pub fn geometry_length_scale(&self) -> f64 {
+        if self.length_unit_refused.is_some() { 1.0 } else { self.length_unit_scale }
+    }
 }
 
 impl Default for UnitScales {
@@ -331,6 +340,7 @@ impl Default for UnitScales {
             length_unit_scale: 1.0,
             plane_angle_to_radians: 1.0,
             project_id: None,
+            length_unit_refused: None,
         }
     }
 }
@@ -372,17 +382,19 @@ pub fn resolve_unit_scales(
             length_unit_scale,
             plane_angle_to_radians,
             project_id,
+            length_unit_refused: None,
         };
     }
 
     // Chain incomplete (partial index) — resolve against a full index.
     let full_index = ifc_lite_core::build_entity_index(content);
     let mut full_decoder = EntityDecoder::with_index(content, full_index);
+    // The one unit policy (#7678): an unusable factor is a refusal, not metres.
+    let unit = length.map(|scale| ifc_lite_core::LengthUnit { scale, unusable_factor: None })
+        .or_else(|| ifc_lite_core::resolve_length_unit(&mut full_decoder, pid).ok());
     UnitScales {
-        length_unit_scale: length.or_else(|| {
-            ifc_lite_core::extract_length_unit_scale(&mut full_decoder, pid).ok()
-        })
-        .unwrap_or(1.0),
+        length_unit_scale: unit.map_or(1.0, |unit| unit.scale),
+        length_unit_refused: unit.and_then(|unit| unit.unusable_factor),
         plane_angle_to_radians: angle
             .or_else(|| {
                 ifc_lite_core::extract_plane_angle_to_radians(&mut full_decoder, pid).ok()
@@ -514,8 +526,9 @@ fn starts_a_record(content: &[u8], hash: usize) -> bool {
 /// Flat wire encodings of the resolved styles for the browser's
 /// `styleIds`/`styleColors` arrays: the rich style index flattened to
 /// `(ids, rgba8)`, with IfcIndexedColourMap dominants, flat material colours,
-/// and per-element first material colours filling the gaps — the exact
-/// layered precedence the browser prepasses have always shipped.
+/// and each element's material fallback colour
+/// ([`crate::style::element_material_fallback_color`], the native rule)
+/// filling the gaps — the layered precedence the browser prepasses ship.
 pub fn flat_styles_rgba8(resolved: &ResolvedPrepass, decoder: &mut EntityDecoder) -> (Vec<u32>, Vec<u8>) {
     let mut merged: FxHashMap<u32, [f32; 4]> = resolved
         .geometry_style_index
@@ -525,8 +538,9 @@ pub fn flat_styles_rgba8(resolved: &ResolvedPrepass, decoder: &mut EntityDecoder
     for (&geometry_id, &color) in &resolved.indexed_colour_index {
         merged.entry(geometry_id).or_insert(color);
     }
-    // Flat material_id → colour, then element id → first material colour, so
-    // `processGeometryBatch`'s per-element fallback picks them up.
+    // Flat material_id → colour, then element id → its material fallback
+    // colour, so `processGeometryBatch`'s per-element fallback picks up the
+    // colour the native pipeline uses (PROCESSING-4, #7691).
     let material_styles = crate::style::build_material_style_index(
         &resolved.material_def_reprs,
         &resolved.orphan_styled_items,
@@ -536,7 +550,7 @@ pub fn flat_styles_rgba8(resolved: &ResolvedPrepass, decoder: &mut EntityDecoder
         merged.entry(mat_id).or_insert(color);
     }
     for (&element_id, colors) in &resolved.element_material_colors {
-        if let Some(&color) = colors.first() {
+        if let Some(color) = crate::style::element_material_fallback_color(colors) {
             merged.entry(element_id).or_insert(color);
         }
     }
@@ -663,27 +677,19 @@ pub fn material_colors_from_flat(
     rgba: &[u8],
 ) -> FxHashMap<u32, Vec<[f32; 4]>> {
     let mut out: FxHashMap<u32, Vec<[f32; 4]>> = FxHashMap::default();
+    let available = rgba.len() / 4;
     let mut offset = 0usize;
     for (i, &element_id) in element_ids.iter().enumerate() {
         let Some(&count) = counts.get(i) else { break };
-        let count = count as usize;
-        let mut colors: Vec<[f32; 4]> = Vec::with_capacity(count);
-        for c in 0..count {
-            let base = (offset + c) * 4;
-            if base + 3 >= rgba.len() {
-                break;
-            }
-            colors.push(
-                crate::style::Rgba::from_rgba8([
-                    rgba[base],
-                    rgba[base + 1],
-                    rgba[base + 2],
-                    rgba[base + 3],
-                ])
-                .to_array(),
-            );
-        }
-        offset += count;
+        // `count` is wire input: clamp to the colours `rgba` holds instead of
+        // reserving `count` (up to 64 GiB) or wrapping `offset` on wasm32
+        // (#7675). A short buffer keeps the colours it has, as before.
+        let end = offset.saturating_add(count as usize).min(available);
+        let colors: Vec<[f32; 4]> = rgba[offset.min(end) * 4..end * 4]
+            .chunks_exact(4)
+            .map(|c| crate::style::Rgba::from_rgba8([c[0], c[1], c[2], c[3]]).to_array())
+            .collect();
+        offset = offset.saturating_add(count as usize);
         if !colors.is_empty() {
             out.insert(element_id, colors);
         }

@@ -20,9 +20,9 @@
 
 import type { EntityRef } from './types.js';
 import { EntityExtractor } from './entity-extractor.js';
+import { getReference } from './attribute-helpers.js';
 import type { IfcSourceBytes } from './source-bytes.js';
 import {
-  composeDerived,
   conversionUnitSymbol,
   currencySymbol,
   measureUnit,
@@ -30,6 +30,7 @@ import {
   type MeasureUnit,
 } from './project-units-symbols.js';
 import { CONVERSION_BASED_UNIT_FACTORS } from './unit-extractor.js';
+import { chargeRead, composeWithinLimit, enterDerived, enterUnit, leaveDerived, newUnitWalk, once, type UnitWalk } from './project-unit-walk.js';
 
 export type { MeasureUnit };
 export { measureUnit };
@@ -40,7 +41,16 @@ export { measureUnit };
 export interface ResolvedUnit {
   symbol: string;
   siScale: number;
+  /** Additive SI offset, present only for an `IfcConversionBasedUnitWithOffset`
+   *  (°F over kelvin): `si = value * siScale + siOffset`. */
+  siOffset?: number;
 }
+
+/** Native current point provider; omitted readers retain parsed-source semantics. */
+export type UnitEntityReader = (expressId: number) => { type: string; attributes: readonly unknown[] } | null;
+
+/** Expected refusal of a current native context; source-only defaults stay unchanged. */
+export class ProjectUnitReadError extends Error {}
 
 interface EntityByIdIndexLike {
   byId: { get(expressId: number): EntityRef | undefined };
@@ -108,25 +118,52 @@ interface DeclaredUnit extends Omit<UnitEntry, 'resolved'> {
 }
 
 /** Resolve a single unit entity by expressId (used for the assignment loop and
- *  for per-property / per-quantity `Unit` overrides). */
+ *  for per-property / per-quantity `Unit` overrides). One bounded walk per
+ *  call: a cycle is unresolved, never a throw. On the parsed-source path so is
+ *  a chain past the depth cap or a unit whose charged reads run past the budget,
+ *  while native callers keep their own read limit (#7547). A flat derived unit,
+ *  as the schema types it, is never charged. */
 export function resolveUnitByRef(
   extractor: EntityExtractor,
   entityIndex: EntityByIdIndexLike,
   ref: number,
+  readEntity?: UnitEntityReader,
 ): UnitEntry | null {
-  const entry = resolveDeclaredUnit(extractor, entityIndex, ref);
+  const walk = newUnitWalk(!readEntity);
+  const entry = resolveUnit(extractor, entityIndex, ref, readEntity, walk);
+  return walk.refused ? null : entry;
+}
+
+function resolveUnit(extractor: EntityExtractor, entityIndex: EntityByIdIndexLike,
+  ref: number, readEntity: UnitEntityReader | undefined, walk: UnitWalk): UnitEntry | null {
+  const entry = walkDeclaredUnit(extractor, entityIndex, ref, readEntity, walk);
   return entry?.resolved ? { ...entry, resolved: entry.resolved } : null;
+}
+
+/** The only way into {@link resolveDeclaredUnit}: a cycle, or on the parsed-source
+ *  path a chain past the depth cap, is refused before anything is read (#7547). */
+function walkDeclaredUnit(extractor: EntityExtractor, entityIndex: EntityByIdIndexLike,
+  ref: number, readEntity: UnitEntityReader | undefined, walk: UnitWalk): DeclaredUnit | null {
+  if (!enterUnit(walk, ref)) return null;
+  try {
+    return resolveDeclaredUnit(extractor, entityIndex, ref, readEntity, walk);
+  } finally {
+    walk.path.delete(ref);
+  }
 }
 
 function resolveDeclaredUnit(
   extractor: EntityExtractor,
   entityIndex: EntityByIdIndexLike,
   ref: number,
+  readEntity: UnitEntityReader | undefined,
+  walk: UnitWalk,
 ): DeclaredUnit | null {
   // @raw-entity-enumeration-ok resolve a declared unit from the parsed source index
   const entRef = entityIndex.byId.get(ref);
-  if (!entRef) return null;
-  const entity = extractor.extractEntity(entRef);
+  // Free at the top level and for a named unit in the top-level unit; else charged before the read (#7547).
+  if (!chargeRead(walk, entRef, 'unit')) return null;
+  const entity = readEntity ? readEntity(ref) : entRef ? extractor.extractEntity(entRef) : null;
   if (!entity) return null;
   const attrs = entity.attributes ?? [];
   const cleanEnum = (v: unknown): string | null =>
@@ -144,8 +181,10 @@ function resolveDeclaredUnit(
       if (!res) return null;
       return { unitType, resolved: { symbol: res.symbol, siScale: res.scale }, monetary: false };
     }
-    case 'IFCCONVERSIONBASEDUNIT': {
-      // [1]=UnitType, [2]=Name, [3]=ConversionFactor
+    case 'IFCCONVERSIONBASEDUNIT':
+    case 'IFCCONVERSIONBASEDUNITWITHOFFSET': {
+      // [1]=UnitType, [2]=Name, [3]=ConversionFactor, [4]=ConversionOffset
+      const withOffset = entity.type.toUpperCase() === 'IFCCONVERSIONBASEDUNITWITHOFFSET';
       const unitType = cleanEnum(attrs[1]);
       const name = typeof attrs[2] === 'string' ? attrs[2] : '';
       // A factor the file does not resolve falls back to the name's known
@@ -154,21 +193,31 @@ function resolveDeclaredUnit(
       // at 1.0 (#4690).
       const namedFactor = unitType === 'LENGTHUNIT' ? CONVERSION_BASED_UNIT_FACTORS[name.toUpperCase()] : undefined;
       const scale = (typeof attrs[3] === 'number'
-        ? conversionFactorScale(extractor, entityIndex, attrs[3])
-        : null) ?? namedFactor;
-      const resolved = scale === undefined ? null : { symbol: conversionUnitSymbol(name), siScale: scale };
+        ? conversionFactorScale(extractor, entityIndex, attrs[3], readEntity, withOffset, walk)
+        : null) ?? (readEntity ? undefined : namedFactor);
+      const symbol = conversionUnitSymbol(name);
+      if (!withOffset) return { unitType, resolved: scale === undefined ? null : { symbol, siScale: scale }, monetary: false };
+      // The offset is the value of this unit at the SI zero (°F over kelvin:
+      // -459.67), so `si = (value - offset) * factor`; an unreadable one
+      // leaves the unit unresolved rather than converted without it.
+      const offset = attrs[4];
+      const resolved = scale === undefined || typeof offset !== 'number' || !Number.isFinite(offset)
+        ? null
+        : { symbol, siScale: scale, siOffset: offset === 0 ? 0 : -offset * scale };
       return { unitType, resolved, monetary: false };
     }
     case 'IFCDERIVEDUNIT': {
       // [0]=Elements (list of refs), [1]=UnitType
+      enterDerived(walk);
       const unitType = cleanEnum(attrs[1]);
       const elemRefs = Array.isArray(attrs[0]) ? attrs[0] : [];
       const parts: Array<[string, number]> = [];
       let scale = 1.0;
       let incomplete = false;
       for (const er of elemRefs) {
-        if (typeof er !== 'number') { incomplete = true; continue; }
-        const el = resolveDerivedElement(extractor, entityIndex, er);
+        const elementRef = readEntity ? getReference(er) : typeof er === 'number' ? er : undefined;
+        if (elementRef === undefined) { incomplete = true; continue; }
+        const el = resolveDerivedElement(extractor, entityIndex, elementRef, readEntity, walk);
         if (el) {
           scale *= Math.pow(el.unitScale, el.exponent);
           parts.push([el.symbol, el.exponent]);
@@ -176,7 +225,9 @@ function resolveDeclaredUnit(
           incomplete = true; // a factor we cannot read: the product is not this unit's scale (#4833)
         }
       }
-      const symbol = composeDerived(parts);
+      leaveDerived(walk);
+      const symbol = composeWithinLimit(parts); // undefined past the engine's string limit (#7547)
+      if (symbol === undefined) return { unitType, resolved: null, monetary: false };
       if (symbol.length === 0) return null;
       return { unitType, resolved: incomplete ? null : { symbol, siScale: scale }, monetary: false };
     }
@@ -194,17 +245,20 @@ function resolveDerivedElement(
   extractor: EntityExtractor,
   entityIndex: EntityByIdIndexLike,
   elemRef: number,
+  readEntity: UnitEntityReader | undefined,
+  walk: UnitWalk,
 ): { symbol: string; unitScale: number; exponent: number } | null {
   // @raw-entity-enumeration-ok resolve an element of a parsed derived unit
   const ref = entityIndex.byId.get(elemRef);
-  if (!ref) return null;
-  const elem = extractor.extractEntity(ref);
+  if (!chargeRead(walk, ref, 'element')) return null;
+  const elem = readEntity ? readEntity(elemRef) : ref ? extractor.extractEntity(ref) : null;
   if (!elem || elem.type.toUpperCase() !== 'IFCDERIVEDUNITELEMENT') return null;
   const attrs = elem.attributes ?? [];
   const unitRef = attrs[0];
   if (typeof unitRef !== 'number') return null;
   const exponent = typeof attrs[1] === 'number' ? Math.trunc(attrs[1]) : 1;
-  const entry = resolveUnitByRef(extractor, entityIndex, unitRef);
+  // @raw-entity-enumeration-ok a named unit in the top-level unit is resolved once per walk (#7547)
+  const entry = once(walk, entityIndex.byId.get(unitRef), 'unit', () => resolveUnit(extractor, entityIndex, unitRef, readEntity, walk));
   if (!entry) return null;
   return { symbol: entry.resolved.symbol, unitScale: entry.resolved.siScale, exponent };
 }
@@ -213,11 +267,14 @@ function conversionFactorScale(
   extractor: EntityExtractor,
   entityIndex: EntityByIdIndexLike,
   measureRef: number,
+  readEntity: UnitEntityReader | undefined,
+  withOffset: boolean,
+  walk: UnitWalk,
 ): number | null {
   // @raw-entity-enumeration-ok read the source measure in a conversion-based unit
   const ref = entityIndex.byId.get(measureRef);
-  if (!ref) return null;
-  const measure = extractor.extractEntity(ref);
+  if (!chargeRead(walk, ref, 'factor')) return null;
+  const measure = readEntity ? readEntity(measureRef) : ref ? once(walk, ref, 'factor', () => extractor.extractEntity(ref)) : null;
   if (!measure || measure.type.toUpperCase() !== 'IFCMEASUREWITHUNIT') return null;
   const attrs = measure.attributes ?? [];
   // [0]=ValueComponent (number or [type, number]), [1]=UnitComponent
@@ -233,11 +290,14 @@ function conversionFactorScale(
   const compRef = attrs[1];
   // @raw-entity-enumeration-ok follow the source unit component reference
   const cRef = typeof compRef === 'number' ? entityIndex.byId.get(compRef) : undefined;
-  const comp = cRef ? extractor.extractEntity(cRef) : null;
+  if (!chargeRead(walk, cRef, 'factorUnit')) return null;
+  const comp = readEntity && typeof compRef === 'number' ? readEntity(compRef) : cRef ? once(walk, cRef, 'factorUnit', () => extractor.extractEntity(cRef)) : null;
   if (!comp) return null;
-  if (comp.type.toUpperCase() !== 'IFCSIUNIT') return value;
+  if (comp.type.toUpperCase() !== 'IFCSIUNIT') return readEntity || withOffset ? null : value;
   const cAttrs = comp.attributes ?? [];
   const name = typeof cAttrs[3] === 'string' ? cAttrs[3] : null;
+  // An offset over a unit that has its own offset (°C) would need both.
+  if (withOffset && name?.replace(/\./g, '').toUpperCase() === 'DEGREE_CELSIUS') return null;
   const prefixAttr = cAttrs[2];
   const prefix = typeof prefixAttr === 'string' && prefixAttr !== '$' ? prefixAttr : null;
   const res = name ? siUnitSymbolAndScale(name, prefix) : null;
@@ -247,14 +307,25 @@ function conversionFactorScale(
 /**
  * Resolve the file's declared units from `IFCPROJECT → IFCUNITASSIGNMENT`.
  * `projectId` defaults to the file's first IFCPROJECT (pass explicitly,
- * from `resolveOwningIfcProjectId`, for an entity owning a later one). Never
- * throws: an absent/malformed assignment yields an empty {@link ProjectUnits}.
+ * from `resolveOwningIfcProjectId`, for an entity owning a later one).
+ * Source-only reads never throw: an absent/malformed assignment yields an
+ * empty resolver. An optional current provider refuses unreadable native
+ * contexts with ProjectUnitReadError instead of guessing their units.
  */
 export function extractProjectUnits(
   source: Uint8Array | IfcSourceBytes,
   entityIndex: EntityIndexLike,
   projectId?: number,
+  readEntity?: UnitEntityReader,
 ): ProjectUnits {
+  if (readEntity) {
+    const point = readEntity;
+    let reads = 0;
+    readEntity = id => {
+      if (++reads > 512) throw new ProjectUnitReadError('Native project unit dependencies exceed the read limit');
+      return point(id);
+    };
+  }
   const byType = new Map<string, ResolvedUnit | null>();
   let monetary: ResolvedUnit | null = null;
 
@@ -263,33 +334,63 @@ export function extractProjectUnits(
   if (resolvedId === undefined) return new ProjectUnits(byType, monetary);
   // @raw-entity-enumeration-ok dereference the parsed project whose unit assignment is being read
   const projectRef = entityIndex.byId.get(resolvedId);
-  if (!projectRef) return new ProjectUnits(byType, monetary);
+  if (!projectRef && !readEntity) return new ProjectUnits(byType, monetary);
 
   const extractor = new EntityExtractor(source);
-  const project = extractor.extractEntity(projectRef);
-  if (!project) return new ProjectUnits(byType, monetary);
+  const project = readEntity ? readEntity(resolvedId) : extractor.extractEntity(projectRef!);
+  if (!project || project.type.toUpperCase() !== 'IFCPROJECT') {
+    if (readEntity) throw new ProjectUnitReadError('Native project unit context is unreadable');
+    return new ProjectUnits(byType, monetary);
+  }
 
   // IFCPROJECT[8] = UnitsInContext (IFCUNITASSIGNMENT)
   const unitsRef = (project.attributes ?? [])[8];
-  if (typeof unitsRef !== 'number') return new ProjectUnits(byType, monetary);
+  if (unitsRef === null) {
+    if (readEntity) throw new ProjectUnitReadError('Native project unit context is unset');
+    return new ProjectUnits(byType, monetary);
+  }
+  if (typeof unitsRef !== 'number') {
+    if (readEntity) throw new ProjectUnitReadError('Native project unit assignment reference is unreadable');
+    return new ProjectUnits(byType, monetary);
+  }
   // @raw-entity-enumeration-ok dereference the parsed IfcUnitAssignment from IfcProject
   const assignmentRef = entityIndex.byId.get(unitsRef);
-  if (!assignmentRef) return new ProjectUnits(byType, monetary);
-  const assignment = extractor.extractEntity(assignmentRef);
+  if (!assignmentRef && !readEntity) return new ProjectUnits(byType, monetary);
+  const assignment = readEntity ? readEntity(unitsRef) : extractor.extractEntity(assignmentRef!);
   if (!assignment || assignment.type.toUpperCase() !== 'IFCUNITASSIGNMENT') {
+    if (readEntity) throw new ProjectUnitReadError('Native project unit assignment is unreadable');
     return new ProjectUnits(byType, monetary);
   }
   const unitList = (assignment.attributes ?? [])[0];
-  if (!Array.isArray(unitList)) return new ProjectUnits(byType, monetary);
+  if (!Array.isArray(unitList)) {
+    if (readEntity) throw new ProjectUnitReadError('Native project unit assignment members are unreadable');
+    return new ProjectUnits(byType, monetary);
+  }
+  if (readEntity && (unitList.length === 0 || unitList.length > 512)) {
+    throw new ProjectUnitReadError(unitList.length === 0
+      ? 'Native project unit assignment is empty' : 'Native project unit assignment exceeds the read limit');
+  }
 
   for (const ref of unitList) {
-    if (typeof ref !== 'number') continue;
-    const entry = resolveDeclaredUnit(extractor, entityIndex, ref);
+    const unitRef = readEntity ? getReference(ref) : typeof ref === 'number' ? ref : undefined;
+    if (unitRef === undefined) {
+      if (readEntity) throw new ProjectUnitReadError('Native project unit assignment member is unreadable');
+      continue;
+    }
+    const walk = newUnitWalk(!readEntity);
+    const walked = walkDeclaredUnit(extractor, entityIndex, unitRef, readEntity, walk);
+    // A refused walk keeps the unit declared, unresolved, never a partial scale (#7547).
+    const entry = walked && walk.refused ? { ...walked, resolved: null } : walked;
+    if (readEntity && (!entry?.resolved || !Number.isFinite(entry.resolved.siScale) || entry.resolved.siScale <= 0)) {
+      throw new ProjectUnitReadError('Native project unit is unresolved or unsupported');
+    }
     if (!entry) continue;
     if (entry.monetary) {
       monetary ??= entry.resolved;
     } else if (entry.unitType && !byType.has(entry.unitType)) {
       byType.set(entry.unitType, entry.resolved);
+    } else if (readEntity && entry.unitType) {
+      throw new ProjectUnitReadError('Native project unit assignment repeats a unit type');
     }
   }
 

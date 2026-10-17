@@ -2,6 +2,12 @@
 
 IFClite supports editing IFC properties in-place with full change tracking, undo/redo, and export. The `@ifc-lite/mutations` package provides the mutation infrastructure, while the viewer integrates it with a property editor UI.
 
+Authored `NewEntity` records carry native `creationId` provenance matching the
+original `CREATE_ENTITY` mutation UUID. It is not an IFC attribute. Preserve
+the original record's token through clone, undo and recovery; a tokenless body
+at a reused express ID cannot establish the identity of a captured entity from
+old journal entries or matching fields.
+
 ## How It Works
 
 Mutations are tracked through a **MutablePropertyView** that wraps the original read-only property table. When you edit a property:
@@ -82,7 +88,11 @@ view.clear();
 
 > **Note:** Undo/redo is handled by the viewer's store (mutationSlice), not directly on MutablePropertyView. In the viewer, use Ctrl+Z / Ctrl+Shift+Z.
 
+Single-quantity edits record `oldQuantityType` and `oldUnit` alongside the old value, so Undo restores the previous quantity class and unit and Redo uses the recorded new metadata. `oldUnit: null` records a previously absent unit. Passing `null` as the unit to `setQuantity` explicitly clears a source unit; omitting it retains the existing source inheritance behavior. Quantity overlays and history use `unitRemoved: true` to distinguish an explicitly removed unit from an older overlay that inherits its source unit. Hosts can replay single-quantity edits through `replayQuantityMutation(view, mutation, 'undo' | 'redo', skipHistory)`; forward `view.applyMutations` uses the same metadata rules. Older history entries did not capture prior metadata: Undo restores their old value while retaining the currently effective class and unit, because a historical type change cannot be reconstructed. Write-only replay targets can omit the optional quantity reader; legacy forward records without a recorded type keep the existing Count fallback. Generated quantity export resolves supported unit names through the same existing unit resolver as properties; unresolved units remain `$`.
+
 Whole-set edits (`createPropertySet`, `deletePropertySet`, `createQuantitySet`, `deleteQuantitySet`, `deleteQuantity`) record the set's overlay rows before and after the edit on the returned mutation's `setOverlay`. A host with its own undo history reverts or re-applies one of them with `view.restoreSetOverlay(mutation.setOverlay.before)` / `(...after)`, which is what the viewer does.
+
+`view.getQuantityMutation(entityId, qsetName, quantityName)` reads the current quantity override, including `unitRemoved`, without relying on the append-only journal. It also reflects edits made with `skipHistory` and current Undo/Redo state. A reader preserving a source quantity’s explicit unit must withhold that unit once this override explicitly removes it.
 
 ### Enumerating the live entity set
 
@@ -253,6 +263,20 @@ In the IFClite viewer:
 5. **Jump or revert** — Jump selects and frames an edited entity. Revert uses Undo for the newest operation; an older independent edit is reversed as a new undo step. If newer edits depend on it, the drawer refuses the reversal. Leave a shared room before reverting; room sync cannot publish these local history reversals yet.
 6. **Undo/Redo** — Ctrl+Z / Ctrl+Shift+Z to undo/redo edits
 7. **Export** — Use **Export modified IFC…** or **Changes only (JSON delta)** from Changes. Both open the viewer's existing export flow.
+
+### Reviewed table, bulk and IDS corrections
+
+The Data Connector (CSV import), the Bulk Property Editor and the IDS correction dialog each have **Review as changes** as their primary action. It converts the configured edit into the reviewed change batch described in [Viewer Assistant: reviewed model changes](viewer-assistant.md#reviewed-model-changes): every change names its element by GlobalId, pins its model, and states the value the model holds now (including unsaved edits) as the expected value. Nothing is written until a batch is applied in the review, which happens as one undo step with a receipt. A value edited after the table or selection was read shows as **Value changed** and is never overwritten.
+
+- **CSV rows** are keyed by a GlobalId, Tag or Name column. A row whose key is empty, repeats on another row, matches no element or matches several elements (a wall and its wall type often share a Name) is skipped and listed with its row number; a key is never guessed. Cells are parsed with the same rules as the direct import (`12,5` in a Real column is refused). Empty cells change nothing, and values already set are counted rather than proposed. Tag keys read each element's Tag and are refused above 200,000 elements.
+- **Units**: a mapped column may declare a unit. The value is converted to SI and then to the frame the model stores: the property's own unit when it has one, otherwise the project unit (0.25 `m` is written as 250 in a millimetre model). A unit that does not fit the target (an area unit on a length quantity) is refused. Without a unit a number is taken to be in the model's stored units. Quantities are only updated where they already exist.
+- **Bulk edits** become one change per target. Deleting a property that is absent, or setting a value that is already set, is counted rather than proposed. A whole number set as Real stays `IfcReal`.
+- **Mappings** are checked before conversion: two columns writing the same value, or a property or quantity set without a name, refuse the review with a message instead of producing a partial batch.
+- **IDS corrections** use the same value typing and base-SI-to-model-unit scaling as the direct correction, keep the IFC data type, and leave validation to the receipt's **Re-run validation**.
+
+One batch holds at most 500 changes; a larger set is split into numbered parts (`… (part 2 of 3)`), each reviewed, applied and undone on its own. Parts never touch the same value. Above 20 parts (10,000 changes) the set is refused with a request to narrow the table or selection.
+
+The direct paths remain as secondary buttons (**Import** and **Apply to N entities**): they stream large imports with progress, match rows by Express ID or by a property value, write one row to several matched elements, and handle sets above the review limit. They do not show expected values or produce a receipt.
 
 ### Properties panel tabs
 
@@ -480,12 +504,16 @@ image, network or application undo resources are implicitly published by this AP
 
 For full element-with-geometry inserts, `@ifc-lite/create` provides anchored builders that emit a complete sub-graph (placement, profile, extruded solid, representation, product shape, rel-contained-in-spatial-structure) into the overlay. The same builders back the viewer's Model workspace commands for these builder-supported elements and their corresponding SDK / sandbox `bim.store.*` methods.
 
+`addOrdinaryElementInStore(editor, anchor, element)` dispatches wall, column, slab, beam, space, roof, plate and member creation through those builders in one atomic IFC edit. A late parameter refusal leaves the overlay, mutation journal and allocator unchanged. `element` uses the existing builder parameters with a lower-case `kind`; dimensions remain storey-local metres. Pass either a resolved `SpatialAnchor` or a synchronous `(draftEditor) => SpatialAnchor` callback. The latter lets a host prepare its existing placement policy inside the same transaction. External mesh, room and history effects run after it returns. The shared SDK factory `createOrdinaryStoreBackend(resolveModel)` supplies the existing eight `bim.store.add*` methods; it resolves the live store, editor and mutation view for each call without changing their anchor or null-placement defaults. MCP records each creation graph as one compound Undo operation, preserving earlier edits.
+
+The viewer's **Start blank** action opens an empty IFC project with a storey, waits for its model registration, and enters Wall on that project. Cancelling or replacing the load prevents a late Wall launch on another model. Walls added there use the normal IFC geometry engine and support Undo and Redo. Primary IFC loads that produce no meshes retain the engine's coordinate information for subsequent edits and reserve their spatial entity ids for federation.
+
 | Builder | Signature highlights | Profile modes |
 |---|---|---|
-| `addColumnToStore` | `Position`, `Width × Depth × Height` | rectangle |
+| `addColumnToStore` | `Position`, `Height`, optional `RefDirection` | rectangle / parameterised `Profile` |
 | `addWallToStore` | `Start`, `End`, `Thickness`, `Height` (planar XY axis enforced) | linear |
-| `addBeamToStore` | `Start`, `End`, `Width × Height` cross-section | linear |
-| `addMemberToStore` | `Start`, `End`, `Width × Height`, `PredefinedType` | linear |
+| `addBeamToStore` | `Start`, `End`, `Width × Height` or `Profile` | rectangle / parameterised `Profile` |
+| `addMemberToStore` | `Start`, `End`, `Width × Height` or `Profile`, `PredefinedType` | rectangle / parameterised `Profile` |
 | `addSlabToStore` | `Position` + `Width × Depth × Thickness` **or** `OuterCurve` polygon | rectangle / polygon |
 | `addRoofToStore` | same shape as slab; emits `.FLAT_ROOF.` PredefinedType | rectangle / polygon |
 | `addPlateToStore` | same shape as slab — thin extruded plate | rectangle / polygon |
@@ -577,6 +605,20 @@ A curtain wall and a design grid have their own in-store builders. `addCurtainWa
 
 The Model workspace's plan pane draws the active storey's design-grid axes and exact `AxisTag` bubbles, including grids authored during the session and grids read from an exported file. Fit includes the axes and reserves room for normal-sized label bubbles, so a grid beyond the building's outline can be framed. Oversized labels may clip; their margin cannot invert the view or pointer transform. Grid edits, Undo and Redo update the drawing. Grid type visibility, embedding-host `IfcGridAxis` hides, model visibility and model-qualified grid or axis entity hides apply to the plan drawing.
 
+`gridIntersectionPlacement(editor, anchor, params, sourceStore?)` writes an `IfcGridPlacement` whose `PlacementLocation` is an `IfcVirtualGridIntersection`. Its two live `Axes` must belong to different rows of the same unambiguous `IfcGrid`. Generic IFC emission preserves valid curved and radial axes. A supplied `GridPlacementId` must be that grid's `ObjectPlacement`; a second intersection used for `RefDirection` must belong to the same grid. Invalid ownership, row membership and placement references refuse before the writer emits any records. `Offsets` remain metres and are converted to the anchor's native length unit.
+
+For file-backed axes, pass the source `IfcDataStore` paired with the editor as the fourth argument, including when the spatial anchor was constructed manually. The reader combines that source with the editor's current overlay, deletions, retypes and positional edits. Overlay-only grids remain callable without a source context. Previously accepted calls with mixed or ambiguous owners, same-row axes or unresolved file ownership now throw; this is a breaking runtime validation contract. IFC2X3 still uses only a second intersection for `RefDirection`, while IFC4 and IFC4X3 may use a direction vector.
+
+`addColumnOnGridToStore(editor, dataStore, anchor, params, { GridId, IntersectingAxes })` creates a column bound to the actual crossing of two readable straight axes. `params.Position` and `RefDirection` remain storey-local metres and section heading. The builder revalidates the live grid, crossing and placement, converts the height and heading into a local child of `IfcGridPlacement`, and emits the whole graph atomically. A moved/deleted grid, unsupported linear snapping basis or failed column parameters leaves no new records. The Column tool retains the actual active-model axis references from a grid-intersection snap and records the complete graph as one Undo/Redo step. Alt bypass, grid-edge snaps and solved points displaced from the crossing use ordinary local placement.
+
+New bound columns use the same authored geometry completion as ordinary columns: they are revealed from Types view, and a parameter mesh supplies their initial geometry when native remeshing has no coordinate frame or returns no mesh. The remembered parameter mesh describes creation; moving the grid later requires successful native remeshing to update the live geometry. Saved IFC placement still follows the grid.
+
+Grid-relative mini exports include the owning `IfcGrid`, whose inverse axis membership supplies the placement context in IFC2X3 and IFC4. `serializeEntitySubgraph` reports a grid placement in `unreadable` when its axes are deleted, belong to ambiguous owners or share one row. Callers must refuse remeshing that result. The exporter accepts valid curved and radial axes; straight-axis restrictions belong to the linear column snapping consumer.
+
+`gridPlacementDependents(dataStore, mutationView, gridIds)` returns live model-local products whose placement follows the given grids, including local children and nested grid-bound grids. It reads the same effective records and ownership as mini export. Invalid bindings are excluded; with valid bindings present it scans placement and product buckets, otherwise it stops at grid placements. The viewer uses this in its shared remesh affected-set, so translating, setting the position of or rotating a grid replaces its bound products' geometry from canonical IFC placement. The move and its Undo/Redo use the same history batch.
+
+Generic viewer position and rotation edits refuse products whose local placement descends from an `IfcGridPlacement`: the child's own zero is not an editable storey position. This avoids presenting grid-relative coordinates as directly writable storey coordinates.
+
 #### Joining existing walls
 
 `joinWallsInStore(editor, dataStore, resolveWallJoinAnchor(dataStore, view), aId, bId, options)` joins straight walls in the same placement frame. It atomically rewrites bodies and axes and creates `IfcRelConnectsPathElements`, replacing an existing relationship for the same pair. Readable hosted openings keep their placement; a cut outside either joined end face, or unreadable opening geometry, refuses the whole operation. IFC2X3, IFC4 and IFC4X3 use their own relationship layouts. Existing geometric options remain `WallJoinApplyOptions`.
@@ -618,7 +660,7 @@ assignMaterialInStore(editor, anchor, layerSetId, [typeId], associations());
 assignMaterialInStore(editor, anchor, usageId, [wallExpressId], associations());
 ```
 
-Layer thicknesses and offsets are metres, converted to the file's length unit. Through the SDK these are `bim.store.addElementType`, `assignType`, `addMaterial`, `addMaterialLayerSet`, `addMaterialLayerSetUsage` and `assignMaterial`. The two `assign*` methods read the model's existing relationships themselves.
+Layer thicknesses and offsets are metres, converted to the file's length unit. Through the SDK these are `bim.store.addElementType`, `assignType`, `addMaterial`, `addMaterialLayerSet`, `addMaterialLayerSetUsage` and `assignMaterial`. The two `assign*` methods read the model's existing relationships themselves. Layer and layer-set schema fields are validated before creating any helpers: an unsupported field, including IFC2X3 layer or set `Description`, leaves the saved records, mutation journal and express-ID allocator unchanged. The loaded MCP model's `bim.store` adapter delegates the same six methods to this factory and records each call as one operation for `mutation_undo`, preserving earlier source and overlay edits. Required IFC2X3 `OwnerHistory` references resolve against that call's live mutation view.
 
 #### Generate spaces — IfcSpace from a storey's walls
 
@@ -642,6 +684,39 @@ The detector also picks up overlay walls (placed via `addWallToStore` since the 
 
 In the viewer, **Room → More** keeps the minimum area, name pattern, and schema-specific space classification alongside read-only candidate totals. `addSpaceToStore` validates the classification before writing: IFC2X3 uses `InteriorOrExteriorSpace`, IFC4 and IFC4X3 use `PredefinedType`, and `USERDEFINED` needs an `ObjectType`. An `EXTERNAL` space sets `Pset_SpaceCommon.IsExternal` to true.
 
+The TypeScript SDK also exposes `bim.store.addStair(modelId, storeyId, params)`
+and `addRailing(modelId, storeyId, params)` using the existing `StairInStoreParams`
+and `RailingInStoreParams`. Dimensions are storey-local metres; the canonical
+builders emit each target schema's attributes and native units. CLI and loaded
+MCP backends require a readable live storey placement. The viewer preserves its
+existing placement preparation and records/remeshes the same graph as its
+Stair and Railing tools.
+
+`bim.store.removeStair(ref)` delegates to `removeStairInStore(dataStore, editor,
+stairId)`. It removes only a uniquely aggregated parent and single flight in
+one atomic edit. Ambiguous/shared flights, incoming references from another
+product, or unreadable live candidate records refuse before writing. Shared
+shape, style, material and placement leaves remain; generic `removeEntity`
+still removes one record. The viewer stashes/prunes the flight mesh and tree
+row, then restores them with one Undo; Redo removes the pair again. Loaded MCP
+records the pair as one public `mutation_undo` operation. These backend
+capabilities are optional, so third-party backends can omit them and receive an
+explicit unsupported-capability error. This slice does not register new QuickJS
+bridge methods or a public MCP Redo tool.
+
+`bim.store.replaceElement(ref, storeyId, element)` is another optional backend
+capability. It accepts the existing eight ordinary builder kinds plus `stair`
+and `railing`, with their canonical params. The existing product must belong to
+one of those supported classes or their schema subtypes. Curtain walls, grids,
+spatial structure and ordinary aggregate roots refuse before placement
+preparation or graph changes; only uniquely owned single-flight stairs have
+an assembly removal contract. Removal and creation share one
+atomic draft; a late builder, placement or ownership refusal leaves the old
+products, prior overlay, journal and allocator intact. The viewer completes
+mesh/tree changes after commit and records one Undo/Redo batch; loaded MCP
+records one public Undo operation. `model.addElement` uses this capability for
+tracked updates and preserves the previous tracking entry on failure.
+
 ### `bim.store.*` — Scripting & SDK
 
 The viewer's QuickJS sandbox and the TypeScript SDK expose the core mutation surface as `bim.store`:
@@ -661,6 +736,26 @@ const col = bim.store.addColumn('default', storey, {
   Position: [1, 1, 0],
   Width: 0.3, Depth: 0.4, Height: 3,
   Name: 'Column 1',
+});
+```
+
+`bim.store.addColumn`, `addBeam` and `addMember` also accept the existing
+`@ifc-lite/create` parameterised `Profile` types instead of rectangular dimensions.
+Columns accept `RefDirection`, a finite non-zero horizontal vector in storey-local
+coordinates; the canonical builder normalises it and defaults to `[1, 0, 0]`.
+Profile dimensions and positions remain metres, including in millimetre models.
+The SDK, viewer adapter and loaded-model MCP backend use the same
+builders and validation. For example:
+
+```typescript
+const storeyId = bim.query().byType('IfcBuildingStorey').refs()[0].expressId;
+const sectionColumn = bim.store.addColumn('default', storeyId, {
+  Position: [2, 1, 0], Height: 3, RefDirection: [0, 1, 0],
+  Profile: {
+    Type: 'I', OverallWidth: 0.4, OverallDepth: 0.6,
+    WebThickness: 0.05, FlangeThickness: 0.07,
+  },
+  Name: 'Turned I column',
 });
 ```
 
@@ -729,3 +824,206 @@ const wall: WallJoinWall = {
 const extended = reshapeWallAxis(wall, [0, 0], [6, 0]);
 const body = wallBodyOutline(extended); // The original start face is retained.
 ```
+
+### Curtain walls and design grids in a loaded model
+
+`bim.store.addCurtainWall(modelId, storeyExpressId, params)` creates the
+`IfcCurtainWall`, its aggregated `IfcMember` mullions/transoms and `IfcPlate`
+panels. It accepts the same `CurtainWallInStoreParams` as the Model workspace.
+`bim.store.addGrid(modelId, storeyExpressId, params)` creates an `IfcGrid` with
+straight tagged axes and a `FootPrint` representation. Both write the complete
+graph in one atomic operation; the viewer and headless hosts record one Undo.
+
+```typescript
+function addDesignGrid(modelId: string, storeyExpressId: number) {
+  return bim.store.addGrid(modelId, storeyExpressId, {
+    Name: 'Design grid',
+    UAxes: [{ Tag: '1', Start: [0, 0], End: [4, 0] }],
+    VAxes: [{ Tag: 'A', Start: [2, -2], End: [2, 2] }],
+  });
+}
+```
+
+Lengths are metres. Curtain-wall endpoints and grid `Position` are
+storey-local; axis endpoints are grid-local; `Direction` is radians.
+`bim.store.addColumnOnGrid(modelId, storeyExpressId, params, binding)` accepts
+rectangular or profiled column parameters and a `GridColumnBinding` containing
+`GridId` and the two actual `IntersectingAxes` express ids. `Position` must
+match their current crossing in the storey frame. A stale crossing, foreign
+axis owner or unsupported placement refuses the entire operation without
+allocating partial geometry. The emitted column retains a real
+`IfcGridPlacement` binding when exported. These optional backend capabilities
+throw a clear error on a host that does not implement them.
+
+`bim.store.editHostedElement(ref, patch)` exposes the same physical edit used by
+hosted sliding and the Model inspector. `Offset` and `Sill` are metres in the
+host frame; `OverallWidth` and `OverallHeight` resize the occurrence and its
+opening together. The edit preserves identity, metadata, relationships and
+other instances of shared source geometry. It refuses overlapping cuts,
+out-of-host dimensions and unsupported geometry atomically. Viewer and MCP
+hosts record one Undo batch and the viewer remeshes the host, cut and filling.
+
+```typescript
+bim.store.editHostedElement({ modelId: 'building', expressId: 1262 }, {
+  OverallWidth: 1.2, OverallHeight: 1.4,
+});
+```
+
+Shared geometry edit planning uses `expandAffectedSet(store, view, ids, cause)`
+from `@ifc-lite/export` to include live hosted products when placements or host
+bodies change. `editOwnershipRefusal(store, view, writtenIds, allowedProducts)`
+checks effective source and overlay references before an in-place write and
+refuses leaves shared with unrelated products. Callers keep planning and writes
+inside one atomic mutation transaction. The viewer's move, rotate and align
+commands use this common plan and preserve the IFC storey frame and model units.
+
+The shared `copyBatchInStore(dataStore, editor, expressIds, transforms, options?)`
+operation prunes selected hosted/assembly dependants and copies the resulting
+roots atomically. `copySourcesInStore(context, expressIds, copyCount?)` reports
+refusals before planning and checks fan-out after pruning carried children; the
+optional count defaults to one. `copiedProductsInStore` supplies the viewer
+preview's products.
+`arrayCopyTransforms(params)` is the same linear/polar planner used for the
+viewer preview and commit; its count includes the original selection, and a
+full polar turn omits the coincident final copy. Each batch is bounded to
+10,000 new root copies before allocation. A separate work budget permits at
+most 50,000 actual product writes per batch, including carried assembly parts,
+openings and fillings. Deep acyclic assembly traversal is iterative; excessive
+reference fan-out refuses before emission. Parent placement frames between an
+occurrence and its storey must be upright; tilted or negative-Z parents refuse
+rather than projecting the requested movement. Tilted occurrence leaves remain
+supported under upright parents. Unknown array modes and overflowing
+derived directions/extents refuse before preview or writes. Native-unit
+conversion and placement composition also refuse nonfinite output atomically. The host records
+its compound Undo
+batch and re-meshes returned products after success.
+
+### Physical command edits on loaded models
+
+The SDK's `bim.store` methods use the same atomic geometry edit cores as the
+viewer commands. References carry a model ID and model-local EXPRESS ID.
+Coordinates and offsets are in IFC storey-local metres; planar rotations use
+radians about an explicit pivot. The viewer adapter handles rendering and
+history after the shared IFC operation commits.
+
+- `copyElements(modelId, expressIds, transforms)` copies selected products for
+  each transform, including their hosted openings/fillings and assembly parts.
+  Selecting a host and its filling copies that filling once.
+- `duplicateElement(ref, { offset, Name? })` uses the same copy graph with the
+  Duplicate naming policy. Supply the IFC offset explicitly; the viewer's
+  directional bounds gesture calculates its own offset.
+- `arrayElements(modelId, expressIds, params)` uses the viewer's linear/polar
+  array planner. `count` includes the original selection; the returned references
+  identify only the new copies.
+- `transformElements(modelId, expressIds, operation)` accepts a planar `move`
+  with `delta` or `rotate` with `pivot` and `angle`. Align and plan movement use
+  the same writer after their gesture computes the delta.
+- `setElementSize(ref, patch)` edits supported wall `Height`/`Thickness`, slab
+  `Thickness`, or linear extrusion/profile `Depth`/`XDim`/`YDim`. Unsupported
+  imported profile shapes refuse instead of being replaced with primitives.
+- `resizeWall(ref, start, end, options?)` changes wall endpoints and carries
+  joined ends by default. Set `moveJoinedEnds: false` explicitly to disable that
+  endpoint policy.
+- `splitElements(modelId, requests)` commits the entire selection atomically.
+  Wall/linear cuts use a distance; slab cuts use two planar points. The larger
+  piece retains source identity and the added piece receives a fresh GlobalId.
+- `trimExtendElement(ref, params)` uses `mode`, `click`, and a live wall boundary
+  or explicit finite boundary segment, with the same shape and host refusals as
+  the viewer.
+
+Each operation records one logical Undo batch. A refusal preserves the graph,
+mutation journal and allocation state. Edits resolve current overlay entities;
+geometry shared with unrelated occurrences is refused when writing it would
+change those occurrences. Backend capabilities are optional: a custom backend
+must implement a method before its namespace can execute it.
+
+### Native Room commands
+
+`await bim.store.roomCommand(modelId, storeyExpressId, command)` derives rooms
+from current native wall meshes. It shares the viewer's native layout cache,
+occupancy checks, supported space footprint reader and IFC writer. Actions are
+`query`, `auto`, `autoAll`, `pick` (with `point`), `footprint`, `update` (with `expressIds`),
+and `edit` (with a `drag`, `split`, `remove` or `prune` layout operation).
+`query` returns candidates without writing. Writes return `created`, `updated`,
+`deleted` and `skipped` references and form one logical Undo batch. Supplied
+footprint placement remains available through `addSpace`.
+
+`autoAll` enumerates every current storey in the explicitly chosen model (the supplied storey ID is its anchor), prepares one detached native graph and commits one recorded action. Its `storeys` result contains each native storey ID, coverage status, candidate population, existing room count and created references. Existing room counts include all live owned `IfcSpace` entities, including unsupported or absent geometry. `effectiveRoomIdsByStorey(store, mutationView, storeyIds)` supplies the same complete bounded native population to SDK preparation and Viewer review; footprint readability only controls geometry planning. `unavailable` coverage refuses the entire commit; `noWalls`, `occupied` and `noFaces` are known no-write storey outcomes. Empty results create no Undo group. This never runs across other federated models. Complete preparation refuses above 128 storeys, 128 candidates or 4096 contour vertices rather than truncating an all-storey claim. Hosts can supply `NativeRoomGeometry.validate` to pin actual mesh/frame inputs across asynchronous preparation and held approval.
+
+Settings use metres: `weld`, `height`, `z` and optional edit
+`tolerance`; `boundary` is `inner`, `center` or `outer`. `namePattern`,
+`PredefinedType` and `ObjectType` control created room metadata. The runtime
+requires the WASM geometry package. The command refuses if its model changes
+while native geometry is preparing. In-process callers can supply an
+`AbortSignal`; cancellation before commit leaves IFC history unchanged.
+
+Native Room layout edits also enter ordinary Undo/Redo history when no IFC rooms exist yet. The `recordSessionMutation` helper records a `SESSION_EDIT` marker for local domain state; it does not modify IFC attributes, allocate entities or emit collaboration operations. Hosts retain the native layout under the actual history head, so Undo/Redo restores the corresponding plate.
+
+For append-only authoring, `view.getMutationCount()` captures the current journal cursor and `view.getMutations(cursor)` reads its appended suffix. This bounds recording overhead by the current call; atomic graph preparation remains a separate cost. Viewer ordinary creation publishes its collaboration graph before adding local Undo history and restores its prepared overlay if publication refuses.
+
+Native Room SDK preparation raises `RoomCommandConflictError` when another Room command owns preparation or the model changes before commit. Callers may retry against current state. Abort signals retain their cancellation reason; no Room commit is published after cancellation.
+
+Hosts that use `createRoomCommandBackend` can call its asynchronous
+`prepareRoomCommand(modelId, storeyExpressId, command)` before asking for
+approval. The returned `PreparedRoomCommand` exposes a detached native
+`preview` model and the planned `result`. For an edit, `layoutAfter` contains
+the detached post-edit native faces, including a layout-only cut with no
+materialized IfcSpace. The existing `result.candidates` keeps its pre-edit
+candidate meaning; hosts show `layoutAfter` to review the approved new layout.
+Preparation changes no live IFC
+graph or Undo history. `validate()` checks the captured model and source-byte
+facade identity, overlay,
+history and retained layout. `commit()` applies the whole captured action
+synchronously through the host recorder, once. Auto approves every captured
+untaken face; this interface does not offer per-room subset approval.
+Always call `dispose()` in a `finally` block or when abandoning a review so
+an uncommitted duplicate native plate is freed. A newer preparation on the
+same backend/model supersedes an older approval. Native queries may refresh
+geometry and the retained cache, but do not write IFC graph changes.
+
+`minArea` uses square metres. Layout-only edits before any IfcSpace exists
+remain session Undo state; exporting IFC does not serialize that retained
+layout unless an operation has materialized rooms in the graph.
+
+### Detecting concurrent overlay edits
+
+`MutablePropertyView.getMutationRevision()` returns an O(1) invalidation token for the live overlay. Capture it before asynchronous preparation and compare it afterward together with the model and view identities. Canonical edits, history-free edits, Undo/Redo and atomic publications advance the token; a rejected detached draft does not change the live token. Conservative increments may invalidate unchanged geometry. The token is local to one view, is not serialized, and must not replace the recorded Undo head.
+
+`readRelatedLists` normally returns syntactically valid relating references and
+excludes explicit IFC unset targets. Its optional fourth argument
+`{ includeMalformedRelatingTargets: true }` also inventories relationships whose
+relating slot is malformed or missing; these rows omit `relatingId` and must be
+refused as unknown. A reference to a missing entity retains its `relatingId`, so
+consumers must separately validate that the target exists and conforms to the
+required IFC type. Explicit unset remains excluded.
+
+`view.getQuantitiesForEntity(entityId, baseProvider?, includeEmptyInstances?)`
+retains a known source quantity-set `globalId` while applying canonical instance
+claims to same-named sets. Ordinary reads omit instances whose last numeric
+member was deleted. A native exporter can pass `true` as the third argument to
+retain those empty instances long enough to remove only their native ownership
+reference. The optional base provider can supply current native quantity sets
+without changing the view's installed source provider. This does not change the
+name-based mutation API or spread an edit across other same-named definitions.
+
+### Same-identity storey reassignment
+
+`planStoreyReassignment(dataStore, view, selectedIds, sourceStoreyId, destinationStoreyId)` reads the complete effective product/dependency/placement state without writing. `reassignElementsToStoreyInStore(dataStore, editor, selectedIds, sourceStoreyId, destinationStoreyId, expected?)` commits that operation atomically. `planStoreyReassignmentCandidates(dataStore, view, selectedIds, sourceStoreyId, destinationStoreyIds)` reads up to 20 distinct destination candidates using one effective Root/relationship inventory and reports each candidate's plan or refusal. This snapshot is scoped to one synchronous request and never retained across edits. Both storeys and every product must belong to the supplied model. An expected plan pins both `sourceStorey` and `destinationStorey` as `{ expressId, GlobalId }` records and refuses changed identities, membership, dependencies, metadata or frames, including a valid unique replacement storey GlobalId.
+
+The operation preserves product EXPRESS IDs, GlobalIds, representation and metadata references, and world placement. It re-expresses existing local placements in the destination storey's canonical full 3D frame; dependent placement chains retain their original parent identities. Native coordinates remain in file units, so metre and millimetre models use the same operation without guessed scale factors. Hosted openings/fillings and aggregate/nested parts travel with their owning roots. Spaces retain spatial aggregation; physical products retain containment. Unrelated source members remain in place. Distinct source relationships remain distinct: a wholly moved relationship retains its EXPRESS ID, GlobalId and metadata; a partial relationship retains its source identity and creates a separate destination entry with fresh identity and copied metadata. Complete relationship attributes are included in the stale-state pin.
+
+```ts
+import type { IfcDataStore } from '@ifc-lite/parser';
+import { StoreEditor, recordCompoundMutation } from '@ifc-lite/mutations';
+import { planStoreyReassignment, reassignElementsToStoreyInStore } from '@ifc-lite/create';
+
+function reassignProducts(dataStore: IfcDataStore, editor: StoreEditor,
+  ids: number[], sourceStoreyId: number, destinationStoreyId: number) {
+  const view = editor.getMutationView();
+  const expected = planStoreyReassignment(dataStore, view, ids, sourceStoreyId, destinationStoreyId);
+  return recordCompoundMutation(view, draft => reassignElementsToStoreyInStore(
+    dataStore, new StoreEditor(dataStore, draft), ids, sourceStoreyId, destinationStoreyId, expected));
+}
+```
+
+Select 1–200 distinct roots; the complete dependency closure is bounded to 5,000 products and the effective relationship inventory to 2,000,000 references. Missing or duplicate identities/ownership, detached hosted or assembly children, cycles, shared placements, unsupported or unreadable world frames, and spatial roots such as sites/buildings/storeys refuse. IFC2X3 requires OwnerHistory; IFC4 and IFC4X3 allow it to be omitted. Native grids and grid-based product placements are unsupported; ordinary local placements may include translated, rotated or tilted frames. A refusal or late transaction failure preserves the graph, journal and allocation state. Recorded Undo restores the complete graph and journal; the native ID allocator remains monotonic after a successful operation.

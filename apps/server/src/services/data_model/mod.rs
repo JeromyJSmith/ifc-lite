@@ -9,6 +9,7 @@ mod generated;
 mod documents;
 mod materials;
 mod material_units;
+mod material_usages;
 mod metadata;
 mod properties;
 mod property_value;
@@ -24,7 +25,7 @@ pub use types::*;
 use classifications::extract_classifications;
 use documents::extract_documents;
 use ifc_lite_core::{
-    build_entity_index, extract_length_unit_scale, DecodedEntity, EntityDecoder, EntityScanner,
+    build_entity_index, resolve_length_unit, DecodedEntity, EntityDecoder, EntityScanner,
 };
 use materials::extract_materials;
 use material_units::MaterialUnitContext;
@@ -56,7 +57,7 @@ where
     let mut total_entities = 0usize;
 
     let mut last_id = 0u32;
-    let mut last_type = String::new();
+    let mut last_type = "";
     let mut max_id = 0u32;
     let mut last_end = 0usize;
     let content_len = content.len();
@@ -64,14 +65,14 @@ where
     while let Some((id, type_name, start, end)) = scanner.next_entity() {
         total_entities += 1;
         last_id = id;
-        last_type = type_name.to_string();
+        last_type = type_name;
         last_end = end;
         if id > max_id {
             max_id = id;
         }
         all_entities.push(EntityJob {
             id,
-            type_name: type_name.to_string(),
+            type_name,
             start,
             end,
         });
@@ -94,7 +95,7 @@ where
         let sample_types: Vec<&str> = all_entities
             .iter()
             .take(20)
-            .map(|j| j.type_name.as_str())
+            .map(|j| j.type_name)
             .collect();
         tracing::debug!(?sample_types, "Sample entity types from scan");
 
@@ -132,19 +133,21 @@ where
         );
     }
 
-    // Parallel extraction using rayon::join
-    let content_arc = Arc::new(content.to_vec());
+    // Parallel extraction using rayon::join. Every extractor borrows the
+    // content: `rayon::join` scopes the borrow, so the copy of the whole
+    // upload this used to make (up to `MAX_FILE_SIZE_MB`, on top of the parse
+    // running beside it) bought nothing (#7676, SERVER-11).
     let (entities, ((property_sets, quantity_sets), relationships)) = rayon::join(
-        || extract_entity_metadata(&all_entities, &content_arc, &entity_index),
+        || extract_entity_metadata(&all_entities, content, &entity_index),
         || {
             rayon::join(
                 || {
                     rayon::join(
-                        || extract_properties(&all_entities, &content_arc, &entity_index),
-                        || extract_quantities(&all_entities, &content_arc, &entity_index),
+                        || extract_properties(&all_entities, content, &entity_index),
+                        || extract_quantities(&all_entities, content, &entity_index),
                     )
                 },
-                || extract_relationships(&all_entities, &content_arc, &entity_index),
+                || extract_relationships(&all_entities, content, &entity_index),
             )
         },
     );
@@ -157,7 +160,7 @@ where
         .map(|e| e.entity_id)
         .unwrap_or(0);
     let length_unit_scale = if project_id_for_units > 0 {
-        extract_length_unit_scale(&mut unit_decoder, project_id_for_units).unwrap_or(1.0)
+        resolve_length_unit(&mut unit_decoder, project_id_for_units).map_or(1.0, |unit| unit.scale) // data: main's value (#7678)
     } else {
         1.0
     };
@@ -177,19 +180,26 @@ where
     let ((classifications, materials), documents) = rayon::join(
         || {
             rayon::join(
-                || extract_classifications(&all_entities, &content_arc, &entity_index),
+                || extract_classifications(&all_entities, content, &entity_index),
                 || {
                     extract_materials(
                         &all_entities,
-                        &content_arc,
+                        content,
                         &entity_index,
                         &material_units,
                     )
                 },
             )
         },
-        || extract_documents(&all_entities, &content_arc, &entity_index),
+        || extract_documents(&all_entities, content, &entity_index),
     );
+
+    // A table over its budget is not served truncated: the refusal travels
+    // with the model to the one serializer every route uses (#7675).
+    let (materials, refused) = match materials {
+        Ok(rows) => (rows, None),
+        Err(reason) => (Vec::new(), Some(reason)),
+    };
 
     // Build spatial hierarchy (depends on relationships and entities)
     let spatial_hierarchy = build_spatial_hierarchy(
@@ -223,6 +233,7 @@ where
         materials,
         documents,
         spatial_hierarchy,
+        refused,
     }
 }
 

@@ -48,6 +48,7 @@ const PINNED_SESSION_RESET_KEYS: readonly string[] = [
   'cesiumTerrainClipY', 'cesiumTerrainHeight', 'cesiumTerrainSaveHeight', 'changeSets',
   'chatAbortController', 'chatError', 'chatStatus', 'chatStreamingContent', 'classFilter',
   'cloudAnnotation2DPoints', 'cloudAnnotations2D', 'compareAcceptedIdentity', 'compareError', 'compareKeyProperty', 'compareRejectedClaims', 'compareResult', // #4955/#4989 reviewed identity and its authored-key scheme name the outgoing files' entities
+  'compareReconciliation', 'compareRunCaptures', // #6921 captured runs name the outgoing federation's model ids
   'compareRunning', 'compareSelectedKey', 'contactShadingIntensity', 'contactShadingQuality',
   'contactShadingRadius', 'contextMenu', 'customOverrideRules', 'dirtyModels', 'discoveredLensData', 'draft',
   'drawing2D', 'drawing2DDisplayOptions', 'drawing2DError', 'drawing2DPanelVisible',
@@ -60,6 +61,7 @@ const PINNED_SESSION_RESET_KEYS: readonly string[] = [
   'idsFocusVisibilityOwned', 'idsLoading', 'idsPanelVisible', 'idsProgress',
   'interactionMode', 'isolatedEntities',
   'landXmlUnitsRefusal', // #5175 LandXML units-refusal retry prompt: dies with the load it belongs to
+  'landXmlAssumptionRefusal', // LandXML georef-assumption retry prompt: dies with the load it belongs to
   'layerDiffBusy', 'layerStack', 'layerStackDiff', 'layerStackPathToId', 'layersPanelVisible',
   'lensAppliedColors',
   'lensAppliedHiddenIds', 'lensAutoColorLegend', 'lensColorMap',
@@ -76,16 +78,18 @@ const PINNED_SESSION_RESET_KEYS: readonly string[] = [
   'playbackTime', 'pointCloudAlignmentAvailable', 'pointCloudAlignmentEnabled',
   'pointCloudAssetCount', 'pointCloudClassCounts', 'pointCloudClassMask',
   'pointCloudColorMode', 'pointCloudDeviationCenterOffset', 'pointCloudDeviationComputed',
-  'pointCloudDeviationHalfRange', 'pointCloudEdlEnabled', 'pointCloudEdlStrength',
+  'pointCloudDeviationHalfRange', 'pointCloudDeviationRevision', 'pointCloudEdlEnabled', 'pointCloudEdlStrength',
+  'pointCloudDeviationStatistics', // #6833 stored deviation statistics describe the outgoing scene's run
   'pointCloudFixedColor', 'pointCloudPointSize', 'pointCloudPreviewStride',
   'pointCloudRoundShape', 'pointCloudSizeMode', 'pointCloudWorldRadius', 'polygonArea2DPoints',
+  'scanDetectionError', 'scanDetectionRun', 'scanDetectionStage', 'scanDetectionStatus', 'scanCreatedGlobalIds', 'scanProposalCreated', 'scanProposalDecisions', 'scanProposalFilter', // #6894 scan-to-BIM review
   'polygonArea2DResults', 'progress', 'projectionMode', 'redoStacks', 'scheduleData',
   'scheduleRange', 'scriptAssistantTurnSnapshot', 'scriptDeleteConfirmId',
   'scriptExecutionState', 'scriptLastDiagnostics', 'scriptLastError', 'scriptLastResult',
   'searchFieldFilter', 'searchFilter', 'searchFilterActiveGroup', 'searchFilterError', 'searchFilterResult',
   'searchFilterRunning', 'searchFilterSchema', 'searchHighlightIndex', 'searchIndexes',
   'searchModalOpen', 'searchModelFilter', 'searchOpen', 'searchQuery', 'searchVimCycle',
-  'sceneState', 'sectionPlane', 'selectedAnnotation2D', 'selectedAnnotationId', 'selectedEntities',
+  'sceneState', 'inactiveSectionPlanes', 'sectionExtraCaps', 'sectionPlane', 'sectionUndo', 'selectedAnnotation2D', 'selectedAnnotationId', 'selectedEntities', // #7545: inactiveSectionPlanes + sectionUndo reset with the active plane
   'selectedEntitiesSet', 'selectedEntity', 'selectedEntityId', 'selectedEntityIds', 'selectionRevision',
   'selectedLandXmlSource', 'selectedModelId', 'selectedStoreys', 'selectedTaskGlobalIds', 'separationLinesEnabled',
   'separationLinesIntensity', 'separationLinesQuality', 'separationLinesRadius',
@@ -113,6 +117,7 @@ const PINNED_ALL_MODELS_CLEARED_KEYS: readonly string[] = [
   'selectedEntities', 'selectedEntitiesSet',
   'selectedEntity', 'selectedEntityId', 'selectedEntityIds', 'selectedLandXmlSource', 'selectedModelId', 'selectedStoreys', 'selectionRevision',
   'validationRuleSetDraft', 'validationRuleSetEditing', // #5825 full unload discards the unsaved editor
+  'scanDetectionError', 'scanDetectionRun', 'scanDetectionStage', 'scanDetectionStatus', 'scanCreatedGlobalIds', 'scanProposalCreated', 'scanProposalDecisions', // #6894 a scan-to-BIM run dies with its models
 ];
 
 /**
@@ -161,6 +166,7 @@ const PINNED_MODEL_REMOVED_KEYS: readonly string[] = [
   'hierarchyBasketSelection', 'hoverState', 'ifcDataStore', 'isolatedEntities',
   'layerDiffBusy', 'layerStack', 'layerStackDiff', 'layerStackPathToId',
   'measure2DCurrent', 'measure2DResults', 'measure2DSnapPoint', 'measure2DStart', 'meshColorBackup', 'models', 'pinboardEntities',
+  'pointCloudDeviationStatistics', // #6833 the run measured scan points against the removed model's meshes
   'polygonArea2DPoints', 'polygonArea2DResults',
   'selectedAnnotation2D', 'selectedEntities', 'selectedEntitiesSet',
   'selectedEntity', 'selectedEntityId', 'selectedEntityIds', 'selectedModelId', 'selectedStoreys', 'selectionRevision',
@@ -208,6 +214,8 @@ function modelRemovedFixture() {
     layerDiffBusy: true,
     // #4215: model 'A' carries a tag, so its assignment is what the removal drops.
     modelTagAssignments: new Map([['A', new Set(['tag-1'])]]),
+    // #6833: a stored deviation run, measured against A's meshes among others.
+    pointCloudDeviationStatistics: { revision: 0, clipRange: 1, overall: {}, assets: [], withinTolerance: null },
   } as unknown as Parameters<typeof modelRemovedScope>[0];
 }
 
@@ -223,6 +231,7 @@ const PINNED_OWNED_KEYS: readonly string[] = [
   'workspaceMode', 'session', // #6232 authoring session: it names one model and storey
   'authoringDefaults', // #6232 M2: type / layer-set picks name one model's entities; dimensions survive
   'documentPanelVisible', // #4594 documents
+  'idsStudioRejection', 'idsStudioFixPreview', // IDS-030 Studio: transient gate/fix feedback; the document itself survives
   'flowPanelVisible', 'flowRunning', 'flowLastRun', 'flowLastError', 'flowLastRunWindow', // #5167 flow
   'flowArtifacts', 'flowProgress', 'flowRunWarnings', // #6612 transient run evidence names the outgoing model inputs
   'chartPanelVisible', 'chartSelectionRevision', 'chartSlice', 'chartSliceSource', 'chartSliceBuckets', 'chartVisibilityOwned', 'chartVisibilityRevision', // #3944 charts
@@ -240,6 +249,7 @@ const PINNED_OWNED_KEYS: readonly string[] = [
   'cesiumTerrainHeight', 'cesiumTerrainSaveHeight', 'changeSets', 'chatAbortController',
   'chatError', 'chatStatus', 'chatStreamingContent', 'classFilter', 'cloudAnnotation2DPoints',
   'cloudAnnotations2D', 'compareAcceptedIdentity', 'compareError', 'compareKeyProperty', 'compareRejectedClaims', 'compareResult', 'compareRunning', // #4955/#4989
+  'compareReconciliation', 'compareRunCaptures', // #6921
   'compareSelectedKey', 'contactShadingIntensity', 'contactShadingQuality',
   'contactShadingRadius', 'contextMenu', 'customOverrideRules', 'dirtyModels', 'discoveredLensData', 'draft',
   'drawing2D', 'drawing2DDisplayOptions', 'drawing2DError', 'drawing2DPanelVisible',
@@ -253,6 +263,7 @@ const PINNED_OWNED_KEYS: readonly string[] = [
   'idsError', 'idsFocusVisibilityOwned', 'idsLoading', 'idsPanelVisible', 'idsProgress',
   'ifcDataStore', 'interactionMode', 'isolatedEntities',
   'landXmlUnitsRefusal', // #5175
+  'landXmlAssumptionRefusal',
   'layerDiffBusy', 'layerStack', 'layerStackDiff', 'layerStackPathToId', 'layersPanelVisible',
   'lensAppliedColors',
   'lensAppliedHiddenIds', 'lensAutoColorLegend',
@@ -269,16 +280,18 @@ const PINNED_OWNED_KEYS: readonly string[] = [
   'playbackTime', 'pointCloudAlignmentAvailable', 'pointCloudAlignmentEnabled',
   'pointCloudAssetCount', 'pointCloudClassCounts', 'pointCloudClassMask',
   'pointCloudColorMode', 'pointCloudDeviationCenterOffset', 'pointCloudDeviationComputed',
-  'pointCloudDeviationHalfRange', 'pointCloudEdlEnabled', 'pointCloudEdlStrength',
+  'pointCloudDeviationHalfRange', 'pointCloudDeviationRevision', 'pointCloudEdlEnabled', 'pointCloudEdlStrength',
+  'pointCloudDeviationStatistics', // #6833 stored deviation statistics describe the outgoing scene's run
   'pointCloudFixedColor', 'pointCloudPointSize', 'pointCloudPreviewStride',
   'pointCloudRoundShape', 'pointCloudSizeMode', 'pointCloudWorldRadius', 'polygonArea2DPoints',
+  'scanDetectionError', 'scanDetectionRun', 'scanDetectionStage', 'scanDetectionStatus', 'scanCreatedGlobalIds', 'scanProposalCreated', 'scanProposalDecisions', 'scanProposalFilter', // #6894 scan-to-BIM review
   'polygonArea2DResults', 'progress', 'projectionMode', 'redoStacks', 'scheduleData',
   'scheduleRange', 'scriptAssistantTurnSnapshot', 'scriptDeleteConfirmId',
   'scriptExecutionState', 'scriptLastDiagnostics', 'scriptLastError', 'scriptLastResult',
   'searchFieldFilter', 'searchFilter', 'searchFilterActiveGroup', 'searchFilterError', 'searchFilterResult',
   'searchFilterRunning', 'searchFilterSchema', 'searchHighlightIndex', 'searchIndexes',
   'searchModalOpen', 'searchModelFilter', 'searchOpen', 'searchQuery', 'searchVimCycle',
-  'sceneState', 'sectionPlane', 'selectedAnnotation2D', 'selectedAnnotationId', 'selectedEntities',
+  'sceneState', 'inactiveSectionPlanes', 'sectionExtraCaps', 'sectionPlane', 'sectionUndo', 'selectedAnnotation2D', 'selectedAnnotationId', 'selectedEntities', // #7545: inactiveSectionPlanes + sectionUndo reset with the active plane
   'selectedEntitiesSet', 'selectedEntity', 'selectedEntityId', 'selectedEntityIds', 'selectionRevision',
   'selectedLandXmlSource', 'selectedModelId', 'selectedStoreys', 'selectedTaskGlobalIds', 'separationLinesEnabled',
   'separationLinesIntensity', 'separationLinesQuality', 'separationLinesRadius',

@@ -31,7 +31,7 @@ impl IfcAPI {
 
         // Build entity index — a compact columnar index (sorted u32 columns +
         // binary search, #1682) wrapped in Arc for cheap reuse.
-        let entity_index = std::sync::Arc::new(ifc_lite_core::ColumnarEntityIndex::from_scan(content));
+        let entity_index = std::sync::Arc::new(super::scan_columnar_index(content));
         // Cache for reuse by processGeometryBatch.
         // Mutex held only briefly to install the Arc; rayon helpers
         // pick up clones below without re-locking. Panic on poison —
@@ -43,7 +43,7 @@ impl IfcAPI {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *slot = Some(entity_index.clone());
         drop(slot);
-        let mut decoder = EntityDecoder::with_arc_columnar_index(content, entity_index);
+        let mut decoder = EntityDecoder::with_arc_columnar_index(content, entity_index).with_strict_reals(); // #7678
 
         // Run combined pre-pass
         let pre_pass = combined_pre_pass(content, &mut decoder);
@@ -177,26 +177,24 @@ impl IfcAPI {
             skip_type_geometry,
             None,
             false,
-            None,
             false,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn pre_pass_streaming_impl(
+    pub(super) fn pre_pass_streaming_impl(
         &self,
         data: &[u8],
         on_event: &Function,
         chunk_size: u32,
         disabled_type_names: Option<Vec<String>>,
         skip_type_geometry: bool,
-        prebuilt: Option<ifc_lite_core::ColumnarEntityIndex>,
+        columns: Option<super::prepass_owned_columns::ShardedColumns<'_>>,
         external_styles: bool,
-        columns: Option<super::prepass_discovery::IndexColumns<'_>>,
         compute_source_fingerprint: bool,
     ) -> Result<JsValue, JsValue> {
-        let prebuilt_arc: Option<std::sync::Arc<ifc_lite_core::ColumnarEntityIndex>> =
-            prebuilt.map(std::sync::Arc::new);
+        let have_columns = columns.is_some();
+        let mut prebuilt_arc: Option<std::sync::Arc<ifc_lite_core::ColumnarEntityIndex>> = None;
         // Load START on the streaming pre-pass path (see build_pre_pass_once).
         self.reset_pipeline_diagnostics();
         use ifc_lite_core::{has_geometry_by_name, keyword_eq, EntityDecoder, EntityScanner, IfcType};
@@ -229,7 +227,7 @@ impl IfcAPI {
         const PREPASS_INDEX_RESERVE_CAP: usize = 40_000_000; // ~0.5GB reserved
         // #3985: a prebuilt index serves every lookup and is retained below;
         // its unused staging map must not reserve another source-sized table.
-        let estimated = if prebuilt_arc.is_some() {
+        let estimated = if have_columns {
             0
         } else {
             (content.len() / 50).min(PREPASS_INDEX_RESERVE_CAP)
@@ -330,10 +328,12 @@ impl IfcAPI {
         let mut prepass_spans = ifc_lite_processing::prepass::PrepassSpans::default();
 
         // STAGE 2: fill collectors from the class columns; no byte scan.
-        if let Some((cids, cstarts, clengths, cclasses)) = columns {
-            let d = super::prepass_discovery::discover_from_columns(
-                content, cids, cstarts, clengths, cclasses, &disabled_types,
-            );
+        if let Some(columns) = columns {
+            // Discovery must see the original file order and matching classes
+            // before the owned index can sort/deduplicate its columns (#6537).
+            let (index, d) = columns.discover_and_build(content, &disabled_types)
+                .map_err(|message| JsValue::from_str(&message))?;
+            prebuilt_arc = Some(std::sync::Arc::new(index));
             buffered_jobs = d.buffered_jobs;
             total_jobs = d.total_jobs;
             project_id = d.project_id;
@@ -491,9 +491,10 @@ impl IfcAPI {
         // Consuming frees the map before sorting: one interleaved transient.
         let entity_index_arc = match prebuilt_arc {
             Some(pi) => pi,
-            None => std::sync::Arc::new(ifc_lite_core::ColumnarEntityIndex::from_hashmap_consuming(
-                entity_index,
-            )),
+            None => std::sync::Arc::new(
+                ifc_lite_core::ColumnarEntityIndex::from_hashmap_consuming(entity_index)
+                    .map_err(|e| JsValue::from_str(&e.to_string()))?,
+            ),
         };
         let have_prebuilt = external_styles; // sharded mode always passes both
 
@@ -540,7 +541,7 @@ impl IfcAPI {
         // deliberately skipped, aggregate void propagation included); sharded
         // (external_styles) mode leaves styles to the worker shards + finalize.
         // `decoder` stays in scope below for the orphan type-geometry pass.
-        let mut decoder = EntityDecoder::with_arc_columnar_index(content, entity_index_arc.clone());
+        let mut decoder = EntityDecoder::with_arc_columnar_index(content, entity_index_arc.clone()).with_strict_reals(); // #7678
         decoder.seed_unit_scales(1.0, plane_angle_to_radians);
         if !external_styles {
             let resolved = ifc_lite_processing::prepass::resolve_prepass(

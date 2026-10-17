@@ -26,6 +26,8 @@
 //! find where a *closed* comment ends — only the unterminated case is
 //! handled differently, and only at that one call site.
 
+pub(crate) use crate::step_encoding::is_page_quote_operand;
+
 /// If a STEP `/* ... */` comment starts at `bytes[i]`, the index just past
 /// its closing `*/`.
 ///
@@ -231,11 +233,21 @@ pub fn close_step_record(bytes: &[u8]) -> RecordClose {
                         Some(off) => pos += off + 1,
                         None => return RecordClose::Unreadable,
                     }
-                    // A doubled '' is an escaped quote: still inside.
-                    if bytes.get(pos) != Some(&b'\'') {
-                        break;
+                    if is_page_quote_operand(bytes, pos - 1) {
+                        continue;
                     }
-                    pos += 1;
+                    // A doubled '' is an escaped quote: still inside.
+                    if bytes.get(pos) == Some(&b'\'') {
+                        pos += 1;
+                        continue;
+                    }
+                    // An unescaped apostrophe (#7541): every byte after it is
+                    // read inverted, so no ')' found from here is this record's.
+                    match super::record_strings::string_parameter_end(bytes, pos - 1) {
+                        super::record_strings::QuoteEnd::Closes => break,
+                        super::record_strings::QuoteEnd::Stray => return RecordClose::Unbalanced,
+                        super::record_strings::QuoteEnd::Unreadable => return RecordClose::Unreadable,
+                    }
                 }
             }
             b'/' if bytes.get(pos + 1) == Some(&b'*') => match skip_step_comment(bytes, pos) {

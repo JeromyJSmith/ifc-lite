@@ -1,14 +1,17 @@
 name: Test Templates
 
 on:
+  workflow_call:
+  workflow_dispatch:
   # push:main intentionally dropped — branch-protected PR runs validate
   # the same SHA before merge.
   pull_request:
     paths:
       - 'packages/create-ifc-lite/**'
+      - '.github/workflows/test-templates.yml'
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: scaffold-cohort-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -18,7 +21,7 @@ jobs:
   test-templates:
     name: Scaffold & verify (${{ matrix.template }})
     # Free GitHub-hosted runner. This job scaffolds a template, runs
-    # `npm install` + tsc + a vite/tsc build against PUBLISHED packages —
+    # `npm ci` + tsc + a vite/tsc build against PUBLISHED packages —
     # no Rust/WASM compile and no cargo cache to preserve, so it never
     # needed Depot's paid cores. A 6-way matrix on `depot-ubuntu-24.04-4`
     # was billing 6 x 2x the base rate for pure JS work; `ubuntu-latest` is
@@ -61,7 +64,7 @@ jobs:
           bun-version: 1.4.2
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 26
 
@@ -69,7 +72,7 @@ jobs:
         run: bun install --frozen-lockfile
 
       - name: Build create-ifc-lite
-        run: bun run --filter=create-ifc-lite build
+        run: bun x turbo build --filter=create-ifc-lite --concurrency=2
 
       - name: Scaffold ${{ matrix.template }} template
         run: |
@@ -78,8 +81,8 @@ jobs:
           node $GITHUB_WORKSPACE/packages/create-ifc-lite/dist/index.js \
             test-${{ matrix.template }} --template ${{ matrix.template }}
 
-      - name: Install template deps (npm, as a real user would)
-        run: npm install --prefer-offline
+      - name: Install the resolved template cohort
+        run: npm ci --prefer-offline
         working-directory: /tmp/scaffold/test-${{ matrix.template }}
 
       - name: Type-check template
@@ -89,3 +92,15 @@ jobs:
       - name: Build template
         run: ${{ matrix.build_command }}
         working-directory: /tmp/scaffold/test-${{ matrix.template }}
+
+      - name: Fetch the reference IFC for the basic consumer
+        if: matrix.template == 'basic'
+        run: node scripts/fixtures/fetch-fixtures.mjs ara3d/AC20-FZK-Haus.ifc
+
+      - name: Run the generated basic project on real IFC bytes
+        if: matrix.template == 'basic'
+        working-directory: /tmp/scaffold/test-basic
+        run: |
+          npm run parse "$GITHUB_WORKSPACE/tests/models/ara3d/AC20-FZK-Haus.ifc"
+          cp "$GITHUB_WORKSPACE/packages/create-ifc-lite/test/fixtures/verify-basic-consumer.mjs" ./verify-basic-consumer.mjs
+          node verify-basic-consumer.mjs "$GITHUB_WORKSPACE/tests/models/ara3d/AC20-FZK-Haus.ifc"

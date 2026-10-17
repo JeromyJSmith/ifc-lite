@@ -34,6 +34,7 @@ import { runOverlayFrameContracts } from './lib/wasm-overlay-frame-contracts.mjs
 import { runRtcPrecisionContracts } from './lib/wasm-rtc-precision-contracts.mjs';
 import { finishContractRun } from './lib/wasm-landxml-contracts.mjs';
 import { runEarlyContracts } from './lib/wasm-early-contracts.mjs';
+import { runScanOutlineContracts } from './lib/wasm-scan-outline-contracts.mjs';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = join(__dirname, '..');
 const FIXTURES_DIR = join(ROOT_DIR, 'tests/models');
@@ -114,6 +115,10 @@ function test(name, fn) {
   }
 }
 runEarlyContracts({ IfcAPI, api, test, skip, root: ROOT_DIR });
+runScanOutlineContracts({ test }); // #6871, fixture-free
+(await import('./lib/wasm-step-page-contracts.mjs')).runStepPageContracts(api, test); // #7540, fixture-free: must precede unrelated fixture early-exit.
+(await import('./lib/wasm-stray-apostrophe-contracts.mjs')).runStrayApostropheContracts(api, test); // #7541, fixture-free
+await (await import('./lib/wasm-scan-refusal-contracts.mjs')).runScanRefusalContracts(api, test); // #7393, fixture-free
 await (await import('./lib/wasm-extrusion-bridge-contracts.mjs')).runExtrusionBridgeContracts(test, ROOT_DIR); // #6306
 if (!COLUMN_AVAILABLE) {
   skip('IFC-backed WASM contracts', `column fixture missing — ${FIXTURES_HINT}`);
@@ -2146,10 +2151,10 @@ await runPrepassClassBoundaryTests(api, test);
 // into "this file refused nothing". Same module split, same reason.
 await runShardRefusalBoundaryTests(api, test);
 
-// ===== Class-toggled classes never ride the instanced shard (#5409) =====
-// The fixture is built from the viewer's class-toggle table, so a class added
-// there and not to the Rust partition fails here.
+// ===== Shard routing: class-toggled classes (#5409), multi-colour sources (EDGE-WASM-5, #7691) =====
+// #5409's fixture is built from the viewer's class-toggle table: a class added there and not to Rust fails.
 await runClassToggleShardContract(IfcAPI, test);
+(await import('./lib/indexed-colour-instancing-contract.mjs')).runIndexedColourInstancingContract(IfcAPI, test);
 await (await import('./lib/wasm-remesh-contracts.mjs')).runRemeshContracts({ IfcAPI, FIXTURES_DIR, FIXTURES_HINT, test, skip }); // #6232
 finishContractRun(api, passed, failed, skipped);
 

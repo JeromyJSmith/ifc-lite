@@ -16,7 +16,7 @@ import { createHoverSlice, type HoverSlice } from './slices/hoverSlice.js';
 import { createCameraSlice, type CameraSlice } from './slices/cameraSlice.js';
 import { createSectionSlice, type SectionSlice } from './slices/sectionSlice.js';
 import { registerMutationViewStoreBinding } from './mutation-view-store-binding.js';
-export { customPlaneCenter, loadLastSectionMode, type LastSectionMode } from './slices/sectionSlice.js';
+export { customPlaneCenter } from './slices/sectionSlice.js';
 import { createMeasurementSlice, type MeasurementSlice } from './slices/measurementSlice.js';
 import { createDataSlice, type DataSlice } from './slices/dataSlice.js';
 import { createModelSlice, type ModelSlice } from './slices/modelSlice.js';
@@ -26,6 +26,7 @@ import { createSheetSlice, type SheetSlice } from './slices/sheetSlice.js';
 import { createBcfSlice, type BCFSlice } from './slices/bcfSlice.js';
 import { createIdsSlice, type IDSSlice } from './slices/idsSlice.js';
 import { createValidationDraftSlice, type ValidationDraftSlice } from './slices/validationDraftSlice.js';
+import { createIdsStudioSlice, type IdsStudioSlice } from './slices/idsStudioSlice.js';
 import { createManualValidationSlice, type ManualValidationSlice } from './slices/manualValidationSlice.js';
 import { createValidationReportsSlice, type ValidationReportsSlice } from './slices/validationReportsSlice.js';
 import { createExtensionsSlice, type ExtensionsSlice } from './slices/extensionsSlice.js';
@@ -39,7 +40,9 @@ import { createPinboardSlice, type PinboardSlice } from './slices/pinboardSlice.
 import { createLensSlice, type LensSlice } from './slices/lensSlice.js';
 import { createClashSlice, type ClashSlice } from './slices/clashSlice.js';
 import { createSavedComparisonsSlice, type SavedComparisonsSlice } from './slices/savedComparisonsSlice.js';
+import { createSavedClashReportsSlice, type SavedClashReportsSlice } from './slices/savedClashReportsSlice.js';
 import { createCompareSlice, type CompareSlice } from './slices/compareSlice.js';
+import { createCompareRunsSlice, type CompareRunsSlice } from './slices/compareRunsSlice.js';
 import { createDockSlice, type DockSlice } from './slices/dockSlice.js';
 import { createSidebarSlice, type SidebarSlice } from './slices/sidebarSlice.js';
 import { createDrawingInspectorSlice, type DrawingInspectorSlice } from './slices/drawingInspectorSlice.js';
@@ -61,6 +64,7 @@ import { createLevelDisplaySlice, type LevelDisplaySlice } from './slices/levelD
 import { createStoreyContextSlice, type StoreyContextSlice } from './slices/storeyContextSlice.js';
 import { createModelPlacementSlice, type ModelPlacementSlice } from './slices/modelPlacementSlice.js';
 import { createPointCloudSlice, type PointCloudSlice } from './slices/pointCloudSlice.js';
+import { createScanDetectionSlice, type ScanDetectionSlice } from './slices/scanDetectionSlice.js';
 import { createUnitDisplaySlice, type UnitDisplaySlice } from './slices/unitDisplaySlice.js';
 import { createSpaceMouseSlice, type SpaceMouseSlice } from './slices/spaceMouseSlice.js';
 import { createLayerStackSlice, type LayerStackSlice } from './slices/layerStackSlice.js';
@@ -68,6 +72,7 @@ import { createZonesSlice, type ZonesSlice } from './slices/zonesSlice.js';
 import { createModelTagsSlice, type ModelTagsSlice } from './slices/modelTagsSlice.js';
 import { withPlacementHistory } from './placement-history.js';
 import { withVisibilityOwnershipInvalidation } from './visibility-invalidation.js';
+import { withStoreChurnCounters } from './perf-churn.js';
 import { registerSidebarExclusivity, registerHierarchyLeftSync, registerDrawingInspectorSheetSync, reconcileInitialStoreSync } from './store-sync.js';
 import { registerOverlayThemeSync } from '@/lib/viewport-ui/overlay-theme-sync';
 
@@ -93,6 +98,7 @@ export type { SheetState } from './slices/sheetSlice.js';
 export type { CollabSlice, CollabRole, CollabStatus, StartCollabOptions } from './slices/collabSlice.js';
 export type { BCFSlice, BCFSliceState } from './slices/bcfSlice.js';
 
+export type { IdsStudioSlice, IdsStudioView } from './slices/idsStudioSlice.js';
 export type { IDSSlice, IDSSliceState, IDSDisplayOptions, IDSFilterMode, IDSFocusMode } from './slices/idsSlice.js';
 
 // Re-export List / Chart / Flow / Document / Pinboard types
@@ -149,6 +155,7 @@ export type ViewerState = AppearanceSlice & LoadingSlice &
   SheetSlice &
   BCFSlice &
   IDSSlice &
+  IdsStudioSlice &
   ValidationDraftSlice &
   ManualValidationSlice &
   ValidationReportsSlice &
@@ -158,8 +165,8 @@ export type ViewerState = AppearanceSlice & LoadingSlice &
   DocumentSlice &
   PinboardSlice &
   LensSlice &
-  ClashSlice &
-  CompareSlice & SavedComparisonsSlice &
+  ClashSlice & SavedClashReportsSlice &
+  CompareSlice & SavedComparisonsSlice & CompareRunsSlice &
   LayerStackSlice &
   DockSlice &
   SidebarSlice &
@@ -177,7 +184,7 @@ export type ViewerState = AppearanceSlice & LoadingSlice &
   CollabSlice &
   AuthoringSessionSlice & AuthoringDefaultsSlice &
   LevelDisplaySlice & StoreyContextSlice &
-  PointCloudSlice & ModelPlacementSlice &
+  PointCloudSlice & ScanDetectionSlice & ModelPlacementSlice &
   UnitDisplaySlice & SpaceMouseSlice & ZonesSlice & ModelTagsSlice &
   ExtensionsSlice & SourcesSlice & SceneStateSlice & ViewerActions;
 
@@ -189,9 +196,10 @@ export type ViewerState = AppearanceSlice & LoadingSlice &
  * `isolatedEntities` / `ghostExceptEntities` without dropping the
  * visibility-ownership records that write makes stale. See
  * `store/visibility-invalidation.ts` for why that is a middleware rather than a
- * helper each writing action remembers to call.
+ * helper each writing action remembers to call. `withStoreChurnCounters`
+ * (outermost) counts writes and subscriber notifications under ?perfTrace=1 (#6957).
  */
-const createViewerStore = () => create<ViewerState>()(withVisibilityOwnershipInvalidation(withPlacementHistory((...args) => ({
+const createViewerStore = () => create<ViewerState>()(withStoreChurnCounters(withVisibilityOwnershipInvalidation(withPlacementHistory((...args) => ({
   // Spread all slices
   ...createLoadingSlice(...args),
   ...createSelectionSlice(...args),
@@ -208,6 +216,7 @@ const createViewerStore = () => create<ViewerState>()(withVisibilityOwnershipInv
   ...createSheetSlice(...args),
   ...createBcfSlice(...args),
   ...createIdsSlice(...args),
+  ...createIdsStudioSlice(...args),
   ...createValidationDraftSlice(...args), ...createManualValidationSlice(...args),
   ...createValidationReportsSlice(...args),
   ...createListSlice(...args),
@@ -217,8 +226,10 @@ const createViewerStore = () => create<ViewerState>()(withVisibilityOwnershipInv
   ...createPinboardSlice(...args),
   ...createLensSlice(...args),
   ...createClashSlice(...args),
+  ...createSavedClashReportsSlice(...args),
   ...createCompareSlice(...args),
   ...createSavedComparisonsSlice(...args),
+  ...createCompareRunsSlice(...args),
   ...createLayerStackSlice(...args),
   ...createDockSlice(...args),
   ...createSidebarSlice(...args),
@@ -237,6 +248,7 @@ const createViewerStore = () => create<ViewerState>()(withVisibilityOwnershipInv
   ...createAuthoringSessionSlice(...args), ...createAuthoringDefaultsSlice(...args),
   ...createLevelDisplaySlice(...args), ...createStoreyContextSlice(...args),
   ...createPointCloudSlice(...args),
+  ...createScanDetectionSlice(...args),
   ...createModelPlacementSlice(...args),
   ...createUnitDisplaySlice(...args),
   ...createSpaceMouseSlice(...args),
@@ -247,7 +259,7 @@ const createViewerStore = () => create<ViewerState>()(withVisibilityOwnershipInv
   ...createAppearanceSlice(...args),
 
   ...createViewerActions(...args),
-}))));
+})))));
 
 const STORE_SINGLETON_KEY = '__ifc_lite_viewer_store__';
 const globalStoreRegistry = globalThis as typeof globalThis & {

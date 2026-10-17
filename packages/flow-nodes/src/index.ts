@@ -12,6 +12,7 @@ import { csvNodes } from './csv-nodes.js';
 import { documentsNodes } from './documents-nodes.js';
 import { elementNodes } from './element-nodes.js';
 import { httpRequestNode } from './http-request-node.js';
+import { idsNodes } from './ids-nodes.js';
 import type { FlowHost } from './host.js';
 import { modelNodes } from './model-nodes.js';
 import { openModelNode } from './open-model-node.js';
@@ -22,11 +23,13 @@ import { viewerNodes } from './viewer-nodes.js';
 import { writeNodes } from './write-nodes.js';
 import { xlsxNodes } from './xlsx-nodes.js';
 import { sessionNodes } from './session-nodes.js';
+import { reviewSnapshotNode } from './review-node.js';
 
 export { isModelSelector, parseTagRules, parseCheckJobs, matchesFilename, AUTOMATION_FEATURES } from './session-contracts.js';
 export type { ModelSelector, SessionModel, SessionModels, FilenameTagRule, ResourceSource, CheckJob, DocumentMapping, SessionAutomationHost } from './session-contracts.js';
 
 export type { FlowHost, FlowNodeDef, TableAccess, StringLookup } from './host.js';
+export type { BcfWriteGateway, BcfWriteIntent } from './bcf-write-gateway.js';
 export { requireCapability, toRef, toSdkRef, resolveByGlobalId, rememberGlobalId, forgetGlobalId, invalidateGlobalIdIndex } from './host.js';
 export { columnTypeOf, VALUE_TYPE_BY_COLUMN_TYPE } from './table-nodes.js';
 export type { ElementSpec } from './element-nodes.js';
@@ -64,11 +67,13 @@ export function createStandardRegistry(): NodeRegistry<FlowHost> {
     scriptListNode,
     httpRequestNode,
     ...bcfNodes,
+    ...idsNodes,
     ...apsNodes,
     speckleReceiveNode,
     ...documentsNodes,
     openModelNode,
     ...sessionNodes,
+    reviewSnapshotNode,
   ]);
 }
 

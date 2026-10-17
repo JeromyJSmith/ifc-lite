@@ -63,6 +63,8 @@ struct Fixture {
     merged_cases: Vec<MergedCase>,
     #[serde(default)]
     refused_cases: Vec<RefusedCase>,
+    #[serde(default)]
+    refused_by_both_cases: Vec<RefusedCase>,
 }
 
 fn fixture() -> Fixture {
@@ -214,6 +216,46 @@ fn logs_the_typescript_replay_would_save_without_an_edit_are_refused() {
         let log = MutationLog::from_json(&case.log.to_string()).expect("log parses");
         let err = export_step_with_log(content.as_bytes(), &StepOptions::default(), &log)
             .expect_err(&format!("{} is refused", case.name));
+        assert!(err.to_string().contains(&case.error), "{}: {err}", case.name);
+    }
+}
+
+/// IFC2X3 has no Formula slot; IFC4 retains it (#7378).
+#[test]
+fn generated_quantity_arity_matches_the_declared_schema() {
+    let fx = fixture();
+    for (case_name, schema, quantity_name, expected) in [
+        ("ifc2x3-edits", "IFC2X3", "Length", "IFCQUANTITYLENGTH('Length',$,$,6.);"),
+        ("create-quantity-set", "IFC4", "L", "IFCQUANTITYLENGTH('L',$,$,3.,$);"),
+    ] {
+        // Generation follows the source family; target-schema conversion is a
+        // separate contract and does not pad optional fields on upgrade.
+        let case = fx.cases.iter().find(|c| c.name == case_name).expect("source-family control");
+        let source = format!("{}\n", fx.sources[&case.source].join("\n"));
+        let log = MutationLog::from_json(&case.log.to_string()).expect("log parses");
+        let options = StepOptions { schema: Some(schema.to_string()), ..StepOptions::default() };
+        let (out, _) = export_step_with_log(source.as_bytes(), &options, &log).expect("export succeeds");
+        let marker = format!("=IFCQUANTITYLENGTH('{quantity_name}'");
+        let quantities: Vec<_> = out.lines().filter(|line| line.contains(&marker)).collect();
+        assert_eq!(quantities.len(), 1, "one regenerated quantity in {schema}");
+        assert!(quantities[0].ends_with(expected), "{schema}: {}", quantities[0]);
+        assert!(out.contains(&format!("FILE_SCHEMA(('{schema}'));")));
+    }
+}
+
+/// #7682: logs BOTH writers refuse (the TypeScript half throws the same
+/// message, `step-log.parity.test.ts`).
+#[test]
+fn logs_both_writers_refuse_are_refused_with_the_shared_message() {
+    let fx = fixture();
+    assert!(!fx.refused_by_both_cases.is_empty(), "the fixture must carry refusedByBothCases");
+    for case in &fx.refused_by_both_cases {
+        let content = format!("{}\n", fx.sources[&case.source].join("\n"));
+        let log = MutationLog::from_json(&case.log.to_string()).expect("log parses");
+        let mut out = Vec::new();
+        let err = export_step_with_log_to_writer(content.as_bytes(), &StepOptions::default(), &log, &mut out)
+            .expect_err(&case.name);
+        assert!(out.is_empty(), "{}: nothing is written", case.name);
         assert!(err.to_string().contains(&case.error), "{}: {err}", case.name);
     }
 }

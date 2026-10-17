@@ -56,6 +56,8 @@
 //! difference only shows on input no file contains. Not pinned in
 //! `step_refuse_vectors.json`, which records what BOTH must refuse.
 
+use ifc_lite_core::step_encoding::step_string_literal_end;
+
 /// Split a STEP attribute list into its top-level arguments, or `None` when
 /// the text is not an argument list this can scan.
 ///
@@ -110,10 +112,10 @@ pub(crate) fn split_top_level_args(attrs: &str) -> Option<Vec<String>> {
     // delimiter STEP cares about is ASCII, so indexing chars costs nothing and
     // leaves the rest of the text alone.
     let text: Vec<char> = attrs.chars().collect();
+    let ascii = ascii_projection(&text);
     let n = text.len();
     let mut out: Vec<String> = Vec::new();
     let mut depth = 0i32;
-    let mut in_string = false;
     let mut current = String::new();
     let mut i = 0usize;
     while i < n {
@@ -126,46 +128,42 @@ pub(crate) fn split_top_level_args(attrs: &str) -> Option<Vec<String>> {
         // the matching `*/`, or to the end when unterminated) into the current
         // slot as one atomic unit; the per-slot grammar check below still gets
         // the last word on whether that slot is a value.
-        if !in_string && ch == '/' && i + 1 < n && text[i + 1] == '*' {
+        if ch == '/' && i + 1 < n && text[i + 1] == '*' {
             let stop = comment_end(&text, i).unwrap_or(n);
             current.extend(text[i..stop].iter());
             i = stop;
             continue;
         }
 
+        // A string literal is copied whole. Where it ends is the shared rule,
+        // so a `\S\'` operand is text, not a closing quote (#7589); a literal
+        // that never closes is an unterminated string, refused.
         if ch == '\'' {
-            current.push(ch);
-            if in_string && i + 1 < n && text[i + 1] == '\'' {
-                current.push('\'');
-                i += 2;
-                continue;
-            }
-            in_string = !in_string;
-            i += 1;
+            let end = step_string_literal_end(&ascii, i)?;
+            current.extend(&text[i..end]);
+            i = end;
             continue;
         }
 
-        if !in_string {
-            if ch == '(' {
-                depth += 1;
-            } else if ch == ')' {
-                depth -= 1;
-                if depth < 0 {
-                    // Already past the record's own closing paren: every comma
-                    // from here would be read as nested and the split is
-                    // meaningless.
-                    return None;
-                }
-            } else if ch == ',' && depth == 0 {
-                out.push(std::mem::take(&mut current));
-                i += 1;
-                continue;
+        if ch == '(' {
+            depth += 1;
+        } else if ch == ')' {
+            depth -= 1;
+            if depth < 0 {
+                // Already past the record's own closing paren: every comma
+                // from here would be read as nested and the split is
+                // meaningless.
+                return None;
             }
+        } else if ch == ',' && depth == 0 {
+            out.push(std::mem::take(&mut current));
+            i += 1;
+            continue;
         }
         current.push(ch);
         i += 1;
     }
-    if in_string || depth != 0 {
+    if depth != 0 {
         return None;
     }
     out.push(current);
@@ -204,6 +202,7 @@ pub(crate) fn split_top_level_args(attrs: &str) -> Option<Vec<String>> {
 /// "consumed to the end" check at the bottom fails the part.
 fn is_well_formed_step_slot(part: &str) -> bool {
     let text: Vec<char> = part.chars().collect();
+    let ascii = ascii_projection(&text);
     let n = text.len();
     let mut i = 0usize;
     let mut depth = 0usize;
@@ -250,23 +249,10 @@ fn is_well_formed_step_slot(part: &str) -> bool {
                 return false;
             }
             match text[i] {
-                '\'' => {
-                    i += 1;
-                    loop {
-                        if i >= n {
-                            return false; // unterminated string
-                        }
-                        if text[i] == '\'' {
-                            if i + 1 < n && text[i + 1] == '\'' {
-                                i += 2;
-                                continue;
-                            }
-                            i += 1;
-                            break;
-                        }
-                        i += 1;
-                    }
-                }
+                '\'' => match step_string_literal_end(&ascii, i) {
+                    Some(end) => i = end,
+                    None => return false, // unterminated string
+                },
                 '"' => {
                     // No doubled-quote escape inside a binary literal: the first
                     // following `"` ends it, matching ifcopenshell's tokenizer.
@@ -328,12 +314,72 @@ fn is_well_formed_step_slot(part: &str) -> bool {
     }
 }
 
+/// Whether a caller-supplied, already-serialized value is ONE STEP value that
+/// may be written into a slot as is (#7682, EXPORT-STEP-26): not empty, one
+/// well-formed value by [`is_well_formed_step_slot`], and holding no `/*` at
+/// all. A value with a top-level `,` would shift every later slot, and one
+/// holding `);` would end the record and start another. A comment is refused
+/// outright, even inside a literal: [`is_well_formed_step_slot`] accepts an
+/// UNTERMINATED trailing comment (a leniency meant for source slots already
+/// inside a record), and a caller value that opens one swallows the rest of
+/// the record and lets a later value close it and inject records of its own.
+/// A caller has no reason to send a comment, so none is written.
+///
+/// A binary literal is held to the ISO 10303-21 form, `"` then one digit
+/// `0`-`3` then uppercase hex then `"` (#7715 review): the slot grammar ends a
+/// binary literal at the next `"` whatever it holds, but core's scanner has no
+/// binary-literal rule and reads a `'` inside one as the start of a string, so
+/// a caller who controls both sides of that disagreement could close the
+/// record and write records of their own.
+pub(crate) fn is_step_value(value: &str) -> bool {
+    !value.trim().is_empty()
+        && !value.contains("/*")
+        && binary_literals_are_hex(value)
+        && is_well_formed_step_slot(value)
+}
+
+/// Every `"…"` outside a string literal is `"[0-3][0-9A-F]*"`.
+fn binary_literals_are_hex(value: &str) -> bool {
+    let b = value.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\'' => match step_string_literal_end(b, i) {
+                Some(end) => i = end,
+                None => return false,
+            },
+            b'"' => {
+                let Some(len) = b[i + 1..].iter().position(|&c| c == b'"') else { return false };
+                let body = &b[i + 1..i + 1 + len];
+                let hex = matches!(body.first(), Some(b'0'..=b'3'))
+                    && body[1..].iter().all(|c| c.is_ascii_digit() || (b'A'..=b'F').contains(c));
+                if !hex {
+                    return false;
+                }
+                i += len + 2;
+            }
+            _ => i += 1,
+        }
+    }
+    true
+}
+
 /// Characters a bare STEP token (keyword, enumeration, number, `#`-reference)
 /// is made of — the same set as the export twin's `/[A-Za-z0-9_.+\-#]/`. `/` is
 /// absent, so a `/` the trivia skipper did not consume (one not opening a
 /// comment) breaks the run short of the slot's end and the slot is refused.
 fn is_bare_token_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '+' | '-' | '#')
+}
+
+/// One byte per char, non-ASCII projected to NUL, so a walker over `&[char]`
+/// can ask the shared byte rule
+/// ([`ifc_lite_core::step_encoding::step_string_literal_end`]) where a string
+/// literal ends and get back a CHAR index (#7589). Every byte that rule
+/// inspects (`'`, `\`, `S`) is ASCII, so the projection cannot change its
+/// answer.
+pub(crate) fn ascii_projection(chars: &[char]) -> Vec<u8> {
+    chars.iter().map(|&c| if c.is_ascii() { c as u8 } else { 0 }).collect()
 }
 
 /// Index just past the `*/` closing the comment that opens at `open` (which

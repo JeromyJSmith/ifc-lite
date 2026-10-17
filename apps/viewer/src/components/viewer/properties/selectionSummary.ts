@@ -3,12 +3,12 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import { IfcQuery } from '@ifc-lite/query';
-import { extractProjectUnits, ProjectUnits, type IfcDataStore } from '@ifc-lite/parser';
+import { extractProjectUnits, readCurrentProjectUnits, ProjectUnits, type IfcDataStore } from '@ifc-lite/parser';
 import type { MutablePropertyView } from '@ifc-lite/mutations';
 import type { EntityRef } from '@/store/types';
 import { effectiveSelectedClass } from './effectiveSelectedClass';
 import { propertyDisplayValue, quantityDisplayValue } from './propertyDisplayValue';
-import { effectivePropertySets, effectiveQuantitySets } from './effectiveSets';
+import { effectiveElementData } from './effectiveElementData';
 
 /**
  * Values are compared across at most this many elements. Counts and the
@@ -38,6 +38,7 @@ interface SelectionSummary {
   attributes: SummaryRow[];
   properties: SummaryGroup[];
   quantities: SummaryGroup[];
+  quantityUnavailable: Array<{ modelId: string; expressId: number; reason: string }>;
 }
 
 /** Rows present on every compared element, keyed `group\u0000name`, in first-seen order. */
@@ -83,17 +84,21 @@ export function summarizeSelection(
   locale: string,
 ): SelectionSummary {
   const queries = new Map<string, IfcQuery | null>();
-  const units = new Map<string, ProjectUnits>();
+  const units = new Map<string, { value: ProjectUnits; available: boolean }>();
   const queryFor = (modelId: string, store: IfcDataStore | null) => {
     if (!queries.has(modelId)) queries.set(modelId, store ? new IfcQuery(store) : null);
     return queries.get(modelId) ?? null;
   };
-  const unitsFor = (modelId: string, store: IfcDataStore | null) => {
+  const unitsFor = (modelId: string, store: IfcDataStore | null, view: MutablePropertyView | undefined) => {
     if (!units.has(modelId)) {
-      units.set(modelId, store?.source?.length && store.entityIndex
-        ? extractProjectUnits(store.source, store.entityIndex) : ProjectUnits.empty());
+      const current = store && view ? readCurrentProjectUnits(store, view) : null;
+      units.set(modelId, {
+        value: current?.value ?? (current ? ProjectUnits.empty() : store?.source?.length && store.entityIndex
+          ? extractProjectUnits(store.source, store.entityIndex) : ProjectUnits.empty()),
+        available: current?.status !== 'unavailable',
+      });
     }
-    return units.get(modelId) ?? ProjectUnits.empty();
+    return units.get(modelId)!;
   };
 
   const elements: Array<SummaryElement & { modelLabel: string }> = refs.map((ref) => {
@@ -106,33 +111,31 @@ export function summarizeSelection(
   const attributeValues: Array<Map<string, string>> = [];
   const propertyValues: Array<Map<string, string>> = [];
   const quantityValues: Array<Map<string, string>> = [];
+  const quantityUnavailable: Array<{ modelId: string; expressId: number; reason: string }> = [];
   for (const { ref } of elements.slice(0, SUMMARY_VALUE_LIMIT)) {
     const source = sourceFor(ref.modelId);
     const store = source?.store ?? null;
-    const node = queryFor(ref.modelId, store)?.entity(ref.expressId) ?? null;
-    const view = source?.view;
-    const projectUnits = unitsFor(ref.modelId, store);
+    const unitContext = unitsFor(ref.modelId, store, source?.view);
+    const projectUnits = unitContext.value;
+    const data = effectiveElementData(ref.expressId, queryFor(ref.modelId, store), source?.view);
+    if (data.quantityStatus === 'unavailable') quantityUnavailable.push({ modelId: ref.modelId, expressId: ref.expressId, reason: data.quantityReason ?? 'Unknown occurrence coverage' });
 
     const attributes = new Map<string, string>();
-    for (const attr of node?.allAttributes() ?? []) attributes.set(`\u0000${attr.name}`, String(attr.value));
-    for (const attr of view?.getAttributeMutationsForEntity(ref.expressId) ?? []) attributes.set(`\u0000${attr.name}`, String(attr.value));
+    for (const [name, value] of data.attributes) attributes.set(`\u0000${name}`, String(value));
     attributeValues.push(attributes);
 
-    const query = queryFor(ref.modelId, store);
-    const psets = effectivePropertySets(view, ref.expressId, () => node?.properties() ?? []);
     const properties = new Map<string, string>();
-    for (const pset of psets) {
+    for (const pset of data.psets) {
       for (const prop of pset.properties) {
-        properties.set(`${pset.name}\u0000${prop.name}`, propertyDisplayValue(prop, projectUnits, unitDisplayOverrides).full);
+        properties.set(`${pset.name}\u0000${prop.name}`, propertyDisplayValue(prop, projectUnits, unitDisplayOverrides, unitContext.available).full);
       }
     }
     propertyValues.push(properties);
 
-    const qsets = effectiveQuantitySets(view, ref.expressId, (baseId) => query?.entity(baseId).quantities() ?? []);
     const quantities = new Map<string, string>();
-    for (const qset of qsets) {
+    for (const qset of data.qsets) {
       for (const q of qset.quantities) {
-        quantities.set(`${qset.name}\u0000${q.name}`, quantityDisplayValue(q, projectUnits, unitDisplayOverrides, locale));
+        quantities.set(`${qset.name}\u0000${q.name}`, quantityDisplayValue(q, projectUnits, unitDisplayOverrides, locale, unitContext.available));
       }
     }
     quantityValues.push(quantities);
@@ -151,6 +154,6 @@ export function summarizeSelection(
     elements: elements.map(({ ref, name, className }) => ({ ref, name, className })),
     attributes: [...sharedRows(attributeValues).values()],
     properties: grouped(sharedRows(propertyValues)),
-    quantities: grouped(sharedRows(quantityValues)),
+    quantities: grouped(sharedRows(quantityValues)), quantityUnavailable,
   };
 }

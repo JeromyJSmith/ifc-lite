@@ -29,6 +29,20 @@ export const comparePanelEn = {
   'comparePanel.setup.save': 'Save comparison setup',
   'comparePanel.setup.open': 'Open comparison setup',
   'comparePanel.setup.opened': 'Setup opened. Click Run comparison to execute it.',
+  'comparePanel.saved.dependencies.warning': 'Charts that read “{name}” will show it as unavailable. Deletion does not edit those charts or replace their source.',
+  'comparePanel.saved.dependencies.count': {
+    one: '{count} chart reference found in readable libraries, including current unsaved entries.',
+    other: '{count} chart references found in readable libraries, including current unsaved entries.',
+  },
+  'comparePanel.saved.dependencies.dashboard': 'Dashboard',
+  'comparePanel.saved.dependencies.document': 'Document',
+  'comparePanel.saved.dependencies.bounded': 'Showing {count} of {total} references.',
+  'comparePanel.saved.dependencies.loading': 'Documents are still loading. Wait before confirming deletion.',
+  'comparePanel.saved.dependencies.unavailable': 'Some saved libraries could not be read completely. More chart references may exist. You can still delete this report after reviewing this limitation.',
+  'comparePanel.saved.dependencies.storagePending': 'Deletion is pending because browser storage is unavailable or full. Keep restores the current saved report.',
+  'comparePanel.saved.dependencies.sourceChanged': 'This report changed or was replaced. Cancel and open deletion again.',
+  'comparePanel.saved.dependencies.changed': 'Chart references changed. Review the updated list before confirming deletion.',
+  'comparePanel.saved.dependencies.review': 'Review updated references',
   'comparePanel.saved.title': 'Saved comparisons',
   'comparePanel.saved.name': 'Comparison name',
   'comparePanel.saved.save': 'Save comparison',
@@ -51,6 +65,13 @@ export const comparePanelEn = {
   'comparePanel.panel.backToChangesTitle': 'Back to changes',
   'comparePanel.panel.topicFor': 'Topic for',
   'comparePanel.panel.countUnchanged': 'Unchanged',
+  // Shared result view (#6925): source, population and coverage lines.
+  'comparePanel.result.source': 'Comparison · {scope} scope',
+  'comparePanel.result.population': { one: '{countDisplay} element compared', other: '{countDisplay} elements compared' },
+  // "differences", not "changed": the Changed badge counts modified elements only.
+  'comparePanel.result.counts': { one: '{countDisplay} difference · {unchanged} unchanged', other: '{countDisplay} differences · {unchanged} unchanged' },
+  'comparePanel.result.noShapeChanges': 'Shape changes are not detected (no mesh fingerprints); placement moves and data are compared.',
+  'comparePanel.result.noGeometryChanges': 'Geometry changes are not detected: a model has no geometry fingerprints.',
 
   // Shared across CompareMatchGroups / CompareResultsList / CompareSuggestions
   'comparePanel.moreNotShown': '+{count} more not shown',

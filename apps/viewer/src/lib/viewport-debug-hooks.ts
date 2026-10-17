@@ -1,6 +1,7 @@
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+import { readPerfFlag } from './perf/flags.js';
 import { appearanceSourceTriangle, MathUtils, type Renderer } from '@ifc-lite/renderer';
 import type { MeshData } from '@ifc-lite/geometry';
 import { getPointCloudScanSample } from '@/hooks/ingest/pointCloudScanCache';
@@ -104,15 +105,26 @@ export function installViewportDebugHooks(
   annotationLineVertexCount: () => number,
 ): void {
   const host = globalThis as Record<string, unknown>;
+  const timingFlag = readPerfFlag('gpuFrameTiming');
+  // Opt-in only: a renderer starts with timing off, so the default install
+  // still just stores the renderer (#5895 witness contract).
+  if (timingFlag === true || timingFlag === 1 || timingFlag === '1') renderer.setGpuFrameTiming(true);
   host.__ifc_lite_render_stats__ = () => ({
+    gpuTiming: renderer.getGpuFrameTiming(),
+    adapter: renderer.getAdapterInfo(),
     frame: renderer.getFrameStats(),
     gpu: renderer.getScene().getResidentGpuBytes(),
     cpuBytes: renderer.getScene().getResidentCpuBytes(),
+    // GPU-resident point-cloud points: what COPC LOD bounds by its budget (#6869).
+    pointCloudPoints: renderer.getPointCloudPointCount(),
   });
   // Renderer-owned color evidence for hardware E2E. The RGBA bytes are copied
   // before the production frame submits, so this avoids compositor retention
   // and exposes no scene/model data to the browser test.
   host.__ifc_lite_capture_color_frame__ = () => encodeColorFrame(renderer.captureColorFrame());
+  // The camera's world view-projection, the matrix every mesh draw packs as
+  // `uniforms.viewProj` (the depth nudge reads its projection from it, #6729).
+  host.__ifc_lite_view_projection__ = () => Array.from(renderer.getCamera().getViewProjMatrix().m);
   host.__ifc_lite_render_visibility__ = (): RenderVisibilitySnapshot => {
     const current = visibility();
     return { hiddenIds: [...current.hiddenIds], isolatedIds: current.isolatedIds ? [...current.isolatedIds] : null };
@@ -184,6 +196,7 @@ export function clearViewportDebugHooks(): void {
   setSourceSegmentScreenProbe(null);
   delete host.__ifc_lite_render_stats__;
   delete host.__ifc_lite_capture_color_frame__;
+  delete host.__ifc_lite_view_projection__;
   delete host.__ifc_lite_render_visibility__;
   delete host.__ifc_lite_annotation_line_vertices__;
   delete host.__ifc_lite_visibility_reasons__;

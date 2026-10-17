@@ -6,6 +6,9 @@ import { test, expect } from '@playwright/test';
 import { writeFileSync, existsSync, mkdirSync, readFileSync } from 'fs';
 import { join, isAbsolute } from 'path';
 import { ViewerBenchmarkPage, ViewerBenchmarkMetrics } from './viewer-benchmark-page';
+import { readGpuHealth, type GpuHealth } from './gpu-health';
+import { withBenchmarkFailureDiagnostics } from './benchmark-failure-diagnostics';
+import { measureInteractionCommits, type InteractionCommits } from './interaction-commits';
 
 interface ViewerBenchmarkResult {
   file: string;
@@ -15,8 +18,22 @@ interface ViewerBenchmarkResult {
     runtime: 'browser-wasm';
     cacheMode: string;
     buildMode: string;
+    uploadMode: 'timed' | 'count';
   };
   metrics: ViewerBenchmarkMetrics;
+  /** #7005: whether each metric had a canonical load span. */
+  loadTrace: {
+    sources: Partial<Record<string, string>>;
+  };
+  /** #6957: pinned worker count, structural counters and the long-frame summary of the load. */
+  loadCounters: ReturnType<ViewerBenchmarkPage['getLoadCounters']>;
+  /**
+   * #6993: whether this sample lost its GPU device. A contaminated sample is
+   * excluded by `benchmark:check` and never recorded as the baseline.
+   */
+  gpuHealth: GpuHealth;
+  /** #6993: React commits caused by one select / hover / panel open on the settled page. */
+  interactionCommits: InteractionCommits;
   thresholds: {
     passed: boolean;
     violations: string[];
@@ -53,8 +70,8 @@ function loadBaseline(): Baseline {
   if (existsSync(baselinePath)) {
     try {
       return JSON.parse(readFileSync(baselinePath, 'utf-8'));
-    } catch (e) {
-      console.warn('Failed to load baseline, starting fresh');
+    } catch (error) {
+      console.warn('Failed to load baseline, starting fresh', error);
       return {};
     }
   }
@@ -160,13 +177,17 @@ test.describe('Viewer Performance Benchmarks', () => {
       const timeoutMs = fileSizeMB > 200 ? 600000 : fileSizeMB > 50 ? 300000 : 180000; // 10min / 5min / 3min
 
       console.log(`Waiting for completion (timeout: ${timeoutMs / 1000}s)...`);
-      await benchmarkPage.waitForCompletion(timeoutMs);
-
-      // Extract metrics
-      const metrics = benchmarkPage.getMetrics();
+      const metrics = await withBenchmarkFailureDiagnostics(benchmarkPage, fileName, async () => {
+        await benchmarkPage.waitForCompletion(timeoutMs);
+        const metrics = benchmarkPage.getMetrics();
+        // #6957: deferred GPU uploads keep counters moving after the root ends.
+        await benchmarkPage.settleLoadCounters();
+        return metrics;
+      });
 
       // Get baseline for this file
-      const baselineMetrics = baseline[fileName]?.metrics || null;
+      const countCohort = benchmarkPage.getUploadMode() === 'count';
+      const baselineMetrics = countCohort ? null : baseline[fileName]?.metrics || null;
 
       // Check thresholds
       const thresholdResult = checkThresholds(metrics, baselineMetrics, thresholds);
@@ -233,7 +254,9 @@ test.describe('Viewer Performance Benchmarks', () => {
         }
       } else {
         console.log(`\n--- No Baseline Available ---`);
-        console.log(`  This run will be used as the baseline for future comparisons.`);
+        console.log(countCohort
+          ? '  Count cohort: timings describe a different upload workload and are not compared.'
+          : '  This run will be used as the baseline for future comparisons.');
       }
 
       if (thresholdResult.violations.length > 0) {
@@ -241,10 +264,32 @@ test.describe('Viewer Performance Benchmarks', () => {
         thresholdResult.violations.forEach((v) => console.log(`  ⚠ ${v}`));
       }
 
+      const { counters: loadCounters } = benchmarkPage.getLoadCounters();
+      if (loadCounters) {
+        console.log(`\n--- Structural Counters (#6957) ---`);
+        for (const [name, value] of Object.entries(loadCounters.structural)) console.log(`  ${name}: ${value.toLocaleString()}`);
+        console.log(`  scheduling-dependent: ${JSON.stringify(loadCounters.scheduling)}`);
+        console.log(`  main thread: ${JSON.stringify(loadCounters.mainThread)}`);
+      }
+
+      // #6993: after every timing is taken, so it cannot move one.
+      const interactionCommits = await measureInteractionCommits(page);
+      console.log(`\n--- React Commits per Interaction (#6993) ---`);
+      console.log(`  ${JSON.stringify(interactionCommits.commits)} hoverHit=${interactionCommits.hoverHit}`);
+      for (const [name, reason] of Object.entries(interactionCommits.errors)) console.warn(`  ⚠ ${name} not measured: ${reason}`);
+
+      // #6993: read last, so a loss at any point of the sample is seen.
+      const gpuHealth = await readGpuHealth(page, benchmarkPage.getConsoleLogs());
+      console.log(`\n--- GPU Device Health (#6993) ---`);
+      console.log(`  devices: ${gpuHealth.devicesCreated ?? 'n/a'}, lost: ${gpuHealth.deviceLost}, instance errors: ${gpuHealth.instanceErrors}, uncaptured errors: ${gpuHealth.uncapturedErrors} (${gpuHealth.source})`);
+      if (gpuHealth.contaminated) {
+        console.warn(`  ⚠ CONTAMINATED SAMPLE: ${gpuHealth.reasons.join('; ')}. Excluded from benchmark:check and the baseline.`);
+      }
+
       console.log(`${'='.repeat(80)}\n`);
 
       // Save results
-      const outputDir = join(process.cwd(), 'tests/benchmark/benchmark-results');
+      const outputDir = join(process.cwd(), 'tests/benchmark', countCohort ? 'benchmark-count-results' : 'benchmark-results');
       if (!existsSync(outputDir)) {
         mkdirSync(outputDir, { recursive: true });
       }
@@ -257,8 +302,15 @@ test.describe('Viewer Performance Benchmarks', () => {
           runtime: 'browser-wasm',
           cacheMode: process.env.VIEWER_BENCHMARK_CACHE_MODE ?? 'default',
           buildMode: process.env.VIEWER_BENCHMARK_BUILD_MODE ?? 'dev',
+          uploadMode: benchmarkPage.getUploadMode(),
         },
         metrics,
+        loadTrace: {
+          sources: benchmarkPage.getMetricSources(),
+        },
+        loadCounters: benchmarkPage.getLoadCounters(),
+        gpuHealth,
+        interactionCommits,
         thresholds: thresholdResult,
       };
 
@@ -279,6 +331,29 @@ test.describe('Viewer Performance Benchmarks', () => {
       // streamCompleteMs is the real "geometry finished" signal.)
       expect(metrics.streamCompleteMs).not.toBeNull();
       expect(metrics.totalMeshes).toBeGreaterThan(0);
+
+      // #7005: timing comes exclusively from the canonical span tree.
+      if (fileName === 'AC20-FZK-Haus.ifc') {
+        expect(benchmarkPage.getLoadTrace(), 'viewer exposed no load-trace span tree').not.toBeNull();
+        expect(benchmarkPage.getMetricSources().streamCompleteMs).toBe('span');
+        // #6957: the load carried its structural counters and frame summary.
+        const { counters } = benchmarkPage.getLoadCounters();
+        // GPU counters are not asserted: they need a WebGPU device, which a
+        // software-rendered runner may lose; the worker and store paths do not.
+        expect(counters?.structural['msg.geometry.out.count'] ?? 0, 'no geometry worker messages counted').toBeGreaterThan(0);
+        expect(counters?.scheduling['store.setState'] ?? 0, 'no store writes counted').toBeGreaterThan(0);
+        expect(counters?.mainThread, 'no long-frame summary recorded').not.toBeNull();
+        // #7022, #7035: one full-source hash pass per primary load, the loader's
+        // placement identity. The cache write, the warm revalidation and the
+        // drawing-markup storage key all reuse it. A second pass fails here.
+        expect(counters?.structural['hash.fullSource.count'], 'full-source hash passes per load').toBe(1);
+        // Moving markup saved under a pre-#7035 key costs one whole-file pass,
+        // counted apart. This fresh profile has no such entry.
+        expect(counters?.structural['hash.drawingLegacyKey.count'] ?? 0, 'legacy drawing-key passes').toBe(0);
+        // #6993: every interaction was driven and went quiet; a renamed row or
+        // panel button must fail here, not silently report nothing.
+        expect(interactionCommits.errors, 'interactions not measured').toEqual({});
+      }
 
       // Geometry correctness validation: Check mesh count matches expected (within 5% tolerance)
       // This detects if optimizations break geometry (e.g., CSG skipping too much, missing cutouts)
@@ -308,7 +383,11 @@ test.describe('Viewer Performance Benchmarks', () => {
       // committed baseline may come from a different machine class than the
       // current runner.
       if (!thresholdResult.passed) {
-        if (process.env.VIEWER_BENCHMARK_ADVISORY === '1') {
+        if (gpuHealth.contaminated) {
+          // #6993: these timings measured a re-upload onto a replacement device,
+          // not the code under test; the sample is flagged, not judged.
+          console.warn(`Thresholds not judged on a GPU-contaminated sample:\n${thresholdResult.violations.join('\n')}`);
+        } else if (process.env.VIEWER_BENCHMARK_ADVISORY === '1') {
           console.warn(
             `Advisory mode: thresholds exceeded but not failing the test:\n${thresholdResult.violations.join('\n')}`
           );

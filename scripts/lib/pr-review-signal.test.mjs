@@ -97,7 +97,14 @@ test('the REAL test.yml derives the lane names the REAL rollup publishes', () =>
     'Changed tests observe production',
     'Typecheck',
     'Lint',
-    'Node tests',
+    // Package suites in four shards, so the 19.5 min single lane stops being
+    // the frontend PR's critical path. Each shard publishes its own check run.
+    'Node tests (shard 1/4)',
+    'Node tests (shard 2/4)',
+    'Node tests (shard 3/4)',
+    'Node tests (shard 4/4)',
+    // #7530: the preserved guard/script workload has its own required job.
+    'Node guards',
     // CI redesign step 5: the feature legs of the Rust lane, off the PR and
     // judged in the merge queue. On a PR its check run is `skipped`.
     'Rust tests (feature builds)',
@@ -106,12 +113,13 @@ test('the REAL test.yml derives the lane names the REAL rollup publishes', () =>
     'Provenance tests',
     'Rust tests',
     'Rust crate semver',
-    // #6361: the smoke lane is two file shards, each a distinct check run.
-    'Viewer E2E smoke (1/2)',
-    'Viewer E2E smoke (2/2)',
-    'Viewer tests (shard 0)',
-    'Viewer tests (shard 3)',
-    'Viewer tests (shard 7)',
+    // #7538: four unchanged-budget smoke shards each publish a distinct check run.
+    'Viewer E2E smoke (1/4)',
+    'Viewer E2E smoke (2/4)',
+    'Viewer E2E smoke (3/4)',
+    'Viewer E2E smoke (4/4)',
+    // #7360: every expanded context remains required at sixteen shards.
+    ...Array.from({ length: 16 }, (_, index) => `Viewer tests (shard ${index})`),
     'Docs checks (docs-only PRs)',
     // #4912: the strict docs site build, on every PR touching docs.
     'Docs site build (mkdocs --strict)',
@@ -120,10 +128,14 @@ test('the REAL test.yml derives the lane names the REAL rollup publishes', () =>
     'Build + WASM + Rust + Node',
     // #3878: the two CSG accept gates are feature builds nothing else compiles.
     'CSG accept gates (feature builds)',
+    // #6959: the perf-ratchet gate, judging the measurement `build` uploads.
+    'Perf ratchet ceilings',
+    // #6982: the callgrind measurement the perf-ratchet gate judges.
+    'Native instruction counts',
   ]) {
     assert.ok(names.includes(observed), `derived set is missing the observed lane "${observed}"`);
   }
-  assert.equal(names.length, 28);
+  assert.equal(names.length, 44);
 });
 
 test('FAIL CLOSED: an empty workflow file is NO_WORKFLOW_TEXT, not an empty lane set', () => {
@@ -262,7 +274,7 @@ test('the REAL test.yml maps every viewer shard to the template the REAL rollup 
   const aliases = matrixSkipAliases(
     readFileSync(join(REPO_ROOT, '.github/workflows/test.yml'), 'utf8'),
   );
-  for (const shard of [0, 1, 2, 3, 4, 5, 6, 7]) {
+  for (const shard of Array.from({ length: 16 }, (_, index) => index)) {
     assert.equal(
       aliases.get(`Viewer tests (shard ${shard})`),
       MATRIX_TEMPLATE,
@@ -297,7 +309,7 @@ test('`excludeJobKeys` must reach BOTH derivations, or the alias map stops cover
 
   // Asymmetric: excluding the job from the ALIASES only puts the shards back.
   const asymmetric = missingLanes(required, PR3581_ROLLUP, matrixSkipAliases(wf, { exclude: [...exclude, 'viewer-tests'] }));
-  for (const shard of [0, 1, 2, 3, 4, 5, 6, 7]) {
+  for (const shard of Array.from({ length: 16 }, (_, index) => index)) {
     assert.ok(asymmetric.includes(`Viewer tests (shard ${shard})`), `shard ${shard} uncovered`);
   }
 });

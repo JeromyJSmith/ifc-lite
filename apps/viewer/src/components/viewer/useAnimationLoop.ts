@@ -1,6 +1,8 @@
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+import { offerErrorReport } from '@/lib/error-reports/context';
 import { flushPlacementGeometry } from '@/lib/model-placement/bounds-revision';
 /**
  * THE render loop for the 3D viewport.
@@ -19,14 +21,13 @@ import { useEffect, type MutableRefObject, type RefObject } from 'react';
 import type { Renderer, VisualEnhancementOptions, LightingEnvironment } from '@ifc-lite/renderer';
 import type { CoordinateInfo } from '@ifc-lite/geometry';
 import { useViewerStore, type SectionPlane } from '@/store';
-import { hoverOutlineTarget } from './useHoverOutline';
-import { chartAwareRendererSelectionFromStore } from '@/lib/charts/renderer-selection';
-import { preserveClashPaintInSelection } from '@/lib/clash/renderer-selection';
-import { sectionRenderClip } from '@/lib/section/section-render-clip';
 import { projectToCssScreen } from '../../utils/projectScreen.js';
 import { getContributionCullConfig } from '../../utils/renderCullConfig.js';
 import { getLodScreenPx } from '../../utils/lodConfig.js';
 import { runGpuUpload } from './gpu-upload-guard';
+import { registerViewportCapture, viewportCaptureOwnsFrame } from '@/lib/viewport-capture';
+import { viewportRenderOptions } from './viewport-render-options';
+import { fieldTelemetry } from '@/lib/perf/fieldTelemetryLoader';
 /** Sun cast-shadow render options, driven by the Environment panel (#2670). */
 export interface SunShadowSettings {
   enabled: boolean;
@@ -58,6 +59,8 @@ export interface UseAnimationLoopParams {
   sunShadowsRef: MutableRefObject<SunShadowSettings | null>;
   sectionPlaneRef: MutableRefObject<SectionPlane>;
   sectionRangeRef: MutableRefObject<{ min: number; max: number } | null>;
+  /** The bounds `sectionRangeRef` is read from, for the other cutting planes' own axes (#7545). */
+  sectionBoundsRef?: MutableRefObject<{ min: { x: number; y: number; z: number }; max: { x: number; y: number; z: number } } | null>;
   /**
    * Mirror of the renderer's model bounds, written each frame after
    * render. Read by the section face-pick handler so the cardinal-
@@ -91,22 +94,7 @@ export function useAnimationLoop(params: UseAnimationLoopParams): void {
     lastFrameTimeRef,
     mouseIsDraggingRef,
     activeToolRef,
-    terrainClipYRef,
-    hiddenEntitiesRef,
-    isolatedEntitiesRef,
-    ghostExceptEntitiesRef,
-    selectedEntityIdRef,
-    selectedModelIndexRef,
-    clearColorRef,
-    visualEnhancementRef,
-    environmentRef,
-    sunShadowsRef,
-    sectionPlaneRef,
-    sectionRangeRef,
     modelBoundsRef,
-    selectedEntityIdsRef,
-    clashHighlightColorsRef,
-    coordinateInfoRef,
     isInteractingRef,
     lastCameraStateRef,
     updateCameraRotationRealtime,
@@ -123,6 +111,7 @@ export function useAnimationLoop(params: UseAnimationLoopParams): void {
     const camera = renderer.getCamera();
     const scene = renderer.getScene();
     let aborted = false;
+    const unregisterCapture = registerViewportCapture(renderer, canvas, () => viewportRenderOptions(renderer, params, false));
 
     // Contribution culling + LOD (issue #1682): resolved once per session —
     // the knobs are load-time A/B switches, not live settings. Only this loop
@@ -135,7 +124,7 @@ export function useAnimationLoop(params: UseAnimationLoopParams): void {
     let lastRotationUpdate = 0;
     let lastScaleUpdate = 0;
     let lastRenderTime = 0;
-    let wasAnimating = false;
+    let wasInteracting = false;
     let residencyRestoreErrorLogged = false;
     let renderErrorLogged = false;
 
@@ -172,6 +161,11 @@ export function useAnimationLoop(params: UseAnimationLoopParams): void {
 
       const deltaTime = currentTime - lastFrameTimeRef.current;
       lastFrameTimeRef.current = currentTime;
+      if (viewportCaptureOwnsFrame(renderer)) {
+        animationFrameRef.current = requestAnimationFrame(animate);
+        return;
+      }
+      fieldTelemetry?.noteNavigateFrame(deltaTime, isInteractingRef.current); // #6961 ifc_navigate (null until a load)
 
       // 1. Drain mesh queue (streaming GPU uploads)
       let queueFlushed = false;
@@ -192,8 +186,7 @@ export function useAnimationLoop(params: UseAnimationLoopParams): void {
       // 1b. Rebuild GPU-evicted batches the last frame asked for (residency
       // budget, issue #1682 phase 3a). Time-budgeted; requests a render so
       // the restored batches appear on the next frame. Guarded like the
-      // instanced-shard drain: an uncaught throw here (e.g. buffer creation
-      // on a lost device) would kill the rAF loop and blank the canvas.
+      // instanced-shard drain: an uncaught throw here (e.g. buffer creation on a lost device) would kill the rAF loop.
       if (scene.hasResidencyRestoreWork()) {
         try {
           const device = renderer.getGPUDevice();
@@ -212,15 +205,10 @@ export function useAnimationLoop(params: UseAnimationLoopParams): void {
       // 2. Camera update (animation / inertia)
       const isAnimating = camera.update(deltaTime);
 
-      // Camera tweens (Home / view cube / zoom-extent) render their frames
-      // with isInteracting=true; without a settle render the last tween frame
-      // could stay on screen at degraded quality until the next incidental
-      // render. Mouse/wheel/touch paths already request their own settle
-      // frame on release — this covers the animation path.
-      if (wasAnimating && !isAnimating && !isInteractingRef.current) {
-        renderer.requestRender();
-      }
-      wasAnimating = isAnimating;
+      const isContinuousRender = isInteractingRef.current || isAnimating;
+      // The first settled frame restores HiDPI sharpness for every navigation path.
+      if (wasInteracting && !isContinuousRender) renderer.requestRender();
+      wasInteracting = isContinuousRender;
 
       // 3. Render if anything changed
       // Peek first — only consume the flag when we actually commit to rendering.
@@ -231,7 +219,6 @@ export function useAnimationLoop(params: UseAnimationLoopParams): void {
       // for large models. Without this, 200K+ mesh models at 60fps overwhelm
       // the main thread and freeze the tab. Inertia alone can run 60+ frames
       // after mouseup, each requiring a full GPU render pass.
-      const isContinuousRender = isInteractingRef.current || isAnimating;
       const throttled = isContinuousRender &&
         continuousThrottleMs > 0 &&
         (currentTime - lastRenderTime) < continuousThrottleMs;
@@ -247,10 +234,6 @@ export function useAnimationLoop(params: UseAnimationLoopParams): void {
       if (willRender) {
         renderer.consumeRenderRequest();
         const renderStart = performance.now();
-        const appliedColors = scene.getColorOverrides();
-        const selection = preserveClashPaintInSelection(
-          chartAwareRendererSelectionFromStore(selectedEntityIdRef.current, selectedEntityIdsRef.current, appliedColors),
-          clashHighlightColorsRef.current, appliedColors);
         // Belt for the renderer's own device-loss latch (#2229). render()
         // contains its failures and degrades to a quiet skip, but this loop
         // must survive even a render-path throw it does not yet contain:
@@ -259,33 +242,11 @@ export function useAnimationLoop(params: UseAnimationLoopParams): void {
         // rest of the session with nothing on screen to say why. Latched to one
         // warning per session — a dead device fails every frame.
         try {
-          renderer.render({
-            hiddenIds: hiddenEntitiesRef.current,
-            isolatedIds: isolatedEntitiesRef.current,
-            ghostExceptIds: ghostExceptEntitiesRef.current,
-            selectedId: selection.selectedId,
-            selectedIds: selection.selectedIds,
-            emphasizeOverrides: (clashHighlightColorsRef.current?.size ?? 0) > 0,
-            selectedModelIndex: selectedModelIndexRef.current,
-            clearColor: clearColorRef.current,
-            visualEnhancement: visualEnhancementRef.current,
-            environment: environmentRef.current,
-            sunShadows: sunShadowsRef.current ?? undefined,
-            isInteracting: isInteractingRef.current || isAnimating,
-            // Let the effects governor judge missed frames against the
-            // intentional large-model throttle instead of display refresh.
-            interactionFrameIntervalMs: continuousThrottleMs || undefined,
-            contributionCull,
-            lod,
-            buildingRotation: coordinateInfoRef.current?.buildingRotation,
-            // The cut: a plane or clip box (#5513), gated on the visibility toggle (#5893); an uncut preview only
-            // inside the Section tool (#6374).
-            ...sectionRenderClip(useViewerStore.getState().sceneState.section.visible, sectionPlaneRef.current, sectionRangeRef.current, useViewerStore.getState().activeTool), ...hoverOutlineTarget(),
-            terrainClipY: terrainClipYRef.current ?? undefined,
-          });
+          renderer.render(viewportRenderOptions(renderer, params, isContinuousRender, continuousThrottleMs, contributionCull, lod));
         } catch (err) {
           if (!renderErrorLogged) {
             renderErrorLogged = true;
+            offerErrorReport({ errorCode: 'renderer_frame_failed' });
             // The dirty flag was consumed on the way in, so this failed frame
             // spent it. Ask for one more, or an idle viewer stays on the stale
             // frame until the user happens to interact. Deliberately inside the
@@ -388,6 +349,7 @@ export function useAnimationLoop(params: UseAnimationLoopParams): void {
 
     return () => {
       aborted = true;
+      unregisterCapture();
       if (animationFrameRef.current !== null) {
         cancelAnimationFrame(animationFrameRef.current);
         animationFrameRef.current = null;

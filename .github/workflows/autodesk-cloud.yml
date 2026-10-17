@@ -1,0 +1,62 @@
+name: Autodesk cloud import
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'rust/cloud-import/**'
+      - 'packages/ifcx/**'
+      - 'apps/autodesk-service/**'
+      - 'apps/autodesk-exchange-worker/**'
+      - '.github/workflows/autodesk-cloud.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'rust/cloud-import/**'
+      - 'packages/ifcx/**'
+      - 'apps/autodesk-service/**'
+      - 'apps/autodesk-exchange-worker/**'
+      - '.github/workflows/autodesk-cloud.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  forma-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - run: rustup show
+      - run: cargo build --locked -p ifc-lite-cloud-import
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - run: bun install --frozen-lockfile
+      - name: Native Forma to IFCX loader contract
+        run: bun run test --env-mode=loose --filter=@ifc-lite/autodesk-service --filter=@ifc-lite/source-autodesk --filter=@ifc-lite/ifcx
+        env:
+          TEST_FORMA_CONVERTER: ${{ github.workspace }}/target/debug/ifc-lite-cloud-import
+  exchange-sdk:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - run: bun install --frozen-lockfile
+      - name: Gateway and Windows HTTP worker contracts
+        run: bun run test --filter=@ifc-lite/autodesk-service --filter=@ifc-lite/source-autodesk
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: '8.0.x'
+      - run: dotnet build apps/autodesk-exchange-worker/AutodeskExchangeWorker.csproj -p:RestoreLockedMode=true --configuration Release
+      - name: Offline export snapshot and workspace guards
+        run: dotnet run --no-build --project apps/autodesk-exchange-worker/AutodeskExchangeWorker.csproj --configuration Release -- --self-test

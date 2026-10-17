@@ -29,6 +29,30 @@ import type { TranslationValue } from '../types';
  * copy and its `FIELDS` title-block label table, for the same reason.
  */
 export const chartsEn = {
+  'chartComparison.label': 'Saved comparison',
+  'chartComparison.choose': 'Choose a completed saved comparison',
+  'chartComparison.pending': 'Source (choose a saved comparison)',
+  'chartComparison.legacy': 'Latest comparison (existing chart)',
+  'chartComparison.unavailable': 'Saved comparison unavailable',
+  'chartComparison.none': 'Complete and save a model comparison to use it here.',
+  'chartComparison.missing': 'Saved comparison unavailable in this browser. Choose another saved comparison; the latest run is not substituted.',
+  'chartComparison.recorded': 'Saved comparison: {name}. Recorded report rows; 3D selection and snapshots are unavailable.',
+  // Saved clash report as a chart source (#6947): ChartSourcePicker.tsx, ChartCard.tsx, document chart captions.
+  'clashChart.label': 'Clash report',
+  'clashChart.current': 'Current result',
+  'clashChart.unavailable': 'Saved clash report unavailable',
+  'clashChart.missing': 'Saved clash report unavailable in this browser. Choose a source; the current result is not shown in its place.',
+  'clashChart.chooseSource': 'Choose a source',
+  'clashChart.caption': 'Saved clash report: {name}, saved {date}',
+  'clashChart.badgeNoMatch': 'Clash rules matched no elements',
+  'clashChart.badgePartialCoverage': 'Some clash rules matched no elements',
+  'clashChart.badgePartial': 'Partial run',
+  'clashChart.badgeStale': 'Models changed before saving',
+  'clashChart.badgeExcluded': '{count} hidden by exclusions',
+  'clashChart.badgeRevision.different': 'Different model revision',
+  'clashChart.badgeRevision.not-loaded': 'Models not loaded',
+  'clashChart.badgeRevision.unverified': 'Revision not confirmed',
+  'clashChart.savedSource': 'a saved clash report',
   // ChartEditor.tsx — Source filter field (#4946)
   'chartEditor.sourceFilterLabel': 'Source filter (selector)',
   'chartEditor.sourceFilterAriaLabel': 'Source filter',

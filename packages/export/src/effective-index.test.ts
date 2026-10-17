@@ -110,6 +110,53 @@ describe('EffectiveEntityIndex agrees with itself', () => {
     expect(store.entityIndex.byType.get('IFCWALL')).toEqual([2, 3]);
   });
 
+  it('appends several created entities to a store bucket without touching the store', async () => {
+    const store = await parseBase();
+    const { view, editor } = newView(store);
+    const first = editor.addEntity('IfcWall', [guid('newE'), null, 'E', null, null, null, null, null, null]);
+    const second = editor.addEntity('IfcWall', [guid('newF'), null, 'F', null, null, null, null, null, null]);
+    const beam = editor.addEntity('IfcBeam', [guid('newG'), null, 'G', null, null, null, null, null, null]);
+
+    const index = getEffectiveEntityIndex(store, view, true);
+
+    // Appending copies the shared bucket once, then grows the copy: copying
+    // on every append made N created entities of one type cost O(N^2).
+    expect(index.byType.get('IFCWALL')).toEqual([2, 3, first.expressId, second.expressId]);
+    expect(index.byType.get('IFCBEAM')).toEqual([beam.expressId]);
+    expect(store.entityIndex.byType.get('IFCWALL')).toEqual([2, 3]);
+    expect(store.entityIndex.byType.has('IFCBEAM')).toBe(false);
+  });
+
+  it('builds byType in work linear in the created entities, not quadratic', async () => {
+    // Counted, not timed: a wall-clock bound is the flake class #3224 records.
+    // Copying a bucket on every append iterates the growing array each time,
+    // ~N^2/2 array-iterator steps for N creates; growing one copy is ~N.
+    const store = await parseBase();
+    const { view, editor } = newView(store);
+    const N = 2000;
+    for (let i = 0; i < N; i++) {
+      editor.addEntity('IfcWall', [guid(`lin${i}`), null, `W${i}`, null, null, null, null, null, null]);
+    }
+    const index = getEffectiveEntityIndex(store, view, true);
+
+    const arrayIteratorProto = Object.getPrototypeOf([][Symbol.iterator]()) as { next: () => unknown };
+    const realNext = arrayIteratorProto.next;
+    let steps = 0;
+    arrayIteratorProto.next = function countedNext(this: unknown) {
+      steps++;
+      return realNext.call(this);
+    };
+    let walls: number[] | undefined;
+    try {
+      walls = index.byType.get('IFCWALL');
+    } finally {
+      arrayIteratorProto.next = realNext;
+    }
+
+    expect(walls).toHaveLength(2 + N);
+    expect(steps).toBeLessThan(4 * N);
+  });
+
   it('reads outgoing references off an authored payload, never off bytes it has none of', async () => {
     const store = await parseBase();
     const { view, editor } = newView(store);

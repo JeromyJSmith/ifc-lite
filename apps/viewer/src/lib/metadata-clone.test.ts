@@ -7,12 +7,14 @@ import assert from 'node:assert';
 import { MutablePropertyView } from '@ifc-lite/mutations';
 import { cloneElementMetadata } from './metadata-clone.js';
 
-import { StubStoreEditor, StubView, makeStubDataStore, type OverlayEntity } from './__test__/stubs.js';
+import { StubStoreEditor, makeStubDataStore, type OverlayEntity } from './__test__/stubs.js';
 
 function makeStore(byType: Map<string, number[]>) {
   return makeStubDataStore(byType) as unknown as Parameters<typeof cloneElementMetadata>[0];
 }
 
+// #7289: use the actual native mutation-view contract; a forged view missed
+// hasChanges and failed all six unchanged-source cloning cases.
 describe('metadata-clone', () => {
   it('uses live relationship membership after create, delete and retype (#5249)', () => {
     const view = new MutablePropertyView(null, 'm');
@@ -30,7 +32,7 @@ describe('metadata-clone', () => {
     const result = cloneElementMetadata(store, view, editor as unknown as Parameters<typeof cloneElementMetadata>[2], 100, [101]);
 
     assert.strictEqual(result.relationshipsTouched, 1);
-    assert.deepStrictEqual(editor.getNewEntity(created.expressId)?.attributes[4], [100, 101]);
+    assert.deepStrictEqual(editor.getNewEntity(created.expressId)?.attributes[4], ['#100', '#101']);
     assert.deepStrictEqual(editor.getNewEntity(50)?.attributes[4], [100]);
     assert.deepStrictEqual(editor.getNewEntity(51)?.attributes[4], [100]);
   });
@@ -41,7 +43,7 @@ describe('metadata-clone', () => {
       attributes: ['guid', null, null, null, [100], 200],
     };
     const editor = new StubStoreEditor([rel]);
-    const view = new StubView() as unknown as Parameters<typeof cloneElementMetadata>[1];
+    const view = new MutablePropertyView(null, 'm');
     const store = makeStore(
       new Map([['IFCRELDEFINESBYPROPERTIES', [50]]]),
     );
@@ -53,7 +55,7 @@ describe('metadata-clone', () => {
       [101, 102],
     );
     assert.strictEqual(result.relationshipsTouched, 1);
-    assert.deepStrictEqual(editor.getNewEntity(50)?.attributes[4], [100, 101, 102]);
+    assert.deepStrictEqual(editor.getNewEntity(50)?.attributes[4], ['#100', '#101', '#102']);
   });
 
   it('preserves overlay #X string refs when appending', () => {
@@ -65,7 +67,7 @@ describe('metadata-clone', () => {
       attributes: ['guid', null, null, null, ['#100', '#101'], '#999'],
     };
     const editor = new StubStoreEditor([rel]);
-    const view = new StubView() as unknown as Parameters<typeof cloneElementMetadata>[1];
+    const view = new MutablePropertyView(null, 'm');
     const store = makeStore(
       new Map([['IFCRELASSOCIATESCLASSIFICATION', [51]]]),
     );
@@ -86,7 +88,7 @@ describe('metadata-clone', () => {
       attributes: ['guid', null, null, null, [42, 43], 999],
     };
     const editor = new StubStoreEditor([rel]);
-    const view = new StubView() as unknown as Parameters<typeof cloneElementMetadata>[1];
+    const view = new MutablePropertyView(null, 'm');
     const store = makeStore(
       new Map([['IFCRELDEFINESBYPROPERTIES', [52]]]),
     );
@@ -109,7 +111,7 @@ describe('metadata-clone', () => {
       attributes: ['guid', null, null, null, [100, 101], 999],
     };
     const editor = new StubStoreEditor([rel]);
-    const view = new StubView() as unknown as Parameters<typeof cloneElementMetadata>[1];
+    const view = new MutablePropertyView(null, 'm');
     const store = makeStore(
       new Map([['IFCRELDEFINESBYPROPERTIES', [53]]]),
     );
@@ -122,12 +124,12 @@ describe('metadata-clone', () => {
       100,
       [101, 102],
     );
-    assert.deepStrictEqual(editor.getNewEntity(53)?.attributes[4], [100, 101, 102]);
+    assert.deepStrictEqual(editor.getNewEntity(53)?.attributes[4], ['#100', '#101', '#102']);
   });
 
   it('returns zero touches when the source has no relationships', () => {
     const editor = new StubStoreEditor([]);
-    const view = new StubView() as unknown as Parameters<typeof cloneElementMetadata>[1];
+    const view = new MutablePropertyView(null, 'm');
     const store = makeStore(new Map());
     const result = cloneElementMetadata(
       store,
@@ -151,7 +153,7 @@ describe('metadata-clone', () => {
       attributes: ['guid', null, null, null, [100], 888],
     };
     const editor = new StubStoreEditor([pset, type]);
-    const view = new StubView() as unknown as Parameters<typeof cloneElementMetadata>[1];
+    const view = new MutablePropertyView(null, 'm');
     const store = makeStore(
       new Map([
         ['IFCRELDEFINESBYPROPERTIES', [60]],
@@ -166,8 +168,8 @@ describe('metadata-clone', () => {
       [200],
     );
     assert.strictEqual(result.relationshipsTouched, 2);
-    assert.deepStrictEqual(editor.getNewEntity(60)?.attributes[4], [100, 200]);
-    assert.deepStrictEqual(editor.getNewEntity(61)?.attributes[4], [100, 200]);
+    assert.deepStrictEqual(editor.getNewEntity(60)?.attributes[4], ['#100', '#200']);
+    assert.deepStrictEqual(editor.getNewEntity(61)?.attributes[4], ['#100', '#200']);
   });
 
   it('no-ops with empty target list', () => {
@@ -177,7 +179,7 @@ describe('metadata-clone', () => {
       attributes: ['guid', null, null, null, [100], 999],
     };
     const editor = new StubStoreEditor([rel]);
-    const view = new StubView() as unknown as Parameters<typeof cloneElementMetadata>[1];
+    const view = new MutablePropertyView(null, 'm');
     const store = makeStore(
       new Map([['IFCRELDEFINESBYPROPERTIES', [70]]]),
     );

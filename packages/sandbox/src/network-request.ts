@@ -17,10 +17,9 @@
  *     (`api.example.com.evil.net`) are rejected by construction: the
  *     grant's per-label pattern (from `@ifc-lite/extensions`' capability
  *     target grammar) must match the hostname label-for-label.
- *   - Only `https:` requests are permitted. `http:`, `file:`, `data:`,
- *     and every other scheme are refused before any grant check runs —
- *     a deliberate scope cut for this phase (see module-level doc in
- *     `bridge-network.ts` for the tradeoff).
+ *   - HTTPS is the default. HTTP requires both an explicit literal loopback
+ *     origin authorization and its exact host grant. Other schemes are
+ *     refused before any grant check runs.
  *   - Redirects are refused outright (`redirect: 'manual'`, and a 3xx
  *     response is reported as a denial rather than followed). This is a
  *     conservative simplification of "refuse a redirect to an ungranted
@@ -36,10 +35,15 @@
 
 import { hasCapability, parseCapability, type Capability } from '@ifc-lite/extensions';
 
+import { assertNetworkEndpoint, createLoopbackHostGrant } from './loopback-policy.js';
+export { loopbackHttpOrigin, createLoopbackHostGrant, assertNetworkEndpoint } from './loopback-policy.js';
+
 export type NetworkMethod = 'GET' | 'POST';
 
 export interface NetworkRequestInit {
   readonly url: string;
+  /** Ephemeral explicit authorization for one literal HTTP loopback origin, including port. */
+  readonly loopbackHttpOrigin?: string;
   readonly method: NetworkMethod;
   readonly headers?: Readonly<Record<string, string>>;
   readonly body?: string;
@@ -73,7 +77,8 @@ export interface NetworkResponse {
 }
 
 export class NetworkDeniedError extends Error {
-  constructor(message: string) {
+  /** false proves preflight refusal; true means a response was received; absent is unqualified. */
+  constructor(message: string, readonly dispatched?: boolean) {
     super(message);
     this.name = 'NetworkDeniedError';
   }
@@ -115,12 +120,15 @@ export function isHostGranted(grants: readonly Capability[], hostname: string): 
   return hasCapability(grants, requested.value);
 }
 
-function assertHttpsAndGranted(url: URL, grants: readonly Capability[]): void {
-  if (url.protocol !== 'https:') {
-    throw new NetworkDeniedError(`network.fetch refused: only https: URLs are permitted, got "${url.protocol}"`);
-  }
-  if (!isHostGranted(grants, url.hostname)) {
-    throw new NetworkDeniedError(`network.fetch refused: host "${url.hostname}" is not covered by a granted network.fetch:<host> capability`);
+function assertEndpointAndGranted(url: URL, grants: readonly Capability[], rawUrl: string, authorizedOrigin?: string): void {
+  try { assertNetworkEndpoint(rawUrl, authorizedOrigin); }
+  catch (error) { throw new NetworkDeniedError(`network.fetch refused: ${error instanceof Error ? error.message : 'Invalid endpoint'}`, false); }
+  const exact = url.protocol === 'http:' ? createLoopbackHostGrant(url.hostname) : undefined;
+  const allowed = exact ? grants.some(grant => grant.scope === exact.scope && grant.action === exact.action
+    && grant.target?.segments.length === 1 && grant.target.segments[0].kind === 'literal'
+    && grant.target.segments[0].value === url.hostname) : isHostGranted(grants, url.hostname);
+  if (!allowed) {
+    throw new NetworkDeniedError(`network.fetch refused: host "${url.hostname}" is not covered by a granted network.fetch:<host> capability`, false);
   }
 }
 
@@ -208,7 +216,7 @@ async function readCappedBody(response: Response, maxBytes: number): Promise<{ b
  * redirect / oversize-body / timeout behaviour against a real local
  * `node:http` server (plain http, no TLS) without also having to stand up
  * TLS for the test fixture; production code reaches this ONLY through
- * `coreNetworkRequest`, which runs `assertHttpsAndGranted` first. Do not
+ * `coreNetworkRequest`, which runs `assertEndpointAndGranted` first. Do not
  * call this directly from a bridge or node — it has no allow-list.
  */
 /**
@@ -252,10 +260,10 @@ export async function executeUngatedRequest(
   // 304 Not Modified is a conditional-request answer (If-None-Match), not a
   // redirect: it has no `Location` and nothing to follow.
   if (response.status >= 300 && response.status < 400 && !(response.status === 304 && init.allowNotModified)) {
-    throw new NetworkDeniedError(`network.fetch refused: server responded with a redirect (${response.status}); redirects are not followed`);
+    throw new NetworkDeniedError(`network.fetch refused: server responded with a redirect (${response.status}); redirects are not followed`, true);
   }
   if (response.type === 'opaqueredirect') {
-    throw new NetworkDeniedError('network.fetch refused: server responded with a redirect; redirects are not followed');
+    throw new NetworkDeniedError('network.fetch refused: server responded with a redirect; redirects are not followed', true);
   }
 
   const { bytes, truncated } = await readCappedBody(response, init.maxBytes);
@@ -280,9 +288,9 @@ export async function coreNetworkRequest(
   try {
     url = new URL(init.url);
   } catch {
-    throw new NetworkDeniedError(`network.fetch refused: "${init.url}" is not a valid URL`);
+    throw new NetworkDeniedError(`network.fetch refused: "${init.url}" is not a valid URL`, false);
   }
-  assertHttpsAndGranted(url, grants);
+  assertEndpointAndGranted(url, grants, init.url, init.loopbackHttpOrigin);
   // `total > NaN` is always false, so a NaN cap would read the whole body:
   // every caller's bounds are checked here, where the cap is enforced (#5446 review).
   if (!Number.isFinite(init.maxBytes) || init.maxBytes < 0) {

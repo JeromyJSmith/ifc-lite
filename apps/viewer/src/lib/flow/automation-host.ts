@@ -9,7 +9,7 @@ import { useViewerStore } from '@/store';
 import { buildReportDocument, type DocumentReportResult, type DocumentResultMapping } from '@/lib/document/build-report-document';
 import { prepareDocument } from '@/lib/document/prepare-document';
 import { exportPreparedDocument, documentPdfWarnings } from '@/lib/document/export-prepared-document';
-import { validateDocumentSpec, type DocumentSpec } from '@/lib/document/types';
+import { migrateDocumentSpec, validateDocumentSpec, type DocumentSpec } from '@/lib/document/types';
 import { sanitizeFilename } from '@/lib/export/download';
 import { sameReportEvidence } from './report-provenance';
 import type { DocumentRunContext } from '@/lib/document/build-report-document';
@@ -56,9 +56,10 @@ export function createAutomationHost(run: WorkflowRun, doc: FlowDocument, addMod
         const imported = await readHistorical(run, file);
         run.check();
         const old = useViewerStore.getState().savedComparisons.find((c) => sameReportEvidence({ ...c, id: '' }, { ...imported, id: '' }));
-        const collision = useViewerStore.getState().savedComparisons.some((c) => c.id === imported.id);
-        const entry = old ?? { ...imported, id: collision ? crypto.randomUUID() : imported.id };
-        const retained = retainComparisonReport(entry, useViewerStore);
+        // External IDs may belong to deleted or unreadable library rows. A new
+        // import gets local identity; identical live evidence remains idempotent.
+        const entry = old ?? { ...imported, id: crypto.randomUUID() };
+        const retained = await retainComparisonReport(entry, useViewerStore);
         for (const warning of retained.warnings) run.warn(warning);
         results.push({ jobId: historicalJobId(slotId, index, file.name), resultId: imported.id, kind: 'comparison', comparison: entry });
       }
@@ -68,7 +69,7 @@ export function createAutomationHost(run: WorkflowRun, doc: FlowDocument, addMod
       guard('storage.write:documents'); run.progress('Building document');
       const c = config !== null && typeof config === 'object' ? config as Record<string, unknown> : {};
       const template = c.template as DocumentSpec | undefined;
-      if (template && validateDocumentSpec(template).length) throw new Error('Invalid native document template');
+      if (template && validateDocumentSpec(migrateDocumentSpec(template)).length) throw new Error('Invalid native document template');
       const state = useViewerStore.getState();
       const results = [...reports(validation), ...reports(comparisons), ...reports(historical)];
       const document = buildReportDocument({ name: typeof c.name === 'string' ? c.name : `${doc.name} report`, results,
@@ -82,7 +83,7 @@ export function createAutomationHost(run: WorkflowRun, doc: FlowDocument, addMod
           }).filter((m, index, all) => all.findIndex((other) => other.name === m.name && other.sourceFingerprint === m.sourceFingerprint) === index),
           summary: run.warnings.join('\n') } });
       run.check(); checkWorkflowModelPins(run);
-      if (!state.upsertDocument(document)) run.warn('Document is available in memory but browser storage refused the save');
+      if (!(await state.upsertDocument(document))) run.warn('Document is available in memory but browser storage refused the save');
       return run.put('document', document);
     },
     exportPdf: (token) => run.withModelRead(async () => {

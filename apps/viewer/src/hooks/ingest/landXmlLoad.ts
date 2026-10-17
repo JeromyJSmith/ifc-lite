@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import type { LoadTrace } from '@ifc-lite/load-trace';
 import type { IfcDataStore } from '@ifc-lite/parser';
 import type { CoordinateInfo, GeometryResult, ModelSpatialReference } from '@ifc-lite/geometry';
 import { totalYupOffset } from '@ifc-lite/geometry/world-frame';
@@ -11,7 +12,12 @@ import { toast } from '../../components/ui/toast.js';
 import { parseLandXmlViewerModelFromBlobAsync, type LandXmlViewerModel } from './landXmlViewerModel.js';
 import type { LandXmlGeometryPreflight } from './landXmlIngest.js';
 import type { LandXmlSchema, LandXmlTinDocument } from './landXmlSemantics.js';
-import { landXmlRenderFrameWarning, MAX_RENDER_FRAME_LOCAL_EXTENT_METRES, meshFitsRenderFrame, meshRenderFrameBounds } from './landXmlRenderFrame.js';
+import {
+  landXmlFrameRefusal, landXmlRenderFrameWarning, MAX_RENDER_FRAME_LOCAL_EXTENT_METRES, meshFitsRenderFrame, meshRenderFrameBounds,
+  renderFrameDistanceMetres, type LandXmlDeclaredCrs, type LandXmlFrameRefusalContext,
+} from './landXmlRenderFrame.js';
+import { landXmlSourceSpatialReference } from './sourceSpatialReference.js';
+import { NO_LANDXML_GEOREF_ASSUMPTIONS, type LandXmlGeorefAssumptions } from './landXmlGeorefAssumptions.js';
 import { LandXmlProvisionalTransaction } from './landXmlProvisionalTransaction.js';
 import { LandXmlProvisionalUploadError } from './landXmlGpuTransactions.js';
 import { markLandXmlGpuUploaded } from './landXmlGpuOwnership.js';
@@ -24,6 +30,8 @@ interface LandXmlLoadOptions {
   targetKind: 'primary' | 'federated';
   totalStartTime: number;
   wasHidden: boolean;
+  /** The load's trace: `ifc_model_loaded` reads its field properties off it (#6961). */
+  trace: LoadTrace;
   /**
    * #5175: opt-in linear unit for a source with no declared `<Units>`. Absent
    * by default, so a unitless source refuses exactly as it did before this
@@ -31,6 +39,13 @@ interface LandXmlLoadOptions {
    * that refusal.
    */
   assumedLinearUnit?: string;
+  /**
+   * The user's georeferencing assumptions for this load (the refusal's retry,
+   * else the viewer settings). Read only for a federated target: they relax
+   * how a LandXML is aligned onto a georeferenced anchor, and a primary load
+   * has no anchor to align onto.
+   */
+  landXmlAssumptions?: LandXmlGeorefAssumptions;
   isCurrent(): boolean;
   setProgress(progress: { phase: string; percent: number }): void;
   setGeometryStreamingActive(active: boolean): void;
@@ -40,6 +55,8 @@ interface LandXmlLoadOptions {
     preflight: LandXmlGeometryPreflight,
     sourceCoordinateInfo: CoordinateInfo,
     spatialReference?: ModelSpatialReference,
+    declaredCrs?: LandXmlDeclaredCrs,
+    assumptions?: LandXmlGeorefAssumptions,
   ): FederatedLandXmlStreamingPlan | null;
   onPrimary(result: LandXmlViewerModel): void;
   finalize(
@@ -53,9 +70,11 @@ interface LandXmlLoadOptions {
       spatialReference?: ModelSpatialReference;
       postAlignmentReframe?: boolean;
       federatedLandXmlStreamingPlan?: FederatedLandXmlStreamingFinalization;
+      landXmlAssumptions?: LandXmlGeorefAssumptions;
     },
   ): Promise<void>;
-  onError(message: string): void;
+  /** `error` is the thrown value, e.g. a `LandXmlFederationRefusedError` carrying its offer. */
+  onError(message: string, error?: unknown): void;
 }
 
 interface LandXmlRollbackOwnership { rollback(): void }
@@ -160,7 +179,12 @@ function updateRetainedGeometry(geometry: GeometryResult, frame: CoordinateInfo)
 }
 
 /** Move parsed LandXML into the federation's already-published render frame. */
-export function reframeLandXmlGeometry(geometry: GeometryResult, document: LandXmlTinDocument, frame: CoordinateInfo): string[] {
+export function reframeLandXmlGeometry(
+  geometry: GeometryResult,
+  document: LandXmlTinDocument,
+  frame: CoordinateInfo,
+  alignment: Pick<LandXmlFrameRefusalContext, 'anchor' | 'aligned' | 'assumptions'> = { anchor: null, aligned: false },
+): string[] {
   // Geometry-free LandXML still owns visible authored line overlays. Its
   // coordinates remain absolute until the overlay renderer subtracts this
   // frame, so there are no mesh origins to move: adopt the complete frame.
@@ -194,7 +218,15 @@ export function reframeLandXmlGeometry(geometry: GeometryResult, document: LandX
     recomputeRenderedFaceCounts(document);
   }
   if (retained.length === 0) {
-    throw new Error(`LandXML model cannot be federated: every surface component lies outside the ${MAX_RENDER_FRAME_LOCAL_EXTENT_METRES / 1000} km shared render-frame envelope`);
+    const refused = createEmptyBounds();
+    for (const mesh of geometry.meshes) {
+      const bounds = meshRenderFrameBounds(mesh);
+      if (bounds !== null) mergeBounds(refused, bounds);
+    }
+    throw landXmlFrameRefusal(
+      renderFrameDistanceMetres(refused, { x: 0, y: 0, z: 0 }),
+      { ...alignment, declared: landXmlSourceSpatialReference(document.coordinateSystem, alignment.assumptions).declaredCrs },
+    );
   }
   geometry.meshes = retained;
   updateRetainedGeometry(geometry, frame);
@@ -214,6 +246,8 @@ export async function loadLandXmlModel(options: LandXmlLoadOptions): Promise<voi
   const federatedPlan = { value: null as FederatedLandXmlStreamingPlan | null };
   let streamedComponents = 0;
   const hasFederatedStreamingPlan = options.openFederatedStreamingPlan !== undefined;
+  const assumptions = options.targetKind === 'federated'
+    ? options.landXmlAssumptions ?? NO_LANDXML_GEOREF_ASSUMPTIONS : NO_LANDXML_GEOREF_ASSUMPTIONS;
   try {
     const result = await parseLandXmlViewerModelFromBlobAsync(
       options.file,
@@ -249,8 +283,8 @@ export async function loadLandXmlModel(options: LandXmlLoadOptions): Promise<voi
         }
       },
       hasFederatedStreamingPlan
-        ? (preflight, sourceCoordinateInfo, spatialReference) => {
-          federatedPlan.value = options.openFederatedStreamingPlan?.(preflight, sourceCoordinateInfo, spatialReference) ?? null;
+        ? (preflight, sourceCoordinateInfo, spatialReference, declaredCrs) => {
+          federatedPlan.value = options.openFederatedStreamingPlan?.(preflight, sourceCoordinateInfo, spatialReference, declaredCrs, assumptions) ?? null;
           return federatedPlan.value !== null;
         }
         : undefined,
@@ -265,6 +299,7 @@ export async function loadLandXmlModel(options: LandXmlLoadOptions): Promise<voi
         provisional.value?.skip(component);
       },
       options.assumedLinearUnit,
+      assumptions,
     );
     // The browser worker is terminated within the cancellation polling bound;
     // this guard also prevents a racing stale reply from mutating model state.
@@ -326,6 +361,7 @@ export async function loadLandXmlModel(options: LandXmlLoadOptions): Promise<voi
       ...(options.targetKind === 'federated' ? { postAlignmentReframe: true } : {}),
       ...(federatedPlan.value ? { federatedLandXmlStreamingPlan: federatedPlan.value } : {}),
       ...(result.spatialReference ? { spatialReference: result.spatialReference } : {}),
+      ...(options.targetKind === 'federated' ? { landXmlAssumptions: assumptions } : {}),
     });
     if (!(await awaitLandXmlFinalization(finalization, options.isCurrent, provisional.value, federatedPlan.value))) return;
     for (const warning of result.warnings) toast.info(warning);
@@ -337,7 +373,7 @@ export async function loadLandXmlModel(options: LandXmlLoadOptions): Promise<voi
       load_path: 'landxml',
       total_elapsed_ms: Math.round(performance.now() - options.totalStartTime),
       was_hidden: options.wasHidden,
-    }, snapshotFromGeometry(options.fileSizeMB, result.geometryResult));
+    }, snapshotFromGeometry(options.fileSizeMB, result.geometryResult), options.trace);
     options.setLoading(false);
   } catch (error) {
     provisional.value?.rollback();
@@ -345,7 +381,7 @@ export async function loadLandXmlModel(options: LandXmlLoadOptions): Promise<voi
     if (!options.isCurrent()) return;
     console.error('[useIfc] LandXML parsing failed:', error);
     const message = error instanceof Error ? error.message : String(error);
-    options.onError(message);
+    options.onError(message, error);
     options.setLoading(false);
   }
 }

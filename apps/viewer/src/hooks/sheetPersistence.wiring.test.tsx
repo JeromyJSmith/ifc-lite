@@ -11,9 +11,9 @@ import { afterEach, it } from 'node:test';
 import { act } from 'react';
 import { useViewerStore } from '@/store';
 import { fixtureModel } from '@/test/store-fixture';
-import { cleanup, render } from '@/test/render';
+import { cleanup, render, waitFor } from '@/test/render';
 import { useDrawing2DPersistence } from './useDrawing2DPersistence';
-import { computeFullSourceHashFromBlob } from '@/utils/sourceContentHash';
+import { placementSourceIdentity } from '@/lib/model-placement/source-identity';
 import type { DrawingSheet } from '@ifc-lite/drawing-2d';
 
 afterEach(cleanup);
@@ -25,16 +25,14 @@ it('restores sheet setup and global templates through the drawing lifecycle (#48
   useViewerStore.getState().updateTitleBlockField('project-name', 'Saved project');
   const expected = useViewerStore.getState().activeSheet!;
   const a = { ...fixtureModel('real-hash-a'), sourceFile: new File(['ISO-10303-21;sheet-model-a'], 'a.ifc') };
-  const hash = await computeFullSourceHashFromBlob(a.sourceFile);
+  const hash = await placementSourceIdentity(a.sourceFile);
   assert.ok(hash);
   const key = `ifc-lite:drawing-sheet:v1:${hash}`;
   localStorage.setItem(key, JSON.stringify({ sheet: expected, savedAt: 1 }));
   localStorage.setItem('ifc-lite:sheet-templates:v1', JSON.stringify({ templates: [{ ...expected, id: 'template-global' }] }));
   useViewerStore.setState({ activeSheet: null, savedSheetTemplates: [], sheetEnabled: false, models: new Map([[a.id, a]]), activeModelId: a.id });
   render(<DrawingPersistenceProbe />);
-  for (let i = 0; i < 100 && !useViewerStore.getState().activeSheet; i++) {
-    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 5)); });
-  }
+  await waitFor(() => !!useViewerStore.getState().activeSheet, 'the saved sheet restores');
   assert.deepEqual(useViewerStore.getState().activeSheet, expected);
   assert.equal(useViewerStore.getState().savedSheetTemplates[0].id, 'template-global');
   act(() => useViewerStore.getState().updateTitleBlockField('project-name', 'Updated via action'));
@@ -44,15 +42,13 @@ it('restores sheet setup and global templates through the drawing lifecycle (#48
   // Replacement bytes may arrive under the same model id. The old cached
   // hash must not restore or overwrite the previous file's sheet.
   const replacement = { ...a, sourceFile: new File(['ISO-10303-21;replacement'], 'a.ifc') };
-  const replacementHash = await computeFullSourceHashFromBlob(replacement.sourceFile);
+  const replacementHash = await placementSourceIdentity(replacement.sourceFile);
   assert.ok(replacementHash);
   const replacementSheet = { ...expected, name: 'Replacement sheet' };
   localStorage.setItem(`ifc-lite:drawing-sheet:v1:${replacementHash}`, JSON.stringify({ sheet: replacementSheet, savedAt: 2 }));
   act(() => useViewerStore.setState({ models: new Map([[a.id, replacement]]) }));
   assert.equal(useViewerStore.getState().activeSheet, null);
-  for (let i = 0; i < 100 && !useViewerStore.getState().activeSheet; i++) {
-    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 5)); });
-  }
+  await waitFor(() => !!useViewerStore.getState().activeSheet, "the replacement file's sheet restores");
   assert.deepEqual(useViewerStore.getState().activeSheet, replacementSheet);
   assert.equal((JSON.parse(localStorage.getItem(key)!) as { sheet: DrawingSheet }).sheet.titleBlock.fields[0].value, 'Updated via action');
 });

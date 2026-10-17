@@ -68,14 +68,14 @@ describe('matchConstraint — simpleValue', () => {
 
   it('matches boolean true (strict lowercase per IDS spec)', () => {
     expect(matchConstraint(sv('true'), true)).toBe(true);
-    // Numeric `1` / `0` are NOT valid boolean literals per IDS 1.0.
-    expect(matchConstraint(sv('1'), true)).toBe(false);
+    // `1` / `0` are in the xs:boolean lexical space (#7543).
+    expect(matchConstraint(sv('1'), true)).toBe(true);
     expect(matchConstraint(sv('false'), true)).toBe(false);
   });
 
   it('matches boolean false (strict lowercase per IDS spec)', () => {
     expect(matchConstraint(sv('false'), false)).toBe(true);
-    expect(matchConstraint(sv('0'), false)).toBe(false);
+    expect(matchConstraint(sv('0'), false)).toBe(true);
     expect(matchConstraint(sv('true'), false)).toBe(false);
   });
 
@@ -175,11 +175,12 @@ describe('matchConstraint — pattern', () => {
     expect(matchConstraint(pat('[\\i][\\c]*'), 'Name_1')).toBe(true);
   });
 
-  it('does not reject valid values for XSD block escapes JS cannot model', () => {
-    // `\p{IsBasicLatin}` has no JS equivalent; approximate permissively
-    // (as the legacy `.` did) rather than failing every value.
+  it('evaluates XSD block escapes exactly (#7400)', () => {
+    // `\p{IsBasicLatin}` is U+0000..U+007F: it used to be an any-character
+    // placeholder that passed every value.
     expect(matchConstraint(pat('\\p{IsBasicLatin}+'), 'A')).toBe(true);
     expect(matchConstraint(pat('\\p{IsBasicLatin}+'), 'Hello')).toBe(true);
+    expect(matchConstraint(pat('\\p{IsBasicLatin}+'), 'ā')).toBe(false);
   });
 
   it('evaluates XSD character-class subtraction exactly instead of dropping the exclusion (#5183)', () => {

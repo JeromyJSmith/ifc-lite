@@ -11,6 +11,8 @@
 
 use std::collections::HashMap;
 
+use ifc_lite_core::step_encoding::step_string_literal_end;
+
 /// Strategy for matching a later model's `IfcSite` / `IfcBuilding` onto the first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ContainerMergeStrategy {
@@ -54,25 +56,17 @@ pub fn nth_attr(line: &str, n: usize) -> Option<&str> {
     let bytes = line.as_bytes();
     let open = bytes.iter().position(|&b| b == b'(')?;
     let mut depth = 0i32;
-    let mut in_string = false;
     let mut idx = 0usize;
     let mut arg_start = open + 1;
     let mut i = open;
     while i < bytes.len() {
-        let c = bytes[i];
-        if in_string {
-            if c == b'\'' {
-                if bytes.get(i + 1) == Some(&b'\'') {
-                    i += 2;
-                    continue;
-                }
-                in_string = false;
+        match bytes[i] {
+            // The shared rule for where a literal ends: a `\S\'` operand is
+            // text, not the closing quote (#7589).
+            b'\'' => {
+                i = step_string_literal_end(bytes, i)?;
+                continue;
             }
-            i += 1;
-            continue;
-        }
-        match c {
-            b'\'' => in_string = true,
             b'(' => {
                 depth += 1;
                 if depth == 1 {
@@ -122,7 +116,9 @@ pub fn storey_elevation(line: &str) -> Option<f64> {
     if trimmed.is_empty() || trimmed == "$" || trimmed == "*" {
         return None;
     }
-    trimmed.parse::<f64>().ok()
+    // The core STEP literal reader, not `str::parse::<f64>`, which read `inf`,
+    // `NaN` and an overflowing `1.E400` as elevations (#7678).
+    ifc_lite_core::parse_step_real(trimmed.as_bytes())
 }
 
 impl SpatialLookup {
@@ -259,6 +255,18 @@ impl SpatialLookup {
 
 #[cfg(test)]
 mod spatial_tests {
+    /// #7678: the elevation reader admits exactly what the STEP decoder does.
+    #[test]
+    fn storey_elevation_reads_through_the_step_literal_reader() {
+        let line = |elev: &str| format!("#5=IFCBUILDINGSTOREY('g',$,'L1',$,$,$,$,$,.ELEMENT.,{elev});");
+        assert_eq!(super::storey_elevation(&line("3.5")), Some(3.5));
+        for bad in ["1.E400", "-1.E400", "inf", "NaN"] {
+            assert_eq!(super::storey_elevation(&line(bad)), None, "{bad}");
+        }
+        let neg = super::storey_elevation(&line("-0.")).expect("-0.");
+        assert!(neg == 0.0 && neg.is_sign_negative());
+    }
+
     use super::*;
     use std::collections::HashSet;
 
@@ -278,6 +286,13 @@ mod spatial_tests {
         assert_eq!(nth_attr(line, 0), Some("'a,b (c)'"));
         assert_eq!(nth_attr(line, 1), Some("#2"));
         assert_eq!(nth_attr(line, 2), Some("'x'"));
+    }
+
+    #[test]
+    fn nth_attr_keeps_a_page_operand_inside_its_string_7589() {
+        let line = r"#1=IFCBUILDINGSTOREY('g',#2,'Para \S\' 5',$,#4);";
+        assert_eq!(nth_attr(line, 2), Some(r"'Para \S\' 5'"));
+        assert_eq!(nth_attr(line, 4), Some("#4"));
     }
 
     #[test]

@@ -2,6 +2,8 @@
 
 IFClite supports **BCF (BIM Collaboration Format)**, the buildingSMART standard for topic tracking in BIM projects. The `@ifc-lite/bcf` package implements BCF 2.1 and 3.0 specifications.
 
+Browser exports use the `.bcf` extension for BCF 2.1/3.0 interoperability. Solibri selects its importer by filename: the same 2.1 archive named `.bcfzip` can silently import zero topics. For an existing archive, rename the file to `.bcf`; do not unpack or rewrite it. IFClite reads both extensions. See [Solibri’s documented extension contract](https://solibri.github.io/Developer-Platform/latest/superrun-actions.html#export_bcf).
+
 ## What is BCF?
 
 BCF allows teams to create, share, and manage **topics** linked to specific locations and components in a BIM model. Each topic can optionally be typed (Issue, Request, Comment, and more) and can include:
@@ -11,6 +13,14 @@ BCF allows teams to create, share, and manage **topics** linked to specific loca
 - **Component references** - Links to specific IFC entities via GlobalId
 
 ## Quick Start
+
+The viewer’s topic list identifies its current BCF workspace and reports the
+number of topics in that workspace separately from those shown by the status
+filter. An empty filtered view preserves the existing topics. Archive exports
+include the whole workspace, including topics hidden by the filter. Topic
+records and statuses do not establish that model checks, imports or server
+topic retrieval are complete; the coverage indicator leaves that outcome
+unknown. Loaded IFC models are not automatically claimed as topic source scope.
 
 ### Reading BCF Files
 
@@ -78,7 +88,7 @@ addCommentToTopic(topic, comment);
 // Add to project
 addTopicToProject(project, topic);
 
-// Export as a .bcfzip archive (returns a Blob)
+// Export a BCF ZIP archive (returns a Blob; use .bcf as the filename)
 const bcfBlob = await writeBCF(project);
 ```
 
@@ -97,7 +107,11 @@ const viewpoint = createViewpoint({
   selectedGuids: selectedGuids, // IFC GlobalIds of selected entities
   hiddenGuids: hiddenGuids,     // IFC GlobalIds of hidden entities
   visibleGuids: visibleGuids,   // IFC GlobalIds for isolation mode (optional)
-  sectionPlane: activePlane,    // Single active clipping plane (optional)
+  sectionPlane: activePlane,    // A single clipping plane (optional)
+  sectionPlanes: [              // Every cutting plane, one ClippingPlanes entry each (optional; replaces sectionPlane)
+    { axis: 'down', position: 40, enabled: true, flipped: false },
+    { axis: 'side', position: 70, enabled: true, flipped: true },
+  ],
   snapshot: base64Image,        // Screenshot as base64 (optional)
 });
 ```
@@ -187,7 +201,7 @@ if (isValidIfcGuid(guid)) {
 
 `generateIfcGuid`, `generateUuid`, and `isValidUuid` are also re-exported.
 
-In the viewer, activating a viewpoint shows its clipping plane (or clears the cut when it has none). Closing the BCF panel gives back the section cut and tool you had before the first viewpoint, unless you moved the cut in the meantime.
+In the viewer, a viewpoint carries every cutting plane (one clipping plane each), and activating one shows them all, replacing the planes on screen, or clears the cut when it has none. BCF has no slot for a plane's name, so planes come back as A, B, C; more than eight planes show the first eight. Closing the BCF panel gives back the section cuts and tool you had before the first viewpoint, unless you changed them in the meantime.
 
 ## IDS Validation Reports as BCF
 
@@ -254,7 +268,7 @@ The package no longer ships a DOM renderer for these markers. The IFClite viewer
 
 ## BCF Servers (BCF API)
 
-Beyond `.bcfzip` files, the `@ifc-lite/bcf-api` package connects to [buildingSMART BCF API](https://github.com/buildingSMART/BCF-API) (OpenCDE) servers and pulls their topics into the same `BCFProject` model:
+Beyond BCF archive files, the `@ifc-lite/bcf-api` package connects to [buildingSMART BCF API](https://github.com/buildingSMART/BCF-API) (OpenCDE) servers and pulls their topics into the same `BCFProject` model:
 
 ```typescript
 import {
@@ -290,6 +304,29 @@ console.log(`Pulled ${project.topics.size} topics (${warnings.length} warnings)`
 
 The client implements the BCF API 2.1 routes (projects, extensions, topics with OData paging, comments, viewpoints, component subresources, snapshots). Non-authentication per-item failures — a missing snapshot, an unreadable components resource — degrade to `warnings` entries; authentication failures (401) and an unreachable topics collection reject the whole pull.
 
+### Request controls and write mapping
+
+Every client method takes an optional trailing `BcfRequestOptions` (`signal`, `timeoutMs`, `headers`), and `topicToApiWrite` / `viewpointToApi` turn `@ifc-lite/bcf` topics and viewpoints into request bodies:
+
+```typescript
+import { BcfApiClient, BcfApiError, topicToApiWrite } from '@ifc-lite/bcf-api';
+import { createBCFTopic } from '@ifc-lite/bcf';
+
+const writer = new BcfApiClient({ baseUrl: 'https://example.com/bcf', getAccessToken: () => 'token' });
+const draft = createBCFTopic({ title: 'Duct crosses beam', author: 'you@example.com', topicType: 'Clash' });
+try {
+  const created = await writer.createTopic('project-id', topicToApiWrite(draft), { timeoutMs: 30_000 });
+  console.log(`Created ${created.guid}`);
+} catch (error) {
+  if (error instanceof BcfApiError) console.error(`Refused with HTTP ${error.status}; nothing was applied`);
+  // A timeout, abort or dropped connection is NOT "not sent": the server may
+  // have created the topic. Look it up before sending the write again.
+  else console.error('Outcome unknown; check the project before retrying', error);
+}
+```
+
+A BCF create is not idempotent and the write bodies carry no client correlation id, so a request that fails after it left the browser has an unknown outcome. An already-aborted signal is refused before `fetch` is called. `viewpointToApi` always writes `default_visibility`, because BCF API defaults it to `false` (isolation) while BCF-XML defaults it to `true`.
+
 ## Viewer Integration
 
 In the IFClite viewer, BCF is integrated through the BCF panel:
@@ -308,7 +345,21 @@ In the IFClite viewer, BCF is integrated through the BCF panel:
 4. **Navigate Viewpoints** - Click a viewpoint to restore camera and visibility
 5. **Add Comments** - Discuss issues directly in the viewer
 6. **Create Topics** - Select entities, position camera, and create new issues
-7. **Export BCF** - Save the project as a `.bcfzip` file for sharing
+7. **Export BCF** - Save the project as a `.bcf` file for sharing. Activity records archive writing and browser publication, including failure details. Closing the panel leaves the native export running; this writer does not support Cancel.
+
+## BCF drafts and publication
+
+The viewer drafts BCF topics from reviewed clash work and publishes them through a durable outbox (#6896). Open it with the checklist button in the BCF panel header.
+
+- **Draft.** In the Clash panel's *Groups* view, **Draft BCF topics from N groups** turns every group of the active grouping workspace into one draft topic holding exactly that group's findings in the current run. **Draft BCF (n)** beside the export actions drafts one topic from the checked clashes. Each topic stores its findings' durable identities (review key and occurrence key), a viewpoint framed by the same clash BCF bridge as the archive export (A/B colours, world coordinates), the type `Clash`, status `Open`, a priority from the worst severity, and no assignee. Drafts are saved in the browser's user-content library, with the same backup, import and recovery as other libraries.
+- **Review.** Rename and edit fields, remove a finding, split chosen findings into a new topic, merge topics (the first keeps its GUID), and add comments. A finding can belong to only one topic; an edit that would break that is refused. The assignee list is filled only from the selected server project's `user_id_type` after **Check project**.
+- **Reconcile.** **Compare** matches every member against the current clash run (occurrence first, then the model-independent review key) and lists, per topic, the findings that are unchanged, gone, newly matched by the source group, or held by another topic. Nothing changes until **Apply** is pressed for that topic; a finding held by another topic is never moved, and new matches of a group that backs several split topics are left for you to place.
+- **Archive.** **Export .bcf** records running, completed or failed archive publication in Activity, with failures also shown in a toast. The native writer continues after the dialog closes and has no Cancel. It writes plain BCF 2.1: other tools see normal topics, comments and viewpoints. Each description ends with a generated mapping footer (batch, topic, member digest and member identities) that **Import BCF archive** reads back into the same batch, topic GUIDs and members. Plain archives import as unmapped topics; a footer whose member lines no longer match its digest is reported and ignored.
+- **Publish.** Pick a project of the connected server. **Check project** compares the writes with the project's `project_actions` and extension vocabularies (type, status, priority, stage, labels, users) and refuses with nothing sent when a value or permission is not allowed. **Publish** records every effect (create topic, viewpoint, comment, update) as an outbox entry before sending it, then stores the server's receipt. Republishing the same batch never creates a topic twice: topics already created get an update only when their fields changed, and an update is held back when someone edited the server topic since it was published (**Overwrite with my update** or **Keep the server version**).
+- **Unknown outcomes.** If the connection drops after a write was sent, the entry becomes *Unknown outcome*. It is never sent again automatically, and neither is anything depending on it. **Check server** looks for it — a created topic by its footer, a comment by its trailer, a viewpoint by its GUID — and records a found match as published. Several candidates are listed for you to choose; only when the server shows no trace can it be sent again. A write interrupted by closing the page is treated the same way after reload; queued writes resume when you publish again.
+- **Backups.** Outbox records imported from a library backup arrive blocked: they keep their published receipts but nothing is sent until each open entry is checked against the server.
+
+The connected client refreshes the access token once when the server answers 401 and repeats that request; a 401 is a refusal before anything is applied, so the repeat cannot duplicate a write. Flow `bcf.createTopic` / `bcf.addComment` runs in the viewer use the same outbox (see [Flow](flow.md)).
 
 ## Key Types
 

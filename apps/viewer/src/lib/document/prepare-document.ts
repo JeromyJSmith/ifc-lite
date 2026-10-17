@@ -16,6 +16,7 @@ import { buildIdsDataset } from '../charts/datasets/ids';
 import { buildCompareDataset } from '../charts/datasets/compare';
 import { largestBucketIds } from '../charts/buckets';
 import { prepareDocumentCharts, type DocumentChartFilterState } from './prepare-charts';
+import { chartSourceContext } from '../charts/chart-source';
 import { prepareListTable } from './prepare-list-table';
 import { listFingerprint } from './list-fingerprint';
 import { resolveComparisonTableState } from './resolve-comparison-table';
@@ -56,7 +57,7 @@ export async function prepareDocument(document: DocumentSpec, state: ViewerState
       filters.set(key, { status: 'error', message: error instanceof Error ? error.message : String(error) });
     }
   }
-  const { aggregations, chartMessages } = prepareDocumentCharts(document, datasets, filters);
+  const { aggregations, chartMessages, chartErrors } = prepareDocumentCharts(document, datasets, filters, chartSourceContext(state));
   const tables = new Map<string, TableState>();
   const providers = document.blocks.some((block) => block.kind === 'table' && block.source.kind === 'list')
     ? prepareListProviders(state, resolveRenderFrame(state.models, state.geometryResult)) : null;
@@ -85,7 +86,7 @@ export async function prepareDocument(document: DocumentSpec, state: ViewerState
   signal?.throwIfAborted();
   return { document, bindings: { models: [...state.models.values()].flatMap((model) => model.ifcDataStore
     ? [{ id: model.id, name: model.name, store: model.ifcDataStore, view: state.mutationViews.get(model.id) }] : []),
-    activeModelId: state.activeModelId, today }, aggregations, chartMessages,
+    activeModelId: state.activeModelId, today }, aggregations, chartMessages, chartErrors,
     tables, topics: state.bcfProject?.topics ?? new Map(),
     snapshotIds: (blockId) => largestBucketIds(aggregations.get(blockId)),
   };

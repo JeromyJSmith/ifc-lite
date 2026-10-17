@@ -2,19 +2,10 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-import { STEP_TRIVIA } from '@ifc-lite/parser';
+import { stepStringLiteralEnd } from '@ifc-lite/encoding';
 import { skipStepComment } from './step-comment-skip.js';
 import { isWellFormedStepSlot } from './step-slot-grammar.js';
-
-/**
- * `#N=CLASS(...)` record prefix, with STEP trivia (whitespace and/or a
- * `/* ... *​/` comment, #3789) tolerated between the type name and its `(`
- * — same adjacency fix as `entity-extractor.ts`'s `extractEntity`, applied
- * here because `replaceStepArgument`'s caller degrades on `null` (a lost
- * repoint, see below), the same failure class. Compiled once since
- * `replaceStepArgument` runs per rewritten line.
- */
-const RECORD_PREFIX_RE = new RegExp(`^(#\\d+\\s*=\\s*(\\w+)${STEP_TRIVIA}\\()([\\s\\S]*)(\\)\\s*;)\\s*$`);
+import { frameArgs, stepRecordFrame } from './step-record-frame.js';
 
 /**
  * The STEP argument parser and rewriter: reading a record's top-level argument
@@ -44,34 +35,26 @@ export function splitTopLevelListItems(text: string): string[] {
   const parts: string[] = [];
   let current = '';
   let depth = 0;
-  let inString = false;
 
   for (let i = 0; i < text.length; i++) {
     const char = text[i];
-    if (!inString && char === '/' && text[i + 1] === '*') {
+    if (char === '/' && text[i + 1] === '*') {
       const stop = skipStepComment(text, i); // see skipStepComment's docstring
       current += text.slice(i, stop);
       i = stop - 1;
       continue;
     }
-    current += char;
-
-    if (inString) {
-      if (char === '\'') {
-        if (text[i + 1] === '\'') {
-          current += text[i + 1];
-          i++;
-        } else {
-          inString = false;
-        }
-      }
-      continue;
-    }
 
     if (char === '\'') {
-      inString = true;
+      // A literal is copied whole; where it ends is the shared rule, so `''`
+      // and a `\S\'` PAGE operand stay inside it (#7589). Unterminated: the rest.
+      const end = stepStringLiteralEnd(text, i);
+      const stop = end === -1 ? text.length : end;
+      current += text.slice(i, stop);
+      i = stop - 1;
       continue;
     }
+    current += char;
 
     if (char === '(') {
       depth++;
@@ -109,14 +92,23 @@ export interface StepRecordSlots {
   readonly suffix: string;
 }
 
-/** Parse a complete STEP record into validated, position-addressable slots. */
+/**
+ * Parse a complete STEP record into validated, position-addressable slots.
+ * The record is framed by `stepRecordFrame` (#7682), so trivia anywhere Part 21
+ * allows it (around the `=`, before the `(`, between the `)` and the `;`) is
+ * kept in `prefix` / `suffix` rather than making the record unreadable.
+ */
 export function readStepSlots(entityText: string): StepRecordSlots | null {
-  const match = entityText.match(RECORD_PREFIX_RE);
-  if (!match) return null;
-  const [, prefix, type, attrsText, suffix] = match;
-  const slots = splitTopLevelStepArguments(attrsText);
+  const frame = stepRecordFrame(entityText);
+  if (frame === null) return null;
+  const slots = splitTopLevelStepArguments(frameArgs(entityText, frame));
   if (slots === null) return null;
-  return { prefix, type: type.toUpperCase(), slots, suffix };
+  return {
+    prefix: entityText.slice(0, frame.head.open + 1),
+    type: entityText.slice(frame.head.typeStart, frame.head.typeEnd).toUpperCase(),
+    slots,
+    suffix: entityText.slice(frame.close),
+  };
 }
 
 /**
@@ -134,7 +126,7 @@ export function readStepSlots(entityText: string): StepRecordSlots | null {
  * is past the end of the argument list; a null must not be treated as "no
  * change", since the intended replacement did not happen.
  *
- * The regex only pins the two ENDS of the record — `#N=CLASS(` and `);`. Text
+ * The frame only pins the two ENDS of the record — `#N=CLASS(` and `);`. Text
  * malformed BETWEEN them is caught by {@link splitTopLevelStepArguments}, which
  * rejects an argument list it could not scan cleanly rather than handing back
  * whatever it accumulated: those parts are not the record's slots, so writing
@@ -224,49 +216,46 @@ export function splitTopLevelStepArguments(input: string): string[] | null {
   const parts: string[] = [];
   let current = '';
   let depth = 0;
-  let inString = false;
 
   for (let i = 0; i < input.length; i++) {
     const char = input[i];
 
     // See skipStepComment's docstring; isWellFormedStepSlot below still
     // rejects an unterminated comment via skipTrivia.
-    if (!inString && char === '/' && input[i + 1] === '*') {
+    if (char === '/' && input[i + 1] === '*') {
       const stop = skipStepComment(input, i);
       current += input.slice(i, stop);
       i = stop - 1;
       continue;
     }
 
+    // A literal is copied whole. Where it ends is the shared rule, so a `\S\'`
+    // operand is text, not a closing quote (#7589); one that never closes is an
+    // unterminated string, refused.
     if (char === "'") {
-      current += char;
-      if (inString && i + 1 < input.length && input[i + 1] === "'") {
-        current += input[i + 1];
-        i++;
-        continue;
-      }
-      inString = !inString;
+      const end = stepStringLiteralEnd(input, i);
+      if (end === -1) return null;
+      current += input.slice(i, end);
+      i = end - 1;
       continue;
     }
 
-    if (!inString) {
-      if (char === '(') depth++;
-      else if (char === ')') {
-        depth--;
-        // Already past the record's own closing paren: every comma from here
-        // would be read as nested and the split is meaningless.
-        if (depth < 0) return null;
-      } else if (char === ',' && depth === 0) {
-        parts.push(current);
-        current = '';
-        continue;
-      }
+    if (char === '(') depth++;
+    else if (char === ')') {
+      depth--;
+      // Already past the record's own closing paren: every comma from here
+      // would be read as nested and the split is meaningless.
+      if (depth < 0) return null;
+    } else if (char === ',' && depth === 0) {
+      parts.push(current);
+      current = '';
+      continue;
     }
 
     current += char;
   }
 
-  if (inString || depth !== 0) return null;
+  if (depth !== 0) return null;
   parts.push(current);
 
   // The three checks above (quote/paren/final-depth) track SCAN state, not

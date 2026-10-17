@@ -5,9 +5,25 @@
 /** Source-owned type groups emitted into the sandbox scripting declarations. */
 export const BIM_DERIVED_TYPE_GROUPS = [
   {
+    title: 'Generic group lifecycle types', namespace: 'BimGroup',
+    sources: ['packages/sdk/src/store-group-types.ts', 'packages/sdk/src/types.ts',
+      'packages/create/src/in-store/group.ts', 'packages/create/src/in-store/group-graph.ts'],
+    roots: ['GroupStoreIdentity', 'GroupStoreSnapshot', 'GroupStoreCreateParams', 'GroupStorePatch'],
+  },
+  {
     title: 'Modelling operation types', namespace: 'BimCreate',
-    sources: ['packages/create/src/in-store/wall-join.ts', 'packages/create/src/in-store/wall-join-apply.ts'],
-    roots: ['WallJoinApplyOptions', 'WallJoinOptions'],
+    sources: [
+      'packages/create/src/in-store/wall-join.ts', 'packages/create/src/in-store/wall-join-apply.ts',
+      'packages/create/src/in-store/column.ts', 'packages/create/src/in-store/beam.ts',
+      'packages/create/src/in-store/align-boxes.ts',
+      'packages/create/src/in-store/member.ts', 'packages/create/src/in-store/profile.ts',
+    ],
+    roots: [
+      'AlignMode', 'WallJoinApplyOptions', 'WallJoinOptions',
+      'ColumnInStoreParams', 'ProfiledColumnInStoreParams',
+      'BeamInStoreParams', 'ProfiledBeamInStoreParams',
+      'MemberInStoreParams', 'ProfiledMemberInStoreParams',
+    ],
   },
   {
     title: 'Clash engine types', namespace: 'BimClash',

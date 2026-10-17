@@ -64,6 +64,16 @@ The bridge mirrors IfcOpenShell `ifctester` semantics (classification sub-refere
 
 Other options in `ValidatorOptions`: `translator` (see below), `includePassingEntities` (default `true`), and `yieldEveryMs` to keep the thread responsive on large models.
 
+### Reusing viewer checks
+
+The Data Validation panel keeps Information rule sets and IDS documents in separate check libraries. Import another file, then use **Select rule set** or **Select IDS document** to switch between checks. Checks with the same title remain separate entries.
+
+For Information validation, **New rule set** starts an editable check and **New from this check** copies the selected rule set. Edits apply to the copy. For IDS, **New from this check** creates an independent library entry containing the original XML; **Download IDS** exports those XML bytes. Use **Delete check** to remove the selected entry. If another check of the same kind remains, the panel selects it.
+
+The libraries survive model replacement and browser reloads on the same origin. Import or storage errors appear in the panel. An invalid replacement keeps the previously accepted check available. The newest picked file owns import completion, including when another mounted panel started the import.
+
+Selecting a different check cancels the current validation and clears its current report. Reports already saved with **Save report** remain in saved history. Run the selected check again against the currently loaded models to produce a new report.
+
 ### Understanding the viewer summary
 
 The viewer shows two different units:
@@ -92,6 +102,8 @@ IDS supports six facet types for defining applicability and requirements:
 | **Material** | Match by material name | `Concrete C30/37` |
 | **PartOf** | Match by spatial containment | `IfcBuildingStorey "Level 1"` |
 
+Material lists whose `IfcMaterial.Name` is explicitly unset (`$` in STEP) retain the known material as `Material #<expressId>`. This is distinct from an unreadable or invalid referenced material: IDS keeps those results uncertain instead of treating them as a definite name mismatch.
+
 ## Constraint Types
 
 Each facet can use different constraint types to match values:
@@ -111,7 +123,7 @@ Validation reports can be generated in multiple languages:
 import { createTranslationService } from '@ifc-lite/ids';
 
 const t = createTranslationService('de'); // German
-// Or: 'en' (English, default), 'fr' (French)
+// Or: 'en' (English, default), 'fr' (French), 'it' (Italian)
 
 // Pass it to validateIDS to translate the report:
 const report = await validateIDS(idsDocument, accessor, modelInfo, { translator: t });
@@ -129,6 +141,25 @@ const auditReport = await auditIDSDocument(idsXml);
 ```
 
 Use `auditIDSStructure(idsDocument)` to audit an already-parsed document.
+
+Against the vendored buildingSMART IDS corpus, the audit reports an error on
+all 27 `invalid-` cases and on none of the 307 pass and fail cases. Among
+other things it checks:
+
+- values against their type: a property value against its `dataType`, an
+  attribute value against the attribute's type on the applicability entity
+  (`FALSE`, `42.0` for an integer and `42,3` are all rejected), and a
+  restriction's base against either;
+- entity names: upper case (`IFCWALL`, not `IfcWall`), and an entity
+  requirement that no applicable class can satisfy (entity facets match the
+  exact class, not subclasses);
+- predefined types: any value is accepted when the enum has `USERDEFINED`
+  (it is matched against `ObjectType`), IFC2X3 occurrences use their type
+  object's enum, and an entity with no PredefinedType rejects one;
+- every facet of a conjunctive restriction (`and`), not only the first;
+- a prohibited specification (`maxOccurs="0"`) with requirements.
+
+The audit checks that an IDS is valid IDS 1.0. To check that it means what you intend (abstract entities that match nothing, `^` in XSD patterns, millimetres where metres are expected, requirements that can never fail or never pass), lint it with `@ifc-lite/ids-authoring`; see [IDS lint rules](ids-lint/index.md).
 
 ## What `.rules.json` rule sets cover that IDS 1.0 cannot
 
@@ -224,7 +255,10 @@ other rule is refused with each reason listed:
 property or quantity rule can compare in SI too: `valueUnit: 'si'` (the
 **SI** toggle on the chip) converts each value with its own unit, meaning
 an explicit `Unit` on the property or quantity, else the project unit for its
-measure type, before comparing. Such a rule exports unchanged. A numeric
+measure type, before comparing. In search and in filters it reads unsaved
+in-session edits like any other property rule, the edited value converted
+with its own unit; validation reads the model as loaded. Such a rule exports
+unchanged. A numeric
 rule without it compares the model's stored numbers. The export converts its
 operand to SI with the unit the given `models` store that value in, and
 refuses the rule when there are no models, when no model has the value, or
@@ -255,6 +289,121 @@ In the viewer, the Data validation panel's Information validation side has
 **Export as IDS** next to **Save**. Both show what was converted and every
 refused rule or specification with its reasons.
 
+The export writes its IDS through `writeIdsXml` from `@ifc-lite/ids` (see
+[Writing IDS documents](#writing-ids-documents)).
+
+## Writing IDS documents
+
+`writeIdsXml` (in `@ifc-lite/ids`) is the IDS 1.0 writer behind the rule-set
+export and the viewer's assistant-drafted IDS. It writes the `info` block,
+entity, attribute, property (with `dataType`), classification, material and
+partOf facets, requirement cardinality and `instructions`, and every
+constraint the parser produces: simple values, patterns, enumerations,
+numeric bounds, length and digit restrictions (`xs:length`, `xs:minLength`,
+`xs:maxLength`, `xs:totalDigits`, `xs:fractionDigits`) and conjunctive
+restrictions (a pattern, an enumeration and bounds in one `xs:restriction`).
+Bounds on `xs:decimal` and the integer bases are written without an exponent.
+
+What has no valid IDS 1.0 form is refused with an error naming it, never
+written as a weaker check: unparseable bounds, two patterns or two
+enumerations in one conjunction (XSD would OR them), conjunctive facets with
+different bases, and a bounds restriction without any facet. Line breaks and
+tabs in attributes such as `instructions` are written as character
+references, so they read back unchanged; a control character XML cannot carry
+is refused with the element or attribute it is in. Every pass/fail case of the
+vendored buildingSMART IDS corpus reads back with the same specifications and
+verdicts.
+
+```typescript
+import { parseIDS, writeIdsXml } from '@ifc-lite/ids';
+
+declare const idsXml: string;
+const rewritten = writeIdsXml(parseIDS(idsXml));
+// Canonical layout: tab indents, CRLF, applicability facets in ids.xsd order.
+const canonical = writeIdsXml(parseIDS(idsXml), { canonical: true, indent: '\t', newline: '\r\n' });
+```
+
+The optional second argument (`IdsXmlFormat`) changes layout and order only,
+never meaning: `indent` (spaces, 0 to 8, or `'\t'`; default 2 spaces),
+`newline` (`'\n'` or `'\r\n'`) and `canonical`. Canonical output writes
+applicability facets in the `ids.xsd` sequence (entity, partOf,
+classification, attribute, property, material) and `ifcVersion` tokens in
+schema order without duplicates, so two documents with the same checks write
+the same bytes; requirements keep their authored order. Writing is
+idempotent: `writeIdsXml(parseIDS(xml), fmt)` returns `xml` for any `xml` it
+wrote with the same `fmt`. `IFC4X3` is written as the IDS 1.0 token
+`IFC4X3_ADD2`, which reads back as `IFC4X3`; a `partOf` relation of voids or
+fills alone is refused, since IDS 1.0 only has the combined
+`IFCRELVOIDSELEMENT IFCRELFILLSELEMENT`.
+
+## IDS 1.1 preview (unstable)
+
+!!! warning "Preview"
+    IDS 1.1 is not released. The features below are **candidates** from the
+    buildingSMART IDS 1.1 milestone. They are off unless you pass
+    `preview: { ids11: true }`, and they will change or disappear when
+    upstream decides. A document that uses them is not valid IDS 1.0.
+
+Pass the flag to every entry point that should see the candidates:
+`parseIDS(xml, { preview })`, `writeIdsXml(doc, fmt, { preview })`,
+`validateIDS(doc, accessor, modelInfo, { preview })` and
+`auditIDSDocument(xml, { preview })`. Without it, nothing changes: the parser
+ignores the 1.1 attributes and elements, the audit reports them as IDS 1.0
+errors, and every buildingSMART IDS 1.0 corpus file writes byte for byte the
+same with the flag on as off. A document that does use a 1.1 feature is
+never quietly downgraded: the writer and the validator throw
+`IDS11PreviewRequiredError` when it reaches them without the flag.
+
+| Feature | Upstream | What the preview does |
+|---|---|---|
+| `uri` on property, classification and material facets in applicability | IDS #188, #251 (merged on the upstream 1.1 branch) | Read and written; informational, never checked against a model |
+| `instructions` on applicability facets | IDS #154 (open proposal) | Read and written. Requirement instructions stay on the requirement, as in 1.0 |
+| Attribute, property, classification and material facets nested in `partOf` | IDS #379, draft PR #380 | The related element must match the entity **and** every nested facet. Exactly one related entity is required |
+| Specification identifiers should be unique | IDS #339 (resolved as documentation) | The preview audit warns on a duplicate (`W_IDS11_IDENTIFIER_DUPLICATE`) |
+| Equality tolerance: inclusive bounds, rounded to 15 decimals | IDS #418 (open) | Simple values and enumerations compare with `v ∓ (abs(v)·1e-6 + 1e-6)`, bounds rounded half-to-even to 15 decimal places, ends included. Ranges never use tolerance |
+
+The audit with the flag reports each use as `I_IDS11_PREVIEW_FEATURE` (an
+`info` issue naming the upstream issue), so a report always says which parts
+are preview. The writer marks preview output with an XML comment and the
+schema location `http://standards.buildingsmart.org/IDS/1.1/ids.xsd`, which
+buildingSMART has not published yet.
+
+```typescript
+import {
+  parseIDS, writeIdsXml, validateIDS, auditIDSDocument, findIds11Features,
+} from '@ifc-lite/ids';
+
+declare const idsXml: string;
+const preview = { ids11: true };
+
+const doc = parseIDS(idsXml, { preview });
+for (const use of findIds11Features(doc)) console.log(use.feature, use.path);
+
+const audit = await auditIDSDocument(idsXml, { preview });
+const report = await validateIDS(doc, accessor, { modelId: 'model', schemaVersion: 'IFC4', entityCount: 0 }, { preview });
+const xml = writeIdsXml(doc, {}, { preview });
+```
+
+The nested partOf facet expresses a case IDS 1.0 cannot: "the spaces of the
+storey named `01` must be named `01-…`" (#379). The partOf finds the storey,
+and the nested attribute facet is a condition on that storey:
+
+```xml
+<partOf relation="IFCRELAGGREGATES">
+  <entity><name><simpleValue>IFCBUILDINGSTOREY</simpleValue></name></entity>
+  <attribute>
+    <name><simpleValue>Name</simpleValue></name>
+    <value><simpleValue>01</simpleValue></value>
+  </attribute>
+</partOf>
+```
+
+Where upstream is undecided the preview takes the most conservative reading:
+for example the extra `partOf` relation of #247 (`IfcRelSpaceBoundary`) and
+the inverse partOf of #200 are not modelled, and translations of names and
+descriptions (#154) have no XML form until upstream gives them one. The
+decisions are recorded in the IDS Studio P-12 work log.
+
 ## Viewer Integration
 
 In the IFClite viewer, IDS validation is integrated through the Data validation panel's IDS validation entry:
@@ -268,7 +417,11 @@ In the IFClite viewer, IDS validation is integrated through the Data validation 
 7. **Export BCF** - Turn validation failures into BCF topics (see [BCF](bcf.md#ids-validation-reports-as-bcf))
 8. **Re-run** - After editing the model, the header's Re-run button repeats the check with the same IDS against the same model the report describes. **Clear results** returns to the pre-run card and keeps the IDS loaded; **Unload IDS** removes both
 
+To correct failures, select a failed specification whose requirement names an exact property and choose **Correct**. Enter the value as the IDS states it (base SI units) and pick the failed elements. **Review as changes** shows each element's stored value and the typed value it would get, scaled into the model's units; apply it from the review and use **Re-run validation** on the receipt to see the before and after counts per specification. **Apply to N entities** writes directly and re-runs validation, without a review or receipt. See [Reviewed table, bulk and IDS corrections](mutations.md#reviewed-table-bulk-and-ids-corrections).
+
 No `.ids` file to hand? With no model of your own open, the empty panel's **Try with demo data** loads the demo project and the IDS written for it.
+
+The [viewer assistant](viewer-assistant.md#reviewed-ids-rule-and-report-drafts) can also draft IDS specifications, information rules and report outlines. It runs the native IDS audit and a dry run on the loaded models before a draft can be saved into this panel's libraries, and keeps requirements no check can cover as explicit unsupported items.
 
 Checks do not automatically create saved reports. To keep a completed IDS or information-validation result, choose **Save report** in its results toolbar. **Saved reports** holds the evidence from that run, including its evaluated model names and fingerprints. The same result can be saved once; later runs can be saved separately. Unsaved results last only for the current session and are replaced by a later completed run or cleared with the results.
 
@@ -276,7 +429,7 @@ Checks do not automatically create saved reports. To keep a completed IDS or inf
 
 Some checks are done by eye rather than by a rule: the model was uploaded to the CDE on time, objects sit on the right storey. The Data validation panel's third tab, **Manual validation**, holds a checklist of groups of such checks. Each check takes **Pass**, **Fail** or **Warning** and an optional comment; a check with no verdict shows as **Not checked**. Each group has a ring chart and there is an overall ring; a warning is counted on its own and never as a pass.
 
-**Edit checklist** adds, renames, reorders and deletes groups and checks. **Save .checklist.json** downloads the structure only (never the answers), so one file can be reused on every model; **Open .checklist.json** and **Recent checklists** load one back. Answers are stored in the browser per model, keyed by the model file's identity, so they come back when the same file is loaded again; with several models loaded, a picker chooses which one is being checked. Manual results are kept apart from IDS and information-validation reports and never replace them. To put them in a report, add a **Manual validation report** block to a [document](documents.md).
+**Edit checklist** adds, renames, reorders and deletes groups and checks. **Save .checklist.json** downloads the structure only (never the answers), so one file can be reused on every model; **Open .checklist.json** and **Recent checklists** load one back. Answers are stored in the browser per model, keyed by the model file's identity, so they come back when the same file is loaded again; with several models loaded, a picker chooses which one is being checked. Manual results are kept apart from IDS and information-validation reports and never replace them. To put them in a report, add a **Validation report** block to a [document](documents.md) and choose the saved or live manual report as its source.
 
 Validation runs in a Web Worker so the UI stays responsive during large runs, with an automatic fallback to in-process validation if the worker is unavailable.
 

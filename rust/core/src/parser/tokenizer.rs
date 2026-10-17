@@ -18,6 +18,8 @@ use nom::{
 
 use crate::error::{Error, Result};
 use crate::generated::IfcType;
+use crate::step_encoding::step_string_literal_end;
+use super::numeric_literal::admit_step_real;
 
 /// STEP/IFC token.
 ///
@@ -34,6 +36,11 @@ pub enum Token<'a> {
     Integer(i64),
     /// Float: 3.14
     Float(f64),
+    /// A complete STEP `REAL` literal that `f64` cannot hold (`1.E400`),
+    /// carried as its raw text. [`super::numeric_literal::admit_step_real`]
+    /// decides which literals land here (#7678): the decoder refuses the
+    /// record for geometry and keeps it, as an infinity, for the data model.
+    UnrepresentableReal(&'a [u8]),
     /// Enum: .TRUE., .FALSE., .UNKNOWN.
     Enum(&'a [u8]),
     /// List: (1, 2, 3)
@@ -55,44 +62,49 @@ fn entity_ref(input: &[u8]) -> IResult<&[u8], Token<'_>> {
 }
 
 /// Parse string literal: 'text' or "text"
-/// IFC uses '' to escape a single quote within a string
-/// Uses memchr for SIMD-accelerated quote searching
+///
+/// An apostrophe literal ends where the shared rule says it does
+/// ([`step_string_literal_end`]): `''` is an escaped quote and the operand of
+/// a `\S\` PAGE directive is text. Ending at that operand left the rest of
+/// `'Para \S\' 5'` as unparseable input, so the whole entity failed to
+/// decode (#7589). The token borrows the content between the quotes, still
+/// escaped; consumers un-double `''` and decode backslash escapes.
 fn string_literal(input: &[u8]) -> IResult<&[u8], Token<'_>> {
-    // Helper to parse string content with escaped quotes - SIMD optimized
-    #[inline]
-    fn parse_string_content(input: &[u8], quote_byte: u8) -> IResult<&[u8], &[u8]> {
-        let bytes = input;
-        let mut pos = 0;
-
-        // Use memchr for SIMD-accelerated searching
-        while let Some(found) = memchr::memchr(quote_byte, &bytes[pos..]) {
-            let idx = pos + found;
-            // Check if it's an escaped quote (doubled)
-            if idx + 1 < bytes.len() && bytes[idx + 1] == quote_byte {
-                pos = idx + 2; // Skip escaped quote pair
-                continue;
-            }
-            // End of string found
-            return Ok((&input[idx..], &input[..idx]));
-        }
-
-        // No closing quote found
-        Err(nom::Err::Error(nom::error::Error::new(
-            input,
-            nom::error::ErrorKind::Char,
-        )))
+    match input.first() {
+        Some(b'\'') => match step_string_literal_end(input, 0) {
+            Some(past_close) => Ok((
+                &input[past_close..],
+                Token::String(&input[1..past_close - 1]),
+            )),
+            None => Err(nom::Err::Error(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::Char,
+            ))),
+        },
+        _ => map(
+            delimited(char('"'), double_quoted_content, char('"')),
+            Token::String,
+        )(input),
     }
+}
 
-    alt((
-        map(
-            delimited(char('\''), |i| parse_string_content(i, b'\''), char('\'')),
-            Token::String,
-        ),
-        map(
-            delimited(char('"'), |i| parse_string_content(i, b'"'), char('"')),
-            Token::String,
-        ),
-    ))(input)
+/// Content of a `"..."` literal up to its closing `"`; a doubled `""` stays
+/// inside. Uses memchr for SIMD-accelerated quote searching.
+#[inline]
+fn double_quoted_content(input: &[u8]) -> IResult<&[u8], &[u8]> {
+    let mut pos = 0;
+    while let Some(found) = memchr::memchr(b'"', &input[pos..]) {
+        let idx = pos + found;
+        if input.get(idx + 1) == Some(&b'"') {
+            pos = idx + 2;
+            continue;
+        }
+        return Ok((&input[idx..], &input[..idx]));
+    }
+    Err(nom::Err::Error(nom::error::Error::new(
+        input,
+        nom::error::ErrorKind::Char,
+    )))
 }
 
 /// Parse integer: 42, -42, +42
@@ -119,7 +131,9 @@ fn integer(input: &[u8]) -> IResult<&[u8], Token<'_>> {
 /// IFC allows floats like "0." without decimal digits
 ///
 /// `REAL` carries the same `[ SIGN ]` as `INTEGER`; see [`integer`] for why a
-/// rejected sign costs the whole entity.
+/// rejected sign costs the whole entity. A literal `f64` cannot hold
+/// (`1.E400`) becomes [`Token::UnrepresentableReal`], by [`admit_step_real`]
+/// (#7678); the decoder, not the tokenizer, decides what that costs.
 /// Uses lexical-core for 10x faster parsing
 #[inline]
 fn float(input: &[u8]) -> IResult<&[u8], Token<'_>> {
@@ -133,7 +147,7 @@ fn float(input: &[u8]) -> IResult<&[u8], Token<'_>> {
         ))),
         |s: &[u8]| {
             lexical_core::parse::<f64>(s)
-                .map(Token::Float)
+                .map(|v| admit_step_real(v).map_or(Token::UnrepresentableReal(s), Token::Float))
                 .map_err(|_| "parse error")
         },
     )(input)
@@ -327,7 +341,34 @@ where
             let ifc_type = IfcType::from_str(type_str);
             Ok((id, ifc_type, args))
         }
-        Err(e) => Err(Error::parse(0, format!("Failed to parse entity: {}", e))),
+        Err(e) => Err(entity_parse_error(input, e)),
+    }
+}
+
+/// Bytes of the failing input quoted in a parse error.
+const ERROR_CONTEXT_BYTES: usize = 64;
+
+/// A nom failure as a bounded [`Error`]: the byte offset, nom's error kind and
+/// at most [`ERROR_CONTEXT_BYTES`] of lossy context. nom 7's `Display` for
+/// `Err` writes the inner error with `{:?}`, which is every REMAINING input byte
+/// as a decimal number, so formatting it built a message 4-5x the record (a
+/// 20 MB point list: ~100 MB of text per failed decode, built and dropped by
+/// every `let Ok(..) else continue` walk; #7675, CORE-5).
+fn entity_parse_error(input: &[u8], e: nom::Err<nom::error::Error<&[u8]>>) -> Error {
+    match e {
+        nom::Err::Incomplete(_) => Error::parse(input.len(), "Failed to parse entity: incomplete input"),
+        nom::Err::Error(inner) | nom::Err::Failure(inner) => {
+            let rest = inner.input;
+            let near = &rest[..rest.len().min(ERROR_CONTEXT_BYTES)];
+            Error::parse(
+                input.len().saturating_sub(rest.len()),
+                format!(
+                    "Failed to parse entity: {:?} near {:?}",
+                    inner.code,
+                    String::from_utf8_lossy(near)
+                ),
+            )
+        }
     }
 }
 

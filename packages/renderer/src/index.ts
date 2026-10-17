@@ -18,7 +18,7 @@ export { invertAppearancePartition, validateAppearancePartition, type Appearance
 import type { AppearancePreview } from './appearance-preview.js';
 import { createReferenceImageManager } from './reference-image-host.js';
 export type { ReferenceImages, ReferenceImageInput, ReferenceImageHit, ReferenceCorners } from './reference-image-types.js';
-import { measureDrawingBuffer, resizeRendererViewport } from './renderer-viewport.js';
+import { MAX_DRAWING_BUFFER_PIXEL_RATIO, measureDrawingBuffer, resizeRendererViewport } from './renderer-viewport.js';
 export type { ProjectionMode } from './camera-state.js';
 export type { InteractionMode } from './camera-controls.js';
 export { pickFitPolicy } from './camera-fit-policy.js';
@@ -63,6 +63,8 @@ export { hostsOtherEntities } from './mesh-entity-hosting.js';
 export { FederationRegistry, federationRegistry } from './federation-registry.js';
 export type { ModelRange, GlobalIdLookup } from './federation-registry.js';
 export * from './types.js';
+export { MAX_EXTRA_CLIP_PLANES } from './extra-clip-planes.js';
+export type { SectionPlaneFrame, SectionFrameInput } from './section-plane-frames.js';
 export {
     resolveEnvironment,
     deriveSkyGradient,
@@ -98,13 +100,9 @@ export { isEntityVisible } from './entity-visibility.js';
 // Alpha constants the Cesium world view must match, since it renders the model
 // through its own glTF pipeline rather than this one (#2591).
 export { DEFAULT_GHOST_ALPHA, OPAQUE_ALPHA_CUTOFF } from './overlay-routing.js';
+export { DEFAULT_MIN_CAST_ALPHA } from './shadow-occluders.js';
 export { VisibilityEpochTracker } from './visibility-epoch.js';
-export type { FrameStats, ResidentGpuBytes } from './render-stats.js';
-// Frame/pass GPU timing (issue #2670 perf-verdict gate). Opt-in and NOT wired
-// into `Renderer` by default — a caller constructs `GpuFrameTimingRecorder`
-// itself and attaches its `timestampWrites` to the passes it wants measured;
-// see `frame-timing-gpu.ts`'s module doc for the usage pattern, and
-// `decideTimingMode` for choosing GPU queries vs. the CPU fallback vs. off.
+export type { FrameStats, ResidentGpuBytes } from './render-stats.js'; // GPU timing is opt-in (#6975).
 export { decideTimingMode, passDurationsMs, frameTotalMs, aggregateFrameTimings } from './frame-timing.js';
 export type { TimingMode, TimingModeRequest, PassTimingSample, FrameTimingReport } from './frame-timing.js';
 export { computeDurationStats, nsToMs, isNegativeDelta } from './frame-timing-stats.js';
@@ -136,6 +134,7 @@ export type {
 export type { GpuUploadOutcome } from './gpu-upload-guard.js';
 export type { DeviceRecoveryFailureReason, DeviceRecoveryOmission, DeviceRecoveryResult } from './device-recovery.js';
 import { modelPlacementBounds, sceneMeshBounds } from './model-placement-bounds.js';
+import { configureRendererGpuTiming, readRendererGpuTiming, releaseRendererGpuTiming, beginRendererGpuTiming, renderPassTimestampWrites, submitRendererGpuTiming } from './renderer-frame-timing.js';
 import { WebGPUDevice, type AdapterInfoSnapshot } from './device.js';
 import { RenderPipeline } from './pipeline.js';
 import { Camera } from './camera.js';
@@ -154,11 +153,13 @@ import type {
     PickResult,
     PickClipState,
     ClipBox,
+    ExtraClipPlane,
     Mesh,
     BatchedMesh,
 } from './types.js';
 import { VisualEnhancementResolver, livePostEffects } from './visual-enhancement.js';
 import { packClipBox } from './clip-box.js';
+import { resolveSectionPlaneFrames, type SectionFrameInput, type SectionPlaneFrame } from './section-plane-frames.js';
 import {
     MESH_FLAGS_BYTE_OFFSET,
     MESH_FLAG_RTE_DRAWABLE,
@@ -166,6 +167,7 @@ import {
     MESH_UNIFORM_OFFSET,
     packRteCameraOrigin,
     packRteFragmentSpace,
+    packSectionPlaneLanes,
 } from './mesh-rte-uniforms.js';
 import { packMeshMaterial } from './mesh-material.js';
 import type { CutPolygon2D, DrawingLine2D, LineOverlayChannel } from './section-2d-overlay.js';
@@ -207,13 +209,16 @@ import {
     appendPointCloudChunk as appendPointCloudChunkImpl,
     beginPointCloudStream as beginPointCloudStreamImpl,
     endPointCloudStream as endPointCloudStreamImpl,
-    removePointCloudAsset as removePointCloudAssetImpl,
+    removePointCloudAsset as removePointCloudAssetImpl, removePointCloudChunk as removePointCloudChunkImpl,
     type PointCloudStreamHost,
 } from './pointcloud/point-cloud-stream-lifecycle.js';
 import type { PointCloudAsset } from '@ifc-lite/geometry';
-import { DeviationComputer, type DeviationComputeOptions, type DeviationComputeResult } from './deviation/deviation-computer.js';
+import { DeviationComputer, type DeviationComputeContext, type DeviationComputeOptions, type DeviationComputeResult } from './deviation/deviation-computer.js';
 export type { DeviationAssetStats } from './deviation/deviation-readback.js';
 import type { DeviationAssetStats } from './deviation/deviation-readback.js';
+import type { DeviationDistances } from './deviation/deviation-statistics.js';
+export { computeDeviationStatistics, computeDeviationStatisticsAsync, countWithinToleranceAsync, deviationHistogramAsync, summarizeDeviationAssetsAsync } from './deviation/deviation-statistics.js';
+export type { DeviationAssetRange, DeviationAssetSummary, DeviationAsyncOptions, DeviationDistances, DeviationHistogram, DeviationHistogramRange, DeviationStatistics, DeviationStatisticsOptions, DeviationToleranceShare } from './deviation/deviation-statistics.js';
 import { runGuardedGpuUpload, isDeviceLossThrow, type GpuUploadOutcome } from './gpu-upload-guard.js';
 import { recoverRendererDevice, rendererDeviceLostError, type DeviceRecoveryOmission, type DeviceRecoveryResult, type RendererRecoveryHost } from './device-recovery.js';
 
@@ -271,6 +276,7 @@ export class Renderer {
     private readonly hoverMeshes = new HoverMeshCache();
     /** Device px per CSS px in the drawing buffer; CSS-px sizes scale by it (#5383). */
     private pixelRatio = 1;
+    private maxPixelRatio = MAX_DRAWING_BUFFER_PIXEL_RATIO;
     private readonly interactionEffects = new InteractionEffectsGovernor();
     // Procedural sky background — created lazily on the first frame that
     // enables it (most sessions never do).
@@ -527,6 +533,9 @@ export class Renderer {
     // every render; read by pick()/pickRect(). null = nothing clipped that frame.
     private _activePickSection: { normal: [number, number, number]; distance: number; flipped: boolean } | null = null;
     private _activePickClipBox: ClipBox | null = null;
+    /** Snapshot of the extra planes the last frame clipped against (#7545), mirrored by the pickers. */
+    private _activePickExtraPlanes: ExtraClipPlane[] | null = null;
+    private _sectionFrameInput: SectionFrameInput | null = null; // what the last frame resolved the section planes from
 
     constructor(canvas: HTMLCanvasElement) {
         this.canvas = canvas;
@@ -630,7 +639,7 @@ export class Renderer {
         // are clamped to the GPU's max 2D texture dimension so the initial
         // pipeline allocations can't overflow on tall/wide layouts.
         const maxDim = this.device.getMaxTextureDimension();
-        const measured = measureDrawingBuffer(this.canvas, maxDim);
+        const measured = measureDrawingBuffer(this.canvas, maxDim, this.maxPixelRatio);
         this.pixelRatio = measured?.pixelRatio ?? 1;
         const width = Math.max(1, Math.min(measured?.width ?? this.canvas.width, maxDim));
         const height = Math.max(1, Math.min(measured?.height ?? this.canvas.height, maxDim));
@@ -848,14 +857,14 @@ export class Renderer {
         if (this.deviceLost) { if (options.fromDevicePromise) this.deviceLossSequence++; return; }
         this.deviceLossSequence++;
         this.deviceLost = true; cancelRendererColorFrame(this);
+        releaseRendererGpuTiming(this);
         this.recovery.lostReferenceImages = this.referenceImages.hasImages();
         this.referenceImages.destroy();
         this.deviceLostGeneration = this.initGeneration;
         this.deviceLostInfo = info;
         console.warn('[Renderer] GPU device lost — halting rendering until re-init:', info.message);
-        // Readiness describes the GPU objects, and every one of them just died:
-        // `isReady()` reports it from here on, and anyone parked in
-        // `whenReady()` is failed rather than left to be resolved by the init
+        // Readiness describes dead GPU objects: `isReady()` reports the loss
+        // and `whenReady()` waiters fail rather than awaiting the init
         // this loss may have landed in the middle of. Done BEFORE the listeners
         // run, so a listener that recovers by calling `init()` synchronously
         // finds the waiters already settled and re-arms the wait for the next
@@ -1040,11 +1049,14 @@ export class Renderer {
         return beginPointCloudStreamImpl(this as unknown as PointCloudStreamHost, meta);
     }
 
-    appendPointCloudChunk(
-        handle: PointCloudAssetHandle,
-        chunk: import('./pointcloud/point-cloud-node.js').PointCloudChunkInput,
-    ): void {
-        appendPointCloudChunkImpl(this as unknown as PointCloudStreamHost, handle, chunk);
+    /** `key` makes the chunk removable on its own via `removePointCloudChunk` (one COPC node, #6869). */
+    appendPointCloudChunk(handle: PointCloudAssetHandle, chunk: import('./pointcloud/point-cloud-node.js').PointCloudChunkInput, key?: string): void {
+        appendPointCloudChunkImpl(this as unknown as PointCloudStreamHost, handle, chunk, key);
+    }
+
+    /** Free the chunks appended under `key`; returns the points removed (0 for a stale handle). */
+    removePointCloudChunk(handle: PointCloudAssetHandle, key: string): number {
+        return removePointCloudChunkImpl(this as unknown as PointCloudStreamHost, handle, key);
     }
 
     endPointCloudStream(handle: PointCloudAssetHandle): void {
@@ -1056,17 +1068,13 @@ export class Renderer {
     }
 
     /**
-     * Reassign a streamed point-cloud's expressId after upload. Use
-     * this when the federation registry assigns a new model offset and
-     * the renderer needs to emit the post-offset globalId in picking
-     * outputs. The change takes effect on the next render — no GPU
-     * buffer rewrite needed.
+     * Bind a streamed point cloud to its federation identity after upload:
+     * the post-offset globalId picking and deviation readback report, and,
+     * when given, the model index they attribute the asset to (#6887). Takes
+     * effect on the next render — no GPU buffer rewrite needed.
      */
-    relabelPointCloudAsset(
-        handle: import('./pointcloud/point-cloud-renderer.js').PointCloudAssetHandle,
-        newExpressId: number,
-    ): void {
-        this.pointCloudRenderer?.relabelAsset(handle, newExpressId);
+    relabelPointCloudAsset(handle: import('./pointcloud/point-cloud-renderer.js').PointCloudAssetHandle, newExpressId: number, modelIndex?: number): void {
+        this.pointCloudRenderer?.relabelAsset(handle, newExpressId, modelIndex);
         this.requestRender();
     }
 
@@ -1126,6 +1134,10 @@ export class Renderer {
     getPointCloudTransform(handle: { id: number }): Float32Array | undefined {
         return this.pointCloudRenderer?.getAssetTransform(handle);
     }
+    /** Exact float64 placement copy for CPU math; the f32 transform rounds map-grid origins (#6894). */
+    getPointCloudPlacement(handle: { id: number }): Float64Array | undefined {
+        return this.pointCloudRenderer?.getAssetPlacement(handle);
+    }
 
     /**
      * Set/clear a streamed cloud's column-major model matrix (16 floats) for
@@ -1148,23 +1160,20 @@ export class Renderer {
      * `deviation/deviation-computer.ts` for the full contract.
      */
     async computeDeviations(opts: DeviationComputeOptions = {}): Promise<DeviationComputeResult> {
-        return this.deviationComputer.compute(opts, {
-            device: this.device,
-            scene: this.scene,
-            pointCloudRenderer: this.pointCloudRenderer,
-            requestRender: () => this.requestRender(),
-        });
+        return this.deviationComputer.compute(opts, this.deviationContext());
     }
 
     /** Read per-scan-asset signed-distance statistics after a completed run. */
     async readDeviationAssetStats(): Promise<DeviationAssetStats[]> {
-        return this.deviationComputer.readAssetStats({
-            device: this.device,
-            scene: this.scene,
-            pointCloudRenderer: this.pointCloudRenderer,
-            requestRender: () => this.requestRender(),
-        });
+        return this.deviationComputer.readAssetStats(this.deviationContext());
     }
+
+    /** Read every computed point's signed distance (4 B/point) for summary statistics (#6872). */
+    async readDeviationDistances(): Promise<DeviationDistances> {
+        return this.deviationComputer.readDistances(this.deviationContext());
+    }
+
+    private readonly deviationContext = (): DeviationComputeContext => ({ device: this.device, scene: this.scene, pointCloudRenderer: this.pointCloudRenderer, requestRender: () => this.requestRender() });
 
     /**
      * Toggle Eye-Dome Lighting and tune its strength.
@@ -1370,7 +1379,7 @@ export class Renderer {
 
     /** The source batch's frame for an individual copy of `meshData` (see individual-mesh-upload.ts). */
     private individualMeshFrame(meshData: MeshData): IndividualMeshFrame {
-        return { sharedOrigin: this.scene.getSharedFrameOrigin(meshData.modelIndex, meshData), quantized: this.scene.isMeshQuantized(meshData) };
+        return this.scene.getIndividualMeshFrame(meshData);
     }
 
     /**
@@ -1469,9 +1478,6 @@ export class Renderer {
         });
     }
 
-    /**
-     * Render frame
-     */
     /** Get diagnostic info for mobile debugging */
     getDiagnostics(): {
         calls: number; skips: number; errors: number; lastError: string;
@@ -1498,15 +1504,15 @@ export class Renderer {
         };
     }
 
+    setGpuFrameTiming(enabled: boolean): void { configureRendererGpuTiming(this, enabled); }
+    getGpuFrameTiming() { return readRendererGpuTiming(this); }
     /**
      * Statistics of the last COMPLETED render() call (draw calls issued,
      * batches drawn / frustum-culled / contribution-culled), or null before
      * the first frame. Pair with `getScene().getResidentGpuBytes()` for the
      * load-complete telemetry snapshot (issue #1682 observability).
      */
-    getFrameStats(): FrameStats | null {
-        return this._lastFrameStats;
-    }
+    getFrameStats(): FrameStats | null { return this._lastFrameStats; }
 
     /**
      * Vendor/architecture identity of the GPU adapter, snapshotted during
@@ -1532,8 +1538,11 @@ export class Renderer {
         return ok;
     }
 
+    /** Draw a frame through the shared submission path, preserving the void API. */
+    render(options: RenderOptions = {}): void { this.renderWithResult(options); }
+
     /**
-     * Draw one frame.
+     * Draw one frame; true only when it submits without a contained synchronous failure (#6709).
      *
      * Never throws, so callers never need to guard this call to keep their
      * animation loop alive.
@@ -1552,31 +1561,28 @@ export class Renderer {
      *    carries on. Once enough such frames have degraded without recovering,
      *    `onPersistentRenderDegradation` fires once.
      *
-     * SCOPE: `renderFrame()` has two try/catch regions — this outer one (canvas
-     * resize, context setup, evicted-batch restore) and an inner one opened
-     * after the swap-chain texture is acquired, covering encoder work through
-     * `submit`. Until #2417 only the outer one discriminated, so a device that
-     * died after `getCurrentTexture()` succeeded degraded quietly forever with
-     * no latch and no toast. Both now run the same policy; the encode catch
-     * additionally balances the frame's validation error scope before doing so.
+     * Frame setup and encoding through `submit` share `containFrameThrow`
+     * (#2417); the encode catch also balances the validation error scope.
+     * Submission is synchronous, distinct from GPU completion/validation.
      */
-    render(options: RenderOptions = {}): void {
+    renderWithResult(options: RenderOptions = {}): boolean {
         this._renderCallCount++;
         // A lost device leaves every pipeline/buffer dead; rendering would only
         // emit a stream of validation errors. Stay quiet until re-init.
         if (this.deviceLost) {
             this._renderSkipCount++; cancelRendererColorFrame(this);
-            return;
+            return false;
         }
         try {
             this.frameContainedThrow = false;
-            this.renderFrame(options);
+            const submitted = this.renderFrame(options);
             // Only a frame that actually got through resets the run. A frame
             // the ENCODE catch contained returns here normally (that catch is
             // inside renderFrame), so "did not throw" is not the same question
             // as "did not fail" — see `frameContainedThrow`.
             if (!this.frameContainedThrow) this.consecutiveDegradedFrames = 0;
             retryRendererColorFrame(this, () => this.requestRender());
+            return submitted;
         } catch (error) {
             // Safari (26.5) reports device loss SYNCHRONOUSLY: a call against a
             // dead device throws `InvalidStateError` instead of — or long
@@ -1591,24 +1597,25 @@ export class Renderer {
             // host down with us".
             this._renderSkipCount++;
             this.containFrameThrow(error, 'frame'); cancelRendererColorFrame(this);
+            return false;
         }
     }
 
     /**
-     * The frame body. Throws on a synchronously-dead GPU device; `render()`
-     * owns the containment. Private for that reason — call `render()`.
+     * The frame body. Throws on a synchronously-dead GPU device;
+     * `renderWithResult()` owns containment for both public render methods.
      */
-    private renderFrame(options: RenderOptions): void {
+    private renderFrame(options: RenderOptions): boolean {
         if (!this.device.isInitialized() || !this.pipeline) {
             this._renderSkipCount++;
-            return;
+            return false;
         }
 
         // Drawing buffer = the element's device-pixel size (capped ratio, clamped
         // to the GPU's max texture dimension); see computeDrawingBufferSize (#5383).
-        const measured = measureDrawingBuffer(this.canvas, this.device.getMaxTextureDimension());
+        const measured = measureDrawingBuffer(this.canvas, this.device.getMaxTextureDimension(), this.maxPixelRatio, options.maxPixelRatio);
         // Skip rendering while the canvas is collapsed or too small.
-        if (!measured || measured.height < 10) { this._renderSkipCount++; return; }
+        if (!measured || measured.height < 10) { this._renderSkipCount++; return false; }
         const { width, height } = measured;
         this.pixelRatio = measured.pixelRatio;
 
@@ -1625,12 +1632,12 @@ export class Renderer {
         }
 
         // Skip rendering if canvas is invalid
-        if (this.canvas.width === 0 || this.canvas.height === 0) { this._renderSkipCount++; return; }
+        if (this.canvas.width === 0 || this.canvas.height === 0) { this._renderSkipCount++; return false; }
 
         // Ensure context is valid before rendering (handles HMR, focus changes, etc.)
         if (!this.device.ensureContext()) {
             this._renderSkipCount++;
-            return; // Skip this frame, context will be ready next frame
+            return false; // Skip this frame, context will be ready next frame
         }
 
         const device = this.device.getDevice();
@@ -1841,7 +1848,7 @@ export class Renderer {
                 errorScopePushed = false;
                 this.drainErrorScope(device);
             }
-            return; // Skip this frame, context will be reconfigured next frame
+            return false; // Skip this frame, context will be reconfigured next frame
         }
         let colorCapture: RendererColorFrameCapture | null = null;
         let colorReadback: ReturnType<typeof encodeRendererColorFrameCapture> | null = null;
@@ -1901,6 +1908,9 @@ export class Renderer {
                 spendLogLatch: () => { this._loggedSectionBounds = true; },
             });
             const sectionPlaneData = sectionFrame.sectionPlaneData;
+            const extraClipPlanes = sectionFrame.extraPlanes;
+            const { bounds: frameBounds } = sectionFrame;
+            this._sectionFrameInput = frameBounds && { primary: options.sectionPlane ?? null, extras: options.extraSectionPlanes ?? [], bounds: frameBounds, buildingRotation: options.buildingRotation };
             if (sectionFrame.bounds) {
                 // Store bounds for section plane visual and camera near/far.
                 // Two wrappers over the same min/max, exactly as before the
@@ -1924,6 +1934,7 @@ export class Renderer {
                     flipped: !!options.sectionPlane?.flipped,
                 }
                 : null;
+            this._activePickExtraPlanes = extraClipPlanes.length > 0 ? extraClipPlanes.map((p) => ({ normal: [...p.normal] as [number, number, number], distance: p.distance, flipped: p.flipped })) : null;
             this._activePickClipBox = options.clipBox?.enabled
                 ? {
                     enabled: true,
@@ -1962,14 +1973,7 @@ export class Renderer {
                     packMeshMaterial(meshBuf, mesh.color[3], mesh.finish ?? mesh.material);
 
                     // Section plane data (offset 40-43)
-                    if (sectionPlaneData) {
-                        meshBuf[40] = sectionPlaneData.normal[0];
-                        meshBuf[41] = sectionPlaneData.normal[1];
-                        meshBuf[42] = sectionPlaneData.normal[2];
-                        meshBuf[43] = sectionPlaneData.distance;
-                    } else {
-                        meshBuf[40] = 0; meshBuf[41] = 0; meshBuf[42] = 0; meshBuf[43] = 0;
-                    }
+                    packSectionPlaneLanes(sectionPlaneData, meshBuf);
 
                     // Clip box (offset 48-55: min.xyz + pad, max.xyz + pad) → enable bit
                     const clipBit = packClipBox(options.clipBox, meshBuf, 48);
@@ -1986,7 +1990,7 @@ export class Renderer {
 
                     // Individual meshes retain their origin and share the RTE
                     // fragment contract with colour batches.
-                    packRteFragmentSpace(relativeToEyeFrame, sectionPlaneData, options.clipBox, meshBuf);
+                    packRteFragmentSpace(relativeToEyeFrame, sectionPlaneData, options.clipBox, meshBuf, extraClipPlanes);
                     const meshOrigin = mesh.rteOrigin
                         ?? [mesh.transform.m[12], mesh.transform.m[13], mesh.transform.m[14]] as [number, number, number];
                     if (!relativeToEyeFrame.tryPackDrawableOrigin(meshOrigin, meshBuf, MESH_UNIFORM_OFFSET.drawableDelta)) {
@@ -2001,6 +2005,7 @@ export class Renderer {
 
             // Now record draw commands
             const encoder = device.createCommandEncoder();
+            beginRendererGpuTiming(this, device, encoder);
 
             // Sun shadow-map pass (#2670, Phase 2). Off unless the caller opts
             // in; when off the hot path pays only this check and (once) an
@@ -2104,6 +2109,7 @@ export class Renderer {
                         box: options.clipBox?.enabled
                             ? { min: options.clipBox.min, max: options.clipBox.max }
                             : null,
+                        extraPlanes: extraClipPlanes,
                     }, { cameraWorld: shadowEye });
 
                     // Shadow uniform: light matrix + sampling params. The kernel
@@ -2174,6 +2180,7 @@ export class Renderer {
             });
 
             const pass = encoder.beginRenderPass({
+                timestampWrites: renderPassTimestampWrites(encoder, 'main'),
                 colorAttachments,
                 depthStencilAttachment: {
                     view: this.pipeline.getDepthTextureView(),
@@ -2475,14 +2482,7 @@ export class Renderer {
                 // Colour + material row (tpl[32..39]) are patched per draw; the
                 // instanced passes keep this opaque default.
                 packMeshMaterial(tpl);
-                if (sectionPlaneData) {
-                    tpl[40] = sectionPlaneData.normal[0];
-                    tpl[41] = sectionPlaneData.normal[1];
-                    tpl[42] = sectionPlaneData.normal[2];
-                    tpl[43] = sectionPlaneData.distance;
-                } else {
-                    tpl[40] = 0; tpl[41] = 0; tpl[42] = 0; tpl[43] = 0;
-                }
+                packSectionPlaneLanes(sectionPlaneData, tpl);
                 // Clip box (offset 48-55: min.xyz + pad, max.xyz + pad) → enable bit
                 const tplClipBit = packClipBox(options.clipBox, tpl, 48);
                 // flags layout (main shader):
@@ -2503,7 +2503,7 @@ export class Renderer {
                 // camera-relative frame. Their fragment clip inputs must use
                 // that same frame; mixing a local vertex with a 5,000 km f32
                 // world plane loses centimetre cuts before the comparison.
-                packRteFragmentSpace(relativeToEyeFrame, sectionPlaneData, options.clipBox, tpl);
+                packRteFragmentSpace(relativeToEyeFrame, sectionPlaneData, options.clipBox, tpl, extraClipPlanes);
 
                 // Helper function to render a batch — patches color into the shared template.
                 // `paint` = a depth-writing opaque draw: colour overrides shade it from the
@@ -2573,6 +2573,9 @@ export class Renderer {
                     batch: typeof allBatchedMeshes[0],
                     kind: 'opaque' | 'transparent',
                 ): GPURenderPipeline => {
+                    const ghost = kind === 'transparent' && xray.isGhostBatch(batch)
+                        ? this.pipeline!.getGhostPipeline(!!batch.quantized, () => this.requestRender()) : null;
+                    if (ghost) return ghost;
                     const base = kind === 'opaque' ? this.pipeline!.getPipeline() : this.pipeline!.getTransparentPipeline();
                     if (!batch.quantized) return base;
                     return this.pipeline!.getQuantizedPipelineVariant(kind) ?? base;
@@ -2896,14 +2899,7 @@ export class Renderer {
                         tpl[32] = mesh.color[0]; tpl[33] = mesh.color[1];
                         tpl[34] = mesh.color[2]; tpl[35] = alphaForMesh(mesh.expressId, mesh.color[3]);
                         packMeshMaterial(tpl, mesh.color[3], mesh.finish ?? mesh.material);
-                        if (sectionPlaneData) {
-                            tpl[40] = sectionPlaneData.normal[0];
-                            tpl[41] = sectionPlaneData.normal[1];
-                            tpl[42] = sectionPlaneData.normal[2];
-                            tpl[43] = sectionPlaneData.distance;
-                        } else {
-                            tpl[40] = 0; tpl[41] = 0; tpl[42] = 0; tpl[43] = 0;
-                        }
+                        packSectionPlaneLanes(sectionPlaneData, tpl);
                         tplFlags[0] = 0;
                         tplFlags[1] =
                             (sectionPlaneData?.enabled ? 1 : 0) |
@@ -2911,7 +2907,7 @@ export class Renderer {
                             tplClipBit;
                         tplFlags[2] = 0;
                         tplFlags[3] = 0;
-                        packRteFragmentSpace(relativeToEyeFrame, sectionPlaneData, options.clipBox, tpl);
+                        packRteFragmentSpace(relativeToEyeFrame, sectionPlaneData, options.clipBox, tpl, extraClipPlanes);
                         const transparentOrigin = mesh.rteOrigin ?? [mesh.transform.m[12], mesh.transform.m[13], mesh.transform.m[14]] as [number, number, number];
                         if (!relativeToEyeFrame.tryPackDrawableOrigin(transparentOrigin, tpl, MESH_UNIFORM_OFFSET.drawableDelta)) continue;
                         tplFlags[0] |= MESH_FLAG_RTE_DRAWABLE;
@@ -2956,14 +2952,7 @@ export class Renderer {
                     tpl[32] = mesh.color[0]; tpl[33] = mesh.color[1];
                     tpl[34] = mesh.color[2]; tpl[35] = mesh.color[3];
                     packMeshMaterial(tpl, mesh.color[3], mesh.finish ?? mesh.material);
-                    if (sectionPlaneData) {
-                        tpl[40] = sectionPlaneData.normal[0];
-                        tpl[41] = sectionPlaneData.normal[1];
-                        tpl[42] = sectionPlaneData.normal[2];
-                        tpl[43] = sectionPlaneData.distance;
-                    } else {
-                        tpl[40] = 0; tpl[41] = 0; tpl[42] = 0; tpl[43] = 0;
-                    }
+                    packSectionPlaneLanes(sectionPlaneData, tpl);
                     tplFlags[0] = 1; // isSelected
                     tplFlags[1] =
                         (sectionPlaneData?.enabled ? 1 : 0) |
@@ -2971,7 +2960,7 @@ export class Renderer {
                         tplClipBit;
                     tplFlags[2] = 0;
                     tplFlags[3] = 0;
-                    packRteFragmentSpace(relativeToEyeFrame, sectionPlaneData, options.clipBox, tpl);
+                    packRteFragmentSpace(relativeToEyeFrame, sectionPlaneData, options.clipBox, tpl, extraClipPlanes);
                     const selectedOrigin = mesh.rteOrigin ?? [mesh.transform.m[12], mesh.transform.m[13], mesh.transform.m[14]] as [number, number, number];
                     if (!relativeToEyeFrame.tryPackDrawableOrigin(selectedOrigin, tpl, MESH_UNIFORM_OFFSET.drawableDelta)) continue;
                     tplFlags[0] |= MESH_FLAG_RTE_DRAWABLE;
@@ -3031,6 +3020,7 @@ export class Renderer {
                         ? { ...sectionPlaneData, flipped: options.sectionPlane?.flipped === true }
                         : null,
                     clipBox: options.clipBox,
+                    extraPlanes: extraClipPlanes,
                     viewport: { width: this.canvas.width / this.pixelRatio, height: this.canvas.height / this.pixelRatio },
                 });
             }
@@ -3054,6 +3044,8 @@ export class Renderer {
                 relativeToEyeFrame,
                 rteViewProj: relativeToEyeFrame.getViewProjection().m,
                 rteCamera: relativeToEyeFrame.getCameraWorld(),
+                extraPlanes: extraClipPlanes,
+                primaryPlane: sectionPlaneData && options.sectionPlane?.enabled ? { ...sectionPlaneData, flipped: options.sectionPlane.flipped === true } : null,
             });
 
             pass.end();
@@ -3070,12 +3062,11 @@ export class Renderer {
                 : (this.hoverMeshes.release(), []);
             const selectionOutline = buildSelectionOutlineFrame({
                 uniformBufferSize: this.pipeline.getUniformBufferSize(), viewProj, relativeToEyeFrame,
-                section: sectionPlaneData, sectionFlipped: options.sectionPlane?.flipped, clipBox: options.clipBox,
+                section: sectionPlaneData, sectionFlipped: options.sectionPlane?.flipped, clipBox: options.clipBox, extraPlanes: extraClipPlanes,
                 selectedMeshes: selectedMeshesForMask, hoverPieces, hoveredId: hoverId, selectedModelIndex: hoverModel,
                 instancedTemplates: this.scene.getInstancedTemplates(),
                 instancedHovered: hoverId != null ? this.scene.getInstancedTemplatesOf(hoverId, hoverModel) : [],
             });
-
             // Created lazily like the sky/shadow passes; each pass inside is too.
             this.postPasses ??= new PostPassChain(this.device, this.pipeline.getSampleCount(), this.pipeline.getBindGroupLayout());
             this.postPasses.encode({
@@ -3085,6 +3076,7 @@ export class Renderer {
                 height: this.canvas.height,
                 // Depth-only: depth24plus-stencil8 cannot be sampled as texture_depth_* with aspect 'all'.
                 depthView: this.pipeline.getDepthOnlyTextureView(),
+                maskDepthView: this.pipeline.getDepthTextureView(),
                 objectIdView,
                 projection: this.camera.getProjMatrix(),
                 enhancement: visualEnhancement,
@@ -3096,7 +3088,7 @@ export class Renderer {
             });
 
             colorReadback = colorCapture && encodeRendererColorFrameCapture(device, encoder, colorCapture);
-            device.queue.submit([encoder.finish()]);
+            submitRendererGpuTiming(this, device, encoder);
             if (colorReadback && colorCapture) {
                 settleRendererColorFrameCapture(this, colorCapture, colorReadback);
                 colorCapture = null; colorReadback = null;
@@ -3124,7 +3116,9 @@ export class Renderer {
                 errorScopePushed = false;
                 this.drainErrorScope(device);
             }
+            return true;
         } catch (error) {
+            releaseRendererGpuTiming(this);
             discardRendererColorFrameReadback(colorReadback);
             // Balance the validation scope if we threw before popping it above —
             // an unpopped scope would capture every later frame's errors silently.
@@ -3160,7 +3154,7 @@ export class Renderer {
             // host memory, and that throws a `RangeError` — which is exactly why
             // the discriminator keys on the TYPE and not on "a frame threw".
             this.containFrameThrow(error, 'encode');
-            cancelRendererColorFrame(this);
+            cancelRendererColorFrame(this); return false;
         }
     }
 
@@ -3206,7 +3200,7 @@ export class Renderer {
      * same fragments and clipped-away geometry can't be selected.
      */
     private activePickClip(): PickClipState {
-        return { sectionPlane: this._activePickSection, clipBox: this._activePickClipBox };
+        return { sectionPlane: this._activePickSection, extraPlanes: this._activePickExtraPlanes, clipBox: this._activePickClipBox };
     }
 
     /**
@@ -3233,7 +3227,7 @@ export class Renderer {
 
     /** Whether the last rendered frame clipped surfaces (section, terrain or box). */
     hasActiveClipping(): boolean {
-        return this._activePickSection !== null || this._activePickClipBox !== null;
+        return this._activePickSection !== null || this._activePickExtraPlanes !== null || this._activePickClipBox !== null;
     }
 
     /** Exact visible-surface raycast in CSS canvas coordinates. */
@@ -3321,6 +3315,9 @@ export class Renderer {
         resizeRendererViewport(this.canvas, this.camera, width, height);
     }
 
+    /** Cap the drawing buffer's device-pixel ratio, trading sharpness for fill on HiDPI screens; see computeDrawingBufferSize. */
+    setMaxPixelRatio(ratio: number): void { this.maxPixelRatio = ratio; this.requestRender(); }
+
     /** Stage one new owner; borrowed mesh buffers must remain immutable until disposal. */
     prepareAuthoredOwner(parts: readonly MeshData[]) {
         if (this.deviceLost || !this.device.isInitialized() || !this.pipeline) throw this.deviceLost ? rendererDeviceLostError() : new Error('Renderer is not initialized.');
@@ -3375,15 +3372,25 @@ export class Renderer {
             tangent:   [number, number, number];
             bitangent: [number, number, number];
         },
+        planeId?: string,
     ): void {
-        this.overlays.uploadSection2DOverlay(polygons, lines, axis, position, sectionRange, flipped, customPlane);
+        this.overlays.uploadSection2DOverlay(polygons, lines, axis, position, sectionRange, flipped, customPlane, planeId);
     }
 
     /**
-     * Clear the 2D section overlay
+     * Clear the 2D section overlay: the primary plane's cap, or with `planeId`
+     * the cap of that cutting plane beyond the first (#7545).
      */
-    clearSection2DOverlay(): void {
-        this.overlays.clearSection2DOverlay();
+    clearSection2DOverlay(planeId?: string): void {
+        this.overlays.clearSection2DOverlay(planeId);
+    }
+
+    /** Every section plane's world frame (#7545), for the UI's tags and handle: the last frame's bounds and rotation, and `planes` (the caller's newest) when given. */
+    getSectionPlaneFrames(planes?: Pick<SectionFrameInput, 'primary' | 'extras'>): SectionPlaneFrame[] { const i = this._sectionFrameInput; return i ? resolveSectionPlaneFrames(planes ? { ...i, ...planes } : i) : []; }
+
+    /** Clear the caps of every cutting plane beyond the first whose id is not in `keep` (#7545). */
+    clearSection2DExtraOverlays(keep: readonly string[] = []): void {
+        this.overlays.clearSection2DExtraOverlays(keep);
     }
 
     /**
@@ -3633,6 +3640,7 @@ export class Renderer {
             this._loggedSectionBounds = false;
         }
 
+        releaseRendererGpuTiming(this);
         // Render pipelines (textures + uniform buffers)
         this.pipeline?.destroy();
         this.pipeline = null;

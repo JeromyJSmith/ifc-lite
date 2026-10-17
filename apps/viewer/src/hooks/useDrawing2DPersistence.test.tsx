@@ -37,16 +37,18 @@
  */
 
 import '@/test/setup-dom.js';
-import { afterEach, beforeEach, describe, it } from 'node:test';
+import { after, afterEach, before, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { useViewerStore } from '@/store';
 import type { FederatedModel } from '@/store';
-import { useDrawing2DPersistence, notifyDrawing2DSectionConfig } from './useDrawing2DPersistence.js';
+import { useDrawing2DPersistence, notifyDrawing2DSectionConfig, hasPersistedMarkupEntryFor } from './useDrawing2DPersistence.js';
 import { loadDrawing2DEntry, clearAllDrawing2DEntries } from '@/store/slices/drawing2DSlice.persistence.js';
-import { computeFullSourceHashFromBlob } from '@/utils/sourceContentHash.js';
+import { placementSourceIdentity } from '@/lib/model-placement/source-identity';
 import { computeSourceFingerprint } from '@ifc-lite/cache';
+import { waitFor } from '@/test/render.js';
+import { settle, trackDigests } from '@/test/settle.js';
 import type { Measure2DResult } from '@/store/slices/drawing2DSlice.js';
 import type { DrawingSheet, SectionConfig } from '@ifc-lite/drawing-2d';
 
@@ -124,32 +126,27 @@ async function mount(): Promise<void> {
   });
 }
 
-/** Flush the microtask queue so an in-flight fingerprint promise settles. */
+/**
+ * Let the active model's restore settle. These stub records carry no
+ * placement identity, so the hook derives one from the file's bytes (#7035):
+ * a slice read and digests (SHA-256 over every 1 MiB chunk for the 4-5 MB
+ * buffers below), which no fixed number of ticks or milliseconds bounds on a
+ * loaded runner (an earlier fixed-tick version failed on CI: a save fired
+ * before `hashCache` had resolved). Wait for the decision itself, then let
+ * what it scheduled run out: `settle` counts only event-loop turns with no
+ * digest in flight, so neither step has a wall-clock budget.
+ */
 async function flush(): Promise<void> {
-  await act(async () => {
-    await new Promise((r) => setTimeout(r, 0));
-    await new Promise((r) => setTimeout(r, 0));
-  });
+  await waitFor(() => {
+    const activeModelId = useViewerStore.getState().activeModelId;
+    return !activeModelId || hasPersistedMarkupEntryFor(activeModelId) !== 'pending';
+  }, 'the active model\'s restore decision');
+  await act(() => settle('the restore\'s follow-up work'));
 }
 
-/**
- * Like {@link flush}, but for the two large-buffer (4-5MB) tests below that
- * hash real content via `computeFullSourceHashFromBlob` (SHA-256 over the
- * whole buffer, plus a `Blob.arrayBuffer()` read) rather than the ~256-byte
- * fixtures every other test in this file uses. `flush`'s fixed two ticks are
- * plenty for that near-instant case but proved NOT enough for a real
- * multi-MB hash under CI's slower/noisier CPU (observed CI failure:
- * `loadDrawing2DEntry` returned `null` right after a save that fired before
- * `hashCache` had resolved) — this ticks far more generously (bounded, not
- * unbounded) rather than weakening any assertion to tolerate that.
- */
-async function flushDeep(): Promise<void> {
-  await act(async () => {
-    for (let i = 0; i < 40; i++) {
-      await new Promise((r) => setTimeout(r, 5));
-    }
-  });
-}
+let restoreDigest: () => void = () => {};
+before(() => { restoreDigest = trackDigests(); });
+after(() => restoreDigest());
 
 beforeEach(() => {
   clearAllDrawing2DEntries();
@@ -170,7 +167,7 @@ afterEach(async () => {
 describe('reload (session-reset) — MUTATION TARGET: Bug 1', () => {
   it('does not overwrite the outgoing model\'s saved entry with the post-reset wipe', async () => {
     const fileA = fileWithBytes(1, 'a.ifc');
-    const hashA = (await computeFullSourceHashFromBlob(fileA))!;
+    const hashA = (await placementSourceIdentity(fileA))!;
     const modelA = stubModel('model-a', fileA);
 
     useViewerStore.setState({ models: new Map([['model-a', modelA]]) });
@@ -210,8 +207,8 @@ describe('active-model switch — MUTATION TARGET: Bug 2', () => {
   it('does not leak the outgoing model\'s markup into the newly-active model\'s saved entry', async () => {
     const fileA = fileWithBytes(1, 'a.ifc');
     const fileB = fileWithBytes(99, 'b.ifc');
-    const hashA = (await computeFullSourceHashFromBlob(fileA))!;
-    const hashB = (await computeFullSourceHashFromBlob(fileB))!;
+    const hashA = (await placementSourceIdentity(fileA))!;
+    const hashB = (await placementSourceIdentity(fileB))!;
     const modelA = stubModel('model-a', fileA);
     const modelB = stubModel('model-b', fileB);
 
@@ -263,9 +260,10 @@ describe('failed hash after close — MUTATION TARGET: release detached sessions
     let rejectRead: ((reason?: unknown) => void) | undefined;
     const failedRead = new Promise<ArrayBuffer>((_resolve, reject) => { rejectRead = reject; });
     const source = fileWithBytes(31, 'failed-hash.ifc');
-    Object.defineProperty(source, 'arrayBuffer', {
+    // The placement identity reads the file in slices (#7035).
+    Object.defineProperty(source, 'slice', {
       configurable: true,
-      value: () => failedRead,
+      value: () => ({ arrayBuffer: () => failedRead }),
     });
     const model = stubModel('failed-hash-model', source);
 
@@ -339,7 +337,7 @@ describe('A → B → A round trip — MUTATION TARGET: Bug 4', () => {
   it('does not overwrite A\'s saved entry with the B → A leg\'s accompanying clear', async () => {
     const fileA = fileWithBytes(1, 'a.ifc');
     const fileB = fileWithBytes(99, 'b.ifc');
-    const hashA = (await computeFullSourceHashFromBlob(fileA))!;
+    const hashA = (await placementSourceIdentity(fileA))!;
     const modelA = stubModel('model-a', fileA);
     const modelB = stubModel('model-b', fileB);
 
@@ -400,9 +398,9 @@ describe('A → B → A round trip — MUTATION TARGET: Bug 4', () => {
 // reused here). Before this fix, this module used THAT fingerprint as the
 // markup-persistence key, so two distinct 4MB models differing only inside
 // the gap would collide on `hashCache`/`localStorage` key and model B would
-// silently restore model A's saved measurements. The fix switches the key to
-// `computeFullSourceHashFromBlob` (true SHA-256 over the whole file), which
-// cannot share this blind spot. MUTATION TARGET: revert the hook's import
+// silently restore model A's saved measurements. The fix switched the key to
+// a hash of every byte of the file (a whole-file SHA-256 then, the placement
+// identity since #7035), which cannot share this blind spot. MUTATION TARGET: revert the hook's import
 // back to `computeSourceFingerprintFromBlob` and this test must fail.
 describe('fingerprint gap collision — MUTATION TARGET: sampled-key data leak', () => {
   it('two 4MB models that collide on the sampled fingerprint do NOT collide on the persistence key', async () => {
@@ -423,8 +421,8 @@ describe('fingerprint gap collision — MUTATION TARGET: sampled-key data leak',
 
     const fileA = new File([bytesA], 'a.ifc', { type: 'application/octet-stream' });
     const fileB = new File([bytesB], 'b.ifc', { type: 'application/octet-stream' });
-    const hashA = (await computeFullSourceHashFromBlob(fileA))!;
-    const hashB = (await computeFullSourceHashFromBlob(fileB))!;
+    const hashA = (await placementSourceIdentity(fileA))!;
+    const hashB = (await placementSourceIdentity(fileB))!;
     assert.notEqual(hashA, hashB, 'the full-content hash must distinguish the two buffers');
 
     // Distinct model ids from every other `describe` in this file: the
@@ -438,10 +436,9 @@ describe('fingerprint gap collision — MUTATION TARGET: sampled-key data leak',
     await mount();
 
     await act(async () => { useViewerStore.getState().setActiveModel('gap-model-a'); });
-    // flushDeep, not flush: this activation hashes a real 4MB buffer
-    // (computeFullSourceHashFromBlob), which can take longer than flush's
-    // fixed two ticks under a loaded CI runner.
-    await flushDeep();
+    // This activation hashes a real 4MB buffer, which can take far longer
+    // than a couple of ticks under a loaded CI runner: `flush` waits for it.
+    await flush();
     await act(async () => {
       useViewerStore.setState({ measure2DResults: [sampleMeasure('mA')] });
     });
@@ -456,12 +453,12 @@ describe('fingerprint gap collision — MUTATION TARGET: sampled-key data leak',
       entryA,
       `expected model A's save to be readable back under its full-content hash key (${hashA}); ` +
       'got nothing — either persistFor never resolved hashCache for this model in time, or the ' +
-      'persistence key is no longer computeFullSourceHashFromBlob',
+      'persistence key is no longer the placement identity',
     );
     assert.strictEqual(entryA.measure2DResults[0].id, 'mA');
 
     await act(async () => { useViewerStore.getState().setActiveModel('gap-model-b'); });
-    await flushDeep();
+    await flush();
 
     const stateForB = useViewerStore.getState();
     assert.deepStrictEqual(
@@ -510,7 +507,7 @@ describe('restoration-ordering race — MUTATION TARGET: cross-model sectionConf
   it('does not let a notify carrying a stale model\'s config overwrite the new model\'s saved sectionConfig', async () => {
     const fileB = fileWithBytes(55, 'race-b.ifc');
     const fileA = fileWithBytes(56, 'race-a.ifc');
-    const hashB = (await computeFullSourceHashFromBlob(fileB))!;
+    const hashB = (await placementSourceIdentity(fileB))!;
     const modelA = stubModel('race-model-a', fileA);
     const modelB = stubModel('race-model-b', fileB);
     const configB: SectionConfig = { ...STALE_CONFIG, plane: { axis: 'z', position: 5, flipped: false } };
@@ -523,7 +520,7 @@ describe('restoration-ordering race — MUTATION TARGET: cross-model sectionConf
     // a real saved sectionConfig on disk, and (leaving B below) an entry in
     // `liveMarkupCache` for its markup arrays.
     await act(async () => { useViewerStore.getState().setActiveModel('race-model-b'); });
-    await flushDeep();
+    await flush();
     await act(async () => { notifyDrawing2DSectionConfig('race-model-b', configB); });
     const entryAfterFirstSave = loadDrawing2DEntry(hashB, DEFAULTS);
     assert.ok(entryAfterFirstSave, `setup: expected an entry under model B's hash (${hashB}) after its first notify`);
@@ -532,7 +529,7 @@ describe('restoration-ordering race — MUTATION TARGET: cross-model sectionConf
     // Visit A — this is the "previous model" an in-flight generation is
     // still computing FOR when the user switches away from it.
     await act(async () => { useViewerStore.getState().setActiveModel('race-model-a'); });
-    await flushDeep();
+    await flush();
 
     // The A -> B leg: bare, not wrapped in `act`, so this hook's own restore
     // effect has not run yet even though `setActiveModel`'s synchronous
@@ -566,7 +563,7 @@ describe('restoration-ordering race — MUTATION TARGET: cross-model sectionConf
 
     // Let the restore effect settle and confirm the IN-MEMORY config used
     // for the next save is B's real one too, not the corrupted one.
-    await flushDeep();
+    await flush();
     await act(async () => { notifyDrawing2DSectionConfig('race-model-b', configB); });
     const entryAfterSettling = loadDrawing2DEntry(hashB, DEFAULTS);
     assert.ok(entryAfterSettling, `expected model B's entry under its hash (${hashB}) after the restore effect settled`);

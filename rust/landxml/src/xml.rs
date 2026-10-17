@@ -4,7 +4,7 @@
 
 use std::{collections::HashMap, str};
 
-use quick_xml::events::BytesStart;
+use quick_xml::events::{BytesRef, BytesStart};
 
 use crate::{LandXmlCancellation, LandXmlDiagnosticCode as Code, LandXmlError, LandXmlLimits};
 
@@ -81,7 +81,7 @@ pub(crate) fn attributes(
             "attribute value",
         )?;
         references += character_references(raw_value);
-        let value = unescape(raw_value)?;
+        let value = unescape(raw_value)?.into_owned();
         if key == "xmlns" {
             namespaces.insert(String::new(), value.clone());
         } else if let Some(prefix) = key.strip_prefix("xmlns:") {
@@ -132,9 +132,21 @@ pub(crate) fn character_references(value: &str) -> usize {
     value.bytes().filter(|byte| *byte == b'&').count()
 }
 
-pub(crate) fn unescape(value: &str) -> Result<String> {
+/// Source text of a reference in element content (#7680 EDGE-LXPARSE-2).
+///
+/// quick-xml 0.42 ends a text event at `&` and reports each `&name;` as its
+/// own `Event::GeneralRef`, so a family parser's text path never sees one.
+/// Every `consume_event` hands this back to that text path instead, which
+/// then applies the same rules as for any other text: one charge against
+/// `max_character_references`, the outside-the-root refusal (so `&#32;`
+/// cannot pass for padding), [`unescape`] (an undeclared entity is
+/// `EntityForbidden`, exactly as in an attribute value), and the capture.
+pub(crate) fn general_ref_source(reference: &BytesRef<'_>) -> String {
+    format!("&{};", &**reference)
+}
+
+pub(crate) fn unescape(value: &str) -> Result<std::borrow::Cow<'_, str>> {
     quick_xml::escape::unescape(value)
-        .map(|decoded| decoded.into_owned())
         .map_err(|_| error(Code::EntityForbidden, "unknown XML entity reference"))
 }
 
@@ -256,14 +268,19 @@ fn utf16_unit(input: &[u8], index: usize, encoding: Encoding) -> u16 {
 
 pub(crate) fn check_declared_encoding(input: &[u8], detected: Encoding) -> Result<()> {
     const DECLARATION_LIMIT: usize = 1024;
-    let declaration = input
-        .get(..input.len().min(DECLARATION_LIMIT))
-        .and_then(|prefix| str::from_utf8(prefix).ok())
-        .filter(|prefix| {
-            prefix
-                .strip_prefix("<?xml")
-                .is_some_and(|rest| rest.as_bytes().first().is_some_and(u8::is_ascii_whitespace))
-        });
+    let prefix = &input[..input.len().min(DECLARATION_LIMIT)];
+    // The window can end inside a multi-byte character. Read the valid
+    // prefix rather than treating the whole window as "no declaration",
+    // which let padding skip the encoding refusal (EDGE-LXPARSE-23, #7693).
+    let declaration = match str::from_utf8(prefix) {
+        Ok(prefix) => Some(prefix),
+        Err(invalid) => str::from_utf8(&prefix[..invalid.valid_up_to()]).ok(),
+    }
+    .filter(|prefix| {
+        prefix
+            .strip_prefix("<?xml")
+            .is_some_and(|rest| rest.as_bytes().first().is_some_and(u8::is_ascii_whitespace))
+    });
     let Some(declaration) = declaration else {
         return Ok(());
     };

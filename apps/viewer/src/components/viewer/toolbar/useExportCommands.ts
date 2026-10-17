@@ -13,6 +13,8 @@
  */
 
 import { useCallback, useMemo } from 'react';
+import { getGlobalRenderer } from '@/hooks/useBCF';
+import { captureViewportFrame } from '@/lib/viewport-capture';
 import { selectHasModelsLoaded, selectModelCount } from '@/hooks/model-presence';
 import { useChangedModels } from '@/hooks/useUnexportedChanges';
 import { totalChangeCount } from '@/lib/export/model-changes';
@@ -23,6 +25,7 @@ import { exportCsvFromBytes } from '@/lib/export/csv';
 import { editedModelBytes } from '@/lib/export/edited-model-bytes';
 import { activeModelName, downloadFile, downloadDataUrl, modelExportFilename } from '@/lib/export/download';
 import { toast } from '@/components/ui/toast';
+import { recordActivity } from '@/lib/activity/activity-journal';
 import { trackExportCompleted } from '@/lib/analytics';
 import type { ExportSurface } from '@/lib/analytics-export-events';
 import { EXPORT_COMMANDS, type CsvExportType, type RegisteredExportCommand } from './export-commands';
@@ -42,6 +45,20 @@ const CSV_SUFFIX: Record<CsvExportType, string> = {
   quantities: '_quantities',
   spatial: '_spatial-hierarchy',
 };
+
+const CSV_ACTIVITY_TITLE = {
+  entities: 'activityTray.job.csvEntities',
+  properties: 'activityTray.job.csvProperties',
+  quantities: 'activityTray.job.csvQuantities',
+  spatial: 'activityTray.job.csvSpatial',
+} as const;
+
+function activeModelExportNote(modelCount: number): string {
+  const otherModelCount = Math.max(0, modelCount - 1);
+  return otherModelCount > 0
+    ? ` — active model only, ${otherModelCount} other loaded model${otherModelCount === 1 ? '' : 's'} not included`
+    : '';
+}
 
 export function useExportCommands(surface: ExportSurface) {
   const ifcDataStore = useViewerStore((s) => s.ifcDataStore);
@@ -69,27 +86,31 @@ export function useExportCommands(surface: ExportSurface) {
    * are unaffected — they go through their own dialogs, which handle the
    * federation themselves.
    */
-  const otherModelCount = Math.max(0, modelCount - 1);
-  const activeModelOnlyNote =
-    otherModelCount > 0
-      ? ` — active model only, ${otherModelCount} other loaded model${otherModelCount === 1 ? '' : 's'} not included`
-      : '';
+  const activeModelOnlyNote = activeModelExportNote(modelCount);
 
   const handleExportCSV = useCallback(async (type: CsvExportType) => {
-    if (!ifcDataStore || ifcDataStore.source.byteLength <= 0) return;
+    const state = useViewerStore.getState();
+    const sourceStore = state.ifcDataStore;
+    if (!sourceStore || sourceStore.source.byteLength <= 0) return;
     try {
-      // The model as edited, not the file as loaded (#5397).
-      const { activeModelId, getMutationView } = useViewerStore.getState();
-      const bytes = editedModelBytes(ifcDataStore, activeModelId ? getMutationView(activeModelId) : null);
-      const csv = await exportCsvFromBytes(bytes, type, { includeProperties: type === 'entities' });
-      downloadFile(csv, modelExportFilename(activeModelName(useViewerStore.getState()), 'csv', CSV_SUFFIX[type]), 'text/csv');
+      const activeModelOnlyNote = activeModelExportNote(selectModelCount(state));
+      const sourceName = activeModelName(state);
+      const filename = modelExportFilename(sourceName, 'csv', CSV_SUFFIX[type]);
+      const mutationView = state.activeModelId ? state.getMutationView(state.activeModelId) : null;
+      await recordActivity({ kind: 'export', title: CSV_ACTIVITY_TITLE[type],
+        subject: `${sourceName}${activeModelOnlyNote}` }, async () => {
+        // The model as edited, not the file as loaded (#5397).
+        const bytes = editedModelBytes(sourceStore, mutationView);
+        const csv = await exportCsvFromBytes(bytes, type, { includeProperties: type === 'entities' });
+        downloadFile(csv, filename, 'text/csv');
+      });
       trackExportCompleted({ format: 'csv', surface });
       toast.success(`Exported ${type} CSV${activeModelOnlyNote}`);
     } catch (err) {
       console.error('CSV export failed:', err);
       toast.error(`CSV export failed: ${err instanceof Error ? err.message : 'Unknown error'}`);
     }
-  }, [ifcDataStore, activeModelOnlyNote, surface]);
+  }, [surface]);
 
   const handleExportJSON = useCallback(() => {
     if (!ifcDataStore) return;
@@ -108,12 +129,13 @@ export function useExportCommands(surface: ExportSurface) {
     }
   }, [ifcDataStore, activeModelOnlyNote, surface]);
 
-  const handleScreenshot = useCallback(() => {
-    // The 3D viewport's canvas, not merely the first on the page (#5601).
-    const canvas = document.querySelector<HTMLCanvasElement>('canvas[data-viewport="main"]');
+  const handleScreenshot = useCallback(async () => {
     try {
-      if (!canvas) throw new Error('no 3D viewport canvas on screen');
-      downloadDataUrl(canvas.toDataURL('image/png'), modelExportFilename(activeModelName(useViewerStore.getState()), 'png', '_screenshot'));
+      const renderer = getGlobalRenderer();
+      if (!renderer) throw new Error('no 3D viewport on screen');
+      const image = await captureViewportFrame(renderer, { read: canvas => canvas.toDataURL('image/png') });
+      if (!image) throw new Error('viewport capture failed');
+      downloadDataUrl(image, modelExportFilename(activeModelName(useViewerStore.getState()), 'png', '_screenshot'));
       trackExportCompleted({ format: 'png', surface });
       toast.success('Screenshot saved');
     } catch (err) {
@@ -125,7 +147,7 @@ export function useExportCommands(surface: ExportSurface) {
   /** Dispatch for the registry's one-click (`kind: 'action'`) commands. */
   const runExportAction = useCallback((action: 'json' | 'screenshot') => {
     if (action === 'json') handleExportJSON();
-    else handleScreenshot();
+    else void handleScreenshot();
   }, [handleExportJSON, handleScreenshot]);
 
   const commands = useMemo<ResolvedExportCommand[]>(

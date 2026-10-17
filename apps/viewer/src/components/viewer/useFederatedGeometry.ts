@@ -5,7 +5,9 @@
 import { useMemo, useRef } from 'react';
 import type { MeshData, CoordinateInfo, GeometryResult } from '@ifc-lite/geometry';
 import type { FederatedModel } from '@/store';
+import { perfTally } from '@ifc-lite/load-trace';
 import { geometryWithModelIndex } from '@/lib/model-placement/model-indices';
+import { carryReleasedMesh } from '@/lib/released-mesh-provenance';
 
 const ZERO_VEC3 = { x: 0, y: 0, z: 0 };
 const DEFAULT_COORDINATE_INFO: CoordinateInfo = {
@@ -35,7 +37,11 @@ function unionBounds(acc: Vec3Bounds | undefined, b: Vec3Bounds | undefined): Ve
   };
 }
 
-/** Cache only same-array streaming appends; immutable replacement may alter any owner (#4451). */
+/** Cache only same-array streaming appends; immutable replacement may alter any owner (#4451).
+ * A single model renders its own mesh array, stamped in place, so the array
+ * keeps its identity across appends and nothing downstream rescans it (#7021).
+ * Several models still merge into wrapper copies; `viewer.modelIndexRespread`
+ * counts those copies. */
 export function useFederatedGeometry(storeModels: ReadonlyMap<string, FederatedModel>,
   geometryResult: GeometryResult | null, modelIdToIndex: ReadonlyMap<string, number>, geometryContentVersion: number) {
   const mergedContentVersionRef = useRef(geometryContentVersion);
@@ -44,6 +50,7 @@ export function useFederatedGeometry(storeModels: ReadonlyMap<string, FederatedM
   const mergedVisibilityRef = useRef<Map<string, boolean>>(new Map());
 
   const mergedSourcesRef = useRef(new Map<string, MeshData[] | undefined>());
+  const mergedIndicesRef = useRef<ReadonlyMap<string, number> | null>(null);
 
   // Multi-model: merge geometries from all visible models
   return useMemo(() => {
@@ -76,6 +83,12 @@ export function useFederatedGeometry(storeModels: ReadonlyMap<string, FederatedM
       let shouldRebuild = false;
 
       if (mergedLengthsRef.current.size !== storeModels.size) {
+        shouldRebuild = true;
+      }
+
+      // A model removed and re-added keeps its mesh array but gets a new index
+      // from the allocator, which shares one map until an assignment changes.
+      if (mergedIndicesRef.current !== modelIdToIndex) {
         shouldRebuild = true;
       }
 
@@ -125,11 +138,13 @@ export function useFederatedGeometry(storeModels: ReadonlyMap<string, FederatedM
             continue;
           }
           for (const mesh of modelGeometry.meshes) {
-            rebuilt.push({ ...mesh, modelIndex });
+            rebuilt.push(carryReleasedMesh(mesh, { ...mesh, modelIndex }));
           }
+          perfTally('viewer.modelIndexRespread', modelGeometry.meshes.length, 'meshes');
           mergedLengthsRef.current.set(modelId, modelGeometry.meshes.length);
         }
         mergedCacheRef.current = rebuilt;
+        mergedIndicesRef.current = modelIdToIndex;
       } else {
         for (const [modelId, model] of storeModels) {
           const modelGeometry = model.geometryResult;
@@ -138,7 +153,10 @@ export function useFederatedGeometry(storeModels: ReadonlyMap<string, FederatedM
           const nextMeshes = model.visible ? (modelGeometry?.meshes ?? []) : [];
           for (let i = previousLength; i < nextMeshes.length; i++) {
             const mesh = nextMeshes[i];
-            mergedCacheRef.current.push({ ...mesh, modelIndex });
+            mergedCacheRef.current.push(carryReleasedMesh(mesh, { ...mesh, modelIndex }));
+          }
+          if (nextMeshes.length > previousLength) {
+            perfTally('viewer.modelIndexRespread', nextMeshes.length - previousLength, 'meshes');
           }
           mergedLengthsRef.current.set(modelId, nextMeshes.length);
           mergedVisibilityRef.current.set(modelId, model.visible);

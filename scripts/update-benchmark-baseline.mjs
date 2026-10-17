@@ -23,6 +23,7 @@
 import { existsSync, readFileSync, readdirSync, writeFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join, resolve } from 'path';
+import { requireTimingUploads } from './lib/benchmark-upload-mode.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -68,10 +69,18 @@ function main() {
   const baseline = existsSync(baselinePath) ? loadJson(baselinePath) : {};
 
   const updated = [];
+  const skipped = [];
   for (const name of files) {
     const payload = loadJson(join(resultsDir, name));
+    requireTimingUploads(payload);
     if (!payload.file || !payload.metrics) {
       throw new Error(`Result ${name} is missing "file" or "metrics"; refusing to write a partial baseline.`);
+    }
+    // #6993: a sample that lost its GPU device re-uploaded onto a replacement
+    // and measured a different load; it must never become the reference.
+    if (payload.gpuHealth?.contaminated === true) {
+      skipped.push(`${payload.file} (${(payload.gpuHealth.reasons ?? ['GPU device lost']).join('; ')})`);
+      continue;
     }
     // Keep the entry's provenance note unless a new one is explicitly given.
     const keptEnvironment = environment ?? baseline[payload.file]?.environment ?? null;
@@ -81,6 +90,17 @@ function main() {
       metrics: payload.metrics,
     };
     updated.push(payload.file);
+  }
+
+  if (skipped.length > 0) {
+    console.warn(`Kept the previous entry for ${skipped.length} result(s) that lost their GPU device:`);
+    for (const entry of skipped) console.warn(`  - ${entry}`);
+  }
+  if (updated.length === 0) {
+    // Not an error (#6993/#7164): the runner's GPU failed, the baseline did
+    // not. Keep every previous entry and leave the file untouched.
+    console.warn('No baseline written: every result lost its GPU device mid-sample; all previous entries kept.');
+    return;
   }
 
   writeFileSync(baselinePath, JSON.stringify(baseline, null, 2) + '\n');

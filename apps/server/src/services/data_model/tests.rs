@@ -749,6 +749,28 @@ fn extracts_defines_by_properties_with_a_grouped_relating_pset_definition_set() 
     assert_eq!(pset.properties[0].property_name, "Fire");
 }
 
+/// EXPORT-DATA-1 (#7681): the same grouped set in the spelling ISO 10303-21
+/// gives a defined type inside a SELECT, the typed parameter
+/// `IFCPROPERTYSETDEFINITIONSET((#20,#22))`. `get_refs` saw only the bare
+/// list, so this spelling still dropped the whole relationship after #4773.
+#[test]
+fn extracts_defines_by_properties_with_a_typed_property_set_definition_set() {
+    let ifc = GROUPED_RELATING_PSET_IFC.replace("(#10),(#20,#22)", "(#10),IFCPROPERTYSETDEFINITIONSET((#20,#22))");
+    assert_ne!(ifc, GROUPED_RELATING_PSET_IFC, "the fixture must carry the typed spelling");
+    let dm = extract_data_model_checked(&ifc);
+    for relating in [20, 22] {
+        assert!(
+            dm.relationships.iter().any(|r| r.rel_type.eq_ignore_ascii_case("IFCRELDEFINESBYPROPERTIES")
+                && r.relating_id == relating
+                && r.related_id == 10),
+            "#79 dropped #{relating} from the typed set: {:?}",
+            dm.relationships
+        );
+    }
+    let pset = dm.property_sets.iter().find(|p| p.pset_id == 20).expect("Pset_Grouped attached to #10");
+    assert_eq!(pset.properties[0].property_name, "Fire");
+}
+
 /// A wall associated DIRECTLY with an `IfcMaterial` (no layer set / usage
 /// indirection) — the `"IFCMATERIAL" =>` arm of `resolve_material`, whose
 /// `category` field (attribute 2) was previously not asserted anywhere: a
@@ -2484,4 +2506,483 @@ fn a_reference_property_reads_the_referenced_name() {
     assert_eq!(value_of("Finish").as_deref(), Some("Oak"));
     assert_eq!(value_of("Spec").as_deref(), Some("Ss_25"));
     assert_eq!(value_of("Bare").as_deref(), Some("#8"));
+}
+
+/// SERVER-5 (#7673): `resolve_material` followed `IfcMaterial*SetUsage`
+/// attribute 0 by recursing into whatever it named, with no type check and no
+/// bound. A usage that names itself recursed until the stack overflowed, and a
+/// stack overflow is `SIGABRT`, not a panic: `CatchPanicLayer` and the
+/// `server-release` unwind profile cannot contain it, so every in-flight
+/// request on the server died with it.
+// Inline here rather than a sibling file: the revert oracle reverts every
+// production file the PR touches (`materials.rs`, `mod.rs`), so a test module
+// declared from either would vanish with the revert instead of going RED.
+mod server_5_material_usages {
+use super::super::{extract_data_model, DataModel, MaterialAssociation};
+
+fn materials_of(dm: &DataModel, element_id: u32) -> Vec<&MaterialAssociation> {
+    dm.materials.iter().filter(|m| m.element_id == element_id).collect()
+}
+
+/// Number of usages in the acyclic `usage -> usage -> ... -> set` chain. A
+/// visited set alone does not bound this shape while the walk recurses: every
+/// id is new, so the chain overflows the stack anyway (AGENTS.md, "Bounding
+/// walks over file-supplied references"). Only an iterative walk survives it.
+const CHAIN_LEN: u32 = 20_000;
+
+/// The hostile file: each wall's `RelatingMaterial` is a usage whose
+/// `ForLayerSet` / `ForProfileSet` does not name a set.
+///
+/// - #10 is the reproduction from the finding: a layer-set usage naming itself.
+/// - #11 is the same for a profile-set usage.
+/// - #12 -> #13 -> #12 is a mutual cycle across the two usage kinds.
+/// - #1000.. is a long acyclic usage chain ending in a real set. Malformed
+///   (`ForLayerSet` should name a set), but the pre-fix walk and the TS twin
+///   both follow it, so it must keep resolving.
+/// - #40 is a well-formed usage -> set, the control that the walk still
+///   resolves real input in the same file.
+fn hostile_usage_ifc() -> String {
+    let mut data = String::from(
+        "#1=IFCPROJECT('Proj0000000000000000001',$,'P',$,$,$,$,$,$);
+#3=IFCWALL('Wall00000000000000003',$,'W3',$,$,$,$,$,$);
+#4=IFCBEAM('Beam00000000000000004',$,'B4',$,$,$,$,$,$);
+#5=IFCWALL('Wall00000000000000005',$,'W5',$,$,$,$,$,$);
+#6=IFCWALL('Wall00000000000000006',$,'W6',$,$,$,$,$,$);
+#7=IFCWALL('Wall00000000000000007',$,'W7',$,$,$,$,$,$);
+#10=IFCMATERIALLAYERSETUSAGE(#10,.AXIS2.,.POSITIVE.,0.,$);
+#11=IFCMATERIALPROFILESETUSAGE(#11,$,$);
+#12=IFCMATERIALLAYERSETUSAGE(#13,.AXIS2.,.POSITIVE.,0.,$);
+#13=IFCMATERIALPROFILESETUSAGE(#12,$,$);
+#20=IFCRELASSOCIATESMATERIAL('Mat0000000000000000020',$,$,$,(#3),#10);
+#21=IFCRELASSOCIATESMATERIAL('Mat0000000000000000021',$,$,$,(#4),#11);
+#22=IFCRELASSOCIATESMATERIAL('Mat0000000000000000022',$,$,$,(#5),#12);
+#23=IFCRELASSOCIATESMATERIAL('Mat0000000000000000023',$,$,$,(#6),#1000);
+#40=IFCMATERIALLAYERSETUSAGE(#41,.AXIS2.,.POSITIVE.,0.,$);
+#41=IFCMATERIALLAYERSET((#42),'GoodSet',$);
+#42=IFCMATERIALLAYER(#43,200.,.F.,'Core',$,$,$);
+#43=IFCMATERIAL('Concrete',$,$);
+#44=IFCRELASSOCIATESMATERIAL('Mat0000000000000000044',$,$,$,(#7),#40);
+",
+    );
+    for i in 0..CHAIN_LEN {
+        let id = 1000 + i;
+        let next = if i + 1 == CHAIN_LEN { 41 } else { id + 1 };
+        data.push_str(&format!("#{id}=IFCMATERIALLAYERSETUSAGE(#{next},.AXIS2.,.POSITIVE.,0.,$);\n"));
+    }
+    format!(
+        "ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n{data}ENDSEC;\nEND-ISO-10303-21;\n"
+    )
+}
+
+/// SERVER-5 (#7673). The walk runs on rayon workers inside
+/// `extract_data_model`, and an unbounded one dies by stack overflow, which
+/// would take the test runner down with it. So the reproduction runs in a
+/// child copy of this test binary and the parent asserts the child exited
+/// cleanly rather than by signal (same pattern as the #3973 spatial-cycle
+/// tests in `tests.rs`).
+#[test]
+fn self_and_mutually_referencing_material_usages_do_not_abort_server_5() {
+    const REPRO_ENV_VAR: &str = "IFC_LITE_SERVER_5_MATERIAL_USAGE_REPRO";
+
+    if std::env::var(REPRO_ENV_VAR).is_ok() {
+        let content = hostile_usage_ifc();
+        let dm = extract_data_model(&content);
+        for element in [3, 4, 5] {
+            assert!(
+                materials_of(&dm, element).is_empty(),
+                "element #{element}: a usage that does not name a set resolves to no material"
+            );
+        }
+        // Element #6 is the long acyclic chain and #7 the well-formed control:
+        // both still resolve the set, as they did before the fix and as the
+        // TS twin does.
+        for element in [6, 7] {
+            let rows = materials_of(&dm, element);
+            assert_eq!(rows.len(), 1, "element #{element}: the usage resolves its set");
+            assert_eq!(rows[0].material_name, "Concrete");
+            assert_eq!(rows[0].set_name.as_deref(), Some("GoodSet"));
+        }
+        eprintln!("SERVER-5 repro resolved {} material rows without aborting", dm.materials.len());
+        std::process::exit(0);
+    }
+
+    let output = run_child(
+        "services::data_model::tests::server_5_material_usages::self_and_mutually_referencing_material_usages_do_not_abort_server_5",
+        REPRO_ENV_VAR,
+    );
+    assert!(
+        output.status.success(),
+        "a self- or mutually-referencing IfcMaterial*SetUsage must neither abort the process \
+         nor hang; child exit status = {:?}\n--- child stdout ---\n{}\n--- child stderr ---\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// The usage arms had no positive coverage in this crate: every existing
+/// material fixture associates the set directly. Pins that a layer-set usage
+/// and a profile-set usage each resolve their set's members, with the usage
+/// recorded as the association's definition.
+#[test]
+fn layer_and_profile_set_usages_resolve_their_sets() {
+    const USAGE_IFC: &str = "ISO-10303-21;
+HEADER;
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('Proj0000000000000000001',$,'P',$,$,$,$,$,$);
+#3=IFCWALL('Wall00000000000000003',$,'W3',$,$,$,$,$,$);
+#4=IFCBEAM('Beam00000000000000004',$,'B4',$,$,$,$,$,$);
+#10=IFCMATERIAL('Concrete',$,'Mineral');
+#11=IFCMATERIAL('Insulation',$,$);
+#12=IFCMATERIALLAYER(#10,0.2,.F.,'Core',$,$,$);
+#13=IFCMATERIALLAYER(#11,0.05,.T.,'Insul',$,$,$);
+#14=IFCMATERIALLAYERSET((#12,#13),'WallSet',$);
+#15=IFCMATERIALLAYERSETUSAGE(#14,.AXIS2.,.POSITIVE.,0.,$);
+#16=IFCRELASSOCIATESMATERIAL('Mat0000000000000000016',$,$,$,(#3),#15);
+#20=IFCMATERIAL('Timber',$,'Wood');
+#21=IFCMATERIALPROFILE('Flange',$,#20,$,$,$);
+#22=IFCMATERIALPROFILESET('BeamSet',$,(#21),$);
+#23=IFCMATERIALPROFILESETUSAGE(#22,$,$);
+#24=IFCRELASSOCIATESMATERIAL('Mat0000000000000000024',$,$,$,(#4),#23);
+ENDSEC;
+END-ISO-10303-21;
+";
+    let dm = extract_data_model(USAGE_IFC);
+
+    let wall = materials_of(&dm, 3);
+    assert_eq!(wall.len(), 2);
+    assert!(wall.iter().all(|m| m.kind == "IfcMaterialLayerSet" && m.definition_id == 15));
+    assert_eq!(wall[0].material_name, "Concrete");
+    assert_eq!(wall[1].material_name, "Insulation");
+    assert_eq!(wall[0].set_name.as_deref(), Some("WallSet"));
+    assert_eq!(wall[1].is_ventilated, Some(true));
+
+    let beam = materials_of(&dm, 4);
+    assert_eq!(beam.len(), 1);
+    assert_eq!(beam[0].kind, "IfcMaterialProfileSet");
+    assert_eq!(beam[0].definition_id, 23);
+    assert_eq!(beam[0].material_name, "Timber");
+    assert_eq!(beam[0].set_name.as_deref(), Some("BeamSet"));
+}
+
+/// Re-run one test of this binary in a child process with `env_var` set, and
+/// kill it past a generous deadline. The bound has two failure modes: recursion
+/// overflows the stack (SIGABRT, which would take the test runner with it),
+/// and unbounded work spins until the deadline. Either shows up here as a
+/// failed exit status instead of a dead runner or a hung CI job.
+fn run_child(test_name: &str, env_var: &str) -> std::process::Output {
+    let exe = std::env::current_exe().expect("current test exe");
+    // libtest's `--exact` names are not crate-qualified.
+    let mut child = std::process::Command::new(exe)
+        .args([test_name, "--exact", "--nocapture"])
+        .env(env_var, "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn child test process");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while child.try_wait().expect("poll child").is_none() {
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    child.wait_with_output().expect("collect child output")
+}
+
+/// Breadth (#7673 review): `FAN_IN` associations all naming the head of one
+/// `CHAIN_LEN`-long usage chain. Without the cross-association memo this is
+/// `FAN_IN × CHAIN_LEN` = 4·10^8 decodes (minutes, measured 43.5 s in release
+/// at this size); with it, each usage is decoded about once.
+#[test]
+fn many_associations_over_one_long_usage_chain_finish_server_5() {
+    const REPRO_ENV_VAR: &str = "IFC_LITE_SERVER_5_FAN_IN_REPRO";
+    const FAN_IN: u32 = 20_000;
+
+    if std::env::var(REPRO_ENV_VAR).is_ok() {
+        let mut data = String::from(
+            "#1=IFCPROJECT('Proj0000000000000000001',$,'P',$,$,$,$,$,$);
+#41=IFCMATERIALLAYERSET((#42),'GoodSet',$);
+#42=IFCMATERIALLAYER(#43,200.,.F.,'Core',$,$,$);
+#43=IFCMATERIAL('Concrete',$,$);
+",
+        );
+        for i in 0..CHAIN_LEN {
+            let id = 1000 + i;
+            let next = if i + 1 == CHAIN_LEN { 41 } else { id + 1 };
+            data.push_str(&format!("#{id}=IFCMATERIALLAYERSETUSAGE(#{next},.AXIS2.,.POSITIVE.,0.,$);\n"));
+        }
+        for i in 0..FAN_IN {
+            let wall = 100_000 + 2 * i;
+            data.push_str(&format!(
+                "#{wall}=IFCWALL('W{i:021}',$,'W',$,$,$,$,$,$);\n#{}=IFCRELASSOCIATESMATERIAL('M{i:021}',$,$,$,(#{wall}),#1000);\n",
+                wall + 1
+            ));
+        }
+        let content = format!("ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n{data}ENDSEC;\nEND-ISO-10303-21;\n");
+        let started = std::time::Instant::now();
+        let dm = extract_data_model(&content);
+        assert_eq!(dm.materials.len(), FAN_IN as usize, "every wall resolves the set");
+        assert!(dm.materials.iter().all(|m| m.material_name == "Concrete"));
+        eprintln!("SERVER-5 fan-in {FAN_IN} x chain {CHAIN_LEN} resolved in {:?}", started.elapsed());
+        std::process::exit(0);
+    }
+
+    let output = run_child(
+        "services::data_model::tests::server_5_material_usages::many_associations_over_one_long_usage_chain_finish_server_5",
+        REPRO_ENV_VAR,
+    );
+    assert!(
+        output.status.success(),
+        "{FAN_IN} associations over one {CHAIN_LEN}-usage chain must neither abort nor run past \
+         the deadline; child exit status = {:?}\n--- child stderr ---\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+}
+
+/// #7675 (S3, from S1's walk audit): the complex-property depth cap bounds a
+/// path's length only, so a member listing itself `k` times was `k^8` reads,
+/// and one visit can copy a long name. The shared vector pins the walk budget
+/// (visits per property, one byte budget per model, every charge from
+/// `ifc_lite_core::limits`) and its marker byte-for-byte against the TS parser
+/// and the Rust exporter, and bounds the total bytes of every value.
+#[test]
+fn complex_property_walk_budget_matches_the_shared_vector() {
+    let vector: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../../packages/parser/test/fixtures/complex-property-budget-7675.json"
+    ))
+    .expect("vector parses");
+    let failed: Vec<String> = vector["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|case| std::panic::catch_unwind(|| check_server_budget_case(case)).is_err())
+        .map(|case| case["name"].as_str().unwrap().to_string())
+        .collect();
+    assert!(failed.is_empty(), "cases that differ from the shared vector: {failed:?}");
+}
+
+fn check_server_budget_case(case: &serde_json::Value) {
+    let ifc = format!(
+        "ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n{}\nENDSEC;\nEND-ISO-10303-21;\n",
+        expand_budget_lines(&case["dataLines"]).join("\n")
+    );
+    let dm = extract_data_model(&ifc);
+    // The server keeps each set once, however many entities share it, so the
+    // model's values together stay within the budget too.
+    let model_total: usize =
+        dm.property_sets.iter().flat_map(|set| set.properties.iter().map(|p| p.property_value.len())).sum();
+    assert!(model_total <= ifc_lite_core::limits::complex_property_output_budget(ifc.len()), "{model_total}");
+    // An entity reads its sets the way the browser's `psetsOf` does: through
+    // `IfcRelDefinesByProperties`, in relationship order, each set once.
+    let mut sets_of: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
+    for rel in dm.relationships.iter().filter(|r| r.rel_type.eq_ignore_ascii_case("IFCRELDEFINESBYPROPERTIES")) {
+        let list = sets_of.entry(rel.related_id).or_default();
+        if !list.contains(&rel.relating_id) {
+            list.push(rel.relating_id);
+        }
+    }
+    for entity in expand_budget_ids(&case["entityIds"]) {
+        let sets: Vec<(String, Vec<String>)> = sets_of
+            .get(&entity)
+            .into_iter()
+            .flatten()
+            .flat_map(|id| dm.property_sets.iter().filter(move |set| set.pset_id == *id))
+            .map(|set| (set.pset_name.clone(), set.properties.iter().map(|p| p.property_value.clone()).collect()))
+            .collect();
+        assert_complex_budget_case(case, ifc.len(), &sets);
+    }
+}
+
+/// The vector's `dataLines` with each `{"repeat": [..], "from", "count"}` run
+/// expanded: `{i}` in each line is `from`, `from + 1`, ... for `count` rounds.
+fn expand_budget_lines(lines: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in lines.as_array().unwrap() {
+        if let Some(text) = line.as_str() {
+            out.push(text.to_string());
+            continue;
+        }
+        for i in expand_budget_ids(&serde_json::json!([line])) {
+            for template in line["repeat"].as_array().unwrap() {
+                out.push(template.as_str().unwrap().replace("{i}", &i.to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// The vector's `entityIds`, each `{"from", "count"}` run expanded.
+fn expand_budget_ids(ids: &serde_json::Value) -> Vec<u32> {
+    let mut out = Vec::new();
+    for id in ids.as_array().unwrap() {
+        match id.as_u64() {
+            Some(id) => out.push(id as u32),
+            None => {
+                let from = id["from"].as_u64().unwrap() as u32;
+                out.extend(from..from + id["count"].as_u64().unwrap() as u32);
+            }
+        }
+    }
+    out
+}
+
+/// #7675 D3: a cut level's `values` list (the parquet `values` column, which
+/// IDS reads) ends with the budget marker, so a member past the cut reads as
+/// truncated rather than absent.
+#[test]
+fn a_cut_complex_property_marks_its_values_list() {
+    let members = vec!["#20"; 1100].join(",");
+    let ifc = format!(
+        "ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n\
+         #20=IFCPROPERTYSINGLEVALUE('P',$,IFCLABEL('v'),$);\n\
+         #22=IFCCOMPLEXPROPERTY('Wide',$,'WideUsage',({members}));\n\
+         #30=IFCPROPERTYSET('Pset0000000000000007675',$,'Pset_Cut',$,(#22));\n\
+         ENDSEC;\nEND-ISO-10303-21;\n"
+    );
+    let dm = extract_data_model(&ifc);
+    let wide = &dm.property_sets[0].properties[0];
+    let marker = ifc_lite_core::limits::COMPLEX_PROPERTY_BUDGET_MARKER;
+    assert!(wide.property_value.ends_with(marker), "{}", wide.property_value);
+    let values = wide.values.as_ref().expect("values");
+    assert_eq!(values.last().map(String::as_str), Some(marker));
+    assert_eq!(values.len(), 1025, "1024 admitted members, then the marker");
+}
+
+/// Check one walk's property sets (name, then the values in order) against
+/// one case of the shared #7675 vector. The TS and exporter tests read the same
+/// file with the same rules: a set is pinned by its property count and its
+/// values joined with `\n` (inline when short, else UTF-8 length and SHA-256),
+/// and the values together stay within the model's output budget.
+fn assert_complex_budget_case(case: &serde_json::Value, input_bytes: usize, sets: &[(String, Vec<String>)]) {
+    use sha2::{Digest, Sha256};
+    let total: usize = sets.iter().flat_map(|(_, values)| values.iter().map(String::len)).sum();
+    let budget = ifc_lite_core::limits::complex_property_output_budget(input_bytes);
+    assert!(total <= budget, "{total} bytes of property values, budget {budget}");
+    let expected: Vec<&str> = case["psets"].as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap()).collect();
+    assert_eq!(sets.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), expected);
+    for pin in case["psets"].as_array().unwrap() {
+        let name = pin["name"].as_str().unwrap();
+        let (_, values) = sets.iter().find(|(n, _)| n == name).unwrap();
+        assert_eq!(values.len() as u64, pin["count"].as_u64().unwrap(), "{name}");
+        match pin.get("values") {
+            Some(exact) => {
+                let exact: Vec<&str> = exact.as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+                assert_eq!(values.iter().map(String::as_str).collect::<Vec<_>>(), exact, "{name}");
+            }
+            None => {
+                let joined = values.join("\n");
+                let hash: String = Sha256::digest(joined.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+                let pinned = (pin["length"].as_u64().unwrap(), pin["sha256"].as_str().unwrap().to_string());
+                assert_eq!((joined.len() as u64, hash), pinned, "{name}");
+            }
+        }
+    }
+}
+
+/// SERVER-26 (#7675): one `IfcRelAssociatesMaterial` emits a row per related
+/// element per resolved layer, each cloning the layer's strings. A layer set
+/// that lists one layer 1 000 times, related to 1 000 elements, is 1 000 000
+/// rows from 14 KB of input, and admission charges only the upload size. The
+/// table is budgeted against the input, and the one serializer every route
+/// sends a data model through refuses a model that hit it.
+#[test]
+fn server_26_material_rows_are_budgeted_not_elements_times_layers() {
+    let layers = vec!["#3"; 1_000].join(",");
+    let elements: Vec<String> = (0..1_000).map(|i| format!("#{}", 100 + i)).collect();
+    let ifc = format!(
+        "ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n\
+         #2=IFCMATERIAL('Concrete',$,$);\n\
+         #3=IFCMATERIALLAYER(#2,0.1,$,'Core',$,$,$);\n\
+         #4=IFCMATERIALLAYERSET(({layers}),'Wall',$);\n\
+         #5=IFCRELASSOCIATESMATERIAL('Rel0000000000000007675',$,$,$,({}),#4);\n\
+         ENDSEC;\nEND-ISO-10303-21;\n",
+        elements.join(",")
+    );
+    let dm = extract_data_model(&ifc);
+    assert!(
+        dm.materials.len() < 1_000_000,
+        "{} material rows from {} bytes of input",
+        dm.materials.len(),
+        ifc.len()
+    );
+    let refused = crate::services::serialize_data_model_to_parquet(&dm).expect_err("a truncated table was served");
+    assert!(refused.to_string().contains("material"), "{refused}");
+}
+
+/// The budget is relative to the input and binds hostile products, not real
+/// buildups: a few walls with a three-layer set keep every row.
+#[test]
+fn server_26_ordinary_layer_sets_keep_every_row() {
+    let ifc = "ISO-10303-21;\nHEADER;\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n\
+        #2=IFCMATERIAL('Concrete',$,$);\n\
+        #3=IFCMATERIALLAYER(#2,0.1,$,'Core',$,$,$);\n\
+        #4=IFCMATERIALLAYERSET((#3,#3,#3),'Wall',$);\n\
+        #5=IFCRELASSOCIATESMATERIAL('Rel0000000000000007675',$,$,$,(#10,#11,#12,#13),#4);\n\
+        ENDSEC;\nEND-ISO-10303-21;\n";
+    let dm = extract_data_model(ifc);
+    assert_eq!(dm.materials.len(), 12);
+    crate::services::serialize_data_model_to_parquet(&dm).expect("served");
+}
+
+/// #7678 review finding 1: the data model reads a record holding a REAL the
+/// double range cannot represent (`1.E400`) as before, never dropping it.
+/// One such value on IfcSite.RefElevation, a storey Elevation, a door's
+/// OverallHeight and a material layer thickness used to erase the site, the
+/// building, both storeys, the element-to-storey map and the materials. The
+/// model must have exactly the shape of its finite twin.
+#[test]
+fn an_overflowing_descriptive_real_never_drops_a_data_model_entity_7678() {
+    let model = |big: &str| {
+        format!(
+            "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\nFILE_NAME('t.ifc','',(''),(''),'','','');\nFILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n\
+#1=IFCOWNERHISTORY($,$,$,$,$,$,$,0);\n\
+#20=IFCPROJECT('0Project00000000007678',$,'P',$,$,$,$,$,$);\n\
+#30=IFCSITE('0Site000000000000007678',$,'Site',$,$,$,$,$,.ELEMENT.,$,$,{big},$,$);\n\
+#31=IFCBUILDING('0Bldg000000000000007678',$,'Bldg',$,$,$,$,$,.ELEMENT.,$,$,$);\n\
+#32=IFCBUILDINGSTOREY('0StoreyBad000000007678',$,'Storey Bad',$,$,$,$,$,.ELEMENT.,{big});\n\
+#33=IFCBUILDINGSTOREY('0StoreyGood0000000767',$,'Storey Good',$,$,$,$,$,.ELEMENT.,3.);\n\
+#40=IFCRELAGGREGATES('0Agg1000000000000767',$,$,$,#20,(#30));\n\
+#41=IFCRELAGGREGATES('0Agg2000000000000767',$,$,$,#30,(#31));\n\
+#42=IFCRELAGGREGATES('0Agg3000000000000767',$,$,$,#31,(#32,#33));\n\
+#50=IFCWALL('0Wall000000000000007678',$,'W',$,$,$,$,$,$);\n\
+#51=IFCDOOR('0Door000000000000007678',$,'D',$,$,$,$,$,{big},0.9,$,$,$);\n\
+#60=IFCRELCONTAINEDINSPATIALSTRUCTURE('0Cont100000000000767',$,$,$,(#50),#33);\n\
+#61=IFCRELCONTAINEDINSPATIALSTRUCTURE('0Cont200000000000767',$,$,$,(#51),#32);\n\
+#70=IFCMATERIAL('Concrete',$,$);\n\
+#71=IFCMATERIALLAYER(#70,{big},$,$,$,$,$);\n\
+#72=IFCMATERIALLAYERSET((#71),'Set',$);\n\
+#80=IFCRELASSOCIATESMATERIAL('0Mat0000000000000767',$,$,$,(#50),#72);\n\
+ENDSEC;\nEND-ISO-10303-21;\n"
+        )
+    };
+    let shape = |dm: &DataModel| {
+        let mut entities: Vec<u32> = dm.entities.iter().map(|e| e.entity_id).collect();
+        entities.sort_unstable();
+        let mut nodes: Vec<(u32, u32, String)> = dm
+            .spatial_hierarchy
+            .nodes
+            .iter()
+            .map(|n| (n.entity_id, n.parent_id, n.type_name.clone()))
+            .collect();
+        nodes.sort();
+        let mut storeys = dm.spatial_hierarchy.element_to_storey.clone();
+        storeys.sort_unstable();
+        let mut materials: Vec<(u32, u32)> = dm.materials.iter().map(|m| (m.element_id, m.definition_id)).collect();
+        materials.sort_unstable();
+        (entities, nodes, storeys, materials, dm.refused.clone())
+    };
+    let finite = extract_data_model_checked(&model("2.5"));
+    let overflow = extract_data_model_checked(&model("1.E400"));
+    let (entities, nodes, storeys, materials, _) = shape(&finite);
+    assert!(entities.contains(&30) && entities.contains(&51), "anti-vacuity: {entities:?}");
+    assert!(nodes.len() >= 5, "anti-vacuity: project, site, building, two storeys: {nodes:?}");
+    assert_eq!(storeys.len(), 2, "anti-vacuity: {storeys:?}");
+    assert_eq!(materials.len(), 1, "anti-vacuity: {materials:?}");
+    assert_eq!(shape(&overflow), shape(&finite));
 }

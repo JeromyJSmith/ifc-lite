@@ -14,7 +14,11 @@
 
 import type { Capability } from '@ifc-lite/extensions';
 import type { FlowHost } from '@ifc-lite/flow-nodes';
+import type { FlowAiService } from '@ifc-lite/flow-nodes/ai';
+import { createNativeBcfWriteGateway } from '@ifc-lite/flow-nodes/bcf-publication-node';
 import type { IfcDataStore } from '@ifc-lite/parser';
+import { createDataAccessor } from '@ifc-lite/ids/bridge';
+import { NativeReviewCaptures, createNativeReviewIdentityTable, readPortableReview, type NativeReviewModel } from '@ifc-lite/sdk/review';
 import { createBimContext, type BimContext } from '@ifc-lite/sdk';
 import { HeadlessBackend } from '../headless-backend.js';
 import { parseIfcBytes } from '../loader.js';
@@ -31,19 +35,44 @@ export interface CliFlowSession {
   active(): HeadlessModel;
 }
 
-export function createCliFlowSession(initial: HeadlessModel, networkGrants: readonly Capability[]): CliFlowSession {
+export function createCliFlowSession(initial: HeadlessModel, networkGrants: readonly Capability[], ai?: FlowAiService, publication: { directory?: string; secrets?: readonly string[] } = {}): CliFlowSession {
   let active = initial;
+  const captures = new NativeReviewCaptures();
+  captures.enrollCredentials(publication.secrets ?? []);
+  const models = (): NativeReviewModel[] => {
+    const owned = active;
+    return [{
+      id: owned.bim.model.activeId() ?? 'model', name: owned.bim.model.active()?.name ?? 'model',
+      owner: owned, store: owned.store, source: owned.store.source,
+      mutationView: () => owned.backend.getMutationView(),
+      identityTable: createNativeReviewIdentityTable(owned.store),
+      expressIdOf: GlobalId => owned.store.entities.getExpressIdByGlobalId(GlobalId),
+      globalIdOf: expressId => owned.store.entities.getGlobalId(expressId),
+    }];
+  };
   const host: FlowHost = {
     get bim() { return active.bim; },
+    // Present only when the environment names a provider (`flow-ai.ts`).
+    ...(ai ? { ai } : {}),
     // `networkGrants` is always the graph's own declared capabilities: a
     // trusted local run is still not trusted to reach a host the graph never
     // declared (see `FlowHost.networkGrants`).
     networkGrants,
+    bcfWrites: createNativeBcfWriteGateway(publication),
+    review: { snapshot(request) {
+      if (request.savedAnalysisRuns === undefined && request.savedValidationReports === undefined) {
+        throw new Error("review.snapshot: the CLI supports supplied historical inputs; native session captures are unavailable");
+      }
+      return readPortableReview(captures, models, request, id => id === (active.bim.model.activeId() ?? "model"));
+    } },
     get defaultModelId() { return active.bim.model.activeId() ?? undefined; },
     // `table.joinByKey`'s tag/property strategies reuse `@ifc-lite/mutations`'
     // csv-match.ts index builder, which needs the raw entity table + mutation
     // view rather than per-ref BimContext accessors (see host.ts's TableAccess).
     tables: (modelId) => active.backend.tableAccess(modelId),
+    // `ids.validate` reads through the same mutation view, so it sees what an
+    // earlier node in the run wrote.
+    idsAccessor: () => createDataAccessor(active.store, undefined, active.backend.tableAccess().mutationView),
     async openModel(bytes, name) {
       const store = await parseIfcBytes(bytes, name);
       const backend = new HeadlessBackend(store, name);

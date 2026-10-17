@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import { reportCorrelation } from '@/lib/error-reports/correlation';
+import { offerErrorReport, attachContextCorrelation } from '@/lib/error-reports/context';
 import type { RenderDegradationInfo } from '@ifc-lite/renderer';
 import { posthog } from '@/lib/analytics';
 import {
@@ -10,6 +12,7 @@ import {
   type DeviceLossContextSource,
 } from './device-loss-context.js';
 import { startDeviceLossRecovery, type DeviceRecoverySource } from './device-loss-recovery.js';
+import { notifyDeviceHealth } from './device-loss-notification.js';
 import { reportDeviceRecovery } from './device-loss-recovery-report.js';
 import { useViewerStore } from '@/store';
 export { modelsWithoutOmittedPointCloudHandles } from './device-loss-recovery-report.js';
@@ -97,11 +100,13 @@ export function reportDeviceLost(
 ): void {
   if (reported) return;
   reported = true;
+  const reportContext = { errorCode: 'gpu_device_lost' };
+  offerErrorReport(reportContext);
 
   console.warn('[Viewport] GPU device lost:', info.reason, info.message);
 
   try {
-    posthog.captureException(
+    const captured = posthog.captureException(
       new Error(`GPU device lost (${info.reason}): ${info.message}`),
       {
         // Enrichment (issue #2624) FIRST, base fields LAST: whatever keys a
@@ -147,34 +152,19 @@ export function reportDeviceLost(
         $exception_fingerprint: deviceLostFingerprint(info.reason),
       },
     );
+    const correlation = reportCorrelation(captured);
+    if (correlation) attachContextCorrelation(reportContext, correlation);
   } catch (err) {
     // Telemetry must never be the thing that breaks the loss path.
     console.warn('[Viewport] device-loss capture failed:', err);
   }
 
-  // Imported lazily to keep the render-path module free of UI imports (same
-  // pattern as gpu-upload-guard). Wording follows that guard's toast, but says
-  // "stopped drawing" rather than its "part of the model may not be drawn":
-  // a lost device stops the WHOLE view, not one batch, and it does not come
-  // back without a reload.
-  void import('@/components/ui/toast').then((m) => {
-    m.toast.error(
-      'The graphics device was lost, so the 3D view has stopped drawing. ' +
-      (recoveryAvailable
-        ? 'Automatic recovery is starting; reload the page if it does not return.'
-        : 'Reload the page to restore rendering.'),
-    );
-  }).catch((err) => {
-    // Best-effort: a failed toast must never mask the device loss itself. But
-    // swallow it SILENTLY and the one case that matters — the toast chunk
-    // failing to load, so the user gets no notification at all about a view
-    // that has stopped — becomes invisible to us too. Log, do not rethrow.
-    // `[Viewport]`, like every other line this module logs. The `[device-loss]`
-    // it used to carry was the only prefix in the file that named a failure
-    // rather than the subsystem, which made the module ungreppable as a whole
-    // and invited its copy on the degradation path to be wrong outright.
-    console.warn('[Viewport] device-loss toast unavailable; loss reported to telemetry only:', err);
-  });
+  notifyDeviceHealth('error',
+    'The graphics device was lost, so the 3D view has stopped drawing. ' +
+    (recoveryAvailable
+      ? 'Automatic recovery is starting; reload the page if it does not return.'
+      : 'Reload the page to restore rendering.'),
+  );
 }
 
 /**
@@ -198,6 +188,8 @@ export function reportPersistentRenderDegradation(
 ): void {
   if (degradationReported) return;
   degradationReported = true;
+  const reportContext = { errorCode: 'persistent_render_degradation' };
+  offerErrorReport(reportContext);
 
   console.warn(
     '[Viewport] rendering degraded without recovering:',
@@ -207,7 +199,7 @@ export function reportPersistentRenderDegradation(
   );
 
   try {
-    posthog.captureException(
+    const captured = posthog.captureException(
       new Error(
         `Rendering persistently degraded (${info.origin}, ${info.consecutiveDegradedFrames} consecutive frames): ${info.detail}`,
       ),
@@ -238,6 +230,8 @@ export function reportPersistentRenderDegradation(
         $exception_fingerprint: 'ifc-lite:render_degraded',
       },
     );
+    const correlation = reportCorrelation(captured);
+    if (correlation) attachContextCorrelation(reportContext, correlation);
   } catch (err) {
     // Telemetry must never be the thing that breaks the render path.
     console.warn('[Viewport] render-degradation capture failed:', err);

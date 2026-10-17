@@ -30,6 +30,7 @@ import { AXIS_INFO, presetViewForAxis } from '../tools/sectionConstants';
 import { TitleBlockEditor } from '../TitleBlockEditor';
 import { useDrawingViewModel } from './useDrawingViewModel';
 import { useDrawingLayers } from './useDrawingLayers';
+import { AssistantAction } from '../assistant/AssistantAction';
 import { DrawingToolbar, type DrawingWidthTier } from './DrawingToolbar';
 import { DrawingExportMenu } from './DrawingExportMenu';
 import { DrawingCanvasView } from './DrawingCanvasView';
@@ -87,9 +88,12 @@ export function DrawingPanel(): React.ReactElement {
   const isCustomPlane = sectionPlane.custom !== undefined;
 
   // The same wording the Section tool's header uses for the cut.
-  const cutLabel = isCustomPlane
+  const cut = isCustomPlane
     ? t('sectionTool.header.custom', { distance: sectionPlane.custom!.distance.toFixed(2) })
     : t('sectionTool.header.axis', { axis: t(AXIS_INFO[sectionPlane.axis].labelKey), position: sectionPlane.position.toFixed(1) });
+  // With several cutting planes the drawing is the ACTIVE plane's (#7545): name it, so "which plane is this?" has an answer.
+  const hasOtherPlanes = useViewerStore((s) => s.inactiveSectionPlanes.length > 0);
+  const cutLabel = hasOtherPlanes && sectionPlane.name ? t('section2d.cutNamed', { name: sectionPlane.name, cut }) : cut;
 
   // The Section tool no longer auto-opens this panel (#5497): a docked or
   // floating drawing can outlive the tool and keep showing the last cut with
@@ -152,6 +156,7 @@ export function DrawingPanel(): React.ReactElement {
             visibleRasterReferenceCount={vm.visibleRasterReferenceCount}
             visibleUnderlayCount={layers.dxfUnderlayData.filter((underlay) => underlay.opacity > 0).length}
           />
+          <AssistantAction />
         </div>
       </div>
 

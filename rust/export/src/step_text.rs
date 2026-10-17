@@ -22,7 +22,9 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use ifc_lite_core::express_id::parse_express_id;
+use ifc_lite_core::step_encoding::step_string_literal_end;
 
+use crate::step_record_frame::{record_frame, record_head};
 use crate::step_slot::split_top_level_args;
 
 /// The edits that apply to one record, where a caller's attribute mutation and
@@ -112,16 +114,15 @@ pub(crate) fn refs_in_line(line: &[u8], out: &mut Vec<u32>) {
 /// changes no decision, so counting it would be reporting a no-op.
 pub(crate) fn refs_in_line_counted(line: &[u8], out: &mut Vec<u32>, refused: &mut usize) {
     let mut i = 0;
-    let mut in_quote = false;
     while i < line.len() {
         let b = line[i];
         if b == b'\'' {
-            // STEP escapes a quote as '' — toggling twice is a no-op, which is fine.
-            in_quote = !in_quote;
-            i += 1;
+            // A `#` inside a literal is text. Where the literal ends is the
+            // shared rule: `''` and a `\S\'` operand stay inside it (#7589).
+            i = step_string_literal_end(line, i).unwrap_or(line.len());
             continue;
         }
-        if !in_quote && b == b'#' {
+        if b == b'#' {
             let mut j = i + 1;
             while j < line.len() && line[j].is_ascii_digit() {
                 j += 1;
@@ -170,22 +171,15 @@ pub(crate) fn apply_attr_mutations_counted(
     muts: &BTreeMap<usize, String>,
     refused: &mut usize,
 ) -> String {
-    let trimmed = line.trim_end();
-    let body = trimmed.strip_suffix(';').unwrap_or(trimmed);
-    let edited = body.find('=').and_then(|eq| {
-        let after = &body[eq + 1..];
-        let popen = after.find('(')?;
-        let aclose = after.rfind(')').filter(|c| *c > popen)?;
-        let prefix = &body[..=eq];
-        let type_name = &after[..popen];
-        let mut args = split_top_level_args(&after[popen + 1..aclose])?;
+    let edited = record_frame(line).and_then(|frame| {
+        let mut args = split_top_level_args(frame.args(line))?;
         for (idx, val) in muts.range(..args.len()) {
             args[*idx] = val.clone();
         }
         if muts.range(args.len()..).next().is_some() {
             *refused += 1;
         }
-        Some(format!("{prefix}{type_name}({});", args.join(",")))
+        Some(frame.with_args(line, &args.join(",")))
     });
     match edited {
         Some(text) => text,
@@ -205,9 +199,8 @@ mod tests;
 /// For a copy-on-write copy: the body is the original's, byte for byte, with
 /// one attribute already replaced, and only the number in front changes.
 pub(crate) fn renumber(line: &str, new_id: u32) -> String {
-    let trimmed = line.trim_end();
-    match trimmed.find('=') {
-        Some(eq) => format!("#{new_id}{}", &trimmed[eq..]),
+    match record_head(line) {
+        Some(head) => format!("#{new_id}{}", line[head.eq..].trim_end()),
         None => line.to_string(),
     }
 }
@@ -225,15 +218,8 @@ pub(crate) fn renumber(line: &str, new_id: u32) -> String {
 /// answer for either: a slot read out of a mis-scanned list is some other
 /// attribute's text, and a copy built from it would carry the wrong value.
 pub(crate) fn attribute_of(line: &str, index: usize) -> Option<String> {
-    let trimmed = line.trim_end();
-    let body = trimmed.strip_suffix(';').unwrap_or(trimmed);
-    let eq = body.find('=')?;
-    let after = &body[eq + 1..];
-    let popen = after.find('(')?;
-    let aclose = after.rfind(')').filter(|c| *c > popen)?;
-    split_top_level_args(&after[popen + 1..aclose])?
-        .into_iter()
-        .nth(index)
+    let frame = record_frame(line)?;
+    split_top_level_args(frame.args(line))?.into_iter().nth(index)
 }
 
 /// Replace references inside one attribute, leaving its neighbours alone.
@@ -254,42 +240,30 @@ pub(crate) fn attribute_of(line: &str, index: usize) -> Option<String> {
 pub(crate) fn substitute_ref_in_attr(attr: &str, from: u32, to: u32) -> Option<String> {
     let old = format!("#{from}");
     let new = format!("#{to}");
+    let bytes = attr.as_bytes();
     let mut out = String::with_capacity(attr.len());
     let mut replaced = false;
-    let mut in_string = false;
-    let mut rest = attr;
-    while let Some(ch) = rest.chars().next() {
-        if in_string {
-            if ch == '\'' {
-                if rest[ch.len_utf8()..].starts_with('\'') {
-                    out.push_str("''");
-                    rest = &rest[ch.len_utf8() * 2..];
-                    continue;
-                }
-                in_string = false;
-            }
-            out.push(ch);
-            rest = &rest[ch.len_utf8()..];
+    // Every index this stops at is an ASCII byte or just past one, so each
+    // slice below sits on a char boundary.
+    let mut copied = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            // The shared rule for where a literal ends (#7589).
+            i = step_string_literal_end(bytes, i).unwrap_or(bytes.len());
             continue;
         }
-        if ch == '\'' {
-            in_string = true;
-            out.push(ch);
-            rest = &rest[ch.len_utf8()..];
+        // `#4` must not match inside `#41`.
+        if bytes[i..].starts_with(old.as_bytes()) && !bytes.get(i + old.len()).is_some_and(u8::is_ascii_digit) {
+            out.push_str(&attr[copied..i]);
+            out.push_str(&new);
+            i += old.len();
+            copied = i;
+            replaced = true;
             continue;
         }
-        if ch == '#' && rest.starts_with(old.as_str()) {
-            let after = &rest[old.len()..];
-            // `#4` must not match inside `#41`.
-            if !after.starts_with(|c: char| c.is_ascii_digit()) {
-                out.push_str(&new);
-                rest = after;
-                replaced = true;
-                continue;
-            }
-        }
-        out.push(ch);
-        rest = &rest[ch.len_utf8()..];
+        i += 1;
     }
+    out.push_str(&attr[copied..]);
     replaced.then_some(out)
 }

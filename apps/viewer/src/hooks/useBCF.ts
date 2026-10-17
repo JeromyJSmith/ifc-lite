@@ -11,12 +11,14 @@
  * - Applying viewpoints to the viewer (camera, selection, visibility)
  */
 
+import { captureBcfFrame } from './bcf/capture-frame';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useViewerStore } from '@/store';
 import type { BCFTopic, BCFViewpoint, BCFHeaderFile } from '@ifc-lite/bcf';
 import {
   createViewpoint,
   extractViewpointState,
+  sectionPlaneToClippingPlane,
   computeMarkerPositions, translateViewpoint, viewpointFromWorld,
   type ViewerCameraState,
   type ViewerBounds,
@@ -35,12 +37,13 @@ import { fromGlobalIdFromModels } from '@/store/globalId';
 import { resolvePresentationIds } from '@/lib/presentation/resolvePresentationIds';
 import { deriveHeaderFiles } from './bcfHeaderFiles';
 import { toast } from '@/components/ui/toast';
+import { MAX_SECTION_PLANES } from '@/lib/section/section-plane-set';
 import { captureVisibility, describeVisibilityNotice } from './bcf/visibility-capture';
 import { visibilityModelIdsForCapture } from './bcf/visibility-model-ids';
 import { capturedSectionPlaneInput, type CapturedSectionPlane } from './bcf/section-plane-position';
 import { bcfWorldOffset, renderFrameBounds, topicToRenderFrame } from './bcf/viewpoint-world-frame';
 import { focusedClashComponents } from './bcf/focused-clash-components';
-import { activeSectionPlane, cardinalSectionFlipped, clearSectionCut, showSectionCut } from '@/store/section-active';
+import { activeSectionPlane, cardinalSectionFlipped, clearSectionCut, clippingSectionPlanes, showSectionCuts } from '@/store/section-active';
 import { SectionRestoreSession } from './bcf/section-restore';
 
 // ============================================================================
@@ -244,37 +247,6 @@ export function useBCF(options: UseBCFOptions = {}): UseBCFResult {
   }, []);
 
   /**
-   * Capture a snapshot from the WebGPU canvas
-   * Captures exactly what the user sees - no re-rendering
-   */
-  const captureSnapshot = useCallback(async (): Promise<string | null> => {
-    const canvas = getCanvas();
-    const renderer = getRenderer();
-    if (!canvas) {
-      console.warn('[useBCF] No canvas available for snapshot capture');
-      return null;
-    }
-
-    try {
-      // Wait for any pending GPU work to complete before capturing
-      // This ensures we capture the fully rendered frame
-      if (renderer) {
-        const device = renderer.getGPUDevice();
-        if (device) {
-          await device.queue.onSubmittedWorkDone();
-        }
-      }
-
-      // Capture exactly what's displayed on the canvas
-      const dataUrl = canvas.toDataURL('image/png');
-      return dataUrl;
-    } catch (error) {
-      console.error('[useBCF] Failed to capture snapshot:', error);
-      return null;
-    }
-  }, [getCanvas, getRenderer]);
-
-  /**
    * Get current camera state from renderer
    */
   const getCameraState = useCallback((): ViewerCameraState | null => {
@@ -304,6 +276,13 @@ export function useBCF(options: UseBCFOptions = {}): UseBCFResult {
       aspectRatio,
     };
   }, [getRenderer]);
+
+  const captureFrame = useCallback(
+    () => captureBcfFrame(getRenderer(), getCanvas(), getCameraState),
+    [getRenderer, getCanvas, getCameraState],
+  );
+  const captureSnapshot = useCallback(async (): Promise<string | null> =>
+    (await captureFrame())?.snapshot ?? null, [captureFrame]);
 
   /**
    * Get model bounds from loaded models
@@ -399,23 +378,16 @@ export function useBCF(options: UseBCFOptions = {}): UseBCFResult {
         );
       }
 
-      // Snapshot FIRST, camera after: the PNG and the camera's `aspectRatio`
-      // describe one frame, so they must come from one drawing buffer.
-      // `captureSnapshot` awaits `queue.onSubmittedWorkDone()` before
-      // `toDataURL`, and the render loop resizes the canvas and calls
-      // `camera.setAspect` inside that wait (`renderer/src/index.ts`, the
-      // `dimensionsChanged` branch). Reading the camera after closes the
-      // window: an `await` resumes in a microtask, a rAF render is a task.
+      // The central capture reads camera metadata just after its full render,
+      // then owns that drawing buffer through completion and image readback.
       let snapshot: string | undefined = snapshotOverride;
+      let cameraState: ViewerCameraState | null = null;
       if (!snapshot && includeSnapshot) {
-        const captured = await captureSnapshot();
+        const frame = await captureFrame();
         if (opts.isCaptureStillValid && !opts.isCaptureStillValid()) return null;
-        if (captured) {
-          snapshot = captured;
-        }
+        if (frame) { snapshot = frame.snapshot; cameraState = frame.camera; }
       }
-
-      const cameraState = getCameraState();
+      cameraState ??= getCameraState();
       if (!cameraState) {
         console.warn('[useBCF] Cannot create viewpoint: no camera state');
         return null;
@@ -424,10 +396,22 @@ export function useBCF(options: UseBCFOptions = {}): UseBCFResult {
       const bounds = getBounds() ?? undefined;
       const capturedSection = capturedSectionPlane ? capturedSectionPlaneInput(capturedSectionPlane, bounds) : null;
       // Only the cut on screen: `enabled` outlives the Section tool (#4806).
-      const shown = activeSectionPlane(useViewerStore.getState());
+      const shown = activeSectionPlane(componentState);
+      // A section box has no plane to export (BCF clips with planes): it is left out, not written as the
+      // axis and position it carried from before it was a box.
+      const shownPlane = shown && !shown.box ? shown : null;
       const viewerSectionPlane = capturedSection?.sectionPlane
-        ?? (shown ? { axis: shown.axis, position: shown.position, enabled: true, flipped: cardinalSectionFlipped(shown) } : undefined);
+        ?? (shownPlane ? { axis: shownPlane.axis, position: shownPlane.position, enabled: true, flipped: cardinalSectionFlipped(shownPlane) } : undefined);
       const viewpointBounds = capturedSection?.bounds ?? bounds;
+      // The other cutting planes ride along (#7545): the viewpoint is what the screen shows, and the
+      // screen keeps only what ALL of them keep. The active plane leads, as captured above. They are
+      // placed against the model's own bounds: `viewpointBounds` may be the collapsed box a captured
+      // 2D section needs for ITS axis, which would move every other axis's plane to the midpoint.
+      const others = bounds
+        ? clippingSectionPlanes(componentState).filter((p) => p.id !== shown?.id && !p.box)
+          .map((p) => sectionPlaneToClippingPlane({ axis: p.axis, position: p.position, enabled: true, flipped: cardinalSectionFlipped(p) }, bounds))
+          .filter((plane): plane is NonNullable<typeof plane> => plane !== null)
+        : [];
 
       // Visibility GUIDs — the isolate allowlist or the hide-list, whichever the
       // viewer is in; what could not be named is reported to the author.
@@ -462,21 +446,23 @@ export function useBCF(options: UseBCFOptions = {}): UseBCFResult {
 
       // Camera and section plane are captured in the render frame; the
       // viewpoint is stored and written in world coordinates (#4806).
-      return translateViewpoint(createViewpoint({
+      const viewpoint = createViewpoint({
         camera: cameraState,
-        sectionPlane: viewerSectionPlane,
+        sectionPlanes: viewerSectionPlane ? [viewerSectionPlane] : [],
         bounds: viewpointBounds,
         snapshot,
         selectedGuids,
         hiddenGuids,
         visibleGuids,
         coloredGuids,
-      }), getWorldOffset());
+      });
+      if (others.length > 0) viewpoint.clippingPlanes = [...(viewpoint.clippingPlanes ?? []), ...others];
+      return translateViewpoint(viewpoint, getWorldOffset());
     },
     [
       getWorldOffset,
       getCameraState,
-      captureSnapshot,
+      captureFrame,
       getBounds,
     ]
   );
@@ -572,7 +558,7 @@ export function useBCF(options: UseBCFOptions = {}): UseBCFResult {
         bounds,
         renderer.getCamera().getDistance() // Use current distance as reference
       );
-      const { camera, sectionPlane: viewpointSectionPlane } = state;
+      const { camera, sectionPlanes: viewpointSectionPlanes } = state;
 
       if (camera) {
         applyCameraState(renderer, camera, animate);
@@ -582,8 +568,13 @@ export function useBCF(options: UseBCFOptions = {}): UseBCFResult {
       // tool — the renderer draws a cut nowhere else); one without clears any
       // cut, parked ones included, so the view matches the topic (#4910).
       if (restoreSection) sectionRestore.noteBeforeViewpoint(useViewerStore.getState());
-      if (viewpointSectionPlane?.enabled) {
-        showSectionCut(useViewerStore.getState, viewpointSectionPlane);
+      const cuts = viewpointSectionPlanes?.filter((plane) => plane.enabled) ?? [];
+      if (cuts.length > MAX_SECTION_PLANES) {
+        console.warn(`[useBCF] The viewpoint has ${cuts.length} clipping planes; showing the first ${MAX_SECTION_PLANES}.`);
+        toast.info(`This viewpoint has ${cuts.length} clipping planes; the first ${MAX_SECTION_PLANES} are shown.`);
+      }
+      if (cuts.length > 0) {
+        showSectionCuts(useViewerStore.getState, cuts.slice(0, MAX_SECTION_PLANES));
       } else {
         clearSectionCut(useViewerStore.getState);
       }

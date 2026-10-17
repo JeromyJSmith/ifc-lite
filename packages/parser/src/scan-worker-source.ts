@@ -233,13 +233,16 @@ ${WORKER_LEXING}
       // would otherwise balance the same record twice. -3 = not computed;
       // -1 = unbalanced but readable; -2 = a literal/comment never closed.
       var recordClose = -3;
+      var quoteEnd = 1; // stringParameterEndAt's answer at a refused closing quote
       while (pos < len) {
         var c6 = buf[pos];
         if (c6 === 0x27) { // quote
+          if (inString && isPageQuoteOperandAt(pos)) { pos++; continue; }
           if (inString && pos + 1 < len && buf[pos + 1] === 0x27) {
             pos += 2;
             continue;
           }
+          if (inString && (quoteEnd = stringParameterEndAt(pos)) !== 1) break;
           inString = !inString;
         } else if (c6 === 0x2F && !inString && opensCommentAt(pos)) {
           // The ';' that ends a record can be preceded by a comment holding
@@ -290,16 +293,15 @@ ${WORKER_LEXING}
         pos++;
       }
 
-      // No ';' of this record's own. EVERY such exit lands here, so the
-      // recovery lives here once rather than at each break -- mirrors
-      // tokenizer.ts's scanEntitiesFast. Resume at the ')' balancing this
-      // record's own '(' when there is one, dropping just this record;
-      // otherwise run to len, ending the scan un-resynced rather than guessing
-      // a resume point from misaligned bytes. The balance walk stops at the
-      // next declaration's '=' (#4573), so a refusal costs this record's
-      // bytes, never a re-walk of the remainder per refusal.
+      // No ';' of this record's own. EVERY such exit lands here, once --
+      // mirrors tokenizer.ts's scanEntitiesFast. An unescaped apostrophe
+      // resumes at the next anchored declaration (#7541); otherwise resume at
+      // this record's own ')', dropping just it, else run to len rather than
+      // guess from misaligned bytes. The balance walk stops at the next '='
+      // (#4573), so a refusal costs this record's bytes, never the remainder.
       if (!foundTerminator) {
         stopped = true;
+        if (quoteEnd === 0) { pos = resyncAtRecordStartAt(pos + 1); continue; }
         if (recordClose === -3) {
           var savedRecLine = line;
           recordClose = findEntityLengthAt(parenPos, startOffset);
@@ -330,6 +332,7 @@ ${WORKER_LEXING}
       var closed = false;
       while (sp < len) {
         if (buf[sp] === 0x27) {
+          if (isPageQuoteOperandAt(sp)) { sp++; continue; }
           if (sp + 1 < len && buf[sp + 1] === 0x27) { sp += 2; continue; }
           sp++;
           closed = true;

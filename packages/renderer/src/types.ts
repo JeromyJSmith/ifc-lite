@@ -6,6 +6,9 @@
  * Renderer types for IFC-Lite
  */
 
+import type { ClipBox } from './clip-types.js';
+export type { ClipBox, ExtraClipPlane } from './clip-types.js';
+
 export interface Vec3 {
   x: number;
   y: number;
@@ -153,6 +156,10 @@ export interface SectionCapStyleOptions {
 }
 
 export interface SectionPlane {
+  /** Keys this plane's cap among the cutting planes beyond the first (#7545); unused on the primary plane. */
+  id?: string;
+  /** False hides the preview quad of the primary plane (the plane still clips and caps). Default true (#7545). */
+  showGizmo?: boolean;
   axis: SectionPlaneAxis;
   position: number; // 0-100 percentage of model bounds
   enabled: boolean;
@@ -177,23 +184,6 @@ export interface SectionPlane {
   normal?: [number, number, number];
   /** Plane offset in world units: `dot(pointOnPlane, normal)`. */
   distance?: number;
-}
-
-/**
- * Axis-aligned clip box (section / crop box): geometry is kept only where it
- * lies INSIDE all six box planes; fragments outside the box are discarded by the
- * shader (real geometry cut, unlike bounding-box element isolation). Coordinates
- * are in the same world space the shader sees as `input.worldPos` — i.e. the
- * viewer space the camera/section planes use. Independent of `sectionPlane`; both
- * can be active at once.
- */
-export interface ClipBox {
-  /** Box min corner [x, y, z] in world space. */
-  min: [number, number, number];
-  /** Box max corner [x, y, z] in world space. */
-  max: [number, number, number];
-  /** When false (or omitted), the box has no effect. */
-  enabled: boolean;
 }
 
 export type ContactShadingQuality = 'off' | 'low' | 'high';
@@ -319,6 +309,8 @@ export interface RenderOptions {
   selectedModelIndex?: number;    // Model index for multi-model selection (must match mesh.modelIndex)
   // Section plane clipping
   sectionPlane?: SectionPlane;
+  /** More cutting planes beyond `sectionPlane` (#7545), each resolved like it; enabled ones clip, and a fragment must survive all (max 7). */
+  extraSectionPlanes?: SectionPlane[];
   // Section / crop box: clip geometry to an axis-aligned world-space box (all six
   // sides). Independent of `sectionPlane`. The GPU picker mirrors the active
   // section plane + clip box from the last render, so cropped/sectioned-away
@@ -329,6 +321,8 @@ export interface RenderOptions {
   terrainClipY?: number;
   // Optional visual effects for better subelement readability
   visualEnhancement?: VisualEnhancementOptions;
+  /** Frame-local resolution cap; cannot exceed the persistent renderer cap. */
+  maxPixelRatio?: number;
   // Streaming state
   isStreaming?: boolean;          // If true, skip expensive operations like picker
   // True during rapid camera movement (zoom, orbit, pan, animations).

@@ -17,6 +17,9 @@ for (const [corruptServedWasm, dirtyWorkingTree] of [[false, false], [true, fals
   mkdirSync(bin);
   writeFileSync(join(repo, '.gitignore'), 'packages/wasm/pkg/\napps/viewer/dist/\n');
   copyFileSync(resolve('scripts/perf/browser-cold-ab.sh'), join(repo, 'scripts/perf/browser-cold-ab.sh'));
+  // This test isolates build/cleanup; real ancestry admission is exercised by
+  // browser-span-source.test.mjs against actual Git commits.
+  writeFileSync(join(repo, 'scripts/perf/browser-span-source.mjs'), "import {execFileSync} from 'node:child_process'; console.log(execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim());\n");
   writeFileSync(join(repo, 'scripts/build-wasm.sh'), '#!/bin/sh\nmkdir -p packages/wasm/pkg\nprintf fixture-wasm > packages/wasm/pkg/ifc-lite_bg.wasm\n');
   const git = args => {
     const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
@@ -29,8 +32,8 @@ for (const [corruptServedWasm, dirtyWorkingTree] of [[false, false], [true, fals
     git(['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'fixture']);
     if (dirtyWorkingTree) writeFileSync(join(repo, 'uncommitted-source.txt'), 'uncommitted');
     // Build tools are bounded stubs; git worktree registration and shell traps are real.
-    writeFileSync(join(bin, 'pnpm'), '#!/bin/sh\nif [ \"$1\" = install ]; then exit 0; fi\nmkdir -p apps/viewer/dist/assets\ncp packages/wasm/pkg/ifc-lite_bg.wasm apps/viewer/dist/assets/ifc-lite_bg-test.wasm\nif [ \"$WRAPPER_CORRUPT_WASM\" = 1 ]; then printf wrong-engine > apps/viewer/dist/assets/ifc-lite_bg-test.wasm; fi\n', { mode: 0o755 });
-    writeFileSync(join(bin, 'node'), `#!/bin/sh\nexec '${process.execPath}' \"$@\"\n`, { mode: 0o755 });
+    writeFileSync(join(bin, 'pnpm'), '#!/bin/sh\nif [ "$1" = install ]; then exit 0; fi\nmkdir -p apps/viewer/dist/assets\ncp packages/wasm/pkg/ifc-lite_bg.wasm apps/viewer/dist/assets/ifc-lite_bg-test.wasm\nif [ "$WRAPPER_CORRUPT_WASM" = 1 ]; then printf wrong-engine > apps/viewer/dist/assets/ifc-lite_bg-test.wasm; fi\n', { mode: 0o755 });
+    writeFileSync(join(bin, 'node'), `#!/bin/sh\nexec '${process.execPath}' "$@"\n`, { mode: 0o755 });
     writeFileSync(join(bin, 'wasm-pack'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
     writeFileSync(join(bin, 'npx'), `#!/bin/sh
 previous=''
@@ -55,6 +58,7 @@ exit 17
       assert.equal(existsSync(marker), false, 'mismatched artifacts must not launch the harness');
     } else {
       assert.ok(existsSync(marker), 'child actually received a live base distribution');
+      // @source-text-assertion-ok child-process output artifact, not source text; verifies the actual forwarded revision label
       assert.match(readFileSync(labelMarker, 'utf8'), dirtyWorkingTree ? /^[a-f0-9]{40}-dirty$/ : /^supplied-branch-dist$/);
       assert.equal(existsSync(readFileSync(marker, 'utf8')), false, 'temporary base distribution was removed');
     }

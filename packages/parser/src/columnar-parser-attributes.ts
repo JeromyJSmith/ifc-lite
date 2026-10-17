@@ -12,8 +12,9 @@
 import type { EntityRef } from './types.js';
 import { decodeIfcString } from '@ifc-lite/encoding';
 import { isIndexableExpressId } from './express-id.js';
-import { opensComment, skipComment, skipTrivia } from './step-lexing.js';
+import { opensComment, skipComment, skipStringLiteral, skipTrivia } from './step-lexing.js';
 import { EntityExtractor } from './entity-extractor.js';
+import { getRootAttrIndices } from './columnar-parser-root-attributes.js';
 
 /** Does `ref`'s byte range contain a `/*` comment opener? Cheap linear scan,
  *  only run on a record `findQuotedAttrRange` already failed to read. */
@@ -48,23 +49,24 @@ export function findQuotedAttrRange(
     if (pos >= end) return null;
     pos++; // skip '('
 
-    // Skip commas to reach the target attribute
+    // Skip commas to reach the target attribute. A string literal is skipped
+    // whole by step-lexing's `skipStringLiteral`, the one rule for where a
+    // literal ends: `''` and a `\S\` PAGE operand are text, so the comma in
+    // `'Para \S\' 5'` is not a separator (#7589).
     if (attrIndex > 0) {
         let toSkip = attrIndex;
         let depth = 0;
-        let inStr = false;
         while (pos < end && toSkip > 0) {
             const ch = buffer[pos];
             if (ch === 0x27 /* ' */) {
-                if (inStr && pos + 1 < end && buffer[pos + 1] === 0x27) {
-                    pos += 2; continue;
-                }
-                inStr = !inStr;
-            } else if (!inStr) {
-                if (ch === 0x28) depth++;
-                else if (ch === 0x29) depth--;
-                else if (ch === 0x2C && depth === 0) toSkip--;
+                const next = skipStringLiteral(buffer, pos, end);
+                if (next < 0) return null;
+                pos = next;
+                continue;
             }
+            if (ch === 0x28) depth++;
+            else if (ch === 0x29) depth--;
+            else if (ch === 0x2C && depth === 0) toSkip--;
             pos++;
         }
     }
@@ -80,20 +82,10 @@ export function findQuotedAttrRange(
 
     // Check for quoted string
     if (pos >= end || buffer[pos] !== 0x27 /* ' */) return null;
-    pos++; // skip opening quote
-    const start = pos;
-
-    // Find closing quote (handle escaped quotes '')
-    while (pos < end) {
-        if (buffer[pos] === 0x27) {
-            if (pos + 1 < end && buffer[pos + 1] === 0x27) {
-                pos += 2; continue;
-            }
-            break;
-        }
-        pos++;
-    }
-    return [start, pos];
+    // The literal ends where `skipStringLiteral` says (#7589); an
+    // unterminated one runs to the record's end, as it always has.
+    const close = skipStringLiteral(buffer, pos, end);
+    return [pos + 1, close < 0 ? end : close - 1];
 }
 
 /**
@@ -155,16 +147,16 @@ export function skipCommas(buffer: Uint8Array, start: number, end: number, count
     let pos = start;
     let remaining = count;
     let depth = 0;
-    let inString = false;
     while (pos < end && remaining > 0) {
         const ch = buffer[pos];
-        if (inString) {
-            if (ch === 0x27 && pos + 1 < end && buffer[pos + 1] === 0x27) { pos += 2; continue; }
-            if (ch === 0x27) inString = false;
-            pos++;
+        // A literal is skipped whole by the shared rule, so a `\S\` PAGE
+        // operand does not end it early (#7589); one that never closes runs
+        // to `end`, as the toggle it replaced did.
+        if (ch === 0x27) {
+            const next = skipStringLiteral(buffer, pos, end);
+            pos = next < 0 ? end : next;
             continue;
         }
-        if (ch === 0x27) { inString = true; pos++; continue; }
         if (opensComment(buffer, pos, end)) {
             const next = skipComment(buffer, pos, end);
             pos = next < 0 ? end : next;
@@ -218,19 +210,29 @@ export function readRefId(buffer: Uint8Array, pos: number, end: number): [number
 
 /** Read a list of entity refs (#id1,#id2,...) or a single #id. Returns [ids, newPos]. */
 export function readRefList(buffer: Uint8Array, pos: number, end: number): [number[], number] {
-    // Kept in sync with isSpaceByte in step-lexing.ts (#3733).
-    while (pos < end && (buffer[pos] === 0x20 || buffer[pos] === 0x09 || buffer[pos] === 0x0A || buffer[pos] === 0x0D || buffer[pos] === 0x0C || buffer[pos] === 0x0B)) pos++;
+    // Trivia is whitespace AND `/* ... */` comments (#7785): a `#` or `)` inside
+    // a comment is not structure. A comment that never closes runs to `end`.
+    pos = skipTrivia(buffer, pos, end).next;
     const ids: number[] = [];
 
     if (pos < end && buffer[pos] === 0x28) {
         pos++;
         while (pos < end && buffer[pos] !== 0x29) {
-            while (pos < end && (buffer[pos] === 0x20 || buffer[pos] === 0x09 || buffer[pos] === 0x0A || buffer[pos] === 0x0D || buffer[pos] === 0x0C || buffer[pos] === 0x0B || buffer[pos] === 0x2C)) pos++;
-            if (pos < end && buffer[pos] === 0x23) {
+            const gap = skipTrivia(buffer, pos, end);
+            pos = gap.next;
+            if (gap.stop) break;
+            if (pos >= end || buffer[pos] === 0x29) break;
+            const b = buffer[pos];
+            if (b === 0x2C) {
+                pos++;
+            } else if (b === 0x23) {
                 const [id, np] = readRefId(buffer, pos, end);
                 if (id >= 0) ids.push(id);
                 pos = np;
-            } else if (pos < end && buffer[pos] !== 0x29) {
+            } else if (b === 0x27) {
+                const next = skipStringLiteral(buffer, pos, end);
+                pos = next < 0 ? end : next;
+            } else {
                 pos++;
             }
         }
@@ -243,7 +245,7 @@ export function readRefList(buffer: Uint8Array, pos: number, end: number): [numb
 }
 
 /**
- * Batch extract GlobalId (attr[0]) and Name (attr[2]) for many entities using
+ * Batch extract schema-declared GlobalId and Name for many entities using
  * only 2 TextDecoder.decode() calls total (one for all GlobalIds, one for all Names).
  *
  * This is ~100x faster than calling extractEntity() per entity for large batches
@@ -277,13 +279,19 @@ export async function batchExtractGlobalIdAndName(
             await yieldIfNeeded();
         }
         const ref = refs[i];
-        const gidRange = findQuotedAttrRange(buffer, ref.byteOffset, ref.byteLength, 0);
-        const nameRange = findQuotedAttrRange(buffer, ref.byteOffset, ref.byteLength, 2);
+        const schema = getRootAttrIndices(ref.type);
+        // Known roots keep the same 0/2 fast path. Known non-roots must not
+        // project Name as GlobalId; unknown vendor types retain the existing
+        // explicit IfcRoot-position policy used by on-demand extraction.
+        const gidIndex = schema.known ? schema.globalId : 0;
+        const nameIndex = schema.known ? schema.name : 2;
+        const gidRange = gidIndex < 0 ? null : findQuotedAttrRange(buffer, ref.byteOffset, ref.byteLength, gidIndex);
+        const nameRange = nameIndex < 0 ? null : findQuotedAttrRange(buffer, ref.byteOffset, ref.byteLength, nameIndex);
 
         gidRanges.push(gidRange ?? [0, 0]);
         nameRanges.push(nameRange ?? [0, 0]);
         nameFound.push(nameRange !== null);
-        commentSuspect.push((gidRange === null || nameRange === null) && hasCommentOpener(buffer, ref));
+        commentSuspect.push(((gidIndex >= 0 && gidRange === null) || (nameIndex >= 0 && nameRange === null)) && hasCommentOpener(buffer, ref));
         validIndices.push(i);
     }
 
@@ -359,9 +367,12 @@ export async function batchExtractGlobalIdAndName(
         if (!commentSuspect[i]) continue;
         const ref = refs[validIndices[i]];
         const attrs = (fallback ??= new EntityExtractor(buffer)).extractEntity(ref)?.attributes ?? [];
+        const schema = getRootAttrIndices(ref.type);
+        const globalId = attrs[schema.known ? schema.globalId : 0];
+        const name = attrs[schema.known ? schema.name : 2];
         result.set(ref.expressId, {
-            globalId: typeof attrs[0] === 'string' ? attrs[0] : '',
-            name: typeof attrs[2] === 'string' ? attrs[2] : undefined,
+            globalId: typeof globalId === 'string' ? globalId : '',
+            name: typeof name === 'string' ? name : undefined,
         });
     }
 

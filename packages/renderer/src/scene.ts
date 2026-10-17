@@ -11,6 +11,7 @@ import { createInstancedRteDeltaStream, invalidateInstancedRteDeltas, type Insta
 import { materializeInstances } from './scene-instance-materialization.js';
 import { InstanceSuppression } from './scene-instance-suppression.js';
 import { createSceneBatch } from './scene-batch-upload.js';
+import { flushQueuedMeshes } from './scene-flush.js';
 import { createStaticGpuBuffer } from './gpu-static-upload.js';
 import { createSceneAppearancePreview, rebindSceneAppearanceAccess, type SceneAppearanceAccess } from './scene-appearance-preview.js';
 import { AppearanceBuckets } from './scene-appearance-buckets.js';
@@ -22,6 +23,7 @@ import type { Mesh, BatchedMesh, Vec3, PickClipState, Material, MeshFinish } fro
 import type { MeshData } from '@ifc-lite/geometry';
 import { hostsOtherEntities } from './mesh-entity-hosting.js';
 import type { RenderPipeline } from './pipeline.js';
+import type { IndividualMeshFrame } from './individual-mesh-upload.js';
 import { BATCH_CONSTANTS } from './constants.js';
 import {
   type BoundingBox,
@@ -48,8 +50,9 @@ import { translateSceneModel, rotateSceneModelInstances, releaseInstanceVertices
 import { ModelTranslations, type ModelYaw } from './model-translation.js';
 import { unionInstancedWorldAabb as unionInstanceBounds } from './scene-instance-bounds.js';
 import { DerivedMeshProvenance } from './scene-derived-mesh-provenance.js';
-import { rebuildSceneBatches } from './scene-batch-rebuild.js';
+import { forgetEmptyModelFrames, rebuildSceneBatches } from './scene-batch-rebuild.js';
 import { regroupStreamedBuckets, type FinalizeRegroup } from './scene-finalize-regroup.js';
+import { perfCount, perfCounters, perfTally, type LoadTrace } from '@ifc-lite/load-trace';
 import {
   dropAllPartialCaches as dropAllPartialCachesIn,
   dropPartialCacheForBatch as dropPartialCacheForBatchIn,
@@ -145,59 +148,7 @@ export interface TexturedMesh {
 export type { InstancedTemplateGPU } from './scene-instance-types.js';
 const EMPTY_INSTANCED_TEMPLATES: readonly InstancedTemplateGPU[] = [];
 
-/**
- * Pure helper: compute the exclusive end index of the next flushPending()
- * append chunk, starting at `readIndex` and bounded by BOTH mesh count
- * (`hardEnd`, computed by the caller) and index volume (`maxIndicesPerAppend`).
- * Always takes at least one mesh past `readIndex` -- a single oversize mesh is
- * split upstream by splitMeshForStreaming, so the volume cap never blocks the
- * first mesh of a chunk.
- *
- * Non-finite-safe by construction: every non-finite `next` (a malformed mesh
- * reporting NaN, +Infinity, or -Infinity for `indices.length`) closes the
- * chunk explicitly instead of being folded into the running `chunkIndices`
- * total. Only NaN would have made a naive cap check `chunkIndices + next >
- * maxIndicesPerAppend` silently `false` forever (`NaN > cap` is always
- * `false`); +Infinity actually made that same check fire immediately
- * (`chunkIndices + Infinity > cap` is `true`), closing the chunk after a
- * single oversize mesh instead of growing it unbounded. The current
- * `!(chunkIndices + next <= maxIndicesPerAppend)` form below rejects both
- * NaN and +Infinity explicitly rather than relying on that asymmetry.
- * -Infinity needed a separate, explicit check: `-Infinity <= cap` is always
- * `true`, so `!(... <= cap)` lets it straight through, and folding it into
- * `chunkIndices` would poison the running total to -Infinity permanently,
- * keeping the cap vacuous for every mesh after it, not just the malformed
- * one.
- */
-export function computeFlushChunkEnd(
-  getIndicesLength: (meshIndex: number) => number,
-  readIndex: number,
-  hardEnd: number,
-  maxIndicesPerAppend: number,
-): number {
-  let chunkEnd = readIndex;
-  let chunkIndices = 0;
-  while (chunkEnd < hardEnd) {
-    const next = getIndicesLength(chunkEnd);
-    if (!Number.isFinite(next)) {
-      // A malformed mesh reporting a non-finite indices.length (NaN, +/-Infinity)
-      // must close the chunk here rather than being folded into chunkIndices:
-      // `chunkIndices += -Infinity` would poison the running total to -Infinity
-      // permanently, making `!(chunkIndices + next <= maxIndicesPerAppend)`
-      // false forever and letting the volume cap never fire again for the
-      // rest of this chunk. Always take at least the first mesh past
-      // readIndex (same progress guarantee as the NaN case below).
-      if (chunkEnd === readIndex) chunkEnd++;
-      break;
-    }
-    if (chunkEnd > readIndex && !(chunkIndices + next <= maxIndicesPerAppend)) {
-      break;
-    }
-    chunkIndices += next;
-    chunkEnd++;
-  }
-  return chunkEnd;
-}
+export { computeFlushChunkEnd } from './scene-flush.js';
 
 export class Scene {
   private meshes: Mesh[] = [];
@@ -209,6 +160,10 @@ export class Scene {
   private meshDataMap: Map<number, MeshData[]> = new Map();         // Map expressId -> MeshData[] (for lazy buffer creation, accumulates multiple pieces)
   private boundingBoxes: Map<number, BoundingBox> = new Map();      // Map expressId -> bounding box (computed lazily)
   private texturedMeshes: TexturedMesh[] = [];                      // #961: IFC surface-textured meshes (own buffers/texture/bindGroup)
+  /** The `positions` each textured drawable was uploaded from. Matched by the
+   *  array, not the MeshData: the appearance preview installs `{...part}`
+   *  copies, which share the array but not the object identity. */
+  private texturedSourcePositions = new WeakMap<TexturedMesh, MeshData['positions']>();
   /** #1781: GPU textures shared across meshes, keyed by `MeshTextureRef.textureId`
    *  (one `IfcImageTexture` → one upload, sampled by every face set mapping it).
    *  Refcounted: entries die when the last referencing mesh is removed / on clear(). */
@@ -605,6 +560,27 @@ export class Scene {
    */
   setQuantizedBatches(enabled: boolean): void {
     this.quantizedBatchesEnabled = enabled;
+  }
+
+  /** The draw origin of the textured drawable rendering `meshData`, or null
+   *  when it renders through a colour batch. A textured mesh never enters a
+   *  bucket: it draws its RAW positions against its own per-element origin,
+   *  unquantized, so a highlight/hover copy must use that frame — the batch
+   *  frame lands a few f32 ulps off and z-fights the texture. */
+  getTexturedDrawOrigin(meshData: MeshData): readonly [number, number, number] | null {
+    const positions = this.derivedMeshProvenance.placedSourceFor(meshData, this.modelTranslations).positions;
+    const tm = this.texturedMeshes.find((m) => m.expressId === meshData.expressId && this.texturedSourcePositions.get(m) === positions);
+    return tm ? tm.origin : null;
+  }
+
+  /** The frame a highlight/hover copy of `meshData` is built in, so it renders
+   *  bit-coincident with its source. A textured piece draws raw positions
+   *  against its own origin, never quantized: relativizing against that origin
+   *  is a +0 fold, where the batch frame would z-fight the texture (#7503). */
+  getIndividualMeshFrame(meshData: MeshData): IndividualMeshFrame {
+    const texturedOrigin = this.getTexturedDrawOrigin(meshData);
+    if (texturedOrigin) return { sharedOrigin: texturedOrigin, quantized: false };
+    return { sharedOrigin: this.getSharedFrameOrigin(meshData.modelIndex, meshData), quantized: this.isMeshQuantized(meshData) };
   }
 
   /** Whether THIS mesh's source batch renders quantized — drives the hydrated-mesh
@@ -1313,6 +1289,7 @@ export class Scene {
 
     this.batchedMeshes = [...this.buckets.values()].flatMap(bucket => bucket.batchedMesh ? [bucket.batchedMesh] : []);
     this.pendingBatchKeys.clear();
+    forgetEmptyModelFrames(this.buckets, this.sharedFrameOrigins);
   }
 
   /**
@@ -1869,13 +1846,10 @@ export class Scene {
     return this.meshQueueReadIndex < this.meshQueue.length;
   }
 
-  /** True while un-finalised streaming fragments are still being drawn. An
-   *  element appended during streaming (e.g. an authored IfcSpace) renders as
-   *  such a fragment AND accumulates in its colour bucket; once the bucket is
-   *  re-batched (e.g. by a move) the fragment becomes a stale duplicate, so the
-   *  caller should `finalizeStreaming` to merge fragments away. */
+  /** True while GPU fragments or retained streamed buckets await finalization.
+   * Recovery retires old-device fragments without retiring their CPU owner. */
   hasStreamingFragments(): boolean {
-    return this.streamingFragments.length > 0;
+    return this.streamingFragments.length > 0 || this.streamedBucketKeys.size > 0;
   }
 
   /** True while a finalize rebuild (sync or time-sliced) is mid-flight —
@@ -1904,77 +1878,20 @@ export class Scene {
    * @param budgetMs Time slice per call. The 12 ms default keeps the main
    *   thread returning to the worker-message pump while geometry streams; a
    *   host with nothing else to serve may drain faster (#6436).
+   * @param trace The streaming load's trace (#6979): a call that uploaded
+   *   anything records one `scene.flushPending` span.
+   * @param deterministicUploads Benchmark-only per-mesh fragments with count
+   *   and index-volume bounds. These totals describe a different timing workload.
    * @returns true if any meshes were processed (caller should render)
    */
-  flushPending(device: GPUDevice, pipeline: RenderPipeline, budgetMs = 12): boolean {
-    if (!this.hasQueuedMeshes()) return false;
-
-    // Drain the queue in chunks bounded by BOTH mesh count AND triangle volume,
-    // yielding the frame back at the TOP of the loop. The mesh-count-only chunker
-    // could merge a 512-mesh chunk of high-poly meshes (e.g. 899 Velux roof
-    // windows at 7624 tris each → ~3.9M tris) in ONE indivisible mergeGeometry +
-    // GPU buffer upload copy — hundreds of ms that parked the main thread
-    // past the 16s stream watchdog. Capping each appendToBatches by index volume
-    // keeps every synchronous slice ≈ one bounded fragment merge (~12-15ms).
-    const MAX_MESHES_PER_FLUSH = 4096;
-    const MESHES_PER_APPEND = 512;
-    const MAX_INDICES_PER_APPEND = Scene.STREAMING_FRAGMENT_MAX_INDICES;
-    const start = performance.now();
-    let processed = 0;
-
-    while (this.meshQueueReadIndex < this.meshQueue.length && processed < MAX_MESHES_PER_FLUSH) {
-      // Yield once the budget is spent (after at least one append) so the main
-      // thread returns to the worker-message pump and the watchdog never trips.
-      if (processed > 0 && performance.now() - start >= budgetMs) {
-        break;
-      }
-
-      const hardEnd = Math.min(
-        this.meshQueue.length,
-        this.meshQueueReadIndex + MESHES_PER_APPEND,
-        this.meshQueueReadIndex + (MAX_MESHES_PER_FLUSH - processed),
-      );
-      const chunkEnd = computeFlushChunkEnd(
-        (i) => this.meshQueue[i].indices.length,
-        this.meshQueueReadIndex,
-        hardEnd,
-        MAX_INDICES_PER_APPEND,
-      );
-
-      // Defensive, not reachable today: chunkEnd is provably > meshQueueReadIndex
-      // here because hardEnd is provably > meshQueueReadIndex whenever this outer
-      // loop iterates, via three invariants that hold simultaneously above:
-      //   (1) this.meshQueue.length > this.meshQueueReadIndex -- the outer while
-      //       condition that got us into this iteration;
-      //   (2) this.meshQueueReadIndex + MESHES_PER_APPEND, and MESHES_PER_APPEND
-      //       (512) is a positive constant;
-      //   (3) this.meshQueueReadIndex + (MAX_MESHES_PER_FLUSH - processed), and
-      //       processed < MAX_MESHES_PER_FLUSH -- the other half of the outer
-      //       while condition -- so that term is >= readIndex + 1 too.
-      // hardEnd is the min of all three, so hardEnd >= readIndex + 1, and
-      // computeFlushChunkEnd always advances by at least one past readIndex.
-      // If a future change breaks any one of those three invariants, hardEnd
-      // could collapse to readIndex and the loop would spin the main thread at
-      // 100% CPU doing zero allocation -- the exact signature that made #2379
-      // expensive to diagnose. This break turns that failure mode into "flush
-      // stops early" instead.
-      if (chunkEnd === this.meshQueueReadIndex) break;
-
-      const chunk = this.meshQueue.slice(this.meshQueueReadIndex, chunkEnd);
-      this.meshQueueReadIndex = chunkEnd;
+  flushPending(device: GPUDevice, pipeline: RenderPipeline, budgetMs = 12, trace?: LoadTrace, deterministicUploads = false): boolean {
+    const result = flushQueuedMeshes(this.meshQueue, this.meshQueueReadIndex, (chunk, nextReadIndex) => {
+      this.meshQueueReadIndex = nextReadIndex;
       this.appendToBatches(chunk, device, pipeline, true);
-      processed += chunk.length;
-    }
-
-    if (this.meshQueueReadIndex >= this.meshQueue.length) {
-      this.meshQueue.length = 0;
-      this.meshQueueReadIndex = 0;
-    } else if (this.meshQueueReadIndex >= 8192 && this.meshQueueReadIndex * 2 >= this.meshQueue.length) {
-      this.meshQueue = this.meshQueue.slice(this.meshQueueReadIndex);
-      this.meshQueueReadIndex = 0;
-    }
-
-    return processed > 0;
+    }, { budgetMs, trace, deterministicUploads, maxIndicesPerAppend: Scene.STREAMING_FRAGMENT_MAX_INDICES });
+    this.meshQueue = result.queue;
+    this.meshQueueReadIndex = result.readIndex;
+    return result.processed > 0;
   }
 
   /**
@@ -2033,7 +1950,7 @@ export class Scene {
    * re-grouped by their CURRENT colour.
    */
   finalizeStreaming(device: GPUDevice, pipeline: RenderPipeline): void {
-    if (this.streamingFragments.length === 0) return;
+    if (!this.hasStreamingFragments()) return;
     this.finalizeInProgress = true;
     try {
       this.finalizeStreamingInner(device, pipeline);
@@ -2069,6 +1986,7 @@ export class Scene {
     // Save references to old fragments/batches — keep them rendering
     // until the new proper batches are fully built (no visual gap).
     const oldFragments = this.streamingFragments;
+    perfTally('render.finalize', oldFragments.length, 'fragments'); // #6957 fragment rebuilds
     const oldBatches = this.batchedMeshes;
     const fragmentSet = new Set(oldFragments);
     const oldBatchSet = new Set(oldBatches);
@@ -2106,6 +2024,8 @@ export class Scene {
     // already retired by rebuildPendingBatches.
     this.retireFinalizedBatches(oldFragments);
     this.retireFinalizedBatches(regroup?.retired ?? []);
+    // #6957: same batch tally as the time-sliced path (only reached when the rebuild succeeded).
+    if (perfCounters.enabled) perfCount('render.finalize.batches', this.batchedMeshes.filter((b) => !oldBatchSet.has(b)).length);
   }
 
   /**
@@ -2117,18 +2037,23 @@ export class Scene {
    * @param device  GPU device
    * @param pipeline  Render pipeline
    * @param budgetMs  Max milliseconds per chunk (default 8 — half a 60fps frame)
+   * @param trace  The load's trace (#6979): `scene.finalize` from this call
+   *   until the promise settles, with `scene.finalize.regroup` under it
    * @returns Promise that resolves when all batches are rebuilt
    */
   finalizeStreamingAsync(
     device: GPUDevice,
     pipeline: RenderPipeline,
     budgetMs: number = 8,
+    trace?: LoadTrace,
   ): Promise<void> {
+    const span = trace?.enabled ? trace.begin('scene.finalize', { fragments: this.streamingFragments.length, ephemeral: this.ephemeralStreamingMode }) : -1;
     if (this.ephemeralStreamingMode) {
       this.finishEphemeralStreaming();
+      trace?.end(span);
       return Promise.resolve();
     }
-    if (this.streamingFragments.length === 0) return Promise.resolve();
+    if (!this.hasStreamingFragments()) { trace?.end(span); return Promise.resolve(); }
     // Mark the rebuild as in-flight: the preamble empties streamingFragments
     // synchronously, so settle-sensitive consumers need this flag until the
     // time-sliced rebuild swaps the new batch array in.
@@ -2138,6 +2063,7 @@ export class Scene {
     // eslint-disable-next-line @typescript-eslint/no-this-alias
     const scene = this;
     const oldFragments = this.streamingFragments;
+    perfTally('render.finalize', oldFragments.length, 'fragments'); // #6957 fragment rebuilds
     const oldBatches = this.batchedMeshes;
     const fragmentSet = new Set(oldFragments);
     const oldBatchSet = new Set(oldBatches);
@@ -2168,6 +2094,7 @@ export class Scene {
       let regroup: FinalizeRegroup | null = null;
       let pendingKeys: string[] = [];
       let keyIdx = 0;
+      let chunks = 0;
 
       function rollback(): void {
         for (const { bucket, previous, previousFrameOrigin, batch } of createdOwned) {
@@ -2191,6 +2118,7 @@ export class Scene {
       function processChunk(): void {
         try {
           const chunkStart = performance.now();
+          chunks++;
           while (keyIdx < pendingKeys.length) {
             const key = pendingKeys[keyIdx++];
             const bucket = scene.buckets.get(key);
@@ -2229,10 +2157,13 @@ export class Scene {
             ...scene.streamingFragments,
           ];
           scene.retireFinalizedBatches(retired);
+          perfCount('render.finalize.batches', createdOwned.length);
           scene.finalizeInProgress = false;
+          trace?.end(span, { batches: createdOwned.length, chunks });
           resolve();
         } catch (err) {
           rollback();
+          trace?.end(span, { error: true });
           reject(err);
         }
       }
@@ -2240,11 +2171,14 @@ export class Scene {
       try {
         // --- Synchronous preamble: re-group the streamed meshes only ---
         scene.streamingFragments = [];
+        const regroupStart = performance.now();
         regroup = scene.regroupStreamed();
+        if (trace?.enabled) trace.record('scene.finalize.regroup', regroupStart, performance.now(), undefined, span);
         pendingKeys = Array.from(scene.pendingBatchKeys);
         scene.pendingBatchKeys.clear();
       } catch (err) {
         rollback();
+        trace?.end(span, { error: true });
         reject(err);
         return;
       }
@@ -3579,7 +3513,7 @@ export class Scene {
       const bindGroup = pipeline.createTexturedBindGroup(uniformBuffer, texture.createView(), sampler);
 
       const box = worldAabbFromPieces([meshData]);
-      this.texturedMeshes.push(this.modelTranslations.registerDrawable({
+      const drawable: TexturedMesh = this.modelTranslations.registerDrawable({
         expressId: meshData.expressId, modelIndex: meshData.modelIndex,
         bounds: box ? { min: [box.min.x, box.min.y, box.min.z], max: [box.max.x, box.max.y, box.max.z] } : undefined,
         vertexBuffer,
@@ -3597,7 +3531,9 @@ export class Scene {
           ? [meshData.origin[0], meshData.origin[1], meshData.origin[2]]
           : [0, 0, 0],
         ...(sharedTextureKey !== undefined ? { sharedTextureKey } : {}),
-      }, meshData.modelIndex ?? 0));
+      }, meshData.modelIndex ?? 0);
+      this.texturedMeshes.push(drawable);
+      this.texturedSourcePositions.set(drawable, meshData.positions);
     } catch (error) {
       vertexBuffer?.destroy();
       indexBuffer?.destroy();

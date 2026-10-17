@@ -27,6 +27,7 @@ fn bspline_basis_table(degree: usize, u: f64, knots: &[f64], count: usize) -> Ve
     let mut cur: Vec<f64> = (0..width)
         .map(|i| if knots[i] <= u && u < knots[i + 1] { 1.0 } else { 0.0 })
         .collect();
+    close_end_span(&mut cur, degree, u, knots);
 
     for k in 1..=degree {
         if cur.len() <= 1 {
@@ -58,6 +59,25 @@ fn bspline_basis_table(degree: usize, u: f64, knots: &[f64], count: usize) -> Ve
     }
     cur.resize(count, 0.0);
     cur
+}
+
+/// Close the last non-empty level-0 span at the domain end `t_max =
+/// knots[len - degree - 1]` (#7687, PROC-S2). Spans are half-open, and a
+/// clamped knot vector (end multiplicity degree+1, the normal case) has no
+/// span starting at `t_max`, so `u == t_max` set no span, every basis value
+/// was 0 and the curve evaluated to the ORIGIN. This is the standard special
+/// case (Piegl & Tiller, A2.1). It fires only when no half-open span already
+/// holds `u`, so an unclamped end, where one does, keeps its single span.
+fn close_end_span(level0: &mut [f64], degree: usize, u: f64, knots: &[f64]) {
+    let Some(&t_max) = knots.len().checked_sub(degree + 1).and_then(|i| knots.get(i)) else {
+        return;
+    };
+    if u != t_max || level0.contains(&1.0) {
+        return;
+    }
+    if let Some(i) = (0..level0.len()).rev().find(|&i| knots[i] < knots[i + 1] && knots[i + 1] == u) {
+        level0[i] = 1.0;
+    }
 }
 
 /// Evaluate a single B-spline basis function `N_{i,p}(u)`. Test-only:
@@ -224,23 +244,38 @@ pub(super) fn tessellate_bspline_surface(
 }
 
 /// Evaluate a B-spline CURVE at parameter t (1D, not surface).
+///
+/// With `weights` (one per control point) the curve is rational (NURBS): the
+/// de Boor sum runs in homogeneous coordinates, `sum(N_i w_i P_i) / sum(N_i
+/// w_i)` (Piegl & Tiller eq. 4.9), as `evaluate_bspline_surface` does (#7750).
 pub(super) fn evaluate_bspline_curve(
     t: f64,
     degree: usize,
     control_points: &[Point3<f64>],
+    weights: Option<&[f64]>,
     knots: &[f64],
 ) -> Point3<f64> {
     let mut result = Point3::new(0.0, 0.0, 0.0);
+    let mut weight_sum = 0.0;
     // One table build for the whole curve point, not one per control point
     // (see `evaluate_bspline_surface` — same reasoning, #4901).
     let table = bspline_basis_table(degree, t, knots, control_points.len());
     for (i, cp) in control_points.iter().enumerate() {
         let basis = table.get(i).copied().unwrap_or(0.0);
         if basis.abs() > 1e-10 {
-            result.x += basis * cp.x;
-            result.y += basis * cp.y;
-            result.z += basis * cp.z;
+            let weighted = basis * weights.and_then(|ws| ws.get(i)).copied().unwrap_or(1.0);
+            result.x += weighted * cp.x;
+            result.y += weighted * cp.y;
+            result.z += weighted * cp.z;
+            weight_sum += weighted;
         }
+    }
+    // Weights are validated > 0, so any positive sum is a real denominator:
+    // a fixed floor collapsed a NURBS whose weights are all uniformly tiny.
+    if weights.is_some() && weight_sum > 0.0 {
+        result.x /= weight_sum;
+        result.y /= weight_sum;
+        result.z /= weight_sum;
     }
     result
 }

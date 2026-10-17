@@ -35,9 +35,10 @@ once with `pnpm fixtures`):
 
 | Command | What it runs |
 |---------|--------------|
-| `pnpm test` | All package unit tests via Turbo (`turbo test`, Vitest per package) |
+| `pnpm test` | Package suites via Turbo, using each package's configured runner |
 | `pnpm test:e2e` | Playwright viewer end-to-end tests (project `viewer-e2e`) |
 | `pnpm test:e2e:ci` | Playwright e2e, CI variant (project `viewer-e2e-ci`) |
+| `pnpm test:packed` | Fresh external npm install from local tarballs; installed declarations, headless roundtrip, lifecycle, real WASM geometry and a Vite worker/WASM bundle |
 | `pnpm test:integration` | Cross-package integration pipeline (`tests/integration.test.ts`) |
 | `pnpm test:api` | Server API tests (`tests/api/`) |
 | `pnpm test:wasm-contract` | Real WASM boundary contract tests (run `pnpm build:wasm` first, or it skips) |
@@ -50,15 +51,46 @@ once with `pnpm fixtures`):
 # Run all TypeScript tests
 pnpm test
 
-# Run specific package
-cd packages/parser && pnpm test
+# Run one package through the dependency graph
+pnpm test --filter=@ifc-lite/parser --concurrency=2 -- --maxWorkers=2
 
-# Watch mode
-cd packages/parser && pnpm exec vitest --watch
+# Run one regression file
+pnpm test --filter=@ifc-lite/parser --concurrency=2 -- parse-model.test --maxWorkers=2
 
-# With coverage
-cd packages/parser && pnpm exec vitest run --coverage
+# Watch mode through the same graph
+pnpm test --filter=@ifc-lite/parser -- --watch
 ```
+
+### Packed consumer workflows
+
+Build the public packages, then exercise the artifacts a fresh consumer installs:
+
+```bash
+pnpm exec turbo build --filter=@ifc-lite/sdk --filter=@ifc-lite/geometry --filter=@ifc-lite/ids --concurrency=2
+pnpm test:packed
+```
+
+Geometry needs a built WASM runtime, or fetch one with `pnpm build:wasm:fetch`. The check creates tarballs with `pnpm pack`, resolves all first-party dependencies to those tarballs, installs them outside the checkout, and verifies that npm installed real directories with no workspace protocols. Its TypeScript consumer compiles against the installed declarations without workspace aliases.
+
+The runtime consumer queries a model, edits a declared property, exports/reopens it, verifies `GlobalId` and the property, checks unsupported-operation and closed-session errors, and exports real WASM geometry as GLB. The committed wall sample always runs. Fetch `ara3d/AC20-FZK-Haus.ifc` with `pnpm fixtures` for the independently authored five-door case; an absent optional fixture prints an explicit skip. CI provisions and verifies the fixtures before this check.
+
+The same external install also builds a browser entry with Vite and verifies that geometry workers and the WASM binary are emitted. This catches missing worker URLs that a Node-only geometry pass cannot detect.
+
+The check removes its temporary installation on success or failure. Capture its JSON receipt with `pnpm --silent test:packed > packed-receipt.json`. A real captured run is in `tests/evidence/packed-workflows/receipt.json`; it records package versions and fixture hashes, with no model bytes.
+
+### Local BCF publication peer
+
+Run `pnpm dev:bcf-test-server` from the repository root for a controlled local BCF API peer. It prints its loopback URL, synthetic token and project ID. In the viewer's BCF server connection form, choose a custom URL and the access-token sign-in method, then load the printed project. Use a local viewer origin (`localhost` or `127.0.0.1`); the peer does not allow other browser origins. It holds only in-memory test data and discards that data on shutdown.
+
+Run its integration acceptance through root Turbo:
+
+```bash
+TEST_PATTERN='bcf-server.publication' pnpm test --filter=@ifc-lite/viewer --only --env-mode=loose
+```
+
+The suite uses actual HTTP requests through the native viewer connector and BCF client. It covers creation/update, human comments, viewpoints referencing a parsed committed SketchUp IFC model, project pull and BCF archive roundtrip, vocabulary rejection, permission loss, and a connection closed after a committed write. This is controlled-peer evidence, not vendor conformance.
+
+The draft/outbox suites run against the same peer (`TEST_PATTERN='bcf-drafts|bcf-publication|BCFDraftsDialog'`). The peer's `loseNextWriteResponse` drops the next committed write's response, and `loseResponsesOfWrites` drops the responses of chosen accepted-write ordinals (1-based), so a test can lose exactly a viewpoint or comment response. Server timestamps use the peer's clock. Snapshot upload, OAuth grants, server-side revision headers and vendor-specific idempotency remain outside this peer's contract.
 
 ### Rust Tests
 
@@ -94,7 +126,7 @@ cargo fuzz run parse_entity -- -max_total_time=60
 ```
 
 The contract under fuzz is that `parse_entity` never panics, hangs, or overflows
-on arbitrary bytes (only returns `Ok`/`Err`). `tests/malformed_input.rs` pins the
+on arbitrary bytes (only returns `Ok`/`Err`). `rust/core/tests/malformed_input.rs` pins the
 same contract for specific inputs in normal CI.
 
 ## Writing Tests

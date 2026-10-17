@@ -428,6 +428,16 @@ test('classifyPath: a test-support module that only registers assertions for a t
   // The allowlist is exact: its siblings are real tooling and stay production.
   assert.equal(classifyPath('scripts/lib/revert-oracle.mjs'), 'production');
 });
+test('classifyPath: the skip-guard helpers that only script tests import are tests (#7030)', () => {
+  // They return the `skip` value for `node:test`. Read as production, a revert
+  // deletes them and every guarded test file dies at import: INCONCLUSIVE for a
+  // change that touched no production behaviour.
+  assert.equal(classifyPath('scripts/lib/host-preconditions.mjs'), 'test');
+  assert.equal(classifyPath('scripts/xmatch/build-output-guard.mjs'), 'test');
+  // Exact, not a directory rule: the modules beside them stay production.
+  assert.equal(classifyPath('scripts/xmatch/guards.mjs'), 'production');
+  assert.equal(classifyPath('scripts/lib/host-preconditions-extra.mjs'), 'production');
+});
 test('classifyPath: Playwright e2e specs and helpers are test files, not ignored (#4553, #6267)', () => {
   // #4553 ignored tests/e2e/** because the oracle had no runner for it and
   // ABORTed the lane. #6267 gave it one: the spec is a test the browser
@@ -689,9 +699,16 @@ test('classifyDiff reports whether Cargo.lock changed (#4592)', () => {
   assert.equal(classifyDiff(parseNameStatus('M\trust/geometry/Cargo.toml')).cargoLockChanged, false);
 });
 
-test('parseNameStatus takes the NEW path of a rename', () => {
+test('#6663: parseNameStatus retains both rename locations through production classification', () => {
   const entries = parseNameStatus('R096\tpackages/a/src/old.ts\tpackages/a/src/new.ts');
-  assert.deepEqual(entries, [{ status: 'R', path: 'packages/a/src/new.ts' }]);
+  const expected = [{ status: 'R', path: 'packages/a/src/new.ts', oldPath: 'packages/a/src/old.ts' }];
+  assert.deepEqual(entries, expected);
+  assert.deepEqual(classifyDiff(entries).production, expected);
+});
+
+test('#6663: copies select only their new path because their source remains on disk', () => {
+  const entries = parseNameStatus('C096\tpackages/a/src/original.ts\tpackages/a/src/copy.ts');
+  assert.deepEqual(entries, [{ status: 'C', path: 'packages/a/src/copy.ts' }]);
 });
 
 test('parseNameStatus on empty input yields no entries', () => {

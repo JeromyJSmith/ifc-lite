@@ -14,9 +14,11 @@ import type { StructuralBackendMethods } from './structural-types.js';
 import type { ScheduleBackendMethods } from './schedule-types.js';
 import type { CostBackendMethods } from './cost-types.js';
 import type { SpacesBackendMethods, StyleBackendMethods } from './backend-extension-types.js';
-import type { CostStoreBackendMethods } from './store-cost-types.js';
-import type { StructuralStoreBackendMethods } from './store-structural-types.js';
-import type { ModellingStoreBackendMethods } from './store-modelling-types.js';
+import type { StoreAuthoringBackendMethods } from './store-authoring-types.js';
+import type {
+  BeamInStoreParams, ColumnInStoreParams, MemberInStoreParams,
+  ProfiledBeamInStoreParams, ProfiledColumnInStoreParams, ProfiledMemberInStoreParams,
+} from '@ifc-lite/create';
 
 // ============================================================================
 // Entity References
@@ -259,12 +261,7 @@ export interface CameraState {
   up?: [number, number, number];
 }
 
-export interface SectionPlane {
-  axis: 'x' | 'y' | 'z';
-  position: number;
-  enabled: boolean;
-  flipped: boolean;
-}
+import type { SectionPlane } from './section-plane.js';
 
 // ============================================================================
 // Spatial Types
@@ -397,6 +394,11 @@ export interface ViewerBackendMethods {
   flyTo(refs: EntityRef[]): void;
   setSection(section: SectionPlane | null): void;
   getSection(): SectionPlane | null;
+  /** Several cutting planes; optional, `bim.viewer` falls back to `setSection` / `getSection`. */
+  setSections?(sections: SectionPlane[]): void;
+  getSections?(): SectionPlane[];
+  addSection?(section: SectionPlane): string | null;
+  removeSection?(id: string): boolean;
   setCamera(state: Partial<CameraState>): void;
   getCamera(): CameraState;
   /**
@@ -413,7 +415,7 @@ export interface ViewerBackendMethods {
 }
 
 export interface MutateBackendMethods {
-  setProperty(ref: EntityRef, psetName: string, propName: string, value: string | number | boolean): void;
+  setProperty(ref: EntityRef, psetName: string, propName: string, value: string | number | boolean, dataType?: string): void;
   setAttribute(ref: EntityRef, attrName: string, value: string): void;
   deleteProperty(ref: EntityRef, psetName: string, propName: string): void;
   batchBegin(label: string): void;
@@ -445,12 +447,10 @@ export interface AddElementCommonParams {
   GlobalId?: string;
 }
 
-export interface AddColumnInStoreParams extends AddElementCommonParams {
-  Position: [number, number, number];
-  Width: number;
-  Depth: number;
-  Height: number;
-}
+/** Rectangular column parameters retain their public interface and inherit
+ * the canonical geometry fields, including storey-local RefDirection. */
+export interface AddColumnInStoreParams extends AddElementCommonParams,
+  Pick<ColumnInStoreParams, 'Position' | 'Width' | 'Depth' | 'Height' | 'RefDirection'> {}
 
 export interface AddWallInStoreParams extends AddElementCommonParams {
   Start: [number, number, number];
@@ -480,12 +480,8 @@ export interface AddSlabPolygonParams extends AddElementCommonParams {
   Thickness: number;
 }
 
-export interface AddBeamInStoreParams extends AddElementCommonParams {
-  Start: [number, number, number];
-  End: [number, number, number];
-  Width: number;
-  Height: number;
-}
+export interface AddBeamInStoreParams extends AddElementCommonParams,
+  Pick<BeamInStoreParams, 'Start' | 'End' | 'Width' | 'Height'> {}
 
 export interface AddDoorInStoreParams extends AddElementCommonParams {
   Position: [number, number, number];
@@ -560,17 +556,10 @@ export interface AddPlatePolygonParams extends AddElementCommonParams {
   PredefinedType?: 'CURTAIN_PANEL' | 'SHEET' | 'USERDEFINED' | 'NOTDEFINED';
 }
 
-export interface AddMemberInStoreParams extends AddElementCommonParams {
-  Start: [number, number, number];
-  End: [number, number, number];
-  Width: number;
-  Height: number;
-  PredefinedType?:
-    | 'BRACE' | 'CHORD' | 'COLLAR' | 'MEMBER' | 'MULLION' | 'PLATE' | 'POST'
-    | 'PURLIN' | 'RAFTER' | 'STRINGER' | 'STRUT' | 'STUD' | 'USERDEFINED' | 'NOTDEFINED';
-}
+export interface AddMemberInStoreParams extends AddElementCommonParams,
+  Pick<MemberInStoreParams, 'Start' | 'End' | 'Width' | 'Height' | 'PredefinedType'> {}
 
-export interface StoreBackendMethods extends CostStoreBackendMethods, StructuralStoreBackendMethods, ModellingStoreBackendMethods {
+export interface StoreBackendMethods extends StoreAuthoringBackendMethods {
   addEntity(modelId: string, def: { type: string; attributes: unknown[] }): EntityRef;
   removeEntity(ref: EntityRef): boolean;
   setPositionalAttribute(ref: EntityRef, index: number, value: unknown): void;
@@ -582,16 +571,16 @@ export interface StoreBackendMethods extends CostStoreBackendMethods, Structural
    * into the overlay so the element appears alongside the existing
    * model on export.
    */
-  addColumn(modelId: string, storeyExpressId: number, params: AddColumnInStoreParams): EntityRef;
+  addColumn(modelId: string, storeyExpressId: number, params: AddColumnInStoreParams | ProfiledColumnInStoreParams): EntityRef;
   addWall(modelId: string, storeyExpressId: number, params: AddWallInStoreParams): EntityRef;
   addSlab(modelId: string, storeyExpressId: number, params: AddSlabInStoreParams): EntityRef;
-  addBeam(modelId: string, storeyExpressId: number, params: AddBeamInStoreParams): EntityRef;
+  addBeam(modelId: string, storeyExpressId: number, params: AddBeamInStoreParams | ProfiledBeamInStoreParams): EntityRef;
   addDoor(modelId: string, storeyExpressId: number, params: AddDoorInStoreParams): EntityRef;
   addWindow(modelId: string, storeyExpressId: number, params: AddWindowInStoreParams): EntityRef;
   addSpace(modelId: string, storeyExpressId: number, params: AddSpaceInStoreParams): EntityRef;
   addRoof(modelId: string, storeyExpressId: number, params: AddRoofInStoreParams): EntityRef;
   addPlate(modelId: string, storeyExpressId: number, params: AddPlateInStoreParams): EntityRef;
-  addMember(modelId: string, storeyExpressId: number, params: AddMemberInStoreParams): EntityRef;
+  addMember(modelId: string, storeyExpressId: number, params: AddMemberInStoreParams | ProfiledMemberInStoreParams): EntityRef;
 }
 
 export interface SpatialBackendMethods {

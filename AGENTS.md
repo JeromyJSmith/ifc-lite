@@ -72,7 +72,7 @@ Filing issues is welcome and unrestricted: an audit producing twenty good issue 
 - Workspace `[profile.release]` sets `panic = 'abort'`; harnesses/examples that need `catch_unwind` (per-element panic isolation) must build with `--profile server-release` (panic=unwind).
 - Driving `GeometryRouter` directly in examples/harnesses skips the RTC rebase: georeferenced models (>1 km coords, e.g. ISSUE_098 at ~5,000 km) produce f32-fabricated geometry "failures"; bucket by coordinate magnitude or rebase before blaming the kernel.
 - Colour and coordinate resolution is canonical Rust shared by the server (`process_geometry`) and viewer (`process_geometry_batch`) so they can't drift; don't re-fork it. Single homes: `default_color_for_type`, `resolve_submesh_color`, **`extract_surface_style_colors`** (the IfcSurfaceStyle to Rendering to Colour leaf; SurfaceColour is the apparent colour, a distinct DiffuseColour IfcColourRgb is only `shading_color`, per #859/#871), and the indexed-colour resolvers, all in `ifc_lite_processing::style`; **`rotation_angle_about_z`** (site/building rotation, off `resolve_scaled_placement`) in `ifc_lite_geometry`. `styling_parity` Rust tests fail the build if a duplicate `get_default_color*` table or a per-pipeline `extract_color_from_rendering`/`extract_color_rgb` reappears. New type default: edit `default_color_for_type` and extend the mesh fixture. Sanctioned exceptions: the 2D drafting fill palette (`IFC_TYPE_FILL_COLORS`, `Drawing2DCanvas.tsx`) is a drafting convention rather than 3D appearance, and standalone debug tools under `rust/geometry/examples/` (can't reach the downstream crate). (#913, #996, #997)
-- Cross-platform determinism is enforced weekly by `.github/workflows/determinism.yml` (free `ubuntu-24.04-arm` runner, also `workflow_dispatch`-able before kernel-sensitive merges): it re-runs `exact_predicate_determinism` and `geometry_correctness_harness` on arm64 against the committed x86_64-generated insta snapshots; a snapshot mismatch there means platform-dependent geometry (a real bug, not flake). It also pins the mesh-output manifests `rust/processing/tests/manifests/mesh_determinism.json` (x86_64/arm64) and `mesh_determinism.wasm32.json` (identical except the documented libm-trig gap), so a legitimate geometry-output change must re-pin **both** manifests, not just the snapshots (#1492, see `docs/architecture/mesh-determinism.md`).
+- Cross-platform determinism is enforced weekly by `.github/workflows/determinism.yml` (arm64; dispatch it before kernel-sensitive merges): it re-runs `exact_predicate_determinism`, `geometry_correctness_harness` and `export_golden` against the committed x86_64 pins; a mismatch is a real platform bug. It also pins `rust/processing/tests/manifests/mesh_determinism.json` (x86_64/arm64) and `mesh_determinism.wasm32.json` (equal except the libm-trig gap): a legitimate geometry-output change re-pins **both**, not just the snapshots (#1492, `docs/architecture/mesh-determinism.md`). Byte outputs are hash-pinned in `tests/golden/*.json`; a red pin prints its `IFC_LITE_REPIN_GOLDEN=1` command; re-pin only what you meant to move (#7671).
 - Geometry-affecting PRs also run `.github/workflows/ifcopenshell-parity.yml` (path-gated): a per-PR quick lane diffs ifc-lite against committed reference dumps in `tools/ifcopenshell_reference/`, plus a nightly full lane on the pinned engine. **It IS blocking**: `parity (in-tree fixtures, committed reference)` is a required context in the `main` ruleset, so a legitimate output change means regenerating the committed reference in the same PR (#1519). Being absent from `test.yml`s `needs:` list is a different thing from being non-required.
 
 ## Performance
@@ -190,7 +190,7 @@ allowlist is `scripts/refwalk-guard-allowlist.txt` and is empty.
   assert.equal(useViewerStore.getState().selectedEntityId, expected);
   ```
   `~icons/*` (unplugin-icons virtual modules) and `import.meta.env` are handled by `src/test/vite-module-hooks.mjs`, registered from the `--import` flag in the viewer's `test` script — it cannot be registered from inside a test file, because module resolution finishes before any module body runs. `installLayout()` also makes `ResizeObserver` deliver an entry: happy-dom ships the class but never fires it, which is why a virtualized list otherwise renders zero rows.
-  Viewer mounting (#2434): `RibbonToolbar` and its tabs mount as-is; `FileTab` needs `fileCommands`; `PropertiesPanel` and `ModelQuery` need a real parsed store, not a cast stub (`new IfcParser().parseColumnar(...)` over inline STEP; see `tools/measure-parity.test.tsx`); `ViewportContainer` needs stubbed `navigator.gpu` and a loaded model, else it shows "WebGPU Not Available". Radix dropdowns open on `pointerdown` then `click`, and portal to `document.body`. `RibbonContentLargeButton` names itself `tooltip ?? contentLabel`; registered `RibbonCommandLargeButton` uses the registry label as its name and tooltip as its description. Assert visible and accessible labels separately.
+  Viewer mounting (#2434): `RibbonToolbar` and its tabs mount as-is; `FileTab` needs `fileCommands`; `PropertiesPanel` and `ModelQuery` need a real parsed store, not a cast stub (`new IfcParser().parseColumnar(...)` over inline STEP); `ViewportContainer` needs stubbed `navigator.gpu` and a loaded model, else it shows "WebGPU Not Available". Radix dropdowns open on `pointerdown` then `click`, and portal to `document.body`. `RibbonContentLargeButton` names itself `tooltip ?? contentLabel`; registered `RibbonCommandLargeButton` uses the registry label as its name and tooltip as its description. Assert visible and accessible labels separately.
   Assert behavior, not wiring: an unreachable component, ignored hook result, or uncalled handler can look correct in source. #2434 tests that only found a component survived deleting it; assert its values (one such bug shipped until mutation testing).
 - Geometry/WASM changes: mocked `@ifc-lite/wasm` tests prove nothing about the boundary; `pnpm test:wasm-contract` runs the real `buildPrePassOnce`/`processGeometryBatch` path and pins the field surface plus unit-scale contract. Extend it when adding wasm API surface. It skips clean (exit 0) if the wasm runtime isn't built, so a local green there proves nothing unless you ran `scripts/build-wasm.sh` first (CI restores the built artifact before the step).
 
@@ -244,16 +244,14 @@ Check again immediately before opening the PR. A claim can appear while you work
 
 If the account is assigned with no claim comment, ask on the issue rather than reading the field as your own. This applies to OUR sessions only. An outside contributor has their own account, so for them the field says what it appears to say.
 
+**Also label the claim** with your session's `claimed:session-<id>` label (create it if missing; `<id>` is your branch suffix); remove it when the PR merges or you stop. Outside contributors' issues get `claimed:contributor`. Before starting, `gh issue view <n> --json labels`: a `claimed:*` label that is not yours means it is taken.
+
 ### The contributor check and the session check are different checks
 
 Doing one does not do the other. Run both, every time:
 
     gh issue view <n> --json assignees      # is one of us on it
     gh pr list --search "<n>"               # CANDIDATES; confirm on the issue page
-
-That search is TEXT: it misses linked PRs that never name the number and returns
-unrelated ones that do. A hit is a reason to look, not an answer; the issue's
-linked-PR list is authoritative where they disagree.
 
 On #3012 the account was self-assigned and a PR appeared 47 minutes later. That looked like a session ignoring the claim; it was an outside contributor, who has no reason to know about an internal assignment. No assignee field would have helped, because no session held it. Only the PR search would have.
 
@@ -271,12 +269,7 @@ Help, no permission needed: reviewing their PR including finding real defects; d
 
 Not help, however good the code: building a parallel implementation and announcing it afterwards; carrying an unraised branch that duplicates their work; pushing to their branch; opening a competing PR on their issue.
 
-If you built something before noticing, say so plainly, hand it over, and let them decide. That is recoverable; landing it is not. When you find you have duplicated someone, the owner follows the rules above in
-order: an outside contributor's PR beats any internal claim; else the earliest
-claim comment wins; the assignee field decides only when neither applies, since it
-cannot name a session. Never whoever is further along or noticed first. Do not
-close the duplicate silently: enumerate what it holds that the survivor does not,
-and never push to a branch you do not own to "help".
+If you built something before noticing, say so plainly, hand it over, and let them decide. That is recoverable; landing it is not. Do not close a duplicate silently: list what it holds that the survivor does not.
 
 This rule exists because it was broken twice in two days against the same external contributor (#2951 filed, assigned and implemented by them as #2952, with #2970 arriving fifteen hours later doing the same thing; and #2670, where they were mid-development when told a parallel implementation existed). The cost is not the wasted effort. It is that a contributor who did everything correctly had to be the one to raise it, twice.
 

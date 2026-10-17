@@ -11,6 +11,10 @@
 //! writer's parity target is what those readers answer, not what the record
 //! means.
 
+use ifc_lite_core::step_encoding::step_string_literal_end;
+
+use crate::step_record_frame::{record_frame, record_head};
+
 fn ws(b: &[u8], mut i: usize) -> usize {
     while i < b.len() && b[i].is_ascii_whitespace() {
         i += 1;
@@ -50,8 +54,9 @@ pub(crate) fn hash_ids(text: &str) -> Vec<u32> {
     out
 }
 
-/// `/KEYWORD\s*\([^,]*,[^,]*,'([^']*)'/i`: the raw third argument of the first
-/// occurrence of `keyword` that the pattern completes on.
+/// `/KEYWORD\s*\([^,]*,[^,]*,'/i` and then the literal opening there, read
+/// whole by the shared rule: the raw third argument of the first occurrence of
+/// `keyword` that completes.
 fn quoted_third(text: &str, keyword: &str) -> Option<String> {
     let upper = text.to_ascii_uppercase();
     let b = text.as_bytes();
@@ -69,9 +74,10 @@ fn quoted_third(text: &str, keyword: &str) -> Option<String> {
         if b.get(c2 + 1) != Some(&b'\'') {
             continue;
         }
-        let start = c2 + 2;
-        let Some(end) = text[start..].find('\'').map(|p| start + p) else { continue };
-        return Some(text[start..end].to_string());
+        // The whole literal, by the shared rule: `''` and a `\S\'` operand
+        // stay inside it rather than cutting the name short (#7589).
+        let Some(end) = step_string_literal_end(b, c2 + 1) else { continue };
+        return Some(text[c2 + 2..end - 1].to_string());
     }
     None
 }
@@ -86,18 +92,12 @@ pub(crate) fn element_quantity_name(line: &str) -> Option<String> {
     quoted_third(line, "IFCELEMENTQUANTITY")
 }
 
-/// `getPropertyIdsInSet`: `/\(\s*(#[^)]+)\s*\)\s*\)\s*;$/`, the members of the
-/// record's closing list.
+/// `getPropertyIdsInSet`: `/\(\s*(#[^)]+)\s*\)\s*$/` over the record's
+/// argument list (its frame, #7682), the members of its closing list.
 pub(crate) fn property_ids_in_set(line: &str) -> Vec<u32> {
+    let Some(frame) = record_frame(line) else { return Vec::new() };
     let b = line.as_bytes();
-    if b.last() != Some(&b';') {
-        return Vec::new();
-    }
-    let mut k = ws_back(b, b.len() - 1);
-    if k == 0 || b[k - 1] != b')' {
-        return Vec::new();
-    }
-    k = ws_back(b, k - 1);
+    let k = ws_back(b, frame.close);
     if k == 0 || b[k - 1] != b')' {
         return Vec::new();
     }
@@ -116,12 +116,15 @@ pub(crate) fn property_ids_in_set(line: &str) -> Vec<u32> {
     Vec::new()
 }
 
-/// `getRelatedEntities`: `/\(([^()]+)\)\s*,\s*#(\d+)\s*\)\s*;/`. The list
+/// `getRelatedEntities`: `/\(([^()]+)\)\s*,\s*#(\d+)\s*$/` over the record's
+/// argument list (its frame, #7682). The list
 /// may not open inside the match, or a set OwnerHistory is read as a related
 /// object (#5794).
 pub(crate) fn related_entities(line: &str) -> Vec<u32> {
+    let Some(frame) = record_frame(line) else { return Vec::new() };
+    let frame_close = frame.close;
     let b = line.as_bytes();
-    for (i, _) in line.match_indices('(') {
+    for (i, _) in line[..frame_close].match_indices('(') {
         let Some(close) = line[i + 1..].find(')').map(|p| i + 1 + p) else { continue };
         if close == i + 1 || line[i + 1..close].contains('(') {
             continue;
@@ -142,12 +145,7 @@ pub(crate) fn related_entities(line: &str) -> Vec<u32> {
         if j == digits {
             continue;
         }
-        j = ws(b, j);
-        if b.get(j) != Some(&b')') {
-            continue;
-        }
-        j = ws(b, j + 1);
-        if b.get(j) != Some(&b';') {
+        if ws(b, j) != frame_close {
             continue;
         }
         return hash_ids(&line[i + 1..close]);
@@ -155,17 +153,12 @@ pub(crate) fn related_entities(line: &str) -> Vec<u32> {
     Vec::new()
 }
 
-/// `getRelatedPropertySet`: `/,\s*#(\d+)\s*\)\s*;$/`.
+/// `getRelatedPropertySet`: `/,\s*#(\d+)\s*$/` over the record's argument
+/// list (its frame, #7682).
 pub(crate) fn related_property_set(line: &str) -> Option<u32> {
+    let frame = record_frame(line)?;
     let b = line.as_bytes();
-    if b.last() != Some(&b';') {
-        return None;
-    }
-    let mut k = ws_back(b, b.len() - 1);
-    if k == 0 || b[k - 1] != b')' {
-        return None;
-    }
-    k = ws_back(b, k - 1);
+    let mut k = ws_back(b, frame.close);
     let end = k;
     while k > 0 && b[k - 1].is_ascii_digit() {
         k -= 1;
@@ -179,39 +172,21 @@ pub(crate) fn related_property_set(line: &str) -> Option<u32> {
 }
 
 /// The owner-history reference in slot 1 of a rooted record:
-/// `/=\s*IFC\w+\s*\(\s*'(?:[^']|'')*'\s*,\s*#(\d+)/i`.
+/// the record's head with an `IFC\w+` type (#7682), `/\s*'/` after its `(`,
+/// the literal opening there (shared rule), then
+/// `/\s*,\s*#(\d+)/`.
 pub(crate) fn owner_history_ref(line: &str) -> Option<u32> {
     let b = line.as_bytes();
-    let eq = line.find('=')?;
-    let mut i = ws(b, eq + 1);
-    if !line[i..].get(..3).is_some_and(|p| p.eq_ignore_ascii_case("IFC")) {
+    let head = record_head(line)?;
+    let ty = head.type_name(line);
+    if ty.len() <= 3 || !ty[..3].eq_ignore_ascii_case("IFC") {
         return None;
     }
-    i += 3;
-    let word = i;
-    while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
-        i += 1;
-    }
-    if i == word {
-        return None;
-    }
-    i = ws(b, i);
-    if b.get(i) != Some(&b'(') {
-        return None;
-    }
-    i = ws(b, i + 1);
+    let mut i = ws(b, head.open + 1);
     if b.get(i) != Some(&b'\'') {
         return None;
     }
-    i += 1;
-    loop {
-        match b.get(i)? {
-            b'\'' if b.get(i + 1) == Some(&b'\'') => i += 2,
-            b'\'' => break,
-            _ => i += 1,
-        }
-    }
-    i = ws(b, i + 1);
+    i = ws(b, step_string_literal_end(b, i)?);
     if b.get(i) != Some(&b',') {
         return None;
     }

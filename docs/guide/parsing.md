@@ -41,6 +41,32 @@ flowchart TB
     style Auto fill:#f59e0b,stroke:#7c2d12,color:#fff
 ```
 
+## Load STEP data without a viewer
+
+Use `parseModel` for a validated STEP or IFCZIP input and a structured record-scan report. It accepts an `ArrayBuffer` or an exact `Uint8Array` view, including a Node Buffer; file and network I/O stay with your application.
+
+```typescript
+import { parseModel, IfcInputError } from '@ifc-lite/parser';
+
+const bytes = await fetch('model.ifc').then(response => response.arrayBuffer());
+try {
+  const { store, report } = await parseModel(bytes, { label: 'model.ifc' });
+  console.log(store.schemaVersion, store.entityCount);
+  if (report.completeness !== 'complete') {
+    console.warn(report.completeness, report.diagnostics);
+  }
+} catch (error) {
+  if (!(error instanceof IfcInputError)) throw error;
+  console.error(error.code, error.message);
+}
+```
+
+`IfcInputError.code` distinguishes `EMPTY_INPUT`, `INVALID_STEP`, `TRUNCATED_STEP`, `MISSING_DATA`, and `INVALID_ARCHIVE`. The CLI uses the same complete-envelope validation. The existing MCP recovery loader uses `validateStepInput(bytes, label, { envelope: 'signature' })`, which only requires the legacy signature probe and preserves partial-file recovery. A terminator inside a string or comment is not a footer; unterminated lexical input is refused. These checks validate the STEP envelope, not IFC schema conformance. IFCX uses `parseAuto` or `parseIfcx` instead.
+
+`report.completeness` describes record scanning only: `complete` means the scanner reported no refused records, `incomplete` means known records were refused or malformed, and `unknown` means the producer omitted a refusal counter or supplied an invalid count. Unknown is never promoted to complete. `oversizedIdCount` is a count or `null`; `malformedRecordDetected` is a boolean or `null`, because that scanner signal is not an exact malformed-record count. Neither a complete scan nor an empty diagnostic list certifies valid attributes, relationships, or geometry.
+
+Existing tolerant `IfcParser.parseColumnar` behavior is unchanged. Its optional `onScanReport` callback exposes the same report without validating the envelope. Existing `onDiagnostic` string messages remain available.
+
 ## Client-Side Parsing
 
 ### Basic Parsing
@@ -201,7 +227,8 @@ for (const pset of psets) {
   }
 }
 
-// Extract quantities
+// Extract quantities; an optional third native mutation view resolves current member Units.
+// Unknown or deleted explicit Units retain raw magnitudes without an assumed SI basis.
 const qsets = extractQuantitiesOnDemand(store, wallId);
 for (const qset of qsets) {
   console.log(`Quantity Set: ${qset.name}`);
@@ -774,5 +801,200 @@ fact before scanning STEP bytes. An absent field retains ordinary source
 extraction; `null` explicitly records that no georeference was supplied. The
 worker transport preserves these fields when reconstructing a store.
 
+`IfcDataStore.lengthUnitSource` says where `lengthUnitScale` came from:
+`'declared'` when the first `IFCPROJECT`'s `IFCUNITASSIGNMENT` declares a
+`LENGTHUNIT` that resolves, and `'default'` when the scale is the unconfirmed
+`1.0` (metres) assumed otherwise, for example with no `IFCPROJECT`, no
+`UnitsInContext` or no `LENGTHUNIT`. A defaulted unit is also reported once per
+parse through `onDiagnostic`, as a line starting with `units: `. A caller that
+compares lengths, areas or volumes, such as an IDS check, can use it to
+qualify or withhold a result. The worker transport carries the field; it is
+absent on stores not parsed from STEP here.
+
 `computeTransformMatrix(MapConversion)` derives the canonical 4×4 matrix
 from the current conversion, including its optional axis scale factors.
+
+The classification readers accept an optional native mutation view: `extractClassificationsOnDemand(store, entityId, mutationView)` and `extractClassificationSystemsOnDemand(store, mutationView)`. Definitions, references and association/type memberships then use the effective IFC records, with the same named/positional attribute precedence as export. Model-local caches refresh at the overlay revision. Source-empty stores retain unresolved markers for source attributes they cannot reconstruct; complete authored records remain readable. Source association endpoint edits require the original source bytes: forwarded immutable memberships cannot reconstruct those live edits, so callers must refuse population claims for that case. An unresolved classification chain does not establish that an explicitly named system is absent.
+
+## Material occurrence precedence
+
+`extractAllMaterialsOnDemand(store, entityId, view)` returns every occurrence assignment, falling back to the entity's type only when the occurrence has none. The optional native mutation view applies current relationship retargeting, deletions, aliases, material edits and newly authored assignment shapes through the same effective readers used for STEP export.
+
+`extractMaterialPropertiesOnDemand(store, entityId, view, revision)` uses the same current assignments for generic material property groups. Named edits apply before positional edits, matching exported records. An unset layer `IsVentilated` remains undefined rather than becoming an explicit false value.
+
+`materialAssignmentsAvailable(store, entityId, view)` reports whether the supplied graph and current edits can prove the complete selected material membership. Source-empty transport without membership data, or with relevant edits to unavailable source relationship records, yields `false`; retained source markers and authored records do not establish a complete count. The Assistant reports null totals and unverified source markers in those cases.
+
+### Canonical names in a schema registry
+
+`getCanonicalEntityName(registry, type)` resolves an exact EXPRESS entity name from one schema registry, case-insensitively. It returns `undefined` for an unknown name. Registries remain mutable: adding, deleting or reordering entity keys updates the next lookup, and case-colliding keys retain the first own-key match. Definitions are read from the current registry rather than cached metadata.
+
+```ts
+import { getCanonicalEntityName, getSchemaRegistryForVersion } from '@ifc-lite/parser';
+const registry = getSchemaRegistryForVersion('IFC4X3');
+const entityName = getCanonicalEntityName(registry, 'IFCRAILWAY');
+```
+
+For a finite synchronous operation that resolves many records, `createSchemaEntityNameSnapshot(registry)` captures ordered entity keys once. Pass the snapshot as the optional final argument to `getCanonicalEntityName`, `getAttributeNamesForSchema`, or `resolveEffectiveEntityRecord`. Metadata definitions remain live; keys added or reordered after capture are observed by a fresh snapshot or a normal public lookup. A snapshot from another registry is ignored. Native Group operations create a fresh snapshot for each graph; they do not freeze the public registry.
+
+```ts
+import { createSchemaEntityNameSnapshot, getAttributeNamesForSchema, getSchemaRegistryForVersion } from '@ifc-lite/parser';
+const registry = getSchemaRegistryForVersion('IFC4X3');
+const names = createSchemaEntityNameSnapshot(registry);
+const attributes = getAttributeNamesForSchema('IFCRAILWAY', 'IFC4X3', names);
+```
+
+
+## Current inherited type quantities
+
+`extractTypeQuantitiesOnDemand(store, expressId)` reads the parsed source snapshot.
+Pass a native mutation view as the optional third argument to follow current
+`IfcRelDefinesByType` assignments and native type quantity attribute edits.
+The shared collector retains its existing quantity type, unit and numeric rules.
+Consumers still append type quantities after occurrence quantities so their own
+declared bases take precedence. Extraction does not write, export, or recompute
+geometry. Source-free stores retain the
+existing prebuilt quantity-table path in their consumers.
+
+```typescript
+import { extractTypeQuantitiesOnDemand, type IfcDataStore } from '@ifc-lite/parser';
+import type { MutablePropertyView } from '@ifc-lite/mutations';
+
+function currentTypeQuantities(store: IfcDataStore, expressId: number, view: MutablePropertyView) {
+  return extractTypeQuantitiesOnDemand(store, expressId, view)?.quantities ?? null;
+}
+```
+
+
+For current reads that need completeness, `readCurrentTypeQuantities(store,
+expressId, view)` returns `{ status, reason, value }`. Unavailable coverage means
+current inherited facts remain unknown, with an explicit reason. Keep occurrence
+quantities separate and preserve that coverage instead of displaying a verified
+empty type inventory or retrying the source snapshot. The current reader bounds
+relationship references, type definitions and quantity members; unsupported
+quantity classes or unreadable values also produce unavailable coverage. Explicit
+quantity units use the same canonical resolver with current native records,
+including newly allocated unit entities. Unreadable/deleted/unsupported units,
+cycles, or more than 512 unit dependency reads refuse current coverage instead
+of falling back to an obsolete scale or default SI. Source-only reads retain
+their existing unit conventions.
+
+```typescript
+import { readCurrentTypeQuantities, type IfcDataStore } from '@ifc-lite/parser';
+import type { MutablePropertyView } from '@ifc-lite/mutations';
+
+function verifiedCurrentTypeQuantities(store: IfcDataStore, expressId: number, view: MutablePropertyView) {
+  const result = readCurrentTypeQuantities(store, expressId, view);
+  return { status: result.status, reason: result.reason, quantities: result.value?.quantities ?? null };
+}
+```
+
+When a quantity's `Unit` is unset, its raw value uses the current project's
+`UnitsInContext`. `readCurrentProjectUnits(store, view, projectId?)` follows the
+current project, unit assignment and canonical unit dependencies. The optional
+project id selects an owning project; omission keeps the canonical default-project
+convention. Available results hold a `ProjectUnits` resolver. Unreadable, deleted,
+unsupported, cyclic or oversized contexts yield `value: null` and an explicit
+unavailable reason. Preserve that coverage instead of substituting the source
+snapshot or interpreting a raw occurrence quantity as SI. These current reads
+bound the project inventory and allow at most 512 dependency reads. They do not
+change source-only conventions, annotate implicit quantities as explicit units,
+or reinterpret cached geometry.
+
+Unavailable project context leaves implicit property and quantity values raw, without
+a physical suffix or display-unit conversion. Dimensionless rows remain readable.
+A quantity with an independently resolved explicit native Unit retains its own
+symbol and canonical SI scale, including display overrides. Current view records
+are consulted even when the store has no source buffer.
+
+For occurrence quantities, pass the native mutation view as the optional third
+argument to `extractQuantitiesOnDemand(store, expressId, view)`. It reads current
+member `Unit` dependencies, including edits, replacement, deletion and Undo.
+An unresolved explicit unit leaves the value raw instead of substituting SI.
+Current inventory reads are bounded to 256 sets, 4,096 members and 512 unit
+dependency reads. Oversized unit records are also refused. If a bound is exceeded
+or a set's member list is unreadable, the reader throws
+`OccurrenceQuantityReadError`; consumers should report unavailable coverage
+instead of displaying an empty result as verified absence. Synchronous SDK and
+export callers may propagate this typed error and fail the operation explicitly;
+consumers with per-element coverage contracts must report unavailable rows.
+Source-only two-argument
+reads retain their existing behavior.
+
+```typescript
+import { readCurrentProjectUnits, type IfcDataStore } from '@ifc-lite/parser';
+import type { MutablePropertyView } from '@ifc-lite/mutations';
+
+function currentVolumeContext(store: IfcDataStore, view: MutablePropertyView) {
+  const current = readCurrentProjectUnits(store, view);
+  return { status: current.status, reason: current.reason,
+    volumeUnit: current.value?.resolvedForUnitType('VOLUMEUNIT') ?? null };
+}
+```
+
+### Source quantity sets owned by a type
+
+`extractTypeEntityOwnQuantities(store, typeExpressId)` reads a type object's source quantity sets directly, including `HasPropertySets`, with the same canonical quantity collection and definition-identity rules as `extractTypeQuantitiesOnDemand(store, occurrenceExpressId)`. It returns an empty array when the source type has no supported numeric quantities. Opaque physical quantity members remain in the native IFC graph; this numeric projection does not describe them. The reader leaves the source bytes unchanged.
+
+```typescript
+import { extractTypeEntityOwnQuantities } from '@ifc-lite/parser';
+
+const typeExpressId = 42; // The selected type object's model-local express ID.
+const typeQuantitySets = extractTypeEntityOwnQuantities(store, typeExpressId);
+```
+
+The optional third argument to `extractTypeEntityOwnQuantities` is a native
+metadata view. It reads that type's current `HasPropertySets`, quantity atoms and
+explicit unit dependencies, including a pending type. This writer base shares
+canonical quantity decoding and unit resolution. Unreadable or unsupported
+current dependencies throw instead of returning a verified empty base. Current
+reads allow at most 256 definitions, 4,096 quantity references, 8,192 entity reads
+and 512 unit dependency reads. The two-argument source reader is unchanged.
+
+The optional current native view of `extractTypeEntityOwnQuantities` also reports `explicitUnitType` for resolved explicit quantity units. The type-owned writer uses this canonical IFC unit category to refuse a dimension-changing edit that would retain an incompatible native unit; the two-argument source-only output is unchanged.
+
+
+Current occurrence-facing type quantity reads also project canonical quantity-journal
+claims when the view exposes them and the export's mutation history nominates that
+type/set. A default-history type write is visible in the live reader and the
+Properties volume breakdown before export, with native definition identity and
+explicit-unit metadata retained. A tracked write followed by a `skipHistory`
+write reads the current overlay value. A standalone `skipHistory: true` quantity
+write with no history nomination retains the existing native export/read basis;
+this repair does not change that separate export-nomination contract. Source-only
+reads without a view remain unchanged. Unsupported unit intent, incompatible
+retained dimensions, or ambiguous definition identities report unavailable
+coverage rather than presenting a fabricated physical quantity.
+
+The Properties quantities tab currently lists occurrence-owned sets. Independently
+inherited Length sets are not added to that list by this writer repair; the
+canonical quantity reader and `QuantitySetCard` still preserve their physical
+unit metadata. The existing zone breakdown displays inherited volume bases.
+
+The Type quantity journal projection preserves native quantity-set order when
+replacing an existing GUID-owned set, so the live volume basis and saved model
+use the same first matching quantity. New definitions follow existing sets.
+
+`findSourceProjectLengthUnit` and `normalizeMapUnitName` expose the STEP
+writer's existing replacement-unit eligibility to canonical reader consumers.
+The resolver uses the first effective source `IfcProject`, its source
+`UnitsInContext`, and source assigned length units. Deleted units, unassigned
+units, overlay-created units, and unsupported labels cannot supply a source
+replacement reference. Labels compare whole canonical unit names rather than
+substrings; the physical scale is retained.
+
+This lower layer shares the existing STEP writer resolver without changing
+its accepted replacement units. Type quantity journal projection consumes it
+in the subsequent fix for #7355.
+
+Pass current effective `IfcProject` ids as `projectIds`, excluding deleted or
+retyped projects with the canonical `iterateEffectiveEntities` inventory. The
+`isDeleted` callback filters assignment and unit references; it does not filter
+the project inventory supplied by the caller.
+
+
+Declared quantity units take precedence over project units. The canonical
+`quantitySiScale` uses a resolved member `Unit` before the project assignment.
+If an explicit native unit is present but cannot be resolved, the collected
+quantity retains `explicitUnitUnresolved: true`; its scale is unavailable
+(`NaN`), rather than silently inheriting a project scale. Consumers must not
+publish that raw value as a physical SI measurement.

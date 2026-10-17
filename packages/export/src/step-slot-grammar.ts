@@ -14,6 +14,8 @@
  * one file also put that file one line under the module-size ratchet.
  */
 
+import { stepStringLiteralEnd } from '@ifc-lite/encoding';
+
 /**
  * How deep a slot's parentheses may nest before the slot is refused.
  *
@@ -143,19 +145,12 @@ export function isWellFormedStepSlot(part: string): boolean {
     const c = part[i];
 
     if (c === "'") {
-      i++;
-      while (i < n) {
-        if (part[i] === "'") {
-          if (part[i + 1] === "'") {
-            i += 2;
-            continue;
-          }
-          i++;
-          return true;
-        }
-        i++;
-      }
-      return false; // unterminated string
+      // The shared rule for where a literal ends: a `\S\'` PAGE operand is
+      // text, not the closing quote (#7589).
+      const end = stepStringLiteralEnd(part, i);
+      if (end === -1) return false; // unterminated string
+      i = end;
+      return true;
     }
 
     if (c === '(') {
@@ -189,7 +184,7 @@ export function isWellFormedStepSlot(part: string): boolean {
     if (i === start) return false;
 
     // A typed value: NAME(...), trivia tolerated before '(' the same way
-    // `RECORD_PREFIX_RE` tolerates it before a record's own '('.
+    // `stepRecordHead` tolerates it before a record's own '('.
     skipTrivia();
     if (part[i] === '(') {
       i++;

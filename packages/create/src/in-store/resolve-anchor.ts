@@ -12,7 +12,7 @@
  * IfcLocalPlacement.
  */
 
-import { EntityExtractor, resolveEffectiveEntityRecord, type EffectiveEntityRecord, type IfcDataStore } from '@ifc-lite/parser';
+import { EntityExtractor, resolveEffectiveEntityRecord, type EffectiveEntityRecord, type IfcDataStore, type SchemaEntityNameSnapshot } from '@ifc-lite/parser';
 import { iterateEffectiveEntityIds, type MutablePropertyView } from '@ifc-lite/mutations';
 import type { SpatialAnchor, SpatialAnchorSchema } from './anchor.js';
 import { safeLengthUnitScale } from './length-unit-scale.js';
@@ -81,14 +81,15 @@ export class AnchorEntityReader {
   private readonly extractor: EntityExtractor | null;
 
   constructor(
-    private readonly store: IfcDataStore,
+    private readonly store: IfcDataStore | null,
     private readonly view: MutablePropertyView | null | undefined,
+    private readonly schemaNames?: SchemaEntityNameSnapshot,
   ) {
-    this.extractor = store.source.byteLength > 0 ? new EntityExtractor(store.source) : null;
+    this.extractor = store && store.source.byteLength > 0 ? new EntityExtractor(store.source) : null;
   }
 
   *ids(type: string): IterableIterator<number> {
-    for (const { expressId } of iterateEffectiveEntityIds(this.store, this.view, [type])) {
+    for (const { expressId } of iterateEffectiveEntityIds(this.store ?? { entityIndex: { byType: new Map(), byId: new Map() } }, this.view, [type])) {
       yield expressId;
     }
   }
@@ -140,7 +141,7 @@ export class AnchorEntityReader {
     if (this.view?.isDeleted(id)) return null;
     const created = this.view?.getNewEntity(id);
     // @raw-entity-enumeration-ok point lookup after effective enumeration; source bytes are needed only for this candidate's attributes
-    const ref = created ? undefined : this.store.entityIndex.byId.get(id);
+    const ref = created ? undefined : this.store?.entityIndex.byId.get(id);
     const source = ref && this.extractor ? this.extractor.extractEntity(ref) : null;
     const entity = created ?? source;
     if (!entity) return null;
@@ -148,6 +149,6 @@ export class AnchorEntityReader {
       retype: this.view?.getEntityTypeMutation(id)?.newType,
       named: this.view?.getAttributeMutationsForEntity(id).map(({ name, value }) => [name, value] as const) ?? [],
       positional: this.view?.getPositionalMutationsForEntity(id) ?? [],
-    }, this.store.schemaVersion);
+    }, this.store?.schemaVersion, this.schemaNames);
   }
 }

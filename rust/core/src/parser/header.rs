@@ -156,6 +156,31 @@ pub fn declared_schema_bounded(content: &[u8]) -> Option<String> {
     declared_schemas_bounded(content).into_iter().next()
 }
 
+/// The first declared `FILE_SCHEMA` identifier that `recognise` accepts, read
+/// from the bounded header window ([`declared_schemas_bounded`]).
+///
+/// THE schema-selection rule: the first RECOGNISED identifier wins, so
+/// `FILE_SCHEMA(('IFC2X3','IFC4X3'))` is IFC2X3 and an unrecognised leading
+/// identifier is skipped rather than ending the search. It mirrors the TS
+/// parser's `detectSchemaVersion` (`packages/parser/src/source-header.ts`).
+/// Every Rust reader of the declared schema goes through it with its own
+/// recogniser: the decoder's attribute layout (`SchemaVersion::from_file_schema`)
+/// and processing's reported `schema_version` (#7691).
+///
+/// What is shared is the SELECTION, not the recogniser. The decoder's
+/// recogniser names only the schemas with an EXPRESS registry (no IFC5),
+/// processing's also knows IFC5, so `('IFC5','IFC4')` reads as IFC4 to the
+/// former and IFC5 to the latter, deliberately: guessing a nearby registry for
+/// IFC5 would relabel positional values (#7740).
+pub fn first_declared_schema<T>(
+    content: &[u8],
+    mut recognise: impl FnMut(&str) -> Option<T>,
+) -> Option<T> {
+    declared_schemas_bounded(content)
+        .iter()
+        .find_map(|label| recognise(label))
+}
+
 /// Read the first declared schema identifier from the complete header.
 ///
 /// STEP re-export preserves the declaration's first identifier. Consumers
@@ -200,6 +225,24 @@ pub fn extract_record_args(text: &str, keyword: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{declared_schema, declared_schema_bounded, MAX_HEADER_BYTES};
+
+    #[test]
+    fn page_quote_operands_keep_header_decoys_inside_literals_7540() {
+        let source = r"'\S\' FILE_SCHEMA((fake)); DATA;' FILE_SCHEMA(('IFC4')); DATA;";
+        assert_eq!(super::find_record_open(source.as_bytes(), b"FILE_SCHEMA"),
+            Some(source.rfind("FILE_SCHEMA").unwrap() + "FILE_SCHEMA".len()));
+        assert_eq!(super::find_section_marker(source.as_bytes(), b"DATA"),
+            source.rfind("DATA"));
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/step-page-directive.json"
+        )).unwrap();
+        for vector in vectors.as_array().unwrap() {
+            let literal = vector["literal"].as_str().unwrap();
+            let text = format!("{literal},NEXT");
+            assert_eq!(super::Lex::new(text.as_bytes()).skip_lexical_at(0), Some(literal.len()),
+                "{}", vector["name"]);
+        }
+    }
 
     #[test]
     fn header_schema_reader_skips_decoys_and_respects_window() {

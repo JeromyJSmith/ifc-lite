@@ -102,16 +102,61 @@ Tools are grouped by capability. Everything below is registered in the default t
 | Geometry | `geometry_bbox`, `geometry_volume`, `geometry_area`, `geometry_get` *(planned)*, `raycast` *(planned)* |
 | Clash | `clash_check`, `clash_matrix` |
 | Validation | `ids_validate`, `ids_explain`, `model_audit`, `gherkin_check` *(planned)* |
+| IDS authoring | `ids_audit`, `ids_lint`, `ids_read`, `ids_apply_ops`, `ids_write`, `ids_schema_search`, `ids_schema_entity`, `ids_schema_pset`, `ids_diff`, `ids_preview` *(planned)*, `ids_infer` *(planned)*, `ids_coverage` *(planned)*, `ids_test` *(planned)* |
 | Mutation | `entity_set_property`, `entity_delete_property`, `entity_set_attribute`, `entity_create`, `entity_delete`, `mutation_batch`, `mutation_undo`, `mutation_diff`, `model_save` |
 | Hosted modelling | `place_opening`, `place_door`, `place_window` |
+| Physical edits | `edit_hosted_element`, `edit_element_geometry`, `copy_elements`, `duplicate_element`, `array_elements` |
+| Native Room | `query_rooms`, `room_command` |
+| Design modelling | `place_curtain_wall`, `place_grid`, `place_grid_column` |
 | Wall joins | `join_walls` |
 | BCF | `bcf_topic_list`, `bcf_topic_create`, `bcf_topic_update`, `bcf_topic_close`, `bcf_viewpoint_create`, `bcf_export` |
 | bSDD | `bsdd_search`, `bsdd_class`, `bsdd_property_sets`, `bsdd_match` |
 | Diff | `model_diff`, `quantity_diff` |
 | Export | `export_ifc`, `export_csv`, `export_json`, `export_glb`, `export_obj`, `export_ifcx`, `export_usd`, `export_pdf_report` *(planned)* |
-| Flow | `describe_flow`, `run_flow` |
+| Flow | `describe_flow`, `run_flow`, `propose_flow`, `resume_flow` |
 | Viewer | `viewer_ask`, `viewer_open`, `viewer_close`, `viewer_status`, `viewer_colorize`, `viewer_isolate`, `viewer_hide`, `viewer_show`, `viewer_reset`, `viewer_fly_to`, `viewer_set_section`, `viewer_clear_section`, `viewer_color_by_storey`, `viewer_color_by_property`, `viewer_get_selection`, `viewer_wait_for_selection`, `viewer_describe_selection` |
 | Draft layers & review | `create_draft_layer`, `draft_apply_ops`, `publish_layer`, `diff_layer`, `dry_run_merge`, `list_conflicts`, `request_review`, `add_review_feedback`, `get_review_feedback`, `add_review_topic`, `respond_to_review` |
+
+IFC, IFCX, USD, GLB, and OBJ exports include pending session creates, edits,
+and deletions. Exporting and reloading an IFC file first is unnecessary.
+
+### IDS authoring
+
+The IDS authoring tools work on IDS documents and need no model. They are
+stateless: a document travels between calls as Studio JSON (the `doc` that
+`ids_read` and `ids_apply_ops` return), with a stable UUID for every
+specification, facet and constraint. Reading the same XML twice gives the
+same ids.
+
+`ids_apply_ops` is the only tool that changes a document. It takes typed
+operations (IDS ops vocabulary v1; the JSON Schema is part of the tool's
+input schema) and passes the whole batch through the grounding gate first:
+every op is validated, and every literal name is checked against the IFC
+schema tables (entities, predefined types, attributes, property sets,
+properties, enumeration values, data types). If one name is wrong, nothing
+is applied and the tool returns `INVALID_INPUT`. `details.issues` lists each
+problem with its gate code, path and ranked candidates, and the text says
+the same:
+
+```text
+The grounding gate refused the batch; nothing was applied.
+- GATE-PROP-001 at ops[2].payload.facet.baseName: … Did you mean: FireRating?
+```
+
+A typical loop: look names up with `ids_schema_search`, `ids_schema_entity` or
+`ids_schema_pset`. Build the document with `ids_apply_ops`, which also returns
+its lint diagnostics. Apply a diagnostic's quick fix by passing its `ops`
+back to `ids_apply_ops`. Finish with `ids_write`. `ids_write` reads its own
+XML back, audits it and refuses a document with audit errors, so Studio JSON
+edited by hand cannot get past the gate that way. It also returns the
+`studio.json` sidecar that keeps the node ids next to the XML.
+
+`ids_diff` compares two IDS revisions (`before_xml` / `before_path`,
+`after_xml` / `after_path`). It returns added, removed and changed entries,
+each with its XML path and one plain-language line. `ids_preview`,
+`ids_infer` and `ids_coverage` evaluate an IDS against a loaded model, and
+`ids_test` runs `.idsz` test suites. These four are declared with their
+final inputs but answer `UNSUPPORTED_OPERATION` until their engines ship.
 
 `join_walls` takes `a_express_id`, `b_express_id`, optional `model_id` and optional `options` (`Name`, `priority: 'a' | 'b'`, `tolerance` in metres and `priorities: { a?: number[]; b?: number[] }`). It uses `bim.store.joinWalls` and the canonical Model workspace core. Both walls must be straight and in the same placement frame. Unreadable hosted cuts, or an opening stranded by either joined end face, refuse atomically. One `mutation_undo` restores the complete earlier wall graph and any replaced relationship. The IFC export contains the join; headless geometry queries continue to read parsed geometry.
 
@@ -275,11 +320,34 @@ Tools are grouped by capability. Everything below is registered in the default t
     output downstream of it comes back with no data rather than reporting the
     half-applied model as a success.
 
-    Element-creation node types (`element.column`, `model.addElement`, …) are
-    not yet runnable through `run_flow`: the MCP server's in-session store
-    adapter does not implement `addColumn`/`addWall`/`addSlab`/`addBeam` (use
-    `entity_create` for those today). A property-writing graph, like the
-    shipped fire-rating-audit example, runs normally.
+    AI nodes are opt-in through `IFC_LITE_AI_MODEL`, `IFC_LITE_AI_API_KEY`
+    and optional `IFC_LITE_AI_BASE_URL`, using the CLI's shared compatible
+    transport and root budget. A review-capable `run_flow` requires a new
+    `checkpoint_path` under `--allow`; it returns `pending.artifacts`,
+    `pending.proposal_digest`, the original budget and the active `model_id`.
+    Downstream effects stay paused. The separate authorized `resume_flow`
+    takes the same graph/inputs, `checkpoint_path` and exact `approved_digest`.
+    It checks current mutate scope and native model state, consumes one disk
+    claim, and restores completed outputs without requesting a new answer.
+    Changing the evidence, graph or budget receipt refuses continuation.
+    Downstream AI requests share the existing allowance. Supply a new
+    `next_checkpoint_path` when another review remains ahead; persistence
+    failure after a claim is recorded as partially committed. A lost owner
+    cannot apply the same record again. Cancellation does not undo effects
+    already completed before a pause or failure.
+
+    `element.wall`, `element.column`, `element.slab`, `element.beam`,
+    `element.stair` and `element.railing` specs
+    connected to `model.addElement` create geometry in the selected loaded
+    model through the same atomic builders as the SDK and viewer. The supplied
+    storey must have a readable placement; dimensions are metres. Each creation
+    is one compound operation for `mutation_undo`. A failed creation leaves no
+    partial helper graph or journal entries. Stair/railing specs use the same
+    canonical parameters as their SDK methods; stairs aggregate one flight.
+    Each call has fresh tracking, so persistent update/remove needs a caller
+    retaining a `TrackingStore`. This does not roll back earlier
+    successful nodes in the flow. Free door/window placement remains unsupported
+    by this adapter; use the hosted placement tools with an actual host.
 
 !!! note "Planned tools return a clean error"
     `geometry_get`, `raycast`, `gherkin_check`, and `export_pdf_report` are
@@ -395,6 +463,24 @@ Domain errors come back inside the tool result with `isError: true` and a stable
 
 For a Tauri, Electron, or Node host, build a server and wire it to a transport directly. The public surface is exported from `@ifc-lite/mcp`:
 
+The `HttpTransport` constructor accepts `maxSessions` (default `1000`) and
+`sessionIdleMs` (default `30 * 60_000`). The limit includes sessions whose
+factory is still building. At capacity, a new `initialize` may reclaim the
+oldest session that has been idle for the window, has no request in flight or
+open event stream, and holds no unpublished layer drafts. A request settling
+or an event stream closing restarts the idle window. Reclamation happens only
+when admitting a new session; there is no timer sweep.
+
+If no safe session can be reclaimed, initialization returns HTTP `503` with
+`error: 'session-capacity'` and ends no session. A request for an unknown or
+reclaimed session returns HTTP `404` with `error: 'unknown-session'`; the
+client can initialize again without a `Mcp-Session-Id` header (an `initialize`
+that still carries the old id gets the same `404`). A request that
+requires a session but omits the header returns HTTP `400`. These capacity
+options are available to library callers; the CLI uses their defaults. The
+constructor throws a `RangeError` for a `maxSessions` that is not an integer of
+at least 1 or a `sessionIdleMs` that is not a finite number of at least 0.
+
 ```ts
 import {
   createMCPServer,
@@ -409,6 +495,27 @@ registry.add(await loadIfcModel('./model.ifc'));
 const server = createMCPServer({ version: '0.1.0', registry });
 const transport = new StdioTransport();
 await transport.connect(server);
+```
+
+A model returned by `loadIfcModel` exposes the existing SDK methods
+`bim.store.addElementType`, `assignType`, `addMaterial`, `addMaterialLayerSet`,
+`addMaterialLayerSetUsage` and `assignMaterial`. These embedded methods use
+`@ifc-lite/create`'s shared schema-aware writers; they are not new JSON-RPC tool
+names. Each successful call records one complete operation for the public
+`mutation_undo` tool. A refused layer or layer-set field creates no orphan
+helpers. Thicknesses and offsets are metres, converted to the model's units;
+IFC2X3 uses its live `IfcOwnerHistory` and rejects IFC4-only fields such as
+layer/set `Description`.
+
+```ts
+import { loadIfcModel } from '@ifc-lite/mcp';
+
+const loaded = await loadIfcModel('./model.ifc', { modelId: 'building' });
+const material = loaded.bim.store.addMaterial(loaded.id, { Name: 'Concrete' });
+const { expressId: layerSetId } = loaded.bim.store.addMaterialLayerSet(loaded.id, {
+  LayerSetName: 'Concrete layer',
+  MaterialLayers: [{ Material: material.expressId, LayerThickness: 0.2 }],
+});
 ```
 
 For an in-process host (no child process, no sockets), use `InProcessTransport` and send JSON-RPC envelopes directly:
@@ -443,3 +550,235 @@ MCP is the richest integration: stateful sessions, live viewer control, subscrip
 Reach for MCP when you want the model held open across a conversation, the viewer in the loop, or scoped permissions. Reach for the CLI when a one-shot command answers the question. Both share the same kernel, so results are consistent either way.
 
 See the [`@ifc-lite/mcp` README](https://github.com/LTplus-AG/ifc-lite/tree/main/packages/mcp) for the complete tool and resource catalogue.
+
+### Loaded-model design placement
+
+`place_curtain_wall`, `place_grid` and `place_grid_column` create elements in
+an existing model through the same builders as the Model workspace and typed
+SDK. Supply `storey_express_id`, canonical PascalCase `params`, and `model_id`
+when more than one model is loaded. `place_grid_column` also requires
+`binding: { GridId, IntersectingAxes: [axisIdA, axisIdB] }`; its storey-local
+`Position` must match the live crossing. Profiled columns may supply `Profile`
+instead of `Width`/`Depth`.
+
+Each call creates a new element and records one `mutation_undo` batch,
+including all curtain-wall parts or grid-placement helpers. Lengths are
+metres; grid `Direction` is radians. These tools require mutation scope.
+
+`edit_hosted_element` edits an existing wall-hosted opening, door or window
+through the shared Model workspace core. Supply `express_id`, `model_id` when
+federated, and a nonempty `patch` containing `OverallWidth`, `OverallHeight`,
+`Offset` and/or `Sill` in metres. It resizes or moves the actual cut and filling
+without replacing identity or relationships. Unsupported, overlapping and
+out-of-host changes leave the graph unchanged. The tool requires mutation scope;
+one `mutation_undo` restores the previous graph.
+
+### Physical command edits
+
+`copy_elements` and `array_elements` copy selections with their hosted
+dependants, fresh GlobalIds and the viewer array policy. `duplicate_element`
+accepts an `express_id`, explicit IFC `offset` and optional `Name`; it preserves
+the viewer Duplicate naming policy and copies the complete hosted graph.
+`edit_element_geometry` accepts a discriminated `operation`: `transform`
+(move/rotate), `align`, `size`, `wall_endpoints`, `split`, or `trim_extend`. Coordinates
+are IFC storey-local metres; rotation angles are radians. Dimension names
+retain their IFC spelling (`Depth`, `XDim`, `YDim`).
+
+Supply `model_id` when multiple models are loaded. These tools require mutation
+scope. Each write records one `mutation_undo` batch including its graph helpers.
+Unsupported shapes, independent hosted copies, unsafe shared geometry, read-only
+access and ambiguous model routing refuse without partial IFC writes.
+
+For `align`, provide `reference_id`, `express_ids` and `mode` (`left`, `centre`,
+`right`, `top`, `middle` or `bottom`). The reference and targets must occupy one
+storey. Bounds come from fresh native meshes, including current overlay edits;
+install the WASM runtime. Each target receives its own storey-local translation
+in one atomic batch. A selected host governs its placement dependants, which move once; joined neighbours follow and
+one Undo restores the entire graph. A fixed reference joined to a target, or
+hosted/joined targets requiring incompatible shifts, refuses before writing.
+
+### Native Room operations
+
+`room_command` accepts `storey_express_id` and `command` with `query`, `auto`,
+`pick`, `footprint`, `update` or `edit`. It uses current native wall/space
+geometry and the retained native Room topology; install the WASM runtime.
+Supply `model_id` when multiple models are loaded. Each write records one
+`mutation_undo` batch including synchronized spaces. Unsupported shapes,
+occupied Footprint, read-only access, and ambiguous routing refuse without
+partial writes. Preparation refuses stale model state and observes request
+cancellation before committing. Session termination and model removal release
+the retained native layout handles.
+
+`query_rooms` is available with read-only tokens. It accepts `storey_express_id`,
+optional `model_id`, and optional `settings` (`weld`, `minArea`, `boundary`),
+and delegates to the same native candidate service without IFC or Undo writes.
+Write actions remain protected by `room_command`'s mutation scope. Unchanged
+headless storeys reuse prepared geometry; source, overlay or journal changes
+invalidate it, and model removal releases the cache.
+
+Cancelled requests return `CANCELLED`; concurrent changes or preparation ownership
+return `STATE_CHANGED`, both with `details.retryable: true`. An unavailable native
+runtime returns `UNSUPPORTED_OPERATION` with reason `NATIVE_RUNTIME_UNAVAILABLE`.
+Malformed commands and unsupported input shapes retain `INVALID_INPUT`.
+
+`propose_flow` lets a read-only MCP caller run a native read/AI-only graph to
+a pending artifact. It rejects declared or node-defined effects and permits
+only `model.read` and `network.ai`. The current read scope and model allowlist
+still apply; the separate `resume_flow` requires current mutate authorization.
+MCP responses and checkpoint budgets include provider usage receipts without
+prompts, replies or credentials; receipt history survives subsequent pauses.
+
+## Captured native Review reads
+
+`review_findings` is a `read` tool, available in read-only configurations without
+validation, mutation or export permission. It reads facts retained by actual
+`ids_validate`, `check_rules` and Flow `ids.validate` producers in the same
+registry, transport session and principal. It does not rerun an analysis, create
+an editor, write an artifact, publish a record or make a human decision.
+
+Arguments are `sources` (default all known kinds), optional `model_ids`, and
+`max_findings` (default 128, maximum 512). Validation includes both IDS and
+information-rule reports; clash, comparison, BCF and linked sources are explicit
+`unsupported` captured native host inputs. Supplied historical analysis runs
+can include clash records; see [Supplied historical Review inputs](#supplied-historical-review-inputs)
+below. Validation without a captured producer
+is `not-run`, with unknown totals rather than a fabricated complete empty run.
+
+Every retained run has a unique producer capture ID, definition SHA-256, full
+raw-source SHA-256 and byte length for each actual target, native specification
+counts and completion time. The sampled model fingerprint remains a separate
+rule-target/cache identity. Reads check the original owner/store/source handles
+and monotonic overlay revision. A changed or replaced source retains its native
+facts as incomplete; replaced source identities cannot bind through a reused
+session model ID. Runs captured with pre-existing overlay edits are
+`partial-source` because these native producer inputs do not prove complete
+effective-overlay attribute/property coverage.
+
+The caller's model scope applies to the entire native target envelope. If a
+multi-model run contains an excluded target, its rows, names, proof digests,
+coverage and run metadata are all withheld. A principal refresh cannot inherit
+another principal's captures. Selection of a subset of a multi-model run also
+withholds that run rather than inventing per-model applicability counts.
+
+Output reports exact retained finding counts and omitted rows separately from
+rendered card totals. Titles, descriptions, labels and other presentation detail are limited to
+512 characters per field with clipping reported; source/element identity fields
+retain their native values under separate capture limits. Capture work is bounded to 64 models, 64 MiB of source
+bytes, 256 specifications, 100,000 native value nodes, 1,048,576 native text characters. At most 32 operations may be awaiting proof or native producer settlement, independently of the 32 retained successful contexts. A refused capture produces explicit unavailability, leaving
+the independent native analysis result intact. Portable saved input and the
+CLI/viewer source providers use the separate supplied historical mode below.
+
+Successful reruns replace the same producer/definition/full-source ownership context only after settlement. Relative ordering follows operation initiation, before proof hashing; older asynchronous completion cannot replace newer success or clear a newer refusal. Producer failure or cancellation releases its pending reservation. A proven newer failed attempt keeps earlier matching facts under their original run ID and completion time as historical, incomplete evidence, even when the earlier source proof completes later. If a later operation replaces that failure proof before an older pending capture can establish equality, the older capture is conservatively omitted with `capture-bound` and unknown historical coverage. `latestAttempt` reports the latest operation outcome and its proof when available; failure before proof does not invent a matching definition or source identity. A later genuine operation can recover transient refusal.
+
+Distinct contexts use bounded oldest-settled retention. Eviction sets `retention.inventoryOmitted`; omitted historical run counts remain unknown. `bounds.knownFindingsScope` is `retained-current-contexts`, so retained row counts never claim a complete historical inventory. If an older proof-pending operation outlives eviction of potentially newer context evidence, its later capture is conservatively refused as `capture-bound`; its independent native report remains intact. This uncertainty uses only a flag on the bounded pending record; `retention.captureRefusal` discloses the resulting `capture-bound` omission without relabelling a newer successful operation. Reads do not change retention or analysis state. If a retained context is replaced or evicted while a read awaits its source proof, that read returns `capture-bound` unavailability rather than claiming older rows as current; a later read can project the newer facts.
+
+Native Review bounds separate `presentationComplete` (all retained rows and text fit the response limits) from `nativeCoverageComplete` (the retained native runs are complete and fresh, with no omitted capture inventory). A complete presentation can still describe a stale or partially evaluated run. Both checks use current model ownership and permissions after source hashing; access revoked during that await suppresses the entire captured target envelope.
+
+Known credentials resolved by an authorized native Flow run are enrolled in
+private owner memory before the graph executes, including the exact trimmed
+form consumed by native XML text. Native capture and final reads
+refuse evidence containing those values, including older captures or enrollment
+during an awaited source hash. Credential work is bounded to 256 input entries per enrollment, 128 distinct values,
+16,384 UTF-8 bytes per value and 1,048,576 bytes per owner; overflow permanently
+refuses that owner's Review reads without discarding previously known values.
+Refused sources report unknown finding counts, not zero. Capture reservations are bounded synchronously before proof work; final ownership, permission and evidence checks still run after hashing. Excess admission preserves already retained native facts and provenance. Capacity overflow is transient; credential enrollment overflow is the permanent security refusal described above.
+
+
+### Supplied historical Review inputs
+
+`review_findings` accepts optional `saved_analysis_runs` and
+`saved_validation_reports` arrays containing the existing portable saved wire
+formats. Supplying either selects the historical reader for that call; omitting
+both retains the captured native reader. Selectors and row limits remain the
+same. Imported evidence does not attest execution or become current merely
+because a payload claimed current freshness: provenance is `imported`, lifecycle
+is historical/not evaluated, and native coverage remains incomplete.
+
+Binding uses the full source SHA-256 and duplicate-checked actual identity
+columns of authorized loaded models. Sampled fingerprints and last-write GUID
+maps do not establish uniqueness. Missing proof/capability, duplicate identities,
+source replacement, edits, permission revocation and work bounds remain explicit.
+The read never reparses each row, creates an editor, reruns analyses, saves an
+artifact or changes the scene. Known credentials and owner admission retain the
+same pre/final refusal boundary as captured native reads.
+
+The registered Flow `review.snapshot` accepts the corresponding optional JSON
+params `savedAnalysisRuns` and `savedValidationReports`. MCP supports captured
+native reads when those params are absent. CLI and viewer Flow hosts support the
+supplied historical mode and explicitly refuse unsupported native session reads;
+they do not fabricate an empty native result.
+
+Supplied analysis libraries advertise only the record kinds they contain. An
+explicit empty saved-validation-report collection declares available empty
+validation history; an empty mixed analysis library declares neither validation
+nor clash history. `bounds.knownFindings` counts only supplied historical rows,
+not unprovided source kinds or independently evaluated native coverage. Source
+states distinguish unavailable evidence from an available empty collection.
+
+## Durable Flow BCF publication recovery
+
+`run_flow` and `resume_flow` route `bcf.createTopic` / `bcf.addComment` through
+the native durable publication gateway. The credential-free journal lives at
+`IFCLITE_BCF_OUTBOX_DIR` or `~/.ifc-lite/bcf-outbox`. Local MCP and CLI share it;
+authenticated callers use separate stable namespaces derived from their
+principal, so a new transport session retains the same recovery state.
+Preserve this directory across process restarts. Unresolved writes refuse an
+identical send even when the server committed before the response was lost.
+
+`bcf_publications_list` requires read permission and returns `entries`, including
+intent, state and any receipt. Recovery requires mutate permission:
+
+1. Call `bcf_publication_check` with `entry_id`, current `capabilities` such as
+   `network.fetch:bcf.example.com`, and optional `token_env`. Reading that token
+   requires its exact `secret.read:<NAME>` capability. The check reads the
+   original server target and durably records manual candidate GUIDs, including
+   trim-equivalent free text. Rewritten or omitted payload fields make unmatched
+   objects unavailable rather than proving absence. Revoked
+   grants never inherit authorization from the original run.
+2. Review the matching candidates, then call `bcf_publication_reconcile` with
+   `entry_id` and one exact `candidate_guid`. It binds the previously checked
+   server identity to the original target and payload and saves a receipt.
+   Arbitrary GUIDs and live send ownership are refused.
+3. Restarting preserves that receipt. A separately reviewed next publication
+   uses its own intent; recovery never blindly resends the uncertain create.
+
+Checks and reconciliation are denied in read-only mode. Tokens are neither
+persisted nor returned; a publication payload containing a known run secret is
+refused before sending. Successful BCF response DTOs redact the actual resolved
+bearer, including literal and Player tokens, after the original receipt is saved.
+The browser content library and external vendor/OAuth
+acceptance remain separate from this native recovery lifecycle.
+
+A remote HTTP session must carry a stable authenticated principal for BCF
+publication or recovery. A session id alone is insufficient: replacing it
+would lose the recovery boundary. Such a session can still run ordinary model
+flows, but cannot write BCF publications or inspect the local CLI journal.
+
+When the caller explicitly supplies `confirm_full_read_access: true` and the
+latest complete successful check proves the server collection is empty,
+`bcf_publication_confirm_absent` with `entry_id` records a separate explicit
+absence decision. It requires mutate permission, sends no write and permits
+only a later deliberate Flow run to send the same intent again. An absent check
+alone never releases a create; a newer unavailable or denied check invalidates
+the earlier absence evidence. Live send ownership also blocks this decision.
+
+Native BCF listing is bounded: `bcf_publications_list` accepts `limit` (1–1000)
+and the preceding `cursor`, and returns `{entries,nextCursor?}`. Follow every
+`nextCursor`, including empty progress pages; the pages are not a snapshot
+across concurrent inserts. Recovery by known `entry_id` remains available when
+new-create capacity is exhausted; existing immutable receipts are retained.
+
+If a sending process cannot be identified on this machine, `bcf_publication_check`
+requires an operator to establish that the old process has stopped and explicitly
+pass `confirm_owner_stopped: true`. This assertion is persisted, never overrides
+an observed live sender, and does not send or retry a create. `token_env` requires
+its exact `secret.read:<NAME>` grant and may contain a short nonempty bearer.
+
+An empty read without this explicit full-scope confirmation is `unavailable`,
+even with a bearer token. Tokens never imply full visibility. Filtered, partial
+or incomparable reads cannot safely release a write; old persisted absence
+records without the confirmation marker remain readable but cannot authorize
+release. Only a caller who knows the original write’s complete access scope
+should make this assertion; live vendor authorization is not qualified.
+
+Unsupported native Review mode is refused before graph effects on CLI/viewer hosts. Supplied historical parameters and Player overrides remain supported; MCP additionally supports captured native Review. Validated restored nodes are not executed or required to reacquire their former services.

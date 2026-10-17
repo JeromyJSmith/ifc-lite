@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import { reportCorrelation } from '@/lib/error-reports/correlation';
+import { offerErrorReport } from '@/lib/error-reports/context';
 /**
  * Error boundary for `React.lazy` chunk roots.
  *
@@ -25,6 +27,7 @@ import { Component, type ErrorInfo, type ReactNode } from 'react';
 import { RefreshCw } from 'lucide-react';
 import { useTranslation, type TranslationKey } from '@/i18n';
 import { posthog } from '@/lib/analytics';
+import { reloadKeepingOpenModels } from '@/lib/reload-resume';
 import { isStaleDeploymentError } from '@/lib/stale-deployment';
 
 /**
@@ -43,8 +46,14 @@ type ChunkErrorTone = 'panel' | 'night';
 const NIGHT_TONE = { fg: '#ede4d3', dim: '#9c9486' } as const;
 
 const CHUNK_LABEL_KEYS = {
+  'Linked records panel': 'semantic.title',
   'Appearance panel': 'viewerShell.chunkLabel.appearancePanel',
   'Charts panel': 'viewerShell.chunkLabel.chartsPanel',
+  'Assistant panel': 'assistant.title',
+  'Point cloud panel': 'pointCloudPanel.title',
+  'Review panel': 'reviewWorkspace.title',
+  'IDS Studio panel': 'idsStudio.title',
+  'Script panel': 'scriptPanel.header.defaultTitle',
   'Flow panel': 'viewerShell.chunkLabel.flowPanel',
   'Drawing panel': 'viewerShell.chunkLabel.drawingPanel',
   'Document panel': 'viewerShell.chunkLabel.documentPanel',
@@ -53,6 +62,8 @@ const CHUNK_LABEL_KEYS = {
   'MCP page': 'viewerShell.chunkLabel.mcpPage',
   'MCP playground': 'viewerShell.chunkLabel.mcpPlayground',
   'RTE GPU witness': 'viewerShell.chunkLabel.rteGpuWitness',
+  'Saved runs': 'compareAnalysis.reconcile.savedTitle',
+  "What's New tab": 'keyboardShortcuts.tabs.whatsNew',
 } as const satisfies Record<string, TranslationKey>;
 
 type ChunkLabel = keyof typeof CHUNK_LABEL_KEYS;
@@ -90,7 +101,7 @@ export class ChunkErrorBoundary extends Component<
     // error-level exception. When a skew reload is in flight the before_send
     // gate in lib/chunk-version-skew.ts drops this as collateral; when no reload
     // is coming, it is a real dead end and worth hearing about.
-    posthog.captureException(error, {
+    const captured = posthog.captureException(error, {
       context: chunk ? 'lazy_chunk_boundary' : 'lazy_subtree_boundary',
       // `lazy_chunk`, not `chunk_label`: the analytics scrub deletes any key
       // with a `label` word (free text is where model names leak), so the
@@ -99,6 +110,7 @@ export class ChunkErrorBoundary extends Component<
       // string from the call sites in this repo, not user data.
       lazy_chunk: this.props.label,
     });
+    if (!chunk) offerErrorReport({ errorCode: 'component_render_error', correlation: reportCorrelation(captured) });
   }
 
   render(): ReactNode {
@@ -156,7 +168,9 @@ function ChunkErrorFallback({
       </span>
       <button
         type="button"
-        onClick={() => window.location.reload()}
+        // A stale chunk keeps the open models across the reload; a crash does
+        // not, so reopening cannot replay whatever crashed.
+        onClick={() => (chunk ? reloadKeepingOpenModels('user') : window.location.reload())}
         className={
           night
             ? 'mt-1 inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-2xs transition-opacity hover:opacity-80'

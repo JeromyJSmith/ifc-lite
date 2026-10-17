@@ -22,15 +22,91 @@ Because a bucket keeps its element ids, the bidirectional link needs no support 
 | Source | One row per | Columns | A bucket selects |
 |--------|-------------|---------|------------------|
 | **Elements** | geometry-bearing element instance across every loaded model | `IFC type`, `Storey`, `Model`, `Name`, plus exact IFC fields chosen for grouping and measuring | the elements |
-| **Clash results** | clash of the current run (after exclusions) | `Rule`, `Severity`, `Detection` (hard / clearance / touch), `Review status`, `Type A`, `Type B`, `Type pair`, `Model A`, `Model B`, `Storey`, `Distance` (m, for a penetration histogram), `Group` | both elements of every clash in it |
+| **Clash results** | clash of the current run (after exclusions), or of the [saved clash report](#saved-clash-report-charts) the chart is bound to | `Rule`, `Severity`, `Detection` (hard / clearance / touch), `Review status`, `Type A`, `Type B`, `Type pair`, `Model A`, `Model B`, `Storey`, `Distance` (m, for a penetration histogram), `Group` | both elements of every clash in it; rows of a saved report do not select the current model |
 | **BCF topics** | topic of the loaded project | `Status`, `Type`, `Priority`, `Assigned to`, `Stage`, `Labels`, `Author`, `Due` (overdue / this week / later / none), `Age` (days), and the dates `Created`, `Modified`, `Due date`, `Closed` | the components of the topics' viewpoints that are loaded |
 | **Schedule tasks** | task of the active schedule | `Task`, `Status`, `Phase at cursor` (not started / in progress / done, following the 4D playback), `Task type`, `Critical`, `Milestone`, `Duration` (days), `Products`, and the dates `Start`, `Finish` | the tasks' products |
 | **IDS results** | (specification, entity) result of the last validation | `Specification`, `Result` (pass / fail), `Entity type`, `Failing facet`, `Model` | the entities |
-| **Model compare** | diff entry of the last comparison | `State`, `What changed`, `IFC type`, `Revision` | the head-side entity (base-side for a deletion) |
+| **Model compare** | recorded change row of a selected saved comparison | `State`, `What changed`, `IFC type`, `Revision` | recorded rows do not select the current model |
+| **Existing unbound Model compare charts** | diff entry of the latest live comparison | `State`, `What changed`, `IFC type`, `Revision` | the head-side entity (base-side for a deletion) |
 
-Date columns feed the `timeline` chart, which buckets per ISO week — topics created or closed per week, tasks starting per week. There is no run history in the viewer, so BCF dates are the only time axis; clash counts over successive runs are not charted.
+Date columns feed the `timeline` chart, which buckets per ISO week — topics created or closed per week, tasks starting per week. BCF dates are the only time axis: saved clash reports let separate charts show separate runs side by side, but there is no chart of clash counts over successive runs.
 
 The dashboard's **scope** applies to the elements source and decides which elements its rows cover: all loaded models, only what is visible right now (the same answer the Lists panel's "visible only" gives), or the basket.
+
+### Saved comparison charts
+
+Complete a model comparison and choose **Save comparison** in Compare models.
+In the chart editor, choose **Model compare → Saved comparison** and select
+the completed report. Each chart retains its own choice when another pair
+is compared or another saved result is selected elsewhere. Newly authored
+comparison charts require a saved choice; existing charts without one keep
+their previous live-comparison behavior.
+
+The dataset contains the saved report's exact change rows, including content
+matches and excluding unchanged rows. It uses the recorded state, change,
+IFC type and revision names. Dashboard cards, document preview and PDF export
+resolve the same saved report. Recorded charts ignore live cross-chart slices
+and do not select, frame, color or capture entities in the current 3D scene.
+
+The optional `ChartSpec.comparisonId` stores the saved report ID. Dashboard
+and document files retain that ID, but do not embed the saved history. An
+imported file needs the matching report in this browser; a deleted or absent
+report shows an explicit unavailable-source message in the card, preview and
+PDF. Choose another saved comparison in the chart editor to replace it. The
+latest live run is never substituted. Saved-comparison JSON can be downloaded
+for evidence, but the viewer currently has no saved-history import control.
+
+### Saved clash report charts
+
+A clash chart reads the **current result** unless you bind it to a saved
+report. Running another check replaces the current result, so every unbound
+clash chart follows it. To keep a run, open **Saved clash reports** in the
+Clash panel header, name the result and choose **Save current result**. In the
+chart editor, choose **Clash results**, then pick the report under **Clash
+report**. That chart now shows the saved run whatever is checked afterwards,
+and two charts bound to two reports show two runs side by side. Choose
+**Current result** in the same list to return a chart to the live run.
+
+A saved report is a frozen copy of the run: its clashes with their rule,
+severity, detection status and distance, the review status, comment, group
+and storey each clash had when it was saved, the rules and settings of the
+run, and the models it ran on with their names and source identities. It
+holds no ids of the loaded model, so a chart of a saved report never selects,
+frames, colors or captures elements in 3D, ignores cross-chart slices, and
+cannot take an element filter (the **Clash rule** filter still applies and
+lists the report's own rules). Reviewing or regrouping clashes later does not
+change a saved report.
+
+The card names its source and anything that limits it as evidence:
+
+| Label | Meaning |
+|-------|---------|
+| **Saved clash report: name, saved date** | The chart shows this saved report, not the current result. |
+| **Clash rules matched no elements** | Every rule with recorded coverage matched zero elements on at least one side. Zero clashes do not establish a clean check. |
+| **Some clash rules matched no elements** | Some rules compared no elements; the count only describes the rules that had matches. |
+| **Partial run** | The run stopped at its candidate-pair limit, so some pairs were never checked. Absent clashes are not evidence that they are gone. |
+| **Models changed before saving** | The model was edited or moved after the run finished and before it was saved. |
+| **N hidden by exclusions** | Your enabled exclusion rules were hiding N clashes when the report was saved. The report holds the clashes the panel showed, so the chart counts a subset of the run. |
+| **Different model revision** | A loaded model has the same name as a recorded one but different content. The chart still shows the recorded results. |
+| **Models not loaded** | The models the report ran on are not open. |
+| **Revision not confirmed** | The viewer cannot tell whether the loaded models are the recorded revision: no source identity was recorded, the recorded and the loaded model have no kind of source identity in common to compare, or the model was edited in the viewer. |
+
+The limiting labels come first on the card, before the report's name, so a
+narrow card cannot cut them off; hover the subtitle for the whole line. The
+chart editor shows the same line under **Clash report**, and a document prints
+it under the chart in the preview and the PDF.
+Saved results are never matched to a different revision of the model: to see
+what changed, run the check again and use **Compare clash runs**.
+
+The optional `ChartSpec.clashReportId` stores the report's ID. Dashboard and
+document files keep that ID but do not embed the report. Reports live in this
+browser's saved content library, survive a reload, and travel in **Storage
+and backup → Download library backup**; importing a backup restores them, and
+a document imported with them keeps each chart on its own report. If a chart's
+report was deleted, or the file was opened in a browser that does not have it,
+the card, the preview and the PDF say **Saved clash report unavailable** and
+show no data. The current result is never shown in its place: choose **Choose
+a source** on the card and pick the current result or another report.
 
 ### Source filter
 
@@ -79,3 +155,9 @@ A numeric column is summed in **one unit**. Each value is converted into it from
 Cards sit on a 12-column grid: drag a card by its title bar, resize it from the corner; positions are part of the dashboard and saved with it. The **⋯** menu next to the dashboard picker renames, duplicates, deletes, exports the dashboard as an `.ifclite-dashboard.json` file, or imports one — an imported dashboard gets fresh ids so it never collides with the copy it came from, and its layout comes along.
 
 Dashboards persist in the browser like saved lists. The first open seeds **Model overview** (elements by type, by storey, and types per storey); the dashboard picker's *New from preset* group adds **Coordination** (clashes by type pair, severity, review status per storey, penetration depth; topics by status, open topics by assignee and due, topics created and closed per week), **Delivery** (IDS result per specification, failures by facet and entity type, elements treemap) and **Schedule** (tasks by phase at the cursor and by type, tasks starting per week, products per phase). Add, edit and remove charts from the panel header; every dashboard is a `DashboardSpec` JSON document validated on load, so a hand-edited or stale entry is dropped with a warning rather than crashing the panel.
+
+Deleting a saved comparison or clash report first lists dashboard and Document charts that read that exact report. Current unsaved native entries are included. Embedded historical report tables remain independent copies. The preview shows up to twenty references and the full number found; unreadable or incomplete libraries are disclosed because additional references may exist. Deletion remains allowed after reviewing that limitation.
+
+Cancel keeps the report. If the report or chart references change while the preview is open, review again before confirming. An import that renames or replaces the pending report revokes the old approval and preserves the imported version for review. Deletion does not edit dependent charts or substitute a current analysis run: those charts show their saved source as unavailable. A browser storage refusal is shown through the native library notice and retry controls; another tab's newer report revision cannot be silently deleted.
+
+The last dependency check runs immediately before the native storage write and again for a pending deletion retried in this tab, including an automatic retry after an import updates the saved report. Closing the preview revokes its approval, including a quota-refused pending deletion; Retry cannot reuse a closed preview. Recover the source and review it again before confirming. Chart and report libraries are not one transaction: a reference added after that final check can still become unavailable. Report revisions remain protected by the existing native storage conflict check.

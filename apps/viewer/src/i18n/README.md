@@ -11,13 +11,25 @@ rather than assembling translated fragments, lowercasing labels, or appending
 suffixes. Missing keys fall back to English; an explicit empty string remains
 empty.
 
-The Section-tool catalogue contains 69 strings covering the mounted 3D
+The Section-tool catalogue contains 72 strings covering the mounted 3D
 Section subtree: plane controls and state messages, cap styling, visualization
 badges and the drag-gizmo tooltip, plus the two entry labels that open a 2D
 drawing. It deliberately does not cover the drawing panel, toolbar, tours,
-number formatting, or locale persistence. Locales registered in tests exercise
+number formatting, or locale persistence. The cutting-plane set (chips, Add
+menu, plane menu, Undo) has its own catalogue, `section-planes.en.ts`. Locales registered in tests exercise
 fallback and live catalogue replacement; they are not languages shipped by
 the viewer.
+
+## Lazily loaded catalogues
+
+A feature that loads on demand can keep its English strings out of the
+page's first load: list the catalogue's key type and key prefix in
+`lazy-catalogues.ts`, and call `registerEnglish(catalogue)` at the
+top of the feature's own module, before it renders (the Flow review card's
+`flow-review.en.ts` is the first). Keys stay fully typed; a lazy key read
+before its catalogue registered renders as the key instead of throwing, and
+locale files may translate lazy keys like any other (the locale-file test
+registers every lazy catalogue before comparing placeholders).
 
 ## Adding a locale
 

@@ -30,6 +30,10 @@ export const geometryExportDialogsEn = {
 
   // --- ExportDialogShell.tsx (#5848) ---
   'geometryExport.shell.filenamePreviewLabel': 'Will save as:',
+  'geometryExport.shell.warningsSummary': {
+    one: '{count} warning',
+    other: '{count} warnings',
+  },
 
   // --- GLBExportDialog.tsx ---
   'geometryExport.glb.triggerButton': 'Export GLB',
@@ -116,6 +120,8 @@ export const geometryExportDialogsEn = {
   'geometryExport.usd.successTitle': 'Success',
   'geometryExport.usd.errorTitle': 'Error',
   'geometryExport.usd.exportedMessage': 'Exported USD ({sizeKb} KB)',
+  'geometryExport.usd.noRenderGeometryError':
+    'USD export produced 0 meshes — the model has no render geometry to export.',
   'geometryExport.usd.failedMessage': 'USD export failed: {reason}',
   'geometryExport.usd.cancelButton': 'Cancel',
   'geometryExport.usd.exportingButton': 'Exporting...',

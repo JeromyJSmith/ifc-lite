@@ -13,8 +13,12 @@
 
 import type { Capability } from '@ifc-lite/extensions';
 import type { FlowHost } from '@ifc-lite/flow-nodes';
-import type { LoadedModel, ModelRegistry } from '../context.js';
+import { createNativeBcfWriteGateway } from '@ifc-lite/flow-nodes/bcf-publication-node';
+import type { LoadedModel, ModelRegistry, ToolContext } from '../context.js';
 import { deriveModelId, loadIfcModelFromBytes } from '../loader.js';
+import { buildIdsAccessor } from './ids-accessor.js';
+import { readNativeReview, readPortableReview } from '@ifc-lite/sdk/review';
+import { nativeReviewModel, reviewCaptures, reviewAccess } from './review-captures.js';
 
 /** `base`, or `base_2`, `base_3`, … — the first id the registry does not hold yet. */
 function freeModelId(registry: ModelRegistry, base: string): string {
@@ -23,9 +27,24 @@ function freeModelId(registry: ModelRegistry, base: string): string {
   return id;
 }
 
-export function createMcpFlowHost(initial: LoadedModel, registry: ModelRegistry, networkGrants: readonly Capability[]): FlowHost {
+export function createMcpFlowHost(initial: LoadedModel, registry: ModelRegistry, networkGrants: readonly Capability[], services: Pick<FlowHost, 'ai' | 'grants'> = {}, context?: ToolContext, publication: Parameters<typeof createNativeBcfWriteGateway>[0] = {}): FlowHost {
   let active = initial;
   return {
+    ...services,
+    bcfWrites: createNativeBcfWriteGateway(publication),
+    ...(context ? {
+      review: { snapshot: request => {
+        const access = reviewAccess(context, 'read');
+        const read = request.savedAnalysisRuns !== undefined || request.savedValidationReports !== undefined
+          ? readPortableReview : readNativeReview;
+        return read(reviewCaptures(context), access.models, request, access.allowed);
+      } } satisfies NonNullable<FlowHost['review']>,
+      validationCapture: {
+        begin: (definition, signal) => reviewCaptures(context).begin('ids', definition, [nativeReviewModel(active)], reviewAccess(context, 'validate').models, reviewAccess(context, 'validate').allowed, signal),
+        finish: (token, report) => reviewCaptures(context).finish(token, report),
+        abandon: (token, reason) => reviewCaptures(context).abandon(token, reason),
+      } satisfies NonNullable<FlowHost['validationCapture']>,
+    } : {}),
     get bim() { return active.bim; },
     networkGrants,
     get defaultModelId() { return active.id; },
@@ -45,6 +64,8 @@ export function createMcpFlowHost(initial: LoadedModel, registry: ModelRegistry,
         strings: model.store.strings ?? null,
       };
     },
+    // `ids.validate` reads the session's effective model, like `ids_validate`.
+    idsAccessor: () => buildIdsAccessor(active.store, active.backend.getMutationView()),
     async openModel(bytes, name) {
       const loaded = await loadIfcModelFromBytes(bytes, name, freeModelId(registry, deriveModelId(name)));
       registry.add(loaded);

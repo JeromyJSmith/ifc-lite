@@ -1,8 +1,8 @@
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
-import { resolve } from 'node:path';
 import { main as assertCargoTargets } from './ci-assert-runnable-cargo-tests.mjs';
+import { isMainEntry } from './lib/is-main-entry.mjs';
 
 export function main(root = process.cwd()) {
   assertCargoTargets([
@@ -14,9 +14,13 @@ export function main(root = process.cwd()) {
     '--package', 'ifc-lite-processing',
     '--test', 'mesh_determinism',
   ], root);
+  assertCargoTargets([
+    '--package', 'ifc-lite-export',
+    '--test', 'export_golden',
+  ], root);
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === resolve(import.meta.filename)) {
+if (isMainEntry(import.meta.url)) {
   try {
     main();
   } catch (error) {

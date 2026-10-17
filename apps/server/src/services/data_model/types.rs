@@ -27,6 +27,12 @@ pub struct DataModel {
     pub documents: Vec<DocumentAssociation>,
     /// Spatial hierarchy data with nodes and lookup maps.
     pub spatial_hierarchy: SpatialHierarchyData,
+    /// Set when a table hit its size budget and extraction stopped filling it
+    /// (#7675: material rows grow as elements x layers). Such a model cannot
+    /// be served: `serialize_data_model_to_parquet`, the one way every route
+    /// sends a data model, refuses it with this reason rather than ship the
+    /// truncated table.
+    pub refused: Option<String>,
 }
 
 /// Metadata for a single IFC entity.
@@ -260,9 +266,12 @@ pub struct SpatialHierarchyData {
 }
 
 /// Job for processing an entity during data extraction.
-pub(crate) struct EntityJob {
+pub(crate) struct EntityJob<'a> {
     pub(crate) id: u32,
-    pub(crate) type_name: String,
+    /// Borrowed from the scanned content (#7676, SERVER-11): one `String`
+    /// per entity was millions of allocations on a large model, for a name
+    /// every extractor only compares.
+    pub(crate) type_name: &'a str,
     pub(crate) start: usize,
     pub(crate) end: usize,
 }

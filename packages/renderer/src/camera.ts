@@ -27,6 +27,7 @@ import {
 } from './camera-guards.js';
 import { RelativeToEyeFrame } from './relative-to-eye.js';
 import { surfaceZoomStep } from './camera-surface-zoom.js';
+import { canAdmitZoomPose } from './camera-zoom.js';
 import { CAMERA_CONSTANTS } from './constants.js';
 
 export class Camera {
@@ -90,6 +91,8 @@ export class Camera {
     // instead: it is a viewport property, so the previous frame's is a far
     // better answer than any constant.
     if (!Number.isFinite(aspect) || aspect <= 0) return;
+    // A redundant viewport update must not invalidate a pending pick snapshot (#6882).
+    if (aspect === this.state.camera.aspect) return;
     this.state.camera.aspect = aspect;
     this.updateMatrices();
   }
@@ -195,6 +198,7 @@ export class Camera {
    *   inertia, so `addVelocity` has no effect on it.
    */
   zoom(delta: number, addVelocity = false, mouseX?: number, mouseY?: number, canvasWidth?: number, canvasHeight?: number, fastZoom?: boolean, surfacePoint?: Vec3): void {
+    if (!Number.isFinite(delta)) return;
     // Zooming IN over geometry approaches the picked surface instead of the
     // target plane, so repeated notches stop short of it (#5393). Pure dolly
     // (fast zoom, Cesium) and orthographic keep the plain path.
@@ -214,6 +218,7 @@ export class Camera {
     const fraction = Math.min(Math.abs(delta) * CAMERA_CONSTANTS.ZOOM_SENSITIVITY, CAMERA_CONSTANTS.MAX_ZOOM_DELTA);
     const next = surfaceZoomStep(this.state.camera, point, fraction);
     if (!next) return false;
+    if (!canAdmitZoomPose(next, this.state.camera)) return true; // Handled, but unsafe: do not fall through to a different zoom.
     // The orbit centre is left where it is on purpose: the mouse path re-seats
     // it on every orbit start, and the new target already sits at the surface.
     // In place, like every other pose writer: callers may hold these objects.
@@ -250,9 +255,13 @@ export class Camera {
   /**
    * Frame selection - zoom to fit bounds while keeping current view direction
    * This is what "Frame Selection" should do - zoom to fill screen
+   *
+   * `padding` (>= 1) states the margin: the box's projected corners reach
+   * `1 / padding` of the half-frame on the limiting axis, exactly, in either
+   * projection (#7617). Omitted, the fixed default multiple of the fit distance applies.
    */
-  async frameBounds(min: Vec3, max: Vec3, duration = 300): Promise<void> {
-    return this.animator.frameBounds(min, max, duration);
+  async frameBounds(min: Vec3, max: Vec3, duration = 300, padding?: number): Promise<void> {
+    return this.animator.frameBounds(min, max, duration, padding);
   }
 
   async zoomExtent(min: Vec3, max: Vec3, duration = 300): Promise<void> {

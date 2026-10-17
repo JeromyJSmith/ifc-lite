@@ -63,7 +63,7 @@ export { countObjVertices } from './obj.js';
 // The JSON-LD / STEP twins of the two counters above: "did this export carry
 // any content?", for the formats whose writers emit a valid but entity-free
 // document when an isolation filter excludes everything (#4659).
-export { countJsonldNodes, countStepEntities } from './zero-content.js';
+export { countJsonldNodes, countStepEntities, countUsdMeshes } from './zero-content.js';
 
 export { columnsToParquet, isParquet } from './columns-to-parquet.js';
 // THE CSV cell escaper for this repo's TypeScript — RFC 4180 quoting plus the
@@ -85,10 +85,11 @@ export { captureAppearanceDependencies } from './appearance-dependencies.js';
 // exporter's own pipeline: read models that must agree with the exported
 // bytes (the cost read model, #4857) read this instead of re-serializing.
 export { effectiveSourceRecord, type EffectiveSourceRecord, effectiveCreatedRecord } from './effective-source-record.js';
-// O(affected) mini STEP file for re-meshing edited elements in the wasm
-// mesher (#6232 WP1): the viewer's re-mesh service is the consumer.
+// Mini STEP and inverse grid placement context for the shared viewer re-mesh
+// service (#6232). Grid-relative context also scans effective grid ownership.
 export {
   serializeEntitySubgraph,
+  gridPlacementDependents,
   remeshContextRoots,
   type EntitySubgraph,
   type EntitySubgraphRequest,
@@ -97,3 +98,8 @@ export {
 // the exporter uses for overlay-created records. The LandXML imagery export
 // appends the appearance planner's entities with it (#5942).
 export { serializeEntityArgs } from './attribute-real-slots.js';
+// Authored property declarations share the exporter's IfcValue registry/domain rules (SDK mutation consumer).
+export { validatePropertyDataType } from './declared-property-type.js';
+
+export { expandAffectedSet, type RemeshCause } from './affected-set.js';
+export { editOwnershipRefusal } from './edit-ownership.js';

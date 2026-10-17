@@ -1,6 +1,6 @@
 {
   "name": "@ifc-lite/pointcloud",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "description": "Point cloud decoders and types for IFC-Lite",
   "type": "module",
   "main": "./dist/index.js",
@@ -13,7 +13,7 @@
     }
   },
   "scripts": {
-    "build": "tsc && node -e \"const f='dist/streaming/worker-client.js';require('fs').writeFileSync(f,require('fs').readFileSync(f,'utf8').replace(/decode-worker\\.ts/g,'decode-worker.js'))\" && node scripts/build-worker-bundle.mjs",
+    "build": "tsc && node ../../scripts/rewrite-worker-urls.mjs dist && node ../../scripts/verify-dist-worker-urls.mjs dist --scripts-only && node scripts/build-worker-bundle.mjs",
     "typecheck": "node ../../scripts/typecheck-tests.mjs",
     "dev": "tsc --watch",
     "test": "vitest run"
@@ -24,7 +24,7 @@
   "devDependencies": {
     "esbuild": "^0.28.2",
     "typescript": "^6.0.3",
-    "vitest": "^5.0.2"
+    "vitest": "^5.0.3"
   },
   "license": "MPL-2.0",
   "author": "Louis True",

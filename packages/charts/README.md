@@ -55,4 +55,23 @@ default or invalid values retain the existing typography. `CHART_FONT_SIZE`
 exposes the bounds and default; `chartFontScale(fontSize)` gives the shared
 ratio for a host's chart headings and surrounding layout.
 
+`ChartSpec.comparisonId?: string` optionally binds a `compare` chart to a
+completed saved comparison in the viewer. Validation rejects an empty ID
+or a binding on another source. The chart package accepts the resolved
+dataset from its host; it does not own or embed the viewer's saved-history
+schema. In the viewer, a missing history dependency remains explicitly
+unavailable rather than using the latest live result. Unbound existing
+comparison charts retain their previous behavior. See the
+[saved comparison chart guide](../../docs/guide/charts.md#saved-comparison-charts)
+for recorded row semantics, local-history dependencies and 3D limitations.
+
+`ChartSpec.clashReportId?: string` optionally binds a `clash` chart to a saved
+clash report in the viewer. Absent means the current clash result, which is
+what existing charts read. Validation rejects an empty ID, a binding on
+another source, and an element filter (`selector` or `groups`) beside it,
+because saved rows carry no element ids; `filter.clashRule` stays valid. As
+with `comparisonId`, the host resolves the dataset and this package does not
+own the saved report's schema. See the
+[saved clash report chart guide](../../docs/guide/charts.md#saved-clash-report-charts).
+
 Part of the [ifc-lite](https://github.com/LTplus-AG/ifc-lite) monorepo. Licensed under MPL-2.0.

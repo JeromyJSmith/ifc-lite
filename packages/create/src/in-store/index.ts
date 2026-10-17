@@ -4,12 +4,15 @@
 
 // In-store builders — emit elements into an existing parsed IfcDataStore
 // via a `StoreEditor` overlay (closes the merge-roundtrip gap from #592).
+export { linearProfileFrame } from './linear-profile-frame.js';
+export { addOrdinaryElementInStore, type OrdinaryInStoreElement } from './ordinary-element.js';
 export {
   addColumnToStore,
   type ColumnInStoreParams,
   type ProfiledColumnInStoreParams,
   type ColumnBuildResult,
 } from './column.js';
+export { addColumnOnGridToStore, type GridColumnBinding, type GridColumnBuildResult } from './grid-column.js';
 export { addWallToStore, emitWallAxisRepresentation, emitWallBodyProfile, wallJoinWallFromParams, type WallInStoreParams, type WallBuildResult } from './wall.js';
 // Wall joins (L / T / butt) and the IfcRelConnectsPathElements they write; the read side sits in wall-join-read.
 export { computeWallJoin, reshapeWallAxis, wallBodyLateralRange, wallBodyOutline } from './wall-join.js';
@@ -39,6 +42,7 @@ export {
 } from './profile.js';
 export { addStairToStore, stairFlightOutline, type StairInStoreParams, type StairBuildResult } from './stair.js';
 export { readStairDimensions, editStairDimensionsInStore, type StairDimensions, type StairDimensionEdit } from './stair-edit.js';
+export { removeStairInStore } from './stair-removal.js';
 export { addRailingToStore, railingPostPoints, type RailingInStoreParams, type RailingBuildResult } from './railing.js';
 export { addCurtainWallToStore, curtainWallLayout, type CurtainWallInStoreParams, type CurtainWallGridSpec, type CurtainWallLayout, type CurtainWallBuildResult } from './curtain-wall.js';
 export {
@@ -233,3 +237,11 @@ export {
 
 export { reanchorHostedOpeningsInStore } from './hosted-placement-edit.js';
 export { reassignHostedOpeningsInStore, type HostedOpeningReassignment } from './hosted-placement-edit.js';
+
+export { replaceElementInStore, type InStoreReplacementElement } from './element-replacement.js';
+export {
+  addGroupToStore, updateGroupInStore, removeGroupInStore, readGroupInStore,
+  type GroupStoreContext, type GroupInStoreParams, type GroupInStorePatch,
+  type GroupRootIdentity, type GroupSnapshot, type GroupMembershipSnapshot,
+} from './group.js';
+export { readGroupEvidenceInStore, readGroupCreateEvidenceInStore, type GroupNativeEvidence, type GroupCreateEvidence } from './group-evidence.js';

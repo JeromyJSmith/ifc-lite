@@ -1,5 +1,7 @@
 # TypeScript API Reference
 
+[Search signatures and symbols in the generated API reference](reference.md).
+
 API documentation for the published TypeScript packages.
 
 ifc-lite ships its public npm packages under the `@ifc-lite/*` scope, plus the `create-ifc-lite` scaffolder. This page lists all of them, with API detail for the core packages. Exact type signatures live in each package's `src/index.ts` and shipped `.d.ts` files.
@@ -45,20 +47,26 @@ ifc-lite ships its public npm packages under the `@ifc-lite/*` scope, plus the `
 | [`@ifc-lite/wasm`](#ifc-litewasm) | WebAssembly bindings for IFC-Lite |
 | [`@ifc-lite/codegen`](#ifc-litecodegen) | TypeScript code generator from IFC EXPRESS schemas |
 | [`create-ifc-lite`](#create-ifc-lite) | Create IFC-Lite projects with one command |
+| [`@ifc-lite/ai`](https://www.npmjs.com/package/@ifc-lite/ai) | Provider-independent AI request core: transport contract, typed outcomes, root budgets, usage receipts and bounded JSON output parsing |
 | [`@ifc-lite/bcf-api`](https://www.npmjs.com/package/@ifc-lite/bcf-api) | BCF API (OpenCDE) REST client for connecting to BCF servers |
 | [`@ifc-lite/charts`](https://www.npmjs.com/package/@ifc-lite/charts) | Headless chart data binding for IFC-Lite: aggregate model rows into buckets that keep their element ids, build ECharts options, render SVG |
 | [`@ifc-lite/documents-api`](https://www.npmjs.com/package/@ifc-lite/documents-api) | OpenCDE Documents API 1.0 client: select, download, query and upload documents against a buildingSMART Documents API server |
 | [`@ifc-lite/flow`](https://www.npmjs.com/package/@ifc-lite/flow) | Keyed-data graph runtime for BIM workflows: typed ports, item/list/group lifting, memoised evaluation, and element tracking for re-runnable graphs |
 | [`@ifc-lite/flow-nodes`](https://www.npmjs.com/package/@ifc-lite/flow-nodes) | Standard node library for @ifc-lite/flow over the ifc-lite SDK: model reads and writes, tables, viewer, and a sandboxed Script node |
+| [`@ifc-lite/ids-agent`](https://www.npmjs.com/package/@ifc-lite/ids-agent) | Headless IDS authoring agent: a tool-calling loop over the IDS Studio op vocabulary, grounded by the gate, producing reviewable proposals |
+| [`@ifc-lite/ids-authoring`](https://www.npmjs.com/package/@ifc-lite/ids-authoring) | Headless IDS authoring core: Studio document with stable node ids, typed invertible operations, a grounding gate against the IFC schema tables, history, sidecar and re-identification |
+| [`@ifc-lite/load-trace`](https://www.npmjs.com/package/@ifc-lite/load-trace) | Dependency-free load-trace spans: performance.measure plus a per-load, cross-thread span tree with worker clock alignment and Chrome-trace export |
 | [`@ifc-lite/merge`](https://www.npmjs.com/package/@ifc-lite/merge) | Three-way merge engine for IFCX layers — MergePlan with auto-merged ops and explicit conflict records, merge-layer emission, rebase, and revert. |
 | [`@ifc-lite/oauth-pkce`](https://www.npmjs.com/package/@ifc-lite/oauth-pkce) | Browser OAuth 2.0 Authorization Code + PKCE flow, shared by ifc-lite's file-source providers |
 | [`@ifc-lite/opencde-foundation`](https://www.npmjs.com/package/@ifc-lite/opencde-foundation) | buildingSMART OpenCDE Foundation API client: version discovery, auth discovery, OAuth2 flows and the shared HTTP client used by every OpenCDE service client |
 | [`@ifc-lite/plugin-api`](https://www.npmjs.com/package/@ifc-lite/plugin-api) | Dependency-free type surface for ifc-lite file-source plugins |
 | [`@ifc-lite/regex-guard`](https://www.npmjs.com/package/@ifc-lite/regex-guard) | A shared, dependency-free guard against catastrophic-backtracking (ReDoS) regex patterns compiled from untrusted input |
 | [`@ifc-lite/rules`](https://www.npmjs.com/package/@ifc-lite/rules) | Filter-rule vocabulary, evaluator and .rules.json information-validation engine for IFC-Lite |
+| [`@ifc-lite/semantic`](https://www.npmjs.com/package/@ifc-lite/semantic) | Portable semantic datasets, profiles, validation and IFC identity resolution |
+| [`@ifc-lite/source-autodesk`](https://www.npmjs.com/package/@ifc-lite/source-autodesk) | Autodesk Forma and Data Exchange cloud-source provider for ifc-lite |
 | [`@ifc-lite/source-dalux`](https://www.npmjs.com/package/@ifc-lite/source-dalux) | Dalux Build (Box) file-source provider for ifc-lite |
 | [`@ifc-lite/source-dropbox`](https://www.npmjs.com/package/@ifc-lite/source-dropbox) | Dropbox file-source provider for ifc-lite |
-| [`@ifc-lite/source-msgraph`](https://www.npmjs.com/package/@ifc-lite/source-msgraph) | Microsoft Graph (OneDrive/SharePoint) file-source provider for ifc-lite |
+| [`@ifc-lite/source-msgraph`](https://www.npmjs.com/package/@ifc-lite/source-msgraph) | Microsoft Graph file-source provider for the signed-in user's own OneDrive |
 | [`@ifc-lite/wasm-lifecycle`](https://www.npmjs.com/package/@ifc-lite/wasm-lifecycle) | Shared WASM engine load-retry classification and cross-realm panic-forwarding, used by @ifc-lite/geometry and @ifc-lite/parser |
 <!-- END GENERATED: package-index -->
 
@@ -135,6 +143,8 @@ interface IfcDataStore extends IfcStoreBase {
   parseTime: number;
   // Length unit scale to metres (e.g. 0.001 for mm files)
   lengthUnitScale?: number;
+  // 'declared' if the project declares its length unit, 'default' if metres are assumed
+  lengthUnitSource?: 'declared' | 'default';
 
   // On-demand lookup maps: entityId -> related expressIds
   onDemandPropertyMap?: Map<number, number[]>;
@@ -199,7 +209,7 @@ class GeometryProcessor {
 
   // Rust-side exporters surfaced on the processor
   exportGlb(buffer, includeMetadata?, hidden?, isolated?, hiddenTypesCsv?, lit?): Uint8Array | null;
-  exportGlbFromMeshes(meshes: MeshData[], includeMetadata?, lit?): Uint8Array | null;
+  exportGlbFromMeshes(meshes: MeshData[], includeMetadata?, lit?, emissive?, worldMatrix?: ArrayLike<number>): Uint8Array | null;
   exportObj(/* ... */): Uint8Array | null;
   exportKmzFromMeshes(
     meshes: MeshData[],
@@ -754,6 +764,8 @@ Mutation types cover properties (`CREATE/UPDATE/DELETE_PROPERTY`, `CREATE/DELETE
 
 Build valid IFC4 STEP files programmatically, or add elements into an already-parsed model.
 
+`storeyPlanFrame(store, storeyExpressId, mutationView)` reads the current native placement chain when a view is supplied, including named/positional edits and authored records. Omit the view for source-only reads. Live unreadable, tilted, cyclic or over-256-placement chains return `null`; preview callers must disclose unavailable geometry. Origins remain metres and directions remain dimensionless.
+
 ### IfcCreator
 
 ```typescript
@@ -933,7 +945,8 @@ function createViewpoint(options): BCFViewpoint;
 // Extract viewer state from a BCF viewpoint
 function extractViewpointState(viewpoint: BCFViewpoint): {
   camera?: ViewerCameraState;
-  sectionPlane?: ViewerSectionPlane;
+  sectionPlane?: ViewerSectionPlane;     // the first clipping plane
+  sectionPlanes?: ViewerSectionPlane[];  // every clipping plane, in order
   selectedGuids: string[];
   hiddenGuids: string[];
   visibleGuids: string[];
@@ -991,7 +1004,7 @@ function auditIDSDocument(/* ... */): IDSAuditReport;
 function auditIDSStructure(/* ... */): IDSAuditReport;
 
 // Report localisation
-function createTranslationService(locale: 'en' | 'de' | 'fr'): TranslationService;
+function createTranslationService(locale: 'en' | 'de' | 'fr' | 'it'): TranslationService;
 ```
 
 ---

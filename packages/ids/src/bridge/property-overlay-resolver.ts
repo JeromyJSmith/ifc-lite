@@ -6,8 +6,16 @@ import { type IfcDataStore } from '@ifc-lite/parser';
 
 import type { PropertySetInfo } from '../types.js';
 
+import { fromSi, isIdentity, toSi } from './measure-conversion.js';
 import { collectAllPropertySets } from './properties.js';
-import { resolveEntityMeasureScales, toBaseSI } from './units.js';
+import { copyOwnUnit, ownUnitOf } from './project-property.js';
+import {
+  ownUnitConversionFor,
+  resolveEntityMeasureScales,
+  toBaseSI,
+  toRaw,
+  type EntityMeasureScales,
+} from './units.js';
 
 /**
  * One pending, in-memory correction to a property value, applied on top
@@ -82,15 +90,23 @@ export function resolveEffectivePropertySets(
   expressId: number,
   propertyOverlay: PropertyOverlayResolver | undefined
 ): PropertySetInfo[] {
-  const base = collectAllPropertySets(store, expressId);
   const overrides = propertyOverlay?.(expressId);
-  if (!overrides || overrides.length === 0) return base;
+  if (!overrides || overrides.length === 0) return collectAllPropertySets(store, expressId);
+  // The entries a correction writes with no unit, and below their copies: an
+  // override of one is read in the project unit (#7542, `existingToBaseSI`).
+  const writtenWithoutUnit = new Set<object>();
+  const base = collectAllPropertySets(store, expressId, writtenWithoutUnit);
 
   // Deep-clone only what we might mutate (psets/properties arrays), so the
   // base projection's cached/shared objects are never touched.
   const result = base.map((pset) => ({
     ...pset,
-    properties: pset.properties.map((p) => ({ ...p })),
+    properties: pset.properties.map((p) => {
+      const copy = { ...p };
+      copyOwnUnit(p, copy);
+      if (writtenWithoutUnit.has(p)) writtenWithoutUnit.add(copy);
+      return copy;
+    }),
   }));
 
   // The overlay's raw values (a `PropertyOverride.value` mirrors whatever
@@ -153,10 +169,16 @@ export function resolveEffectivePropertySets(
       // scale: a non-measure property (IFCLABEL, boolean, identifier)
       // has no scale and passes through untouched.
       const existing = targetSet.properties[idx];
-      targetSet.properties[idx] = {
+      const withoutUnit = writtenWithoutUnit.has(existing);
+      const replacement = {
         ...existing,
-        value: toBaseSI(override.value, existing.dataType, scales),
+        value: existingToBaseSI(existing, withoutUnit, override.value, scales),
       };
+      // Keep its own Unit so a later override of the same property in this
+      // array converts in that unit too. An entry written with no unit now
+      // holds such a value, so a later override reads in the project unit.
+      if (!withoutUnit) copyOwnUnit(existing, replacement);
+      targetSet.properties[idx] = replacement;
     } else if (matchingSets.length > 0) {
       // No same-named set carries this property yet — a PROPERTY_MISSING
       // correction (#3943): the property is being CREATED, not updated, so
@@ -203,4 +225,64 @@ export function resolveEffectivePropertySets(
   }
 
   return result;
+}
+
+type ProjectedProperty = PropertySetInfo['properties'][number];
+
+/**
+ * An override of an EXISTING property is written in that property's raw
+ * frame: its own `Unit` when it declares one (#7395), else the project's.
+ * An entry a correction cannot edit in place (`withoutUnit`) takes the
+ * project's (#7542): every quantity, and every entry inherited from the
+ * type. The viewer writes its correction as a new property with no unit
+ * (see `collectAllPropertySets`).
+ */
+function existingToBaseSI(
+  existing: ProjectedProperty,
+  withoutUnit: boolean,
+  value: PropertyOverride['value'],
+  scales: EntityMeasureScales
+): PropertyOverride['value'] {
+  const own = withoutUnit ? undefined : ownUnitOf(existing);
+  if (!own) return toBaseSI(value, existing.dataType, scales);
+  const c = ownUnitConversionFor(existing.dataType, own.siScale, own.symbol, own.siOffset);
+  return typeof value === 'number' && !isIdentity(c) ? toSi(value, c!) : value;
+}
+
+/**
+ * The inverse of what {@link resolveEffectivePropertySets} applies to an
+ * override: convert a base-SI value (an IDS literal, or a correction typed to
+ * satisfy one) into the raw frame `psetName`.`propName` on `expressId` is
+ * stored in — the property's own `Unit` when it declares one, else the
+ * project unit for `dataType` (or, when omitted, the property's own
+ * dataType). A property the entity does not carry yet takes the project
+ * unit, matching how a created override is read back. So does an entry a
+ * correction cannot edit in place (#7542): every quantity, and every entry
+ * the entity inherits from its type. The viewer writes that correction as a
+ * new property with no unit (see `collectAllPropertySets`).
+ */
+export function propertyValueToRaw(
+  store: IfcDataStore,
+  expressId: number,
+  psetName: string,
+  propName: string,
+  dataType: string | undefined,
+  value: string | number | boolean
+): string | number | boolean {
+  const psetLower = psetName.toLowerCase();
+  const propLower = propName.toLowerCase();
+  const writtenWithoutUnit = new Set<object>();
+  let existing: ProjectedProperty | undefined;
+  for (const pset of collectAllPropertySets(store, expressId, writtenWithoutUnit)) {
+    if (pset.name.toLowerCase() !== psetLower) continue;
+    existing = pset.properties.find((p) => p.name.toLowerCase() === propLower);
+    if (existing) break;
+  }
+  const effectiveType = dataType ?? existing?.dataType;
+  const own = existing && !writtenWithoutUnit.has(existing) ? ownUnitOf(existing) : undefined;
+  if (own) {
+    const c = ownUnitConversionFor(effectiveType, own.siScale, own.symbol, own.siOffset);
+    return typeof value === 'number' && !isIdentity(c) ? fromSi(value, c!) : value;
+  }
+  return toRaw(value, effectiveType, resolveEntityMeasureScales(store, expressId)) as string | number | boolean;
 }

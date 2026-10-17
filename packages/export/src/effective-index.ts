@@ -453,10 +453,10 @@ class OverlayIndex implements EffectiveEntityIndex {
 
   get byType(): Map<string, number[]> {
     if (this.cachedByType) return this.cachedByType;
-    // Shallow copy: the arrays are SHARED with the store until a key actually
-    // changes, and every key that changes is replaced with a fresh array. The
-    // store's own index is never mutated.
+    // Arrays stay SHARED with the store until a key changes; a changed key gets ONE fresh
+    // array (`owned`) that later appends grow: the store is never mutated, N appends are O(N).
     const out = new Map(this.sourceByType);
+    const owned = new Set<string>();
 
     const removeByType = new Map<string, Set<number>>();
     const markRemoved = (id: number): void => {
@@ -473,17 +473,15 @@ class OverlayIndex implements EffectiveEntityIndex {
     }
     for (const [type, ids] of removeByType) {
       const arr = out.get(type);
-      if (arr) out.set(type, arr.filter((id) => !ids.has(id)));
+      if (arr) { out.set(type, arr.filter((id) => !ids.has(id))); owned.add(type); }
     }
 
     const append = (type: string, id: number): void => {
       const arr = out.get(type);
-      out.set(type, arr ? [...arr, id] : [id]);
+      if (arr && owned.has(type)) arr.push(id);
+      else { out.set(type, arr ? [...arr, id] : [id]); owned.add(type); }
     };
-    for (const id of this.created.keys()) {
-      const type = this.typeOf(id);
-      if (type) append(type, id);
-    }
+    for (const id of this.created.keys()) { const type = this.typeOf(id); if (type) append(type, id); }
     for (const [id, retype] of this.retypes) {
       if (this.created.has(id) || this.tombstones.has(id) || !this.base.has(id)) continue;
       const target = retype.newType.toUpperCase();

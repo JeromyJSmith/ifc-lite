@@ -4,7 +4,7 @@
 
 /** Static workspace, schedule, preference, and help commands (#5870). */
 import {
-  CalendarPlus, ChevronsRight, Crosshair, Eraser, GraduationCap, Info, Palette,
+  CalendarPlus, ChevronsRight, Crosshair, Eraser, GraduationCap, Info, LayoutTemplate, Palette,
   PanelRight, RotateCcw, Settings, SlidersHorizontal, Sparkles, Sun,
 } from 'lucide-react';
 import { EVENT_SHOW_SHORTCUTS } from '@/lib/tours/events';
@@ -67,6 +67,17 @@ export const WORKSPACE_SURFACE_COMMANDS = [
     run: () => { resetLayout(); },
   },
   {
+    // Presets are previewed and applied in the Customize popover, never applied from the palette directly (#6926).
+    id: 'sidebar:layout-presets', labelKey: 'layoutPresets.paletteLabel',
+    keywords: 'layout preset coordinator review workspace arrange clash bcf assistant restore',
+    category: 'Panels', icon: LayoutTemplate, surfaces: paletteOnly, enabled: alwaysEnabled,
+    run: () => {
+      const state = useViewerStore.getState();
+      state.setSidebarMode('expanded');
+      state.setSidebarCustomizing(true);
+    },
+  },
+  {
     id: 'schedule:generate', labelKey: 'commandPalette.schedule.generate.label',
     keywords: '4d ifctask construction sequence storey building create gantt',
     category: 'Tools', icon: CalendarPlus, surfaces: paletteOnly, enabled: alwaysEnabled,
@@ -119,7 +130,7 @@ export const WORKSPACE_SURFACE_COMMANDS = [
   {
     id: 'pref:settings', labelKey: 'commandPalette.pref.settings.label', ribbonLabelKey: 'ribbon.view.settings', ribbonTooltipKey: 'ribbon.view.settingsTooltip',
     keywords: 'settings preferences options configure theme toolbar spacemouse',
-    category: 'Preferences', icon: Settings, surfaces: paletteAndRibbon, enabled: alwaysEnabled,
+    category: 'Preferences', icon: Settings, surfaces: ['palette', 'ribbon', 'mobile'], enabled: alwaysEnabled,
     run: () => { openSettings(); },
   },
   {

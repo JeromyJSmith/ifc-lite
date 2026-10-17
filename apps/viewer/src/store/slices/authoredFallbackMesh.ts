@@ -55,13 +55,15 @@ export async function remeshAuthoredElement(get: Get, modelId: string, entityId:
   const dataStore = authoredDataStore(state, modelId);
   const remembered = dataStore ? fallbacks.get(dataStore)?.get(entityId) : undefined;
   if (!dataStore || !remembered || !isLiveWithoutMesh(state, modelId, entityId)) return { outcome, fallback: false };
+  const frame = storeyAuthoringFrame(dataStore, remembered.storeyExpressId, coordinateInfoOf(state, modelId), state.mutationViews.get(modelId));
+  if (frame.unavailable) return { outcome, fallback: false };
   const mesh = buildElementMesh({
     type: remembered.element.kind,
     globalId: toGlobalIdFromModels(state.models, modelId, entityId),
     storeyElevation: dataStore.spatialHierarchy?.storeyElevations?.get(remembered.storeyExpressId) ?? 0,
     payload: authoredElementMeshPayload(
       remembered.element,
-      storeyAuthoringFrame(dataStore, remembered.storeyExpressId, coordinateInfoOf(state, modelId)),
+      frame,
     ),
   });
   if (!mesh) return { outcome, fallback: false };
@@ -138,7 +140,8 @@ function storeyLocalPayload(element: AuthoredElement): ElementMeshPayload {
       const [Width, Depth] = 'Profile' in p ? profileSectionExtent(p.Profile) : [p.Width, p.Depth];
       return {
         type: 'column', params: { Width, Depth, Height: p.Height }, position: p.Position,
-        ...(p.RefDirection ? { refDirection: [p.RefDirection[0], p.RefDirection[1]] as const } : {}),
+        // The IFC writer's default is storey-local +X, so it must turn with the frame too (#6593).
+        refDirection: p.RefDirection === undefined ? [1, 0] : [p.RefDirection[0], p.RefDirection[1]],
       };
     }
     case 'wall': {

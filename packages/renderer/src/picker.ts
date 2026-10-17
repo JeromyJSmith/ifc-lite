@@ -18,10 +18,12 @@ import {
   writeInstancedPickUniforms,
   writePickUniforms,
 } from './picker-rte-uniforms.js';
-import { isReadbackAbort, releaseReadbacks } from './picker-readbacks.js';
-import { relativeToEyeWgsl } from './shaders/relative-to-eye.wgsl.js';
+import { isReadbackAbort, PickerReadbackOwner } from './picker-readbacks.js';
+import { PickDepthSample } from './picker-depth-sample.js';
 import { drawInstanceRuns, uploadInstancedRteDeltas } from './instanced-rte.js';
 import { INSTANCED_RTE_DELTA_SLOT, INSTANCED_VERTEX_BUFFERS } from './instanced-vertex-layout.js';
+import { EXTRA_CLIP_BYTES, EXTRA_CLIP_FLOATS, packExtraClip } from './extra-clip-planes.js';
+import { flatPickShaderWgsl, instancedPickShaderWgsl } from './picker-shaders.js';
 
 /** Point-pick sizing parameters forwarded to the GPU pipeline. */
 export interface PointPickSizing {
@@ -39,7 +41,11 @@ export class Picker {
   private instancedPickPipeline: GPURenderPipeline | null = null;  // GPU-instancing: pick pass for instanced occurrences; null if the backend rejected it
   private instancedPickBindGroup: GPUBindGroup | null = null;
   private instancedUniformBuffer: GPUBuffer;
+  /** Extra cutting planes (#7545), one block shared by every pick draw; rewritten per pass. */
+  private extraClipBuffer: GPUBuffer;
+  private readonly extraClipScratch = new Float32Array(EXTRA_CLIP_FLOATS);
   private depthTexture: GPUTexture;
+  private depthSample: PickDepthSample;
   private colorTexture: GPUTexture;
   private uniformBuffer: GPUBuffer;
   private expressIdBuffer: GPUBuffer;
@@ -47,6 +53,7 @@ export class Picker {
   private maxMeshes: number = 100000; // Support up to 100K meshes (was 10K)
   /** Set by `destroy()`; makes it idempotent and turns `pick`/`pickRect` into no-ops. */
   private destroyed = false;
+  private readonly readbacks: PickerReadbackOwner;
   private pointPicker: PointPicker | null = null;
   // Flat meshes each bind a dynamic 256-byte slot: RTE view projection +
   // model linear transform + clip state + split drawable origin. A single
@@ -59,6 +66,8 @@ export class Picker {
   constructor(device: WebGPUDevice, width: number = 1, height: number = 1) {
     this.webgpuDevice = device;
     this.device = device.getDevice();
+    this.readbacks = new PickerReadbackOwner(this.device);
+    this.depthSample = new PickDepthSample(this.device);
 
     // Create textures for picking
     this.colorTexture = this.device.createTexture({
@@ -70,10 +79,7 @@ export class Picker {
     this.depthTexture = this.device.createTexture({
       size: { width, height },
       format: 'depth32float',
-      // COPY_SRC so we can read the depth texel at the click position
-      // back to the CPU and unproject to recover the world-space hit
-      // point for hover tooltips / measurements.
-      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
     });
 
     // One dynamically-offset uniform slot per flat mesh. The buffer carries
@@ -81,6 +87,10 @@ export class Picker {
     // for each draw after all queue writes have completed.
     this.uniformBuffer = this.device.createBuffer({
       size: this.maxMeshes * 256,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this.extraClipBuffer = this.device.createBuffer({
+      size: EXTRA_CLIP_BYTES,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
     this.instancedUniformBuffer = this.device.createBuffer({
@@ -97,65 +107,7 @@ export class Picker {
 
     // Create picker shader that uses storage buffer for per-object expressId
     const shaderModule = this.device.createShaderModule({
-      code: `
-        ${relativeToEyeWgsl}
-        struct Uniforms {
-          viewProj: mat4x4<f32>, // translation-free RTE projection
-          model: mat4x4<f32>,    // linear transform; translation lives in originHigh/Low
-          clipBoxMin: vec4<f32>,   // xyz = min corner (world), w = pad
-          clipBoxMax: vec4<f32>,   // xyz = max corner (world), w = pad
-          sectionPlane: vec4<f32>, // xyz = plane normal, w = plane distance
-          clipFlags: vec4<u32>,    // x: bit0 sectionEnabled, bit1 flipped, bit2 clipBox
-          originHigh: vec4<f32>,
-          originLow: vec4<f32>,
-        }
-        @binding(0) @group(0) var<uniform> uniforms: Uniforms;
-        @binding(1) @group(0) var<storage, read> expressIds: array<u32>;
-
-        struct VertexInput {
-          @location(0) position: vec3<f32>,
-          @location(1) normal: vec3<f32>,
-        }
-
-        struct VertexOutput {
-          @builtin(position) position: vec4<f32>,
-          @location(0) @interpolate(flat) objectId: u32,
-          @location(1) worldPos: vec3<f32>,
-        }
-
-        @vertex
-        fn vs_main(input: VertexInput, @builtin(instance_index) instanceIndex: u32) -> VertexOutput {
-          var output: VertexOutput;
-          let linear = (uniforms.model * vec4<f32>(input.position, 0.0)).xyz;
-          let relative = rteWorldPosition(linear, RteDrawableUniform(uniforms.originHigh, uniforms.originLow)).xyz;
-          output.position = uniforms.viewProj * vec4<f32>(relative, 1.0);
-          output.worldPos = relative;
-          // Look up expressId from storage buffer using instance index
-          output.objectId = expressIds[instanceIndex];
-          return output;
-        }
-
-        @fragment
-        fn fs_main(input: VertexOutput) -> @location(0) u32 {
-          // Mirror the main render's clip discards so a click can't select a
-          // fragment the user has sectioned or cropped out of view.
-          if ((uniforms.clipFlags.x & 1u) != 0u) {  // section plane enabled
-            let flipped = (uniforms.clipFlags.x & 2u) != 0u;
-            let side = select(1.0, -1.0, flipped);
-            let distToPlane = (dot(input.worldPos, uniforms.sectionPlane.xyz) - uniforms.sectionPlane.w) * side;
-            if (distToPlane > 0.0) {
-              discard;
-            }
-          }
-          if ((uniforms.clipFlags.x & 4u) != 0u) {  // clip box enabled
-            let p = input.worldPos;
-            if (any(p < uniforms.clipBoxMin.xyz) || any(p > uniforms.clipBoxMax.xyz)) {
-              discard;
-            }
-          }
-          return input.objectId;
-        }
-      `,
+      code: flatPickShaderWgsl,
     });
 
     this.pipeline = this.device.createRenderPipeline({
@@ -163,6 +115,7 @@ export class Picker {
         entries: [
           { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform', hasDynamicOffset: true, minBindingSize: 224 } },
           { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
+          { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform', minBindingSize: EXTRA_CLIP_BYTES } },
         ],
       })] }),
       vertex: {
@@ -209,6 +162,10 @@ export class Picker {
           binding: 1,
           resource: { buffer: this.expressIdBuffer },
         },
+        {
+          binding: 2,
+          resource: { buffer: this.extraClipBuffer },
+        },
       ],
     });
 
@@ -219,73 +176,7 @@ export class Picker {
     // from a flat mesh-index (bit 30 clear) or a point (bit 31). No expressId
     // storage buffer — the id rides the instance buffer per occurrence.
     const instancedPickModule = this.device.createShaderModule({
-      code: `
-        ${relativeToEyeWgsl}
-        struct Uniforms {
-          viewProj: mat4x4<f32>,
-          clipBoxMin: vec4<f32>,   // xyz = min corner (world), w = pad
-          clipBoxMax: vec4<f32>,   // xyz = max corner (world), w = pad
-          sectionPlane: vec4<f32>, // xyz = plane normal, w = plane distance
-          clipFlags: vec4<u32>,    // x: bit0 sectionEnabled, bit1 flipped, bit2 clipBox
-          cameraHigh: vec4<f32>,
-          cameraLow: vec4<f32>,
-        }
-        @binding(0) @group(0) var<uniform> uniforms: Uniforms;
-        struct VertexInput { @location(0) position: vec3<f32> }
-        struct InstanceInput {
-          @location(3) m0: vec4<f32>,
-          @location(4) m1: vec4<f32>,
-          @location(5) m2: vec4<f32>,
-          @location(6) m3: vec4<f32>,
-          @location(7) instEntityId: u32,
-          @location(9) instFlags: u32,
-          @location(10) anchorHigh: vec4<f32>,
-          @location(11) anchorLow: vec4<f32>,
-        }
-        struct VertexOutput {
-          @builtin(position) position: vec4<f32>,
-          @location(0) @interpolate(flat) objectId: u32,
-          @location(1) @interpolate(flat) instFlags: u32,
-          @location(2) worldPos: vec3<f32>,
-        }
-        @vertex
-        fn vs_main(input: VertexInput, inst: InstanceInput) -> VertexOutput {
-          var output: VertexOutput;
-          let m = mat4x4<f32>(inst.m0, inst.m1, inst.m2, inst.m3);
-          let linear = (m * vec4<f32>(input.position, 0.0)).xyz;
-          let relative = rteWorldPosition(linear, RteDrawableUniform(inst.anchorHigh, inst.anchorLow)).xyz;
-          output.position = uniforms.viewProj * vec4<f32>(relative, 1.0);
-          output.worldPos = relative;
-          // bit 30 = instanced marker; express id in the low 30 bits.
-          output.objectId = 0x40000000u | (inst.instEntityId & 0x3FFFFFFFu);
-          output.instFlags = inst.instFlags;
-          return output;
-        }
-        @fragment
-        fn fs_main(input: VertexOutput) -> @location(0) u32 {
-          // Hidden occurrences (flags bit 1) are not pickable — mirror the render-pass
-          // discard so a hidden instanced element can't be selected through the picker.
-          if ((input.instFlags & 2u) != 0u) {
-            discard;
-          }
-          // Mirror the main render's section + crop-box discards for occurrences.
-          if ((uniforms.clipFlags.x & 1u) != 0u) {  // section plane enabled
-            let flipped = (uniforms.clipFlags.x & 2u) != 0u;
-            let side = select(1.0, -1.0, flipped);
-            let distToPlane = (dot(input.worldPos, uniforms.sectionPlane.xyz) - uniforms.sectionPlane.w) * side;
-            if (distToPlane > 0.0) {
-              discard;
-            }
-          }
-          if ((uniforms.clipFlags.x & 4u) != 0u) {  // clip box enabled
-            let p = input.worldPos;
-            if (any(p < uniforms.clipBoxMin.xyz) || any(p > uniforms.clipBoxMax.xyz)) {
-              discard;
-            }
-          }
-          return input.objectId;
-        }
-      `,
+      code: instancedPickShaderWgsl,
     });
     // NON-FATAL: the instanced pick pipeline is an add-on (instanced occurrences are
     // also resolvable via the GPU/CPU flat paths). A degraded WebGPU backend (e.g.
@@ -308,7 +199,10 @@ export class Picker {
       });
       this.instancedPickBindGroup = this.device.createBindGroup({
         layout: this.instancedPickPipeline.getBindGroupLayout(0),
-        entries: [{ binding: 0, resource: { buffer: this.instancedUniformBuffer } }],
+        entries: [
+          { binding: 0, resource: { buffer: this.instancedUniformBuffer } },
+          { binding: 1, resource: { buffer: this.extraClipBuffer } },
+        ],
       });
     } catch (err) {
       console.warn('[Picker] instanced pick pipeline unavailable; instanced occurrences fall back to other pick paths:', err);
@@ -329,10 +223,8 @@ export class Picker {
    * For point hits, expressId is the federated globalId of the asset
    * (already correct for hover/selection plumbing — no remapping needed).
    *
-   * Returns null once `destroy()` has run — every texture and buffer below is
-   * already freed, so the `mapAsync` readback could only reject. Also returns
-   * null if the device dies *during* the readback, which no entry guard can
-   * pre-empt (see {@link isReadbackAbort}).
+   * Returns null after picker teardown or device loss, including loss between
+   * successful mapping and consumption of the mapped range (#6881).
    */
   async pick(
     x: number,
@@ -347,16 +239,12 @@ export class Picker {
     clip?: PickClipState | null,
     pointRteSnapshot?: RelativeToEyeSnapshot,
   ): Promise<PickResult | null> {
-    if (this.destroyed) return null;
+    if (this.destroyed || this.readbacks.deviceLost) return null;
     const encoder = this.renderPickPass(
       width, height, meshes, viewProj, pointNodes, pointSizing, instancedTemplates, clip, pointRteSnapshot,
     );
 
-    // Clamp the texel origin to the texture bounds. Math.floor(x/y) can
-    // be -1 or equal to width/height on border clicks (and on
-    // pointer-captured drags that leave the canvas), and either makes
-    // copyTextureToBuffer reject the submit. pickRect already guards
-    // this path; pick() needs the same.
+    // Border clicks and pointer-captured drags use the same clamped ID/depth texel.
     const sampleX = Math.max(0, Math.min(width - 1, Math.floor(x)));
     const sampleY = Math.max(0, Math.min(height - 1, Math.floor(y)));
 
@@ -367,71 +255,43 @@ export class Picker {
       size: BYTES_PER_ROW,
       usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
     });
-    encoder.copyTextureToBuffer(
-      {
-        texture: this.colorTexture,
-        origin: { x: sampleX, y: sampleY, z: 0 },
-      },
-      { buffer: readBuffer, bytesPerRow: BYTES_PER_ROW, rowsPerImage: 1 },
-      { width: 1, height: 1 },
-    );
 
-    // Depth readback for click-to-world unprojection. WebGPU forbids
-    // partial copies from depth/stencil-format textures — the copy must
-    // cover the entire subresource. So we copy the whole depth image
-    // and index into the buffer client-side after mapping. depth32float
-    // = 4 bytes per texel; bytesPerRow must still be a multiple of 256.
-    const depthBytesPerRow = Math.ceil((width * 4) / 256) * 256;
-    const depthBuffer = this.device.createBuffer({
-      size: depthBytesPerRow * height,
-      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-    });
-    encoder.copyTextureToBuffer(
-      {
-        texture: this.depthTexture,
-        origin: { x: 0, y: 0, z: 0 },
-        aspect: 'depth-only',
-      },
-      { buffer: depthBuffer, bytesPerRow: depthBytesPerRow, rowsPerImage: height },
-      { width, height },
-    );
-
-    this.device.queue.submit([encoder.finish()]);
-    // GPUMapMode.READ = 1 (WebGPU spec)
+    // The compute sample and ID copy share the render submission and staging
+    // buffer. Each pick owns its coordinates and output until mapping finishes.
+    this.readbacks.track(readBuffer);
+    let depthResources: readonly GPUBuffer[] = [];
+    let sample: number;
+    let depth: number;
     try {
-      await Promise.all([readBuffer.mapAsync(1), depthBuffer.mapAsync(1)]);
+      encoder.copyTextureToBuffer(
+        {
+          texture: this.colorTexture,
+          origin: { x: sampleX, y: sampleY, z: 0 },
+        },
+        { buffer: readBuffer, bytesPerRow: BYTES_PER_ROW, rowsPerImage: 1 },
+        { width: 1, height: 1 },
+      );
+      depthResources = this.depthSample.encode(
+        encoder, this.depthTexture, sampleX, sampleY, readBuffer, 4,
+      );
+      this.readbacks.track(...depthResources);
+      this.device.queue.submit([encoder.finish()]);
+      await readBuffer.mapAsync(GPUMapMode.READ);
+      if (this.destroyed || this.readbacks.deviceLost) return null;
+      const bytes = readBuffer.getMappedRange();
+      sample = new Uint32Array(bytes, 0, 1)[0];
+      depth = new Float32Array(bytes, 4, 1)[0];
     } catch (err) {
-      // Free BOTH readbacks on every failure path, not just the aborted one.
-      // `Promise.all` rejects the moment one map fails, so the other may have
-      // succeeded and still be holding its mapped GPU allocation — rethrowing
-      // without this leaks it for the life of the device.
-      releaseReadbacks(readBuffer, depthBuffer);
-      // The device died between submit and readback — see isReadbackAbort.
-      if (!isReadbackAbort(err)) throw err;
+      if (!this.readbacks.deviceLost && !isReadbackAbort(err)) throw err;
       return null;
+    } finally {
+      this.readbacks.release(readBuffer, ...depthResources);
     }
-    const sample = new Uint32Array(readBuffer.getMappedRange())[0];
-    const depthBytes = new Uint8Array(depthBuffer.getMappedRange());
-    const depthOffset = sampleY * depthBytesPerRow + sampleX * 4;
-    const depth = new Float32Array(
-      depthBytes.buffer,
-      depthBytes.byteOffset + depthOffset,
-      1,
-    )[0];
-    readBuffer.unmap();
-    depthBuffer.unmap();
-    readBuffer.destroy();
-    depthBuffer.destroy();
 
     const decoded = decodePickSample(sample);
     if (decoded.kind === 'none') return null;
 
-    // Unproject (x, y, depth) → world space. Reverse-Z keeps depth in
-    // [0, 1] (1 = near, 0 = far) — same NDC convention as the camera
-    // raycaster, so MathUtils.transformPoint with the inverse viewProj
-    // gives the world hit position directly.
-    // Flat meshes, points and instanced occurrences all rasterise in the
-    // captured RTE frame. Decode depth with that same immutable projection.
+    // Decode reverse-Z depth with the immutable RTE projection used to rasterise.
     const rteDecoded = decoded.kind === 'mesh' || decoded.kind === 'point' || decoded.kind === 'instanced';
     const projectedWorld = unprojectPickSample(
       rteDecoded && pointRteSnapshot ? pointRteSnapshot.getViewProjection().m : viewProj,
@@ -482,7 +342,7 @@ export class Picker {
     clip?: PickClipState | null,
     pointRteSnapshot?: RelativeToEyeSnapshot,
   ): Promise<Set<number>> {
-    if (this.destroyed) return new Set();
+    if (this.destroyed || this.readbacks.deviceLost) return new Set();
     // Normalise + clip rect to texture bounds.
     const lx = Math.max(0, Math.floor(Math.min(x0, x1)));
     const ly = Math.max(0, Math.floor(Math.min(y0, y1)));
@@ -504,53 +364,51 @@ export class Picker {
       size: rowStride * rectH,
       usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
     });
-    encoder.copyTextureToBuffer(
-      {
-        texture: this.colorTexture,
-        origin: { x: lx, y: ly, z: 0 },
-      },
-      { buffer: readBuffer, bytesPerRow: rowStride, rowsPerImage: rectH },
-      { width: rectW, height: rectH },
-    );
-    this.device.queue.submit([encoder.finish()]);
+    this.readbacks.track(readBuffer);
     try {
+      encoder.copyTextureToBuffer(
+        {
+          texture: this.colorTexture,
+          origin: { x: lx, y: ly, z: 0 },
+        },
+        { buffer: readBuffer, bytesPerRow: rowStride, rowsPerImage: rectH },
+        { width: rectW, height: rectH },
+      );
+      this.device.queue.submit([encoder.finish()]);
       await readBuffer.mapAsync(1);
-    } catch (err) {
-      // Released on every failure path, not just the aborted one — a real
-      // fault must not leak the readback's GPU allocation on its way out.
-      releaseReadbacks(readBuffer);
-      // The device died between submit and readback — see isReadbackAbort.
-      if (!isReadbackAbort(err)) throw err;
-      return new Set();
-    }
-    const view = new Uint32Array(readBuffer.getMappedRange());
-    const ids = new Set<number>();
-    const stridePx = rowStride / 4;
-    for (let y = 0; y < rectH; y++) {
-      const row = y * stridePx;
-      for (let x = 0; x < rectW; x++) {
-        const sample = view[row + x];
-        if (sample === 0) continue;
-        // Same three-way decode single-click uses — including the instanced
-        // case (the shader writes the express id straight into the sample) and
-        // the mesh case's (index + 1) offset. Both live in pick-resolve.ts and
-        // must not be re-implemented here.
-        //
-        // The bare id, not a PickResult: this returns a Set<expressId>, which
-        // has no room for a per-item result — a marquee that hits three panes
-        // of one curtain wall is one entry — and allocating a result per
-        // non-zero texel just to read `.expressId` off it dominated the rect.
-        // Single-click pick is the per-item surface.
-        //
-        // modelIndex is dropped for the same reason, which is why a point
-        // sample's owning asset (a linear scan, once per texel) is not resolved.
-        const expressId = resolvePickedExpressId(decodePickSample(sample), meshes);
-        if (expressId !== null) ids.add(expressId);
+      if (this.destroyed || this.readbacks.deviceLost) return new Set();
+      const view = new Uint32Array(readBuffer.getMappedRange());
+      const ids = new Set<number>();
+      const stridePx = rowStride / 4;
+      for (let y = 0; y < rectH; y++) {
+        const row = y * stridePx;
+        for (let x = 0; x < rectW; x++) {
+          const sample = view[row + x];
+          if (sample === 0) continue;
+          // Same three-way decode single-click uses — including the instanced
+          // case (the shader writes the express id straight into the sample) and
+          // the mesh case's (index + 1) offset. Both live in pick-resolve.ts and
+          // must not be re-implemented here.
+          //
+          // The bare id, not a PickResult: this returns a Set<expressId>, which
+          // has no room for a per-item result — a marquee that hits three panes
+          // of one curtain wall is one entry — and allocating a result per
+          // non-zero texel just to read `.expressId` off it dominated the rect.
+          // Single-click pick is the per-item surface.
+          //
+          // modelIndex is dropped for the same reason, which is why a point
+          // sample's owning asset (a linear scan, once per texel) is not resolved.
+          const expressId = resolvePickedExpressId(decodePickSample(sample), meshes);
+          if (expressId !== null) ids.add(expressId);
+        }
       }
+      return ids;
+    } catch (err) {
+      if (!this.readbacks.deviceLost && !isReadbackAbort(err)) throw err;
+      return new Set();
+    } finally {
+      this.readbacks.release(readBuffer);
     }
-    readBuffer.unmap();
-    readBuffer.destroy();
-    return ids;
   }
 
   /**
@@ -581,10 +439,7 @@ export class Picker {
       this.depthTexture = this.device.createTexture({
         size: { width, height },
         format: 'depth32float',
-        // COPY_SRC so single-pixel pick can read depth back for the
-        // hover-XYZ unprojection. Rect pick doesn't sample depth but
-        // costs nothing to keep the flag set.
-        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
       });
     }
     // WebGPU texture views can't be reused after submit, so build fresh ones.
@@ -615,6 +470,11 @@ export class Picker {
       if (meshes[i]) meshIndexArray[i] = i + 1;  // +1 so 0 means no hit
     }
     this.device.queue.writeBuffer(this.expressIdBuffer, 0, meshIndexArray);
+
+    // One block for every draw of this pass: the cutting planes beyond the first,
+    // in the frame the pass rasterises (eye-relative when an RTE snapshot drives it).
+    packExtraClip(clip?.extraPlanes, pointRteSnapshot?.getCameraWorld() ?? null, this.extraClipScratch, 0);
+    this.device.queue.writeBuffer(this.extraClipBuffer, 0, this.extraClipScratch);
 
     pass.setPipeline(this.pipeline);
     for (let i = 0; i < meshes.length; i++) {
@@ -679,7 +539,7 @@ export class Picker {
         worldRadius: sz.worldRadius,
         pointSizePx: sz.pointSizePx,
         clickTolerancePx: sz.clickTolerancePx ?? 2,
-      }, clip?.sectionPlane ?? null, pointRteSnapshot, clip?.clipBox ?? null);
+      }, clip?.sectionPlane ?? null, pointRteSnapshot, clip?.clipBox ?? null, clip?.extraPlanes ?? null);
     }
     pass.end();
     return encoder;
@@ -718,6 +578,10 @@ export class Picker {
           binding: 1,
           resource: { buffer: this.expressIdBuffer },
         },
+        {
+          binding: 2,
+          resource: { buffer: this.extraClipBuffer },
+        },
       ],
     });
   }
@@ -730,10 +594,12 @@ export class Picker {
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
+    this.readbacks.destroy();
     this.colorTexture.destroy();
     this.depthTexture.destroy();
     this.uniformBuffer.destroy();
     this.instancedUniformBuffer.destroy();
+    this.extraClipBuffer.destroy();
     this.expressIdBuffer.destroy();
     this.pointPicker?.destroy();
     this.pointPicker = null;

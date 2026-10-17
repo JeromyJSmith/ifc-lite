@@ -3,58 +3,26 @@
 //! slots (`readStepSlots`) and replacing one (`replaceStepArgument`), under the
 //! TypeScript slot grammar.
 
+use crate::step_record_frame::record_frame;
+
 /// `replaceStepArgument`: slot `index` of the record replaced, or `None` when
 /// the record does not read as `#id=TYPE(args);` with that slot.
 pub(crate) fn replace_argument(text: &str, index: usize, replacement: &str) -> Option<String> {
-    let (prefix_end, attrs, suffix) = record_parts(text)?;
-    let mut args = split_args(attrs)?;
+    let frame = record_frame(text)?;
+    let mut args = split_args(frame.args(text))?;
     if index >= args.len() {
         return None;
     }
     args[index] = replacement.to_string();
-    Some(format!("{}{}{}", &text[..prefix_end], args.join(","), suffix))
+    Some(frame.with_args(text, &args.join(",")))
 }
 
-/// `RECORD_PREFIX_RE`: `(end of "#id=TYPE(", argument text, ")<ws>;")`.
-pub(crate) fn record_parts(text: &str) -> Option<(usize, &str, &str)> {
-    let t = text.trim_end();
-    let b = t.as_bytes();
-    if !t.starts_with('#') || !t.ends_with(';') {
-        return None;
-    }
-    let digits = 1 + t[1..].find(|c: char| !c.is_ascii_digit())?;
-    if digits == 1 {
-        return None;
-    }
-    let after_eq = t[digits..].trim_start().strip_prefix('=')?.trim_start();
-    let type_start = t.len() - after_eq.len();
-    let type_len = after_eq.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))?;
-    if type_len == 0 {
-        return None;
-    }
-    let mut i = type_start + type_len;
-    while i < b.len() && b[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    if b.get(i) != Some(&b'(') {
-        return None;
-    }
-    let prefix_end = i + 1;
-    let mut k = t.len() - 1;
-    while k > 0 && b[k - 1].is_ascii_whitespace() {
-        k -= 1;
-    }
-    if k == 0 || b[k - 1] != b')' || k - 1 < prefix_end {
-        return None;
-    }
-    Some((prefix_end, &t[prefix_end..k - 1], &t[k - 1..]))
-}
-
-/// `readStepSlots`: the record's argument slots, or `None` when it does not
-/// read as `#id=TYPE(args);` with a splittable list.
-pub(crate) fn read_slots(text: &str) -> Option<Vec<String>> {
-    let (_, attrs, _) = record_parts(text)?;
-    split_args(attrs)
+/// `readStepSlots`: the record's UPPERCASE type and argument slots, or `None`
+/// when it does not read as `#id=TYPE(args);` with a splittable list.
+pub(crate) fn read_slots(text: &str) -> Option<(String, Vec<String>)> {
+    let frame = record_frame(text)?;
+    let slots = split_args(frame.args(text))?;
+    Some((frame.head.type_name(text).to_ascii_uppercase(), slots))
 }
 
 /// `splitTopLevelStepArguments`: the shared splitter, then every part held to
@@ -76,7 +44,8 @@ fn well_formed_slot(part: &str) -> bool {
         return true;
     }
     let chars: Vec<char> = part.chars().collect();
-    let mut g = Grammar { c: &chars, i: 0 };
+    let ascii = crate::step_slot::ascii_projection(&chars);
+    let mut g = Grammar { c: &chars, a: &ascii, i: 0 };
     if !g.value(0) {
         return false;
     }
@@ -86,6 +55,8 @@ fn well_formed_slot(part: &str) -> bool {
 
 struct Grammar<'c> {
     c: &'c [char],
+    /// `c` projected to one byte per char, for the shared literal-end rule.
+    a: &'c [u8],
     i: usize,
 }
 
@@ -145,21 +116,15 @@ impl Grammar<'_> {
         self.trivia();
         let Some(c) = self.at(self.i) else { return false };
         match c {
-            '\'' => {
-                self.i += 1;
-                while let Some(ch) = self.at(self.i) {
-                    if ch == '\'' {
-                        if self.at(self.i + 1) == Some('\'') {
-                            self.i += 2;
-                            continue;
-                        }
-                        self.i += 1;
-                        return true;
-                    }
-                    self.i += 1;
+            // The shared rule for where a literal ends: a `\S\'` operand is
+            // text, not the closing quote (#7589).
+            '\'' => match ifc_lite_core::step_encoding::step_string_literal_end(self.a, self.i) {
+                Some(end) => {
+                    self.i = end;
+                    true
                 }
-                false
-            }
+                None => false,
+            },
             '(' => {
                 self.i += 1;
                 self.list(depth + 1)
@@ -197,3 +162,7 @@ impl Grammar<'_> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "lines_tests.rs"]
+mod tests;

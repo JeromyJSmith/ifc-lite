@@ -2,6 +2,22 @@
 
 IFClite is designed to be fast and lightweight. This page covers bundle size, parsing speed, rendering performance, and how the architecture keeps things efficient.
 
+## Inspect GPU pass timing
+
+The viewer's `?perf.gpuFrameTiming=1` flag enables timestamp queries on the
+actual renderer device. Its existing `__ifc_lite_render_stats__()` diagnostic
+includes `gpuTiming`: resolved per-pass samples, mode, dropped history, skipped
+frames, errors, and a resource epoch. Samples are bounded and asynchronous;
+frames arriving during readback are skipped. `unsupported` carries no fabricated
+GPU duration. Queue completion latency remains a separate measurement.
+
+SDK consumers can call `renderer.setGpuFrameTiming(true)` and
+`renderer.getGpuFrameTiming()`; see the renderer package README. Device loss
+clears previous samples and cancels pending readback before loss observers run.
+Recovery preserves the setting and advances the epoch. Turn timing off to free
+its query and readback resources. Instrumentation changes the workload, so use
+the same setting when comparing measurements.
+
 ## Bundle Size
 
 The whole client-side engine (parser, exact CSG geometry kernel, and all Rust exporters) ships as a single WASM module of roughly 7.9 MB, about 2.6 MB gzipped over the wire (measured on the published `@ifc-lite/wasm` tarball: `npm pack @ifc-lite/wasm` then `gzip -9 -c pkg/ifc-lite_bg.wasm | wc -c`). It is loaded once, lazily, and cached by the browser. Optional heavyweight features stay out of the bundle: DuckDB-WASM for SQL queries is only downloaded on the first `sql()` call, and only if you install it.
@@ -59,6 +75,51 @@ These design decisions have the biggest impact on performance:
 - **Columnar storage**: Data is stored by type (IDs, types, names as separate arrays) for cache-efficient access patterns.
 - **Zero-copy ArrayBuffer transfer**: Buffers are transferred between worker and main thread, not copied.
 
+Worker tracing must publish before terminal messages: the main thread may
+terminate a worker as soon as its completion event arrives. A
+`createWorkerTraceHost` handler calls `flush(completedSpanName)` before sending
+that event to complete and publish its named span along with pending counters.
+Plain `flush()` publishes only spans that have already ended. The geometry
+prepass follows this contract so its scan remains visible in load traces.
+
+Worker trace factories also accept `endpoint: () => self` for sender-side
+message accounting. Each thread publishes `msg.worker.out.transferBytes`
+from its actual transfer lists before buffers detach and before the host can
+terminate it. Received buffer bytes alone cannot distinguish transfers from
+clones; structured-clone byte counts remain estimates. Parser WASM scans
+report typed-array ingress through the same counter registry, while an
+entity-index handoff avoids that scan.
+
+Timing consumers check every present upload-mode declaration; a timed
+environment tag cannot override a legacy count declaration in imported data.
+
+Structural GPU cohorts can enable `?perf.benchmarkUploads=1` before loading a
+model. The viewer then calls `SceneContents.flushPending` with its optional
+`deterministicUploads` argument: each mesh produces its own streaming fragment,
+and each frame is bounded by mesh count and index volume. This removes arrival
+timing from fragment grouping. The ordinary time-budgeted policy remains the
+default. Count cohorts have a different transient upload workload, so their
+latency metrics cannot be compared with timing runs or recorded as a timing
+baseline. Device-loss samples still require the existing contamination checks.
+
+When a device is replaced during a load, the viewer retries retained source
+geometry and pending instanced shards even if no later source update arrives.
+A stream that ends while the device is absent is finalized after recovery.
+Already uploaded streaming fragments can recover when their original CPU owners
+remain retained. Replacement pipelines and geometry are staged before the device
+becomes available to frame or stream-end consumers; the pending cursor resumes
+once after that commit. A source clear, replacement, active finalizer or released
+CPU geometry prevents this retained-stream recovery. With performance tracing
+enabled, `gpu.recovery.outcome.*` counters and a categorical recovery console
+message record the actual result, even when the load span has already ended.
+Queued moves, rotations, colours, removals and remeshed slots also retry.
+Independent annotation, alignment and grid lines, annotation fills and texts
+retain their CPU inputs for the same recovery retry. A failed symbolic upload
+is contained and its partial GPU layer is cleared instead of unmounting the
+viewport.
+Recovery restores renderability; a device-loss run remains contaminated and
+cannot serve as a timing baseline.
+
 ## Client vs Server Performance
 
 | | Client (WASM) | Server (Rust) |
@@ -88,6 +149,37 @@ node scripts/fixtures/fetch-fixtures.mjs "various/O-S1-BWK-BIM architectural - B
 ```
 
 Results are saved to `tests/benchmark/benchmark-results/` with automatic regression detection. See the [benchmark README](https://github.com/LTplus-AG/ifc-lite/tree/main/tests/benchmark) for details on test models, metrics, and CI integration.
+
+## Perf ratchet ceilings
+
+Some performance numbers are deterministic enough to block a merge on: byte sizes, structural counts, instruction counts. Those are held by a ratchet. Each family keeps its ceilings in `tests/perf-ratchets/<family>.json`, and the `Perf ratchet ceilings` job in `test.yml` fails a PR when a measured value goes above its ceiling plus tolerance. Families: `native-instructions` and `native-instructions-large` hold callgrind instruction counts per pipeline phase (`scripts/perf/instructions.sh`, tolerance 0.05%) for FZK-Haus (every Rust-affecting PR) and ISSUE_129 (daily lowering job only, about 2.5 minutes under callgrind); they gate kernel and parse work, not scheduling or browser effects. `browser-frames` holds the repeatable rows of the nightly frame rig (below). The first family is `bundle`: the brotli size (quality 11) of the engine WASM, and the raw size of the viewer's main entry chunk (`viewer-entry-js-bytes`) and of every JS file `index.html` loads eagerly (`viewer-eager-js-bytes`).
+
+**Reading a ceiling.** Each entry has an `id`, the `metric` it measures, the `ceiling`, a `tolerance`, and `provenance` (the `main` commit and time it was measured at). An `exact` tolerance means any rise fails, which is used for structural counts. A `relative` tolerance of `0.005` allows up to 0.5% above the ceiling; the raw viewer JS metrics use `0.001` (0.1%). That band is total slack, not a per-PR allowance: the ceiling does not move when a PR lands inside it, so several small rises still fail once together they cross it. When the check fails, the job summary (and a sticky PR comment) shows a table of every metric that moved, with ceiling, allowed maximum, measured value and the change.
+
+**Lowering is automatic.** `.github/workflows/perf-ratchet-lower.yml` runs daily on `main`, rebuilds and re-measures, and opens or updates one PR that lowers every ceiling whose value dropped (for a `relative` metric, once the drop clears the tolerance band, so build noise does not open a PR every day). Those PRs list each change, old to new, and reference no issue: they are authored by the `PERF_RATCHET_PAT` account, which must be in `exemptLogins` in `scripts/issue-queue.config.json` for the required `Issue queue` check to pass. A ceiling's history is its `provenance` plus `git log -- tests/perf-ratchets`. If a later run finds that nothing clears its band any more, it closes the open lowering PR rather than leaving an outdated ceiling to be merged.
+
+The job opens PRs with the repository secret `PERF_RATCHET_PAT`, never `GITHUB_TOKEN`, because PRs that token creates do not start CI. It also never uses `RELEASE_PAT`, because RELEASE.md requires the release account to be used by nothing else. To set it up, create a fine-grained PAT from an account separate from the `RELEASE_PAT` account and listed in `exemptLogins` (today the maintainer, `louistrue`). Scope it to this repository only, with **Contents: Read and write** and **Pull requests: Read and write**. **Workflows: Read and write** is also needed when the lowering branch, which is reset onto `main`, carries workflow changes. Store it as `PERF_RATCHET_PAT`. Without it, the job still measures and lowers. It writes the old-to-new table to its summary, uploads the lowered files as the `perf-ratchet-lowered-ceilings` artifact, warns that no PR was opened, and stays green.
+
+**Raising is a human decision.** If a PR has to grow a metric, edit the entry in `tests/perf-ratchets/<family>.json` in that PR: set `ceiling` to the new measured value and `provenance` to the commit you measured, and justify the cost in the PR description (what grew, why it is worth it, what was tried to avoid it). Never widen `tolerance` to make a breach pass. Reproduce the CI measurement locally with:
+
+```bash
+pnpm build:wasm && pnpm build:e2e
+node scripts/perf-ratchet/measure-bundle.mjs --out /tmp/bundle.json
+node scripts/perf-ratchet/perf-ratchet.mjs check --measured /tmp/bundle.json
+```
+
+**Why the viewer JS is gated raw, not brotli (#7007).** Raw bytes of the viewer JS repeat exactly: three clean builds of one tree, and CI re-runs of one commit, give the same raw size for every eager file. Brotli-11 of the ~4.4 MB entry chunk does not. Swapping only the 24-character build timestamp that `vite.config.ts` bakes in (`__BUILD_DATE__`, same length, nothing else changed) moves its brotli size by up to about 0.5%, the width of the old band. Every build has a new timestamp, and any real edit perturbs the compressor the same way, so a brotli gate on this JS fails or passes on compressor luck. A raw gate has no noise, so its 0.1% band is only slack for small growth, not a noise allowance. The brotli sizes are still measured and listed under "Informational, not gated" in the report (`informational` in the measured JSON). The engine WASM stays on brotli because `wasm-opt` can shrink the raw file while growing the transfer size (see the lever ledger in `scripts/perf/README.md`), and it embeds no timestamp.
+
+**When `viewer-eager-js-bytes` fails.** That metric is the total raw size of every JS file `dist/index.html` makes the browser fetch before first paint: the module `<script src>` plus each `<link rel="modulepreload">`. A failure means the PR put more code on the boot path. The job summary table shows how many bytes; the `detail` of `viewer-eager-js-bytes` in the measured JSON lists the files. Pick one of two fixes:
+
+1. **Lazy-load the new code.** This is the default answer. A feature that is not needed to show the first frame belongs behind a dynamic `import()` (a panel, a dialog, an exporter, a tool that opens on click), so it ships in a chunk `index.html` does not list. Check afterwards that nothing eager imports it statically, which pulls it straight back in: re-run the local measurement above and compare the file list.
+2. **Raise the ceiling, with a reason.** If the code really has to be eager, edit the `viewer-eager-js-bytes` entry as described under "Raising is a human decision" and say in the PR what the code does at boot, why it cannot wait, and what you tried. Do not widen `tolerance`.
+
+The eager file count and names remain in the byte metric’s diagnostic detail. Chunk count has no ceiling: the requested week of measurements is unavailable, so #7002 removes the count gate rather than choosing an unsupported allowance.
+
+**The `browser-frames` family is nightly, not a PR gate (#6975).** The deterministic frame rig (`.github/workflows/browser-frames.yml`, chrome-headless-shell on SwiftShader) writes 96 rows per run. After the rig's admission check passes, `scripts/perf-ratchet/measure-browser-frames.mjs` re-admits the artifact and gates only the rows that repeat within one build. Today that is one row: the GPU upload volume (`gpu_write_kib`) of the Snowdon streaming load, with a relative tolerance. It catches a load that uploads the scene twice, and any upload growth larger than the band. Everything else is listed as informational. Main-thread milliseconds and load frame, draw and submit counts vary by tens of percent between runs of the same build. FZK's load upload volume varies by just over the 1% cap, because it moves with the number of frames rendered during the load. The orbit/hover render counts follow the viewer's adaptive throttle on SwiftShader. A partial or GPU-contaminated artifact is refused, not evaluated. A breach turns the nightly lane red. Lowering uses the latest successful `browser-frames` run on `main`, so it lags that lane by up to a day. The repeatability verdict and the criteria are in `scripts/perf/evidence/gpu-frame-timing-6975/frame-ratchet/repeatability.json`, and `scripts/perf/frame-ratchet-evidence.mjs` regenerates it from downloaded artifacts. Before you gate another row, re-run that file over new same-build artifacts. Do not edit the list by hand.
+
+A local build embeds different source paths in the WASM than CI does, so expect small differences; the CI job's summary is the number that counts. Adding a family means adding a `scripts/perf-ratchet/measure-<family>.mjs` that writes the measured JSON, a seeded ceiling file, and a measure step in CI and in the daily workflow.
 
 ## Further Reading
 

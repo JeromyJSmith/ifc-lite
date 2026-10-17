@@ -27,7 +27,18 @@ with `pnpm fixtures`); express ID 42 is its `External wall total` cost item.
 `bim.cost` reads the loaded IFC source snapshot and returns decimal strings;
 pending generic mutation overlays are not included until reload.
 
+## Installation diagnostics
+
+```bash
+ifc-lite doctor
+ifc-lite doctor --json > ifclite-diagnostics.json
+```
+
+Reports the CLI runtime, resolved versions of its declared first-party dependencies, and WASM binary structure, byte length and SHA-256. It loads no IFC model or geometry module, so it can report damaged package entries. Exit 0 means every reported check passed; exit 1 means a check failed. The report describes this CLI installation. WASM validation checks binary structure without initializing IFC bindings.
+
 ## Commands
+
+- `doctor` - runtime, package versions and WASM binary checks
 
 - `info` - model summary: schema, entities, storeys
 - `query` - query entities by type, properties, quantities; supports `--sum`, `--group-by`, `--spatial`
@@ -58,7 +69,7 @@ pending generic mutation overlays are not included until reload.
 - `gym` - reset/step/reward environment loop over the existing schema/clash/ids checks (see below)
 - `schema`, `bsdd`, `diagnose-geometry`, `extract-entities`, `generate-spaces`, `lod`, `ext` - see `ifc-lite --help`
 
-Global flags: `--json`, `--out <file>`, `--verbose`, `--quiet`, `--debug`, `--log-level <level>`.
+Global flags: `--json`, `--verbose`, `--quiet`, `--debug`, `--log-level <level>`.
 
 ## gym
 
@@ -92,6 +103,29 @@ v0 ops mirror `bim.mutate`'s method names exactly: `setProperty`, `setAttribute`
 
 Determinism: the same model plus the same op sequence yields byte-identical reward lines (sorted arrays, no timestamps, fixed-precision floats).
 
+## Durable Flow BCF writes
+
+Flow BCF API creates persist a credential-free intent before sending in
+`IFCLITE_BCF_OUTBOX_DIR` (default `~/.ifc-lite/bcf-outbox`). Preserve
+this directory across restarts. Unknown outcomes block identical writes until review:
+
+```bash
+ifc-lite flow bcf list
+ifc-lite flow bcf check <entryId> --allow-host bcf.example.com --token-env BCF_TOKEN
+# Only if this read sees the full collection in the original write access scope:
+ifc-lite flow bcf check <entryId> --allow-host bcf.example.com --token-env BCF_TOKEN --confirm-full-read-access
+ifc-lite flow bcf reconcile <entryId> --guid <checkedGuid>
+# Only after a complete empty check with explicitly confirmed full read visibility:
+ifc-lite flow bcf confirm-absent <entryId>
+```
+
+Check reads the recorded target using a fresh explicit host grant and an environment
+variable reference for the token. Review the actual server object before reconciling a
+checked candidate. Reconciliation records its GUID durably and never sends a write.
+Only an explicitly full-visibility complete empty check permits `confirm-absent`, which releases the
+intent for a later deliberate rerun and sends nothing itself. Unavailable or ambiguous
+checks do not permit release. Token presence is not proof of visibility: `--confirm-full-read-access` asserts that this authorized read sees the full target collection under the same access scope as the original write. Omit `--token-env` for a genuinely public server; the visibility assertion remains required for absence. The journal retains this proof marker, without storing credential or principal identity. Older markerless absent checks stay readable but require a fresh asserted check before release. Storage errors and secret-bearing payloads refuse the effect.
+
 ## Links
 
 - Docs: https://ifclite.dev/docs/
@@ -100,3 +134,5 @@ Determinism: the same model plus the same op sequence yields byte-identical rewa
 ## License
 
 MPL-2.0
+
+Semantic datasets use the same shared profile and provider engine as the viewer. Run `ifc-lite semantic --help` for `validate`, `query`, `assets`, and authenticated HTTPS `serve`; see the [headless semantic guide](https://ifclite.dev/docs/guide/semantic-headless/).

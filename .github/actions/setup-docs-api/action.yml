@@ -1,0 +1,22 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+name: Generate public API reference
+description: Install locked workspace tooling and render the API reference before strict MkDocs
+runs:
+  using: composite
+  steps:
+    - name: Setup Bun
+      uses: oven-sh/setup-bun@v2
+      with:
+        bun-version: 1.4.2
+    - name: Setup Node.js
+      uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version: 26
+    - name: Install reference tooling
+      shell: bash
+      run: bun install --frozen-lockfile
+    - name: Generate searchable public API reference
+      shell: bash
+      run: bun run docs:api

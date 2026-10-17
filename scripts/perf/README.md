@@ -23,9 +23,762 @@ scripts/perf/probe.sh tests/models/ara3d/schependomlaan.ifc --iters 5 --json > /
 
 # symbolized flamegraph (opens Firefox profiler) to see WHICH function:
 scripts/perf/flame.sh tests/models/ara3d/schependomlaan.ifc
+
+# deterministic per-phase instruction counts (callgrind, single thread):
+scripts/perf/instructions.sh tests/models/ara3d/AC20-FZK-Haus.ifc --json
 ```
 
 Fetch a fixture first if missing: `pnpm fixtures ara3d/schependomlaan.ifc`.
+
+**Instruction ceilings gate kernel and parse work only (#6982).** The
+`native-instructions` ratchet (`tests/perf-ratchets/native-instructions*.json`,
+0.05% tolerance, FZK-Haus per PR, ISSUE_129 daily) is a blocking check for
+per-element kernel, decode and caching changes: callgrind counts follow them
+to ~0.1% with run-to-run variance <= 1e-6. It runs `--single-thread` natively,
+so it does not see scheduling, threading, WASM or browser-only effects (worker
+fan-out, memory bandwidth, GPU); a change in those still needs an end-to-end
+A/B (`ab.sh`, the browser rigs below), and a green ratchet is no evidence for it.
+
+
+## Accepted eager viewer JS growth (#7759)
+
+The maintainer approved resetting only the eager viewer JS ceiling to the
+measurement from [main's ccf60b6bc0 build](https://github.com/LTplus-AG/ifc-lite/actions/runs/38927644281).
+The `perf-ratchet-measured` artifact supplies the size and timestamp recorded in
+`tests/perf-ratchets/bundle.json`; the independent builds for #7757 and #7758
+reproduced the same raw JS sizes. Summing the eager scripts from #7758's hosted
+viewer artifact independently reproduced the measurement. The existing tolerance,
+entry JS ceiling and approved WASM ceiling stay unchanged.
+
+This accepts accumulated eager-load growth, with no runtime speed claim. Record
+acceptance against raw bytes: timestamp-sensitive JS Brotli sizes remain
+informational, as documented by the measurer (#7007).
+
+## Accepted engine bundle growth (#7756)
+
+The maintainer approved resetting only the engine WASM transfer-size ceiling to
+the measurement from [main's d8c110166a build](https://github.com/LTplus-AG/ifc-lite/actions/runs/38912543766).
+That build includes the recent Rust correctness changes; its `perf-ratchet-measured`
+artifact supplies the size and timestamp recorded in `tests/perf-ratchets/bundle.json`.
+Recompressing the same build's WASM locally with Brotli quality 11 reproduced the
+measurement. The existing tolerance and both viewer JS ceilings stay unchanged.
+This accepts accumulated bundle growth, with no runtime performance claim.
+
+Treat transfer-size acceptance separately from runtime performance and output
+correctness: a size-ceiling update supplies evidence for neither. Future growth
+still requires its own measured acceptance or a reduction.
+
+## Published worker asset closure (#7648)
+
+A Node geometry consumer passed while a fresh Vite consumer failed: the geometry
+worker pool retained a TypeScript URL absent from its npm tarball. Package build
+metadata now uses the same all-module rewrite and independent verification as the
+parser; geometry and point-cloud verification checks script targets while their
+WASM assets resolve through declared packages. Turbo hashes the shared scripts.
+
+This is a packaging correction, with no runtime speed claim. The baseline browser
+artifact cannot bundle, so it supplies no valid browser timing comparison. Real
+Node consumer runs before and after produced identical mesh/triangle counts and
+byte-identical GLB exports for the committed wall and ArchiCAD FZK fixtures. See
+`tests/evidence/packed-workflows/worker-packaging.json`. Keep the external Vite
+bundle in acceptance: a Node-only WASM pass cannot prove worker asset closure.
+
+## Several cutting planes: caps and clip cost (#7545)
+
+Browser A/B of `main` against the branch on a real GPU (Chrome 155, NVIDIA Blackwell, WebGPU), production
+`vite build` of each side, a **fresh Chrome per sample** on a unique CDP port and throwaway profile, the six
+variants (main at 0 and 1 plane, branch at 0, 1, 4 and 8 planes) in a **random order per round** (seeded,
+`ab-order.mjs`'s generator), 4 rounds on AC20-FZK-Haus and 3 on a 29 MB heavy fixture of the repo. Each
+sample loads the model, sets the planes through the store (Section tool open, 3D cut overlay on), waits for
+every cap, then orbits for 370 frames counting what the frame submits.
+
+| model | variant | draws / frame | writeBuffer / frame | submit-to-done median (ms, per sample) | caps ready after (ms) |
+| --- | --- | --- | --- | --- | --- |
+| AC20 | main, no plane | 26 | 25 | 2.17 (2.26 2.08 2.06 2.44) | - |
+| AC20 | branch, no plane | 26 | 25 | 2.44 (2.61 2.42 2.46 2.35) | - |
+| AC20 | main, 1 plane | 29 | 26 | 2.54 (2.48 2.03 2.59 2.68) | 40-64 |
+| AC20 | branch, 1 plane | 29 | 27 | 2.63 (2.62 2.63 2.66 2.55) | 55-81 |
+| AC20 | branch, 4 planes | 39 | 33 | 2.62 (2.86 2.25 2.73 2.51) | 59-119 |
+| AC20 | branch, 8 planes | 52 | 42 | 2.71 (3.07 2.60 2.27 2.83) | 107-175 |
+| heavy | main, no plane | 302 | 302 | 2.56 (2.56 2.44 2.85) | - |
+| heavy | branch, no plane | 302 | 302 | 2.75 (2.75 3.25 1.92) | - |
+| heavy | main, 1 plane | 305 | 303 | 2.48 (2.48 2.52 2.43) | 86-122 |
+| heavy | branch, 1 plane | 305 | 304 | 2.74 (2.73 3.14 2.74) | 111-164 |
+| heavy | branch, 4 planes | 315 | 311 | 3.12 (3.12 3.27 2.31) | 216-265 |
+| heavy | branch, 8 planes | 328 | 319 | 2.84 (3.00 2.84 2.64) | 464-712 |
+
+Reading it:
+
+- **No plane and one plane draw exactly what main draws** (draws per frame identical on both models; one more
+  `writeBuffer` per frame with a plane). The legacy 96-float uniform block is byte-identical; the per-mesh
+  uniform is 128 floats larger, which is the only per-frame cost of the clip with no extra plane.
+- Submit-to-done latency (how long the GPU takes after the frame is submitted) is within about 0.1-0.3 ms of
+  main at 0 and 1 plane. Branch is at or above main in most pairs; with 3-4 samples per cell, a spread of
+  +-0.3 ms inside a cell and a 2-3 ms baseline this is the edge of the noise, so it is recorded as a possible
+  small cost of the larger uniform, not as "no change".
+- **Each extra plane costs about three more draws per frame** (its cap fill, outline and line passes): 4 planes
+  +10 draws, 8 planes +23 on both models, and +0.1-0.4 ms of GPU latency.
+- The caps of the planes that are not active are cut on the CPU, off the render path: all caps are ready in
+  under 0.2 s on AC20 and 0.5-0.7 s on the heavy fixture with 8 planes.
+- What this does NOT measure: frame pacing. The hosted display ran rAF at 30 Hz, so every variant shows a
+  33.3 ms frame; only GPU latency and the per-frame counts discriminate. Absolute numbers drift between
+  sessions on this machine; only these interleaved pairs compare.
+
+Verdict: no fallback needed. The caps layer ships with every enabled plane capped.
+
+## Printable ASCII STEP escaping (#7363)
+
+Campaign Group worker profiling attributed substantial work to rebuilding
+already escaped printable ASCII Names character by character. The canonical
+TypeScript escaper now returns its native quote/backslash replacement result
+when no control or non-ASCII directive is needed. Shared cross-language vectors
+and exact byte/roundtrip controls cover the unchanged directive path. This is
+a native authoring/export workload correction, not a browser model-load speed
+claim. A worker profile attributes work; isolated native acceptance under the
+original deadlines is still required before a qualification verdict.
+
+## Workbench preset controls load on demand (#6926)
+
+The U03 preset controls initially exceeded the eager bundle allowance when
+combined with the U02 activity tray, although each branch fit separately.
+Loading the sidebar customizer only when opened reduced eager startup code,
+but did not by itself clear the combined allowance. The subsequent shared
+editor-state chunk separation on main restored headroom for the complete
+campaign snapshot without another ceiling increase or tolerance change.
+The real activity-bar regression opens the customizer, previews and applies
+the coordinator preset, then restores the original layout and keyboard focus.
+Reset also retires the saved preset through a small startup gateway instead
+of importing the optional preview and placement controls. The mounted
+regression reopens customization after Reset and confirms Restore is gone.
+This is a bundle-size verdict; it makes no model-load speed claim.
+Lesson: measure queued viewer features together, and keep optional editor
+surfaces behind their actual entry point.
+
+## Structural counters and long frames per load (#6957)
+
+Sender-side accounting (#6993) now distinguishes actual worker transfer lists
+from the host's received-buffer estimate. Both worker trace factories use the
+same message meter and publish increments before data messages, so a terminal
+transport survives immediate host termination. Parser phase traces also carry
+WASM ingress; a successful entity-index handoff avoids that scan. The
+[real-model receipt](evidence/worker-accounting-6993/README.md) records both
+the canonical load and a separate actual parser scan. Lesson: receiving an
+ArrayBuffer does not prove it was transferred, and flushing before constructing
+the terminal message cannot account for that message. This is instrumentation
+qualification, with no throughput verdict; GPU count repeatability remains open.
+
+The bounded count cohort (#6993) uses one streaming fragment per mesh, with
+mesh-count and index-volume bounds. Actual production FZK/Snowdon pairs
+[repeat allocation and static-upload totals](evidence/count-uploads-6993/README.md)
+despite different drain/finalization boundaries. Mutable table writes still
+vary, so the shared static-buffer uploader has a distinct counter instead of
+classifying all non-uniform writes as structural. Count-mode samples carry a
+different workload and are refused by timing/baseline consumers. Lesson:
+removing the clock budget does not make arbitrary fragment grouping or mutable
+GPU writes structural. This is count qualification, not a throughput win.
+
+The recovery replay qualification (#6993, folded #7164) found a correctness
+hole after device replacement: geometry arriving while the device was absent
+was never uploaded if the source stopped changing. The streaming hook now
+observes the existing recovery epoch and retains a missed stream completion.
+The same publication retries queued moves, rotations, colours, removals and
+remeshed slots across the extracted renderer drains.
+A subsequent normal entity-move allocation refusal exposed a sibling-effect
+hole: rebatching was contained, but the annotation line upload still escaped
+React and unmounted the viewport. Independent symbolic line/fill/text effects
+now use the same upload guard and recovery epoch. Resource owners release
+unregistered allocations before propagating failure. This is failure
+containment and resource ownership, with no throughput claim.
+The [native GPU receipt](evidence/recovery-replay-6993/README.md) compares the
+exact base, healthy control and candidate through the canonical file loader.
+The candidate restores the healthy scene's geometry and appearance identity;
+the base remains empty after the same controlled loss. Lesson: replacing a
+device does not wake source-driven effects by itself. Forced-loss samples
+remain contaminated for performance measurement, and this does not explain
+the original unforced SwiftShader loss.
+
+Under `?perfTrace=1` and in every benchmark run, each load's span tree also
+carries counters (`LoadTraceSnapshot.counters`): full source copies, worker
+messages and their clone/transfer/shared bytes per direction, typed-array
+bytes handed to wasm per worker and method, GPU buffers and uploaded bytes,
+`mergeGeometry` calls and vertices, finalize rebuilds, store writes and
+subscriber notifications, the per-append model-index re-spread, and a
+LoAF/longtask summary attributed to the innermost open span. The benchmark
+pins 4 geometry workers (`VIEWER_BENCHMARK_GEOM_WORKERS`) and records them in
+`loadCounters`, split in two. `structural` (copies, messages, wasm ingress)
+repeated exactly across runs on FZK and Snowdon, except for a few bytes of
+parser diagnostic strings that carry elapsed times, so a diff there means
+the load did different work. `scheduling` (GPU uploads and merges, React
+commits, store churn) moves with frame timing. `flushPending` slices its
+upload queue by a time budget, and SwiftShader loses and re-creates the
+device mid-load, which re-uploads everything, so compare those as a spread.
+Lesson: the benchmark's old 2D canvas probe could claim the viewport canvas
+before the renderer did. After that `getContext('webgpu')` returns null, the
+renderer logs "Failed to get WebGPU context", and the run measures no GPU work
+at all. The probe now checks only the canvas size, and the counters are read
+once they stop moving, not when the load root ends.
+
+React commits per load are the `react.commits` counter, taken from the
+DevTools global hook's `onCommitFiberRoot`: React's production build compiles
+`<Profiler onRender>` out, so a root Profiler would count zero in the build
+the benchmark and users run. `node scripts/perf/hook-census.mjs` counts hook
+call sites and `useViewerStore` subscriptions on the viewport, properties,
+hierarchy and streaming paths statically (minified component names make a
+runtime fiber census unattributable, and mounted counts move with UI state).
+
+## GPU point-pick depth candidate held (#6881)
+
+The [same-submission GPU oracles](evidence/bounded-depth-readback-6881/README.md)
+qualify single-texel extraction against a full-depth copy on hardware, including
+concurrent maps and target replacement. Production family, ID/item/model and georeferenced world-coordinate controls
+match the original renderer, and device destruction retires pending picks. The candidate shares ID/depth staging and keeps per-pick inputs immutable.
+Four complete interleaved fresh-document public-model viewer pairs retain unchanged geometry and hit provenance, reduced mapped bytes, and mixed interaction timings. One pair has unresolved world-coordinate differences without camera/frame receipts; a fifth attempt lost the native browser. Cold-load provenance remains unverified. Real federated viewer qualification is outstanding. No speedup or shipping verdict is accepted. Lesson: a bounded readback and exact
+GPU sample establish neither complete picking parity nor interaction throughput.
+
+Independent Linux qualification adopted the existing readback cleanup repair;
+inverse fault controls demonstrate the ownership defects and the repaired paths
+release their buffers. Source-matched base/candidate viewer runtimes were built
+and pinned. T3 navigation refused before the declared model phase, with the
+earlier RAF refusal preserved. The subsequent current-main integration passed
+root renderer tests, full serial root typecheck with both postchecks, lint and
+source gates. Current real-model comparisons, federation and focused physical
+performance remain held; CPU integration and cleanup qualification do not
+replace them. No browser or GPU cohort ran for the integration update.
+
+A subsequent normal main integration includes merged #7361 without copying its
+classification workaround. Identical actual-main and candidate CPU controls
+reproduce obsolete-picker results and delayed standalone teardown cleanup. One
+shared pending-readback owner and a picker-installation epoch repair that class;
+corrected root tests, full serial typecheck and source gates pass. Diagnostic
+method retirement also preserves later owners. These are lifecycle invariants,
+not native GPU acceptance. The current app/observer pair must be rebuilt and
+frozen before the separate T3 correctness session. Original coordinates,
+deadlines, refusals and the focused-performance hold remain.
+
+Mounted base and original-draft hover controls also reproduce stale hits and
+misses after newer input, pointer exit/cancel, unmount and ownership changes.
+The [CPU hover archive](evidence/bounded-depth-readback-6881/hover-ownership-cpu-20261010.json.gz)
+retains those inverses and the corrected shared viewport validity contract.
+Selection and hover retain independent request generations. The diagnostic
+recorder now retains resolved IFC identity and source provenance; serialization
+controls do not establish native picked identities. No additional performance
+claim follows from either repair.
+
+
+## Prepass terminal trace publication (#6993)
+
+The host terminates the prepass worker on its completion event. Draining only
+finished spans at that point preserved counters but lost the active scan
+span, whose handler had not returned. The worker now completes that named
+span before publishing completion, using the shared trace host. Behavioral
+controls observe the scan and counters before the terminal event, preserve
+unrelated in-flight spans, and reject duplicate publication on handler return.
+Verdict: diagnostic correctness, with no model-load speed claim. The disabled
+trace returns before scanning active spans, and geometry production is
+unchanged. Lesson: flush-before-termination must close the work represented
+by the terminal event; a drain alone cannot preserve an open span. Other M2b
+transfer, interaction, deterministic-upload and device-loss obligations remain
+open.
+
+## Worker warm-up candidate held (#7036)
+
+The resumed [cold-load captures](evidence/worker-warmup-7036/README.md) show
+earlier worker readiness but mixed first-visible and total-load results. No
+end-to-end speedup is accepted. The candidate creates fresh workers beside the
+file read and still terminates them after each load; it does not satisfy the
+original persistent-reuse requirement. Geometry counts match, but an ordered
+geometry hash was not collected. Repeat/federation measurements during takeover
+overlapped validation builds and need an idle-machine repeat. Lesson: moving
+worker initialization earlier is an opportunity screen, not a performance
+verdict. Keep the measurement and memory constraints before changing the rollout.
+
+The experiment defaults off on both the viewer and worker paths. Repeated cache
+hits cannot extend an unused worker's expiry, and memory-pressure retries drain
+the pool without refilling it. These are lifecycle corrections, not an accepted
+performance win; the end-to-end verdict above remains held.
+
+## Single-model appends cost O(new meshes) in the viewport (#7021)
+
+**Shipped.** While one model streamed in, `geometryWithModelIndex` copied
+every accumulated mesh on each viewport render to stamp `modelIndex`. The
+copy gave the merged array a new identity, so the "incremental" type
+filter, the type/occurrence scans and `Viewport`'s appearance-source list
+started over each time, and that list copied every mesh a second time.
+Measured with `loadCounters` (4 pinned workers, viewer-benchmark-ci): on
+Holter each JS-side mesh was copied about 13 times, filtered 13 times and
+copied 13 more times for appearance sources per load. Fix: a single model
+renders its own mesh array, with `modelIndex` stamped in place by
+`stampModelIndex`. It remembers per array how far it has stamped, so the
+array keeps its identity and the existing incremental scans stay
+incremental. One model's appearance list is that same array, and the index
+allocator returns one shared map until an assignment changes. After the
+fix, `viewer.modelIndexStamp` and `viewer.filterScan` each equal the JS
+mesh count, and `viewer.modelIndexRespread` and `viewer.appearanceSource`
+are 0 on single-model loads. Mesh and draw counts are unchanged.
+`useFederatedGeometry.streaming.test.tsx` guards the per-append cost.
+
+**Kept, deliberately:** the store still clones `models` per append. About
+125 selectors read `s.models`, and its identity is how they hear about an
+append to a non-active model, so dropping the clone would freeze them. The
+clone itself is O(models). The cost was in what rescanned downstream.
+**Still open:** several models keep wrapper copies (O(new) per append) and
+build the appearance list in O(total) on every `models` change.
+`store.notifications` (about 680 subscribers per write) is untouched.
+**Lesson:** a cache keyed on array identity is only as incremental as its
+least stable upstream producer. Count the visits (`viewer.filterScan`)
+instead of trusting the "incremental" comment.
+
+## Federated appearance-source rebuilding candidate (#6537 / #7021)
+
+**Merged in #7369; end-to-end performance held.** The
+[real FZK/Snowdon mounted controls](evidence/federated-appearance-6537/README.md)
+demonstrate repeated accumulated/peer mesh visits and ownership wrapper copies
+in the remaining multi-model appearance list. Canonical producer stamping and
+a retained ordered list remove that repeated source work; replacement, content,
+visibility, removal/readdition and CPU-release controls pass with unchanged
+ordered geometry. Earlier-model appends still move suffix references to retain
+model order, counted separately. No load-time or peak-memory improvement is
+accepted: actual worker-pool federation A/B and focused GPU acceptance remain
+outstanding. Lesson: borrowing producer objects removes wrapper allocation,
+but grouped ordering still has a movement cost; qualify the real federation
+journey instead of a single-model cold load.
+The [removal gate and idle admission](evidence/federated-appearance-6537/gate-and-admission-20261010/README.md)
+are recorded separately: global Knip failed with unrelated source findings
+adjudicated by the campaign root; the timing cohort stopped at actual CPU,
+paging and swap admission before any model or probe ran. Lesson: a campaign
+reservation does not establish host-wide idle across other project owners.
+
+## Frame-time rigs (#6960)
+
+Two rigs measure viewer frames; neither is a PR gate. Both inject the same
+in-page probe (`tests/benchmark/frames/frame-probe.ts`): rAF callback time,
+rendered vs idle frames (a frame that called `getCurrentTexture`), and
+`GPUQueue.submit` / `draw*` / `writeBuffer` per frame.
+
+- **Deterministic, CI-capable**: `pnpm test:benchmark:frames` (needs a built
+  viewer and `pnpm exec playwright install chromium-headless-shell`).
+  chrome-headless-shell is driven frame by frame over CDP
+  `HeadlessExperimental.beginFrame` on an exact 8.333 ms grid (new-headless
+  Chrome lacks that command). Scenarios on FZK and Snowdon: streaming load,
+  Home plus scripted orbit, hover sweep. Records main-thread task time per
+  frame, frames over budget, missed vsyncs (load only) and rendered vs idle
+  frames as `browser-frames` rows in `test-results/browser-frames.json`. GPU
+  time is excluded by construction (SwiftShader). Runs nightly in
+  `.github/workflows/browser-frames.yml`. Within one build, scripted
+  orbit/hover counts repeat, but streaming-load frame, draw and submit counts
+  do not, and millisecond metrics move with machine load. Compare spreads,
+  not single runs (see "Frame ratchet: only load upload volume repeats" below).
+- **Real GPU, local only**: `scripts/perf/frame-gpu-rig.mts` drives Windows
+  Chrome from WSL (random CDP port, throwaway profile killed by path and
+  deleted), serves a production build same-origin, loads `?model=`, presses
+  Home and replays the same orbit and hover at 120 Hz of wall time. Reports
+  rAF delta p50/p95/max, submits and draws per rendered frame and
+  `onSubmittedWorkDone` latency. Absolute frame time drifts between sessions,
+  so pass `--dist-base <base build>` for counterbalanced base/branch pairs and
+  read the paired ratio. Serialise timed runs:
+  `flock /tmp/ifclite-perf.lock npx tsx scripts/perf/frame-gpu-rig.mts tests/models/ara3d/AC20-FZK-Haus.ifc --pairs 3 --branch-revision <built-revision>`.
+  With `--dist-base`, also pass `--base-revision <base-built-revision>`. Both
+  revisions must include #6979 and are recorded before host/browser work. This
+  checks source ancestry; retain independent build/hash receipts binding each
+  dist to its declared revision. Offline `--plan` and `--summarize` need no revisions.
+- **Real GPU structural counts, local only (#6993)**:
+  `scripts/perf/native-count-driver.mts` reuses the frame rig's Windows
+  Chrome lifecycle, host/physical-session admission and static server, and
+  `ViewerBenchmarkPage` for the load itself. Two fresh loads each of FZK and
+  Snowdon, one fresh owned profile per sample, at exactly
+  `?perfTrace=1&geomWorkers=4&meshCache=0&perf.benchmarkUploads=1&perf.batchSizing=%7B%22targetMs%22%3A8000%2C%22minJobs%22%3A64%2C%22maxJobs%22%3A64%7D`,
+  through the canonical file input (`useIfcLoader.loadFile`, never `?model=`).
+  A sample is healthy only with a finished metadata completion (parser or
+  canonical cache), `geometry.streamComplete`, an ended root, a finished
+  `scene.finalize`, count-mode flushes, settled counters, the GPU
+  allocation/static-upload and sender transfer vectors, zero device loss or
+  replacement, zero page errors and every interaction-commit step measured.
+  Unhealthy samples are kept, with their refusals. Receipts: fixture, dist
+  `index.html` and served WASM SHA-256s, branch revision, Chrome version,
+  host admission before/after, per-sample JSON and `summary.json` (exit 0
+  only when every sample is healthy and both vectors repeat per fixture):
+  `flock /tmp/ifclite-perf.lock npx tsx scripts/perf/native-count-driver.mts --branch-revision <built-revision> --require-host-idle --require-physical-display`.
+  `--plan` prints the samples and URL without launching anything. It does NOT
+  prove latency or throughput (count uploads are a different workload and are
+  refused by timing consumers), CPU mesh byte identity, schedule-independent
+  aggregate `gpu.writeBytes`, or device-loss recovery
+  (`evidence/recovery-replay-6993` covers that separately); `--branch-revision`
+  checks source ancestry only, so the served-file hashes are the build binding.
+
+## Deterministic frame evidence admission (#6975)
+
+The [historical artifact audit](evidence/gpu-frame-timing-6975/frame-admission/historical-artifact-audit.json)
+found changing streaming counts and main-thread totals across actual hosted
+runs. Those builds differed, so they do not establish same-build repeatability;
+no frame ceiling is justified by this audit. The workflow's former scenario
+count also admitted incomplete metrics and retained no GPU-health witness.
+The rig now preserves per-fixture completion, page errors and the shared
+session-counter/console health classification, and admission requires every
+expected metric and healthy completion. Canonical metadata/root/finalization
+readiness and health are checked after the original scenario windows. Raw
+failed evidence remains uploaded. Enabling trace counters makes this a new
+instrumented cohort; its rows must not be pooled with older unobserved runs.
+Lesson: scenario coverage alone does not prove complete or uncontaminated
+measurements. Physical-display nights and calibrated thresholds remain
+outstanding; for which rows now carry ceilings, see the next section.
+
+## Frame ratchet: only load upload volume repeats (#6975)
+
+Verdict: the `browser-frames` ratchet family gates one row, the Snowdon
+streaming-load `gpu_write_kib`. All other rows stay informational. The
+evidence is [repeatability.json](evidence/gpu-frame-timing-6975/frame-ratchet/repeatability.json):
+hosted runs of two builds (current `main`, which seeds the ceiling, and the
+#7601 retry head), with raw per-run values, run ids, artifact sha256s,
+per-build stats and a verdict for each of the 96 rows.
+`frame-ratchet-evidence.test.mjs` recomputes that verdict. The criteria were
+fixed before the `main` runs were downloaded and were not changed afterwards.
+
+- The #6975 expectation was "load counts and main-thread totals repeat". The
+  data refutes it. Within ONE build, main-thread totals, percentiles and load
+  frame/draw/submit counts move by tens of percent on hosted SwiftShader. Load
+  length in frames depends on main-thread speed, and draws and submits follow
+  the frames rendered during the load. None of them can hold a ceiling whose
+  band means anything.
+- Load upload volume is the one row that is close to stable. On Snowdon it
+  stays far inside the cap. On FZK it moves with the number of frames rendered
+  during the load and lands just over the 1% cap on `main`, so it stays
+  informational. Do not loosen the cap after the fact to admit it.
+- Orbit/hover render, draw, submit and upload counts were identical in every
+  run of each build, but #6975 rules them out: they follow the adaptive render
+  throttle, which a slower runner engages with no code change. Note that they
+  are sensitive. The FZK orbit upload volume differs between the two builds.
+  This is informational only; the two builds are not in an ancestor relation,
+  so no regression is claimed. Revisit with physical-GPU nights, not by
+  relaxing the rule.
+- Contamination is real and handled. On hosted SwiftShader, Dawn sometimes
+  loses its instance mid-load (mostly on Snowdon), and the renderer then
+  re-uploads the whole scene. Before #7601 that failed the run outright
+  (two of the five pre-retry runs in the evidence, Snowdon both times; #7601
+  saw about two in six).
+  #7601 replaces such an attempt with a fresh browser, at most twice, and
+  retains each refusal in `refusedAttempts`. Every post-#7601 run in the
+  evidence was admitted. The tally per fixture is in the evidence file. The
+  ratchet consumes only admitted artifacts: the measurer re-runs admission and
+  refuses rather than evaluating, and the daily lowering reads only the
+  latest *successful* `main` run of the lane.
+- Not proven: real-GPU frame cost (SwiftShader only), and behaviour on another
+  runner image or Chrome version. The pre-#7601 artifacts lack attempt
+  receipts, so they are counted for contamination but not admitted.
+
+## Real-GPU nightly trend and alert (#6975)
+
+`frame-gpu-night-trend.mts append` turns one real-GPU rig run directory into
+one row of an append-only JSONL trend: the night, the hash of the raw
+`runs.jsonl`, the night-profile hash, per-metric medians and a status. A night
+is `ok` only when every sample carries the strict admission witnesses the rig
+records under `--require-host-idle`, `--require-physical-display` and
+`--require-gpu-timing` (quiet host before and after, one physical console
+session, held foreground, a hardware adapter, per-pass GPU timing). A run
+without them is kept as `failed` and an admission refusal as `refused`, so
+both interrupt the seven-night calendar instead of vanishing. Rows are refused
+when the run finished more than 24 h before the append, when the receipt is
+already present or when the run started before the last row: no backfill.
+
+`evaluate` prints a verdict for one night and, with `--report-issue`, opens
+the regression issue or comments on the open one through `gh`. No threshold
+ships: without a thresholds file every verdict is `uncalibrated`. A thresholds
+file is admitted only when it names seven consecutive `ok` nights of the trend
+under one profile and no maximum is below a value those nights measured.
+Nothing installs a scheduler; whatever runs a night calls the rig, then
+`append`, then `evaluate`. Zero genuine nights are recorded as of this entry.
+
+## Viewer JS is gated on raw bytes, not brotli (#7007)
+
+The viewer build is byte-reproducible apart from `__BUILD_DATE__` (the build
+timestamp `vite.config.ts` bakes into the entry chunk and `analytics`). Module
+order was NOT the cause: three clean builds of one tree kept all 304 JS files'
+raw sizes and, chunk hashes stripped, every file's content except those two;
+both CI attempts of one commit kept the entry's raw size and the eager file
+order. Brotli-11 of the entry chunk is still noisy, because a
+same-length timestamp swap alone is enough to jump it by ~0.5% (bimodal over
+48 dates, matching the 4.3 KB CI re-run swing). Pinning the timestamp would
+only make one tree repeat; every other edit perturbs the compressor the same
+way. **Lesson:** gate the JS on raw bytes, report brotli, and don't try to
+make a brotli number on a multi-megabyte JS chunk stable to better than ~0.5%.
+
+## Instruction counts track kernel and parse work, not scheduling (#6958)
+
+Replay before any gate: `instructions-replay.mjs` rebuilt both sides of 12
+ledger entries in throwaway worktrees (every side built and ran on today's pinned
+toolchain; none had to be skipped) and counted one single-threaded `process_geometry` call per fixture
+under callgrind, 3 runs per side. A direction is read only outside a flat band
+of max(0.01%, combined run-to-run spread of the two sides). Raw runs:
+`evidence/instruction-replay-6958/results.json`. Inputs, refs and claims:
+`candidates.json`.
+
+| entry | ledger end-to-end verdict | fixture (claimed) | Ir delta | flat band | verdict |
+|---|---|---|---:|---:|---|
+| CDT scan kill (46dcdeec2) | ISSUE_129 geometry 991 -> 651 ms | ISSUE_129 | -47.12% | ±0.011% | tracks |
+| #1916 squash (seam conform + CDT) | 979 -> 646 ms | ISSUE_129 | -27.17% | ±0.040% | tracks (output changed) |
+| #1568 point-cache hoist | win on shared-point steel models | #1572 shared-point fixture | -3.17% | ±0.017% | tracks |
+| #1572 cache across chunks/splits | win on shared-point steel models | #1572 shared-point fixture | -0.34% | ±0.021% | tracks |
+| #1184 cheap-hash BREP dedup | win on steel/Tekla | #1572 shared-point fixture | -2.46% | ±0.010% | tracks |
+| #1130 content dedup | 20-30% slower net | FZK / ISSUE_129 / shared-point | +9.98% / +0.33% / +87.0% | <= ±0.031% | tracks |
+| #1177 dedup off | revert of that loss | FZK / ISSUE_129 / shared-point | -12.31% / -0.51% / -43.45% | <= ±0.017% | tracks |
+| #4061 vertex reuse (rejected) | native -1.17% / -1.27%; rejected in the browser | FZK / ISSUE_129 | -0.11% / -1.08% | ±0.010% | tracks the native direction |
+| #1909 dedup gate | no corpus fixture crosses the gate; A/B was noise | FZK / ISSUE_129 | +0.22% / +0.03% | ±0.045% / ±0.076% | FZK does not track: real cost |
+| #1431 worker sizing (TS only) | -21% peak memory, 0 regression | FZK | +0.01% | ±0.058% | tracks (flat) |
+| #1255 threads bundle (feature off) | #1429 dead end | FZK / ISSUE_129 | -0.00% / -0.00% | <= ±0.036% | tracks (flat) |
+| #4054 parity BVH (rejected) | no native number recorded | FZK / ISSUE_129 | -0.21% / -5.74% | ±0.010% | no claim to compare |
+
+Not every fixture had a ledger claim; unclaimed ones are recorded as context
+in `results.json`. Notable ones: #1184 and #1568 cost +1.3% / -0.12% on FZK,
+and #1572 is flat on FZK and ISSUE_129. The #1916 squash costs +1.5% on FZK,
+with changed output.
+
+- **Where counts apply.** Every claimed direction for a kernel, decode or
+  memoization change came back with the ledger's sign, with one exception:
+  #1909 on FZK-Haus, where the ledger expected flat and the count rose +0.22%
+  (see below). The agreeing set includes both
+  content-dedup flips and the CDT kill, which the ledger measured only by
+  instrumented slot counts and wall time. Magnitudes are not wall-clock
+  proportional: the CDT kill is -47% Ir against -34% geometry ms, the #1916
+  squash -27% against -34%. Use counts to detect and size a change in work, not
+  to predict milliseconds.
+- **Where they do not.** Scheduling, threading and memory policy are invisible
+  by construction: the run is one thread and counts no stalls. #1431 and #1255
+  are flat because they do not change the native work, and #1572's multi-thread
+  amplification fix shows only its small single-thread part (-0.34%). Browser
+  verdicts are invisible too. #4061's native direction tracks, but it was
+  rejected on browser readiness and output gates, and #4054's -5.7% on ISSUE_129
+  says nothing about the browser screen that rejected it. A count win is not a
+  ship verdict.
+- **What counts saw that wall-clock missed.** #1909's gate decodes the shell's
+  face list for every faceted BREP. On FZK-Haus, where no BREP crosses the
+  gate, that is +0.22% work, about 5x outside the band. The wall-clock A/B
+  recorded for it swung ±10% with run order.
+- **Determinism caveat for history.** Today's code repeats to ~1e-6.
+  Historical binaries repeat only to ~1e-3 on a single run, because glibc
+  `_int_malloc`/`unlink_chunk` path lengths vary between runs. The first
+  single-run replay (`results-single-run.json`) produced false "flat/more" reads
+  inside that spread. Always run several times per side and take the band from
+  the measured spread.
+- **Verdict for #6958.** Counts track kernel and parse work, so per-phase
+  FZK-Haus and ISSUE_129 counts are now M4 ceilings (seeded by #6995 for
+  #6982, FZK-Haus per PR and ISSUE_129 daily). Scheduling-only and
+  browser-only levers still need the end-to-end harnesses.
+
+## Load-trace spans replace console scraping (#6956)
+
+Viewer load milestones are now named spans (`@ifc-lite/load-trace`): one tree
+per load across the main thread and the geometry workers, mirrored into User
+Timing as `ifc:<name>` and readable as `window.__IFC_LITE_LOAD_TRACE__` under
+`?perfTrace=1`. The viewer benchmark reads its timing metrics from that tree
+exclusively after the follow-up release (#7005). The transitional console
+regexes and agreement comparator have been removed. Mesh/entity counts and
+render diagnostics remain available, but no console timing/completion enters
+a sample. Use the span tree for any new load-time metric. Tracing off is not a lever: the disabled
+trace is a no-op object, about 2 ns per instrumented call in Node, against
+roughly 25 calls per load.
+
+## Pending picking survives redundant viewport synchronization (#6882)
+
+Native-GPU navigation qualification exposed a shared correctness defect before
+the resolution-cap candidate could receive a performance verdict. A queued pick
+was discarded when `Camera.setAspect` repeated its current ratio, although its
+projection, camera pose and CSS viewport were unchanged. Preserve that snapshot
+with an exact no-op in the aspect setter; do not suppress equal relative-to-eye
+frames globally, since scene republication intentionally invalidates picks.
+
+A proportional resize can preserve the aspect while changing pick coordinates.
+Check the original CSS-to-texel mapping after every asynchronous picking path,
+including rectangle selection and its readback-error fallback. Physical drawing
+buffer changes with unchanged CSS mapping remain valid. This is a correctness
+prerequisite, not a measured speed improvement or an explanation of the earlier
+spontaneous miss. Keep functional qualification separate from timing admission.
+[Original actual-GPU observations and compiled qualification](evidence/redundant-aspect-pick-6882/README.md)
+preserve the source identities and evidence boundaries.
+
+## Historical CSG job observations (#6516)
+
+Use the existing ordered CSG census for a small feature-gated diagnostic before
+adding geometry hooks or porting newer algorithms into historical releases.
+Complete public-model loads preserve the ordinary output within each release,
+and individual job replays reproduce their canonical batches. Matching original
+source tuples localizes the public slab's changed output and larger later host
+operands, consistent with the source's retained-hole correction. This does not
+establish the private reported regression's cause or a performance improvement.
+
+Interpret these as positive wrapper observations only. Existing recording can
+precede empty checks, silently return empty on a poisoned lock, and retain an
+unbounded vector within a call. Do not infer zero work, complete invocation
+counts or causal workload ratios. Preserve the earlier validator refusal: the
+old streaming helper performs a separate verification load, so its aggregate
+log counts cannot be compared directly with a single-load diagnostic. Compare
+ordinary logs within the same load boundary. Delivery and private-file output
+checks are documented in [stream-diagnostic.md](stream-diagnostic.md).
+
+The isolated Actions bundle also passed complete public-model checks on Linux
+and Windows, including the uploaded and downloaded file inventory. Both
+platforms preserve the same per-release output and original-job replay results.
+Fresh source builds still differ from the published engines and earlier local
+builds; the qualified delivery does not establish byte-equivalent engines,
+timings or private-model compatibility. Keep those identities separate and
+require the same-release output checks on the reporter's model. The committed
+[delivery summary](csg-work-delivery-qualification.json) pins the actual run.
+
+## Bundled main-first module sharing: scoped SDK result (#6537)
+
+Bundled initialization removes the second observed WASM request before the
+default SDK worker pool. Both completed historical candidates retain equal
+CPU-channel output and full unnormalized diagnostics across the fixed public
+families, but elapsed observations remain small or mixed with all outliers kept.
+They do not establish an all-model win. Separately fresh engines differ in code
+and data despite equal captured Rust/build inputs, including absolute checkout
+paths; their elapsed differences do not isolate the JavaScript mechanism.
+
+Starting shared acquisition exposes failure semantics that merely joining an
+optional promise did not exercise. Preserve original rejection inside canonical
+retry, optional callers' null fallback, and the same response for permitted MIME
+fallback. Fatal bytes must not cause refetches; successful streaming must not
+leave a cloned body. Public glue also returns its initialized engine before
+reading options: eager acquisition broke warm-engine offline compatibility.
+Prepare lazy public-init options so that only a cold engine acquires a module.
+Actual generated-loader controls preserve the predecessor assertion failure,
+the intermediate cross-realm harness refusal, and the corrected warm-engine proof.
+
+The corrected lazy source now has its own qualified fresh default-worker SDK
+comparison, with equal produced CPU-channel identity and untouched diagnostics,
+passing preceding noise controls, resource gates, final freeze and cleanup.
+The house and heavy CSG observations consistently improve; the CSG and large
+architecture pairs are mixed. Every observation remains, including high baseline
+values. The second observed request is removed, but independently fresh engine
+bytes still differ, so elapsed results do not isolate JavaScript's contribution.
+This is a scoped SDK result, not a universal speed, RSS or full-viewer verdict.
+The lesson is to share cold acquisition without breaking public glue's warm
+fast path, preserve failure contracts, and qualify actual worker-pool completion
+separately from cached-artifact functional proofs. [All raw cohorts, compatibility
+failures, corrected proofs and limits](evidence/bundled-wasm-init-6537/README.md)
+remain available without replacing or pooling earlier evidence.
+
+## Direct vertex packing: do not ship the current candidate (#6537)
+
+The candidate removes an intermediate vertex buffer for eligible quantized
+batches. Regression controls establish the allocation reduction and preserve
+the original GPU upload bytes, including float rounding and fallback cases.
+That resource improvement did not establish an end-to-end speed improvement:
+fresh native-GPU worker-pool pairs were slightly slower on the house model,
+mostly slower on Holter, and mixed on the larger architectural model. The
+Revit cohort was interrupted by detected background activity before its last
+pair completed. No replacement sample was inserted and no full-corpus verdict
+is claimed. The current candidate stays out of production.
+
+The complete house, Holter and architectural pair groups retain identical CPU
+geometry and appearance fingerprints. Heavy-scene GPU batch sizes and images
+varied even between baseline loads, so those runs do not prove heavy-scene
+GPU byte or pixel identity. Sampled JavaScript heap is not physical peak
+memory. The separate admission-scheduling attempt stopped during its first
+baseline A/B sample and establishes no candidate comparison.
+
+Lesson: fewer staging bytes are a hypothesis about cost, not a speed verdict.
+Measure eligible vertex volume, float-fallback work and renderer completion
+before revisiting this candidate. Preserve interrupted runs, their exclusion
+reasons and unchanged output witnesses. Source controls, the unshipped patch,
+all raw attempts and paired derivations are in
+[`evidence/packing-verdict-6537/`](./evidence/packing-verdict-6537/README.md).
+
+## Affinity admission and compact worker packets: defer (#6537)
+
+The sticky-key admission pilot has meaningful pool/recovery and inverse
+controls, but both full-load cohorts stopped on detected background work.
+They retain their original contaminated rows without substitutes. A later
+O-S1 diagnostic explains flat/instance redistribution and preserves occurrence
+counts, while reconstructed positions and normals still differ. This does not
+qualify byte identity, canonical precision, GPU picking or a complete throughput
+verdict. Do not ship the pilot from worker-only or flat-only evidence.
+
+Compact worker source packets remain a feasibility question. The canonical
+forward-reference census measures reached record bytes, not every direct,
+inverse, setup and recovery access. Original offsets still reach near the file
+end. Establish conservative dependency completeness and offset addressability
+before introducing any producer; then measure construction, copies and whole
+load. A sparse reference list is not a safe packet or physical-memory result.
+
+Lesson: separate scheduling credit, dependency completeness and geometry
+representation from the final load metric. Preserve true sticky keys and the
+canonical parser; defer mechanisms whose correctness or end-to-end verdict
+remains incomplete. [Raw dispositions and prerequisites](evidence/deferred-worker-mechanisms-6537/README.md)
+retain source attribution and the excluded attempts.
+
+## Known-explicit orientation: rejected, do not ship (#6537 / #6788)
+
+The private known-explicit helper preserved adaptive arithmetic and passed the
+predicate/workspace correctness controls. Earlier default-worker SDK results
+showed a scoped ISSUE129 benefit; the separate native comparison remained mixed.
+The fresh integrated default-worker SDK comparison retained CPU output identity
+and complete diagnostics, but every observed Holter pair was slower. Haus and
+O-S1 were mixed. The heavy-family regression blocks shipment under the project's
+no-regressions requirement; the orientation implementation is removed. Freshly
+built WASM artifacts differ between arms, so this rejects the candidate
+combination without isolating dispatch as the cause of the Holter slowdown.
+
+Lesson: a scoped CSG signal cannot justify a regression on a heavy public model.
+Instruction attribution and avoided dispatch do not establish consumer benefit.
+Stop this candidate, preserve every pair and refusal, and keep the rejected patch
+as data so the mechanism is not proposed again without genuinely new evidence.
+The [lossless rejection record](evidence/explicit-orientation-6537/README.md)
+retains immutable sources, correctness controls, historical SDK/native cohorts
+and the new integrated comparison. No universal, full-viewer, physical-memory or
+complete IFC fidelity benefit is claimed.
+
+## Checked-magnitude products: native benefit, SDK mixed (#6537 / #6764)
+
+Bounding provably-fitting checked products by their actual magnitude widths
+reduces arithmetic work while preserving the full overflow/fallback paths.
+The qualified canonical warm/prepared native comparison improves on the
+void-heavy CSG model; Holter remains neutral and the house result is noisy.
+Counts and ordered mesh fingerprints agree within the fingerprint's declared
+coverage. The separate default-worker SDK cohort remains mixed, and full-viewer
+performance is unqualified. This is no universal worker-pool speedup claim.
+
+Lesson: real arithmetic opportunity and native instruction reductions do not
+establish browser throughput. Preserve exact overflow, sign and row-carry
+oracles, then measure the actual consumer and disclose identity exclusions.
+The [lossless native evidence and audit history](
+evidence/checked-magnitude-native-6537/README.md) retain all original pairs,
+the corrected checker-status refusal, prior instruction/correctness evidence,
+and scope limits. Available-memory guards exist in the frozen producer, but
+missing numeric readings prevent reconstruction of the admission floor.
+
+## Initial index reservation: no attributable default-pool benefit (#6537)
+
+The PR #6730 source inspection found no changed reservation request in its
+four default SDK fixture routes. The house remains below activation; the three
+larger models use sharded, prebuilt indexes that bypass the changed constructors.
+Their unused prepass staging map already reserves zero on the base revision.
+The bounded captures retain equal produced CPU output and complete diagnostics,
+including known kernel failures. They establish neither faithful IFC output nor
+an affected-path speed or physical-memory verdict. The earlier resource refusal
+remains preserved separately from the larger-budget inspection.
+
+Lesson: verify that the default load actually executes the changed allocation
+before assigning it an end-to-end benefit. This finite corpus does not rule out
+an affected input between cap activation and default sharding, and does not
+qualify the candidate for merge. [Source eligibility and complete raw evidence](
+evidence/default-pool-reservation-6537/README.md) retain the unshipped attribution.
+
+## Ring neighbour searches: do not infer a general hotspot (#6537)
+
+Opt-in canonical work counts and feature-off output controls do not support
+linked-neighbour indices as a broad performance fix. The public slab has little
+searching beyond adjacent live vertices; Holter has none. House and Revit CSG
+contain additional probes, but no profile establishes time dominance or that
+constructing neighbour arrays would pay back. A synthetic collinear ring proves
+the quadratic worst case, not its relevance to these models. The diagnostic
+preserves the algorithm and its output; it is not an optimization or speed claim.
+
+Lesson: count actual post-weld searches before replacing their representation.
+Saved raw-ring lengths cannot reconstruct cleaned-ring work. Preserve exact
+sweep order, predicates, coordinates and topology if profiling later warrants
+a prototype, then qualify the ordinary end-to-end worker pool.
+[Complete native work census, source identities and output controls](
+evidence/ring-search-opportunity-6537/README.md) retain the bounded public screen
+and its exclusions.
 
 ## Opt-in map geometry compatibility export (#6587)
 
@@ -79,6 +832,46 @@ handedness of local Y. Reuse the canonical placement frame rather than adding
 another direction decoder, and test both forward conic sampling and Cartesian
 trim inversion; either half alone leaves a mirrored or incorrectly trimmed arc.
 
+## In-call geometry heartbeat replaces wall-clock element skips (#4884 follow-up)
+
+Field signature: one mid-size model opened by about ten people stalled for most
+of them; when it loaded, the median `total_elapsed_ms` was about 145 s while
+first geometry appeared within seconds, and loads with the same mesh roster
+reported flat triangle totals varying almost fourfold. 145 s is the hung-call recovery budget:
+45 s until a silent multi-job call is replaced, a one-job-per-call replay, then
+90 s more until the slow element is skipped. A synthetic file with one wall
+carrying 200 tilted circular openings reproduced it exactly in the browser
+(143 s, wall skipped, identical on every run), and adding CPU load changed which
+calls were replayed and therefore the reported mesh and triangle counts.
+
+The worker could not speak while inside one WASM call, so a slow element and a
+hung call looked identical. The kernel now calls `ifc_lite_geometry::progress::tick`
+at coarse points of every long path (each boolean, analytic prism cut,
+consolidation bucket and region, conform loop, strided CDT and exact-predicate
+work). The binding rate-limits that to one JS callback a second, and the worker
+forwards it as its existing liveness message only while a batch call runs. A
+call that stops reporting is still recovered exactly as before, and every call
+keeps an absolute 10-minute bound (`MAX_GEOMETRY_CALL_MS`) however often it
+reports: past it the pool recovers the call like a silent one, and with
+recovery off it stops counting heartbeats as liveness so the stream watchdog
+still fires. With no hook
+installed (every native target) a tick is one atomic load; ordered native mesh
+fingerprints are unchanged on AC20, ISSUE_129 and Holter.
+
+Coverage was measured, not assumed: a native hook recording the longest gap
+between ticks found 7-8 s single-call stretches on the synthetic walls (a
+quadratic conform candidate scan and one large constrained triangulation)
+before those loops were covered; after, the longest gap is about 1.3 s natively
+on the synthetic walls and under 0.5 s on the heavy corpus models. Result on the
+synthetic file: 88 s with the wall present instead of 143 s with it skipped, the
+same 483 meshes and 548,428 triangles idle and under load, and no recovery.
+
+Lesson: never let a wall-clock budget decide WHAT geometry is produced. A
+recovery timer is legitimate for a call that has stopped making progress, but
+it needs a progress signal to tell that apart from a slow call. Open follow-ups:
+the analytic prism route spends most of such a wall's time before deferring to
+the exact kernel, and the flat/instanced split still follows call composition.
+
 ## Shared-buffer retries after a WASM trap (#6542)
 
 A compatibility retry must distinguish a rejected shared view from a WASM
@@ -128,6 +921,76 @@ budget is the default whenever geometry streams. Lesson: a time slice sized
 for one phase silently carries into the next. Timestamp phase boundaries
 (`Stream complete`, `Streaming ended`, `finalizeStreamingAsync complete`)
 before assuming the tail is finalize work.
+## One full-source hash per load, beside the critical path (#7022)
+
+The loader awaited the placement identity (SHA-256 in 1 MiB chunks) before the
+cache lookup, then hashed the same bytes again for the cache write or for a
+warm hit's background revalidation. The identity now starts once the bytes are
+in hand and is awaited only by finalize (so a complete model still carries it),
+the cache write (which stores it) and the revalidation (which compares against
+it). A cache entry holding a bare whole-file hash from an older viewer is a
+miss, purged and rewritten by the reparse. Each full-source pass now counts as
+`hash.fullSource` in the structural counters.
+
+Interleaved real-GPU pairs (Windows Chrome over CDP, five rounds, FZK, Snowdon,
+a 54 MB and a 327 MB model, cold and warm) gave identical mesh counts and
+identity values. The cache lookup now starts up to ~0.4 s earlier on the 327 MB
+model, but first geometry, first visible and load total stayed within the base
+spread on every fixture. The pass was never the gate: engine init (cold) and
+the IndexedDB read (warm) end at the same time either way. Verdict: structural
+win (one loader pass instead of two, none on the critical path), no end-to-end
+speed claim.
+
+Lesson: count passes before timing them. The counter showed a second pass per
+primary load that the issue never listed: the drawing-markup restore
+(`useDrawing2DPersistence`) re-reads the whole Blob and hashes it, because its
+localStorage key is a bare SHA-256. Sharing it needs a key migration, so it is
+the next lever, not part of this change. Freeing a span from the critical path
+only helps if nothing parallel ends at the same moment; check the next span's
+end, not just this one's start.
+
+## Drawing persistence keyed by the load's identity (#7035)
+
+The second full-source pass #7022 found is gone. 2D-drawing persistence
+(markup and sheet in localStorage, DXF underlays in IndexedDB) was keyed by a
+bare whole-file SHA-256 that `useDrawing2DPersistence` computed by re-reading
+the file. It is now keyed by the placement identity already on the model
+record, so a primary load makes one `hash.fullSource` pass and the FZK
+benchmark pins that at 1.
+
+Entries saved under the old key are moved, not dropped. A bare 64-hex key can
+be told from an identity key by its shape, so a load pays for the old hash
+only when some old-shaped entry is stored, only after the model has finished
+loading, and once per file: an identity that has been checked is remembered.
+Activations recheck for newly written legacy entries without rereading a successfully hashed File. Failed byte or IndexedDB reads leave the move unchecked and retryable.
+That pass is counted as `hash.drawingLegacyKey`, apart from `hash.fullSource`.
+Each move writes under the identity key, reads it back and only then removes
+the old entry. When a quota failure prevents that write, restore still uses
+the readable merged entry while retaining the original and retrying the move
+on the next activation. A cleared sheet is an explicit stored choice, so a
+legacy sheet cannot revive it.
+
+Verdict: structural win (one pass per load instead of two), no timing claim.
+The removed pass ran beside the load, not in front of it.
+
+Lesson: one key served three stores. The issue named the markup; the same
+hash also keyed the sheet and the DXF underlays, and re-keying only the markup
+would have kept the whole-file hash alive for the other two. Before removing a
+derived value, list every store keyed by it.
+
+Bundle: the key resolver, the legacy-key move and the IndexedDB underlay store
+are imported on demand, so the change lowers the eager bytes instead of adding
+to them. Two things cost more than the code they moved. A first dynamic import
+in a chunk brings a preload table that lists every file the imported chunk
+depends on. And the bundler groups modules by the set of entries that reach
+them, so an on-demand entry that reaches only part of an eager chunk splits
+that chunk: importing the underlay store alone (it reaches
+`dxfReferencePlane` but not the rest of the store chunk) cut the store chunk
+in two. One entry for both, with the eager functions it needs handed over
+rather than imported, left every eager chunk as it was. Lesson: after moving
+code behind a dynamic import, compare the per-chunk sizes and the eager file
+count against the base build, not just the total.
+
 ## Placement identity from memory (#6431)
 
 Before parsing, the loader awaited a full-content SHA-256 identity (1 MiB chunks)
@@ -735,6 +1598,8 @@ timings the pipeline already publishes (`ProcessingStats`) plus an isolated
 Flags: `--suite` (all catalogued heavy fixtures on disk), `--iters N`,
 `--census` (CSG op distribution), `--json` (stdout; table stays on stderr),
 `--fingerprint` (ordered mesh fingerprint, computed outside the timed interval),
+`--single-thread` (one rayon worker on the calling thread; for instruction
+counting, its times are not comparable with multi-threaded runs),
 `OBS=1` env (build with `observability` to fill `faceted_brep_time_ms`).
 
 JSON `allWallMs` measures each complete `process_geometry` call, including final
@@ -765,6 +1630,48 @@ Why `--profile profiling`: release-grade opt but keeps symbols and
 - `index-scan alone` vs `entity_scan`: the gap is job-list + quick-metadata
   building layered on the raw scan.
 
+## Instruction counts (`instructions.sh`, #6958)
+
+`scripts/perf/instructions.sh <fixture> [--json] [--keep <dir>]` builds
+`perf_probe` with `--features phase-markers` (into `target/phase-markers`, so it
+never swaps the binary under `probe.sh`) and runs it once under
+`valgrind --tool=callgrind` with `--single-thread --iters 1`. The feature puts a
+never-inlined empty marker call on every `ProcessingStats` timer edge
+(`rust/processing/src/processor/phase_marks.rs`); callgrind's
+`--dump-before=...::phase_marks::*` writes one dump per edge, and
+`instructions-report.mjs` folds them into
+`{fixture, commit, phases:{parseIr, entityScanIr, lookupIr, preprocessIr,
+geometryIr, totalIr}, outside, processIr, meshes, vertices, triangles}`. Each
+phase covers exactly the window its millisecond timer covers; `parseIr`
+includes the untimed code between the sub-phases, as `parse_time_ms` does.
+Without the feature the markers compile to nothing (mesh fingerprints are
+identical with the feature off, on, and with `--single-thread`).
+
+- **Determinism.** Entity scan and lookup are exactly reproducible. Across
+  independent runs of one binary (some concurrent, on a loaded machine),
+  geometry varied by at most 254 Ir of 367M on FZK-Haus (7e-7) and 8,912 Ir of
+  28.7G on ISSUE_129 (3e-7); preprocess varied by at most 31 Ir. The residue
+  comes from `std::collections::HashMap` per-process hash seeds (probe lengths
+  in `clip_mesh_with_half_space`, `promote_cutter_verts_onto_host_faces`,
+  `remove_internal_membrane`, `union_all`, and in preprocess); output is
+  unaffected. `--single-thread` runs the one rayon worker on the calling thread
+  (`use_current_thread`): with a separate worker thread, idle spinning and
+  hand-off added noise of up to ~1e-5. Raw runs:
+  `evidence/instruction-replay-6958/determinism.json`.
+- **Not wall time.** Counts are immune to machine load and need no quiet
+  machine, but they ignore memory stalls, cache misses and parallel
+  scheduling. Read them as work, not latency.
+- **Cost.** ~60-100x a native run: FZK-Haus ~6 s, ISSUE_129 ~2.5 min.
+- `perf stat -e instructions:u` is not wired in: it is unavailable under WSL and
+  counts from different tools are not comparable with each other.
+
+For historical commits, which have no markers,
+`instructions-replay.mjs` injects `rust/processing/examples/instructions_driver.rs`
+(one `process_geometry` call between `--dump-before`/`--dump-after` dumps) into
+a throwaway worktree per ref via `build-at-ref.sh`, the same worktree builder
+`ab.sh` uses for its base side. It counts whole calls only. See the replay
+verdict in the ledger below.
+
 ## Flamegraph (`flame.sh`)
 
 `samply record` on the profiling binary, opens the Firefox profiler. Click into
@@ -783,7 +1690,8 @@ are timed in JS. Diagnose there with:
   **user-facing** truth (time-to-first-paint, time-to-complete).
 - **Console `[stream]` timeline** (`packages/geometry/src/geometry-parallel.ts`)
   and `[useIfc] TOTAL LOAD TIME` lines: `meta @`, `styles @`, `entity-index @`,
-  worker-ready, first-batch. The CI benchmark scrapes these.
+  worker-ready, first-batch. These are diagnostics; CI timing and readiness
+  use canonical load-trace spans. Count-only console fields remain available.
 - **`?perfMem=1`** -> `memoryAccounting` `[mem-summary]` (JS heap, per-worker WASM
   heap, geometry bytes, transport bytes; `apps/viewer/src/lib/perf/memoryAccounting.ts`).
 - **CI viewer benchmark** (`.github/workflows/benchmark.yml`, advisory): 6 load
@@ -830,6 +1738,21 @@ cp scripts/perf/browser-corpus.example.json scripts/perf/browser-corpus.local.js
 # edit browser-corpus.local.json with real absolute paths, then:
 scripts/perf/browser-cold-ab.sh --corpus scripts/perf/browser-corpus.local.json
 ```
+
+**Span-only release boundary (#7005):** the migration shipped in v10.4.0;
+the follow-up package release at `7eeffbb960596669f1a4cb5e0d01e980999e20f6`
+was published by [the original release run](https://github.com/LTplus-AG/ifc-lite/actions/runs/38333269170).
+The harness now refuses source revisions older than #6979
+(`272ebd8615d038dc20dd8aec4e3bb88d1acf9fa7`). The wrapper checks both sources
+before building. Direct frozen-dist runs must pass `--branch-revision <sha>`
+and, with `--dist-base`, `--base-revision <sha>`; these resolved identities are
+saved in `source-revisions.json`. Fetch the migration's Git history first.
+These declarations do not authenticate arbitrary dist bytes: retain the matching
+build/hash receipt. Runtime completion still requires valid spans, loader success,
+renderer finalization and an allocated canvas. Missing traces cannot fall back
+to logs. Console mesh/entity/file-size counts and steady-state render diagnostics
+remain; no console timing or completion value is accepted. Legacy timing fields
+without a canonical span remain null. This removal makes no speed claim.
 
 **What "cold" means, precisely:** each sample gets a brand-new
 `chromium.launch()` (no persistent profile) closed completely before the next
@@ -958,6 +1881,13 @@ Preserve failed loads alongside successful samples. Listen for renderer crashes
 as well as JavaScript errors, and stop memory sampling on every exit path.
 
 ### Shipped wins
+- **Review startup bundle (#7015):** load the Script panel on demand and keep
+  CodeMirror's shared state module in its own chunk. Assistant text-edit planning
+  still uses `ChangeSet`, while the editor UI stays outside the eager import
+  closure. The production bundle clears the unchanged size ceilings; this is a
+  byte-size verdict, not a measured load-time improvement. **Lesson:** inspect
+  the complete HTML preload closure, and isolate shared state before assuming a
+  dynamic panel import makes its dependencies lazy.
 - **Firefox spatial-publication stall (#3983):** Chrome-only cold-load timing
   missed an engine-dependent entity-cache eviction cost. Georeference discovery
   runs through the property-set index during React rendering. Restarting a Map
@@ -1612,6 +2542,19 @@ The existing prepass can publish the exact full-byte source key through a fresh 
   probe on `?geomWorkers=N`: `useIfcLoader.ts` documents that worker count cannot
   affect output (disjoint deterministic element slices), so that probe is
   predicted clean by the codebase itself.
+- **`mesh_count` and `total_triangles` count FLAT meshes only, and the flat /
+  instanced split is decided per WASM batch call.** An occurrence is instanced
+  when its representation repeats often enough *within one call*, so anything
+  that changes call composition moves geometry between the flat list and the
+  instancing shards without changing what renders: the wall-clock adaptive batch
+  sizer, the device-dependent worker count, and a hung-call replay at one job per
+  call. Measured on a synthetic heavy model: identical rendered geometry came out
+  as 549 meshes / 242,052 flat triangles on an idle host and 683 / 243,660 under
+  CPU load. So "the geomWorkers probe is predicted clean" holds for rendered
+  geometry, not for these two telemetry fields. A small `mesh_count` delta with a
+  LARGE `total_triangles` delta is the other signature: a skipped element (see
+  the "In-call geometry heartbeat replaces wall-clock element skips" section near
+  the top of this file); read `hung_elements_skipped` first.
 - **`total_elapsed_ms` is not pure compute — it contained an unbounded hidden-tab
   stall** (#2385, fixed). `useIfcLoader` awaited a bare `requestAnimationFrame`
   at stream-complete; rAF is never serviced while the document is hidden, so a
@@ -1640,9 +2583,181 @@ The existing prepass can publish the exact full-byte source key through a fresh 
   initial Holter browser cohort confirmed frame progress and no 14-second load,
   but concurrent host jobs made its small timing delta inconclusive.
 
+#### Field properties on every load and journey (#6961)
+
+`ifc_model_loaded` now carries the same milestones on every load path (wasm
+streaming, cache, server, IFCX, GLB, point cloud, LandXML), plus main-thread
+health, worker bytes, the journey and the perf-flag arm. Absent always means
+"not measured", never 0; a value the load path measured itself always wins.
+
+| property | meaning |
+|---|---|
+| `first_visible_geometry_ms` | first pixel: the paint after the first geometry append (`geometry.firstVisible`). Was wasm-only; now also cache. |
+| `spatial_ready_ms` | spatial tree usable (`parser.spatialReady`; on a cache hit, the store restore `cache.storeReady`). New. |
+| `metadata_complete_ms` | properties usable (`parser.complete`; cache: `cache.storeReady`). Was wasm-only. |
+| `stream_complete_ms` | last geometry batch appended (`geometry.streamComplete`). Was wasm-only; now also cache. |
+| `milestone_source` | `trace`: the four come from the load's streamed milestones. `commit`: a single-step path (server, IFCX, GLB, point cloud, LandXML) committed the model at once, so all four are its `total_elapsed_ms`. Never compare a `commit` row's first pixel with a `trace` row's. |
+| `journey` | charter journey: `J1` cold open, `J2` cache hit, `J4` federated add. |
+| `cache_tier` | `source`, `mesh-only` or `none` (the cache plan for this load). |
+| `worker_count` | geometry workers the pool started (absent on paths without a pool). |
+| `main_thread_blocked_ms` | sum of long-animation-frame `blockingDuration` (or long-task time over 50 ms where LoAF is missing) for frames starting between load start and capture. |
+| `longest_long_frame_ms`, `long_frame_count` | the longest such frame and how many there were. |
+| `long_frame_source` | `loaf` or `longtask`; compare rows of the same source only. All four main-thread fields are absent where the engine has neither (Firefox, Safari). |
+| `worker_transfer_bytes` | mesh bytes the geometry workers handed the main thread plus the parser's transport bytes, from `memoryAccounting` (already on every load). 0 when a pool ran and moved nothing; absent when no pool ran (cache, server). It counts payload bytes, not the clone estimate `?perfTrace=1` records per message. |
+| `perf_flags` | the M7 arm: `default`, or the non-default flags as sorted `id=value` pairs joined by `,` (read at capture). |
+| `load_path` | now actually arrives. The scrubber deleted it until #6961 (the key matches the `path` word); the closed vocabulary `wasm`/`cache`/`server`/`point-cloud`/`landxml` is now kept. Rows before that have no `load_path` and no `journey`, so a pre-#6961 cache hit reads as `J1`: judge `J1` against `J2` only on a baseline captured entirely after this change. |
+
+How it is measured without the tracer. With `?perfTrace=1` off, every load
+gets a `FieldLoadTrace` (`apps/viewer/src/lib/perf/fieldLoadTrace.ts`) in place
+of the old no-op trace: it records the first time of each milestone and the
+load attributes that the instrumented call sites already pass, and nothing
+else (spans, records and worker merges stay no-ops). Main-thread health comes
+from one `PerformanceObserver` on `long-animation-frame` (and `longtask`),
+created when the first load starts and reading back missed frames through its
+`buffered` replay; it only fires on frames over 50 ms and keeps at most 2,000.
+Both, and the three events below, live in an on-demand chunk
+(`lib/perf/fieldTelemetry.ts`), so the entry chunk grows by about 600 raw
+bytes. The recording tracer was not an option: it keeps every span, a counter
+registry and a 20k-entry frame log, and counting message bytes walks every
+worker payload.
+
+Sampled events. All carry `journey`, `perf_flags`, `was_hidden` and, where a model is
+loaded, `file_size_mb`/`mesh_count` from the last load (the same model key as
+`ifc_model_loaded`); nothing else identifies the model.
+
+| event | journey | what | sample rate, and why |
+|---|---|---|---|
+| `ifc_inspect` | J5 | `inspect_ms`: viewport click to the paint after the properties panel committed that entity | 10% of selection clicks, at most 10 per page session. Clicks outnumber loads by an order of magnitude; the paired ratio needs a few samples per person per window, not every click. Sent only when the panel is open. |
+| `ifc_navigate` | J6 | `frame_p50_ms`, `frame_p95_ms`, `frame_max_ms` over 120 camera-interaction frames (orbit, pan, zoom), excluding each interaction's first frame, frames while geometry streams and hidden-tab frames | once per page session, every session: one row per session is already the cap. Frame intervals include the adaptive render throttle, which is what the user sees. |
+| `viewer_boot` | J0 | `drop_target_ms` (navigation to the empty viewer's drop target enabled), `engine_wasm_compiled_ms` (navigation to the prewarmed engine compiled), `engine_wasm_compile_ms` (the prewarm's own fetch + compile), `engine_wasm_compiled` | once per page load, every page load. Sent when both are known, or 30 s after the field chunk loads. `drop_target_ms` is absent when a load started first; `engine_wasm_compile_ms` is absent when a load joined the compile; both are absent when the prewarm was skipped (Save-Data, 2G). |
+
+#### The field verdict (#6961)
+
+`scripts/perf/field-verdict.mjs` applies the paired-ratio method above to one
+deployed build: per (event, metric, journey, person, model) cell,
+`median(recent) / median(baseline)`, where recent is the judged build's rows
+and the divisor comes from the baseline window (the 14 days before that build
+first appeared) and from the `default` arm only. A group's pooled ratio is the
+median of its cell ratios, reported per journey and pooled across journeys,
+each per `perf_flags` arm. The threshold is on speed (1 / ratio): pooled speed
+below 0.95 with at least 5 paired cells is `regressed`; fewer cells is
+`insufficient`, which is the common case at current volume and is not a
+pass. `was_hidden = true` rows and bot traffic are excluded in the query.
+
+```bash
+node scripts/perf/field-verdict.mjs --print-sql --build <sha> > verdict.sql   # the HogQL below, filled in
+POSTHOG_PERSONAL_API_KEY=... node scripts/perf/field-verdict-fetch.mjs --build <sha> --out result.json
+node scripts/perf/field-verdict.mjs result.json --build <sha>                  # markdown; --json for data
+```
+
+`.github/workflows/field-verdict.yml` runs this daily at 05:15 UTC, before the
+05:45 deploy, against the build production has served since the previous
+deploy, and posts the markdown on the PR that build's commit came from (once
+per build). It needs one repository secret, `POSTHOG_PERSONAL_API_KEY`: a
+PostHog personal API key with only `query:read`, scoped to project 199147
+(EU cloud). Without it every run skips with a notice. Opening a thread when a
+pooled group regresses is the next step and is not wired yet.
+
+The HogQL the script expects (`__BUILD__` is the 12-character
+`app_build_sha`, `__BASELINE_DAYS__` the baseline length; the script reads it
+from this block). It already aggregates to one row per (person, model,
+journey, arm, metric, window) cell, not per load; `field-verdict-fetch.mjs`
+appends `LIMIT`/`OFFSET` and pages over the fully ordered result until it is
+complete, and fails rather than judge a partial one:
+
+<!-- field-verdict-hogql -->
+```sql
+SELECT
+  event,
+  journey,
+  arm,
+  person,
+  model,
+  metric,
+  window,
+  quantile(0.5)(value) AS median,
+  count() AS n
+FROM (
+  SELECT
+    event,
+    -- Rows before #6961 carry no `journey` (and no `load_path`: the scrubber
+    -- deleted it), so they fall back to load_target; a pre-#6961 cache hit
+    -- therefore reads as J1.
+    coalesce(
+      toString(properties.journey),
+      multiIf(
+        event = 'ifc_model_loaded' AND properties.load_target = 'federated', 'J4',
+        event = 'ifc_model_loaded' AND properties.load_path = 'cache', 'J2',
+        event = 'ifc_model_loaded', 'J1',
+        event = 'ifc_inspect', 'J5',
+        event = 'ifc_navigate', 'J6',
+        'J0'
+      )
+    ) AS journey,
+    coalesce(toString(properties.perf_flags), 'default') AS arm,
+    toString(person_id) AS person,
+    -- The model is its format plus size to 10 KB: no name ever leaves the browser.
+    if(event = 'viewer_boot', '-', concat(coalesce(toString(properties.format), '?'), ':', toString(round(toFloat(properties.file_size_mb), 2)))) AS model,
+    if(toString(properties.app_build_sha) = '__BUILD__', 'recent', 'baseline') AS window,
+    arrayJoin(arrayFilter(m -> isNotNull(m.2), [
+      tuple('total_elapsed_ms', toFloat(properties.total_elapsed_ms)),
+      tuple('first_visible_geometry_ms', toFloat(properties.first_visible_geometry_ms)),
+      tuple('spatial_ready_ms', toFloat(properties.spatial_ready_ms)),
+      tuple('metadata_complete_ms', toFloat(properties.metadata_complete_ms)),
+      tuple('stream_complete_ms', toFloat(properties.stream_complete_ms)),
+      tuple('main_thread_blocked_ms', toFloat(properties.main_thread_blocked_ms)),
+      tuple('inspect_ms', toFloat(properties.inspect_ms)),
+      tuple('frame_p95_ms', toFloat(properties.frame_p95_ms)),
+      tuple('drop_target_ms', toFloat(properties.drop_target_ms)),
+      tuple('engine_wasm_compile_ms', toFloat(properties.engine_wasm_compile_ms))
+    ])) AS pair,
+    pair.1 AS metric,
+    pair.2 AS value
+  FROM events
+  WHERE event IN ('ifc_model_loaded', 'ifc_inspect', 'ifc_navigate', 'viewer_boot')
+    AND timestamp >= now() - INTERVAL 90 DAY
+    -- Baseline: the __BASELINE_DAYS__ days before the judged build first appeared.
+    AND timestamp >= (
+      SELECT min(timestamp) FROM events
+      WHERE event = 'ifc_model_loaded' AND timestamp >= now() - INTERVAL 60 DAY
+        AND toString(properties.app_build_sha) = '__BUILD__'
+    ) - INTERVAL __BASELINE_DAYS__ DAY
+    AND (
+      toString(properties.app_build_sha) = '__BUILD__'
+      OR (
+        timestamp < (
+          SELECT min(timestamp) FROM events
+          WHERE event = 'ifc_model_loaded' AND timestamp >= now() - INTERVAL 60 DAY
+            AND toString(properties.app_build_sha) = '__BUILD__'
+        )
+        -- Only people who also used the judged build can form a pair.
+        AND person_id IN (
+          SELECT person_id FROM events
+          WHERE event IN ('ifc_model_loaded', 'ifc_inspect', 'ifc_navigate', 'viewer_boot')
+            AND timestamp >= now() - INTERVAL 60 DAY
+            AND toString(properties.app_build_sha) = '__BUILD__'
+        )
+      )
+    )
+    -- A load spanning a tab switch timed the user's absence (#2385).
+    AND NOT ifNull(toString(properties.was_hidden) = 'true', false)
+    AND NOT ifNull(toString(properties.$virt_is_bot) = 'true', false)
+)
+GROUP BY event, journey, arm, person, model, metric, window
+ORDER BY event, journey, metric, person, model, window
+```
+
 ### Source and buffer ownership during WASM prepass (#3989)
 
 Source-session reuse, binding-owned index adoption and direct transfer of already-owned mesh getter arrays preserve byte-taking compatibility and source-replacement resets. The standalone own-layer native subset was slower in full-load timing, while Holter's measured peak memory fell; the cause remains unestablished and favorable memory does not waive the timing concern. The intended integrated merge parent differs from that standalone comparison, and its proposed comparison remains unrun; results with different parents must not be pooled. Combined native/browser results do not isolate a gain for this layer, and invalid Firefox cohorts provide no throughput evidence. Real WASM contracts verify returned buffers survive handle free, memory growth and transfer, including textures. Establish ownership at the binding: a JavaScript view does not remove the WASM input copy, and borrowed WASM-memory views must not be transferred as owned output.
+
+### Remaining sharded prepass column adoption (#6537)
+
+The [retained source-matched hosted qualification](https://github.com/LTplus-AG/ifc-lite/blob/5081a5efadc3072e6b710fd8e1c3b22aa6aafa9b/scripts/perf/evidence/owned-prepass-columns-6537/README.md) is neutral: every public family had mixed paired elapsed deltas, with no consistent default SDK throughput improvement or measured comparative RSS gain. Complete produced CPU-channel identity and unnormalized diagnostics matched across fresh default-pool samples, with original shard activation logs retained. Historical local refusals remain separate and provide no timing verdict. This is not native, full-viewer, metadata or GPU evidence.
+
+Both sharded prepass bindings adopt numeric columns already copied into WASM by the ABI; geometry-worker index installation already adopts them under #3989. Original-order discovery precedes sorting/deduplication, preserving class alignment, every discovery occurrence and last-occurrence lookup precedence. Actual native pointer and real-WASM controls qualify that ownership contract. On unsorted input, later index construction can overlap existing sort transients with discovered jobs/spans: deleting a clone does not prove a lower physical memory peak or faster loading. The finite hosted result does not isolate that allocation lifetime or an elapsed cause. The durable evidence passed bounded data-only extraction, literal-original comparison and replay controls.
+
+A [separate public GNI correctness inspection](https://github.com/LTplus-AG/ifc-lite/blob/b0a8c2f00091dea356e2a06472b1bb82ef8f2c55/scripts/perf/evidence/public-gni-fullpool-6537/README.md) completed this unchanged source through the default pool under its separately declared correctness resource budget. It is not a paired performance comparison or admission under the timing memory ceiling. Integration and review disposition remain separate.
 
 ### Standing constraints
 - Geometry is **client-side only** (no server meshing).
@@ -2820,3 +3935,83 @@ completion timeout limit the inference; the evidence preserves qualification
 failures rather than discarding them. The lesson is to measure the actual default
 worker pool even for opt-in APIs, and to separate post-timing byte witnesses from
 the completion boundary. See [the evidence](../../docs/architecture/evidence/alignment-sections-6603/README.md).
+
+### Checked direct-record prepass projection screen (#6537)
+
+The [canonical-parser census](evidence/prepass-projection-6537/README.md) found
+no unused nested attribute containers in the screened direct prepass record
+families across the small, CSG, heavy and large public controls. The separate Revit
+medical capture had no covered void/fill records. Snowdon's covered pairs had
+no unused nested void/fill containers. Other unused fields are not classified
+by that screen. The dominant
+styled-item population's unused name field had no string payload. Do not
+prototype removing unused nested value trees on this evidence or revisit the
+rejected general constructor. A different worker capture must first establish
+substantial unused materialization on the critical path. This native opportunity
+screen is not a browser speedup or a measurement of indirect style decoding.
+
+## Activity tray startup budget (#6952, U02)
+
+The maintainer approved the measured eager-JavaScript ceiling for U02 while
+keeping its existing tolerance. Job recording, the running badge and completion
+announcements must work before the detail tray opens; detail rows remain lazy.
+Deferring popup initialization and journal restoration increased eager bytes in
+the production bundle and was discarded. The verdict is a deliberately approved
+startup cost, not a speed improvement. Measure the complete eager chunk graph:
+extracting a module can increase shared imports even when its entry chunk shrinks.
+
+### Viewer preferences editor imports (P20, #6924)
+
+A hook used by the Assistant must live separately from the optional preferences editor: importing the hook from the editor makes its dynamic import ineffective. Keep the live project/model hook in a small module and load the form through its native lazy boundary. The combined production measurement showed no meaningful size improvement from the hook split. The remaining content-library registration and recipe run state still participate in startup; keep the split for the lazy editor boundary, without claiming a bundle reduction.
+
+## Federated CPU alias release correctness (#6584, #6537)
+
+Main's single-model array stamping supersedes the old general owner-cache
+prototype, whose measurements remain historical. Current-main mounted controls
+still reproduce CPU buffers stranded in retained federation copies, including
+an earlier immutable recolour that array-revision refresh misses. Canonical
+release now follows weak aliases at the existing shallow-copy/provenance seam,
+clearing only shared fields and preserving independent updates, retained counts,
+GPU content version and the global streaming prefix.
+
+The [retained controls and earlier negative measurements](evidence/owner-cache-6537/README.md)
+prove reference removal and collectability; they do not measure OS peak memory
+or establish a current end-to-end speedup. Lesson: invalidate shared CPU owners
+at release rather than repairing only the current rendering cache.
+
+Follow-up review of the bounded CPU release fix found that canonical frame restoration replaces source allocations before release, leaving prior registered copies alive. The release helper now remembers historical source allocation identities weakly and clears them alongside current shared fields while preserving independent replacements. Actual frame-restore regression and backing-allocation collection controls qualify this correction; no native speed or resident-memory improvement is claimed. See `evidence/owner-cache-6537/source-frame-replacement/`.
+
+A second bounded-release follow-up showed that immutable recolouring after frame restoration also needs to carry historical ownership. Flat pruned weak snapshots now transfer only across complete shared allocation domains; snapshots remain independent so derived replacements cannot pollute original ownership. Actual canonical recolour regressions and collection controls qualify this correction. The evidence retains the separate WASM identities observed before and after Turbo typecheck rather than relabeling a functional run. See `evidence/owner-cache-6537/immutable-history-carry/`; no native performance claim is made.
+
+## Opening-repair evidence and recording checker (#6940)
+
+**Unmerged geometry stack: browser performance UNQUALIFIED; geometry merge hold.** The
+five-layer stack adds opening corner reconciliation, certified independent plane
+fits, closed-original-operand finite-wall protection and locally unrepresentable
+cap repair. Recorded source-matched MiniBIM native/WASM/viewer parity and complete
+per-arm normalized FZK/ISSUE129/Holter CPU transfers support bounded correctness.
+Explained changed outputs retain strict cross-arm identity FAIL.
+
+Both source-matched Holter recordings qualify functional recording feasibility.
+The original October 15 finite interleaved browser cohort (plan `fdd4b255…`) fails: the first completed load fails its
+unchanged POST cadence gate, the next planned load exhausts canonical host
+refusals, and the remaining planned samples are unlaunched. Every failed attempt
+and missing sample is retained. No throughput, neutral-performance or speed claim
+is supported. Lesson: classify full consumer output in its actual frame/context,
+then qualify the unchanged complete worker-pool cohort; repaired geometry and a
+successful functional recording cannot substitute for those gates.
+Before selecting a cohort, verify the live HTTPS state and collector rather than
+trusting a cached preview page. A scheduled opportunity stopped before timing
+when the benchmark server and its forwarding route were missing; restoring them
+does not turn that unlaunched cohort into performance evidence.
+The three October 16 opportunities are distinct failed cohorts, not replacement
+samples for that original report; the [evidence index](../../docs/architecture/evidence/opening-tears-6940/README.md)
+identifies each plan and disposition. Their local receipts are not included in
+the original published packet. All scheduled opportunities are exhausted.
+Lesson: retain cohort identity through PR summaries and stop at the original
+admission budget; later host quietness cannot qualify a refused case.
+The [V6 supplemental join](../../docs/architecture/evidence/opening-tears-6940/recording-checker-v6/README.md)
+now uses the reviewed first-frame clock contract in both cadence and markers,
+and reads finalized sidecars at their actual case paths. Lesson: verify final
+checker contracts and receipt discovery against retained real captures before
+spending another capture window. This integration fix grants no timing verdict.

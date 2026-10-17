@@ -10,6 +10,100 @@
 
 use super::*;
 
+#[test]
+fn legal_page_quote_operands_retain_each_record_and_span_7540() {
+    let vectors: serde_json::Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/step-page-directive.json"
+    )).unwrap();
+    for vector in vectors.as_array().unwrap() {
+        let literal = vector["literal"].as_str().unwrap();
+        let body = format!("IFCWALL({literal},($))");
+        assert_eq!(crate::parser::lexical::close_step_record(body.as_bytes()),
+            crate::parser::lexical::RecordClose::At(body.len()), "{}", vector["name"]);
+        for paired in [false, true] {
+            let records = [
+                format!("#20=IFCWALL('id20',$,{literal},$) /* ) ; */ ;"),
+                "#21=IFCWALL('id21',$,'W-2',$);".to_string(),
+                "#22=IFCWALL('id22',$,'W-3',$);".to_string(),
+                format!("#30=IFCDOOR('id30',$,{},$);", if paired { literal } else { "'D-1'" }),
+                "#31=IFCCARTESIANPOINT((1.,2.,3.));".to_string(),
+            ];
+            let content = format!(
+                "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION(({literal}),'2;1');\nENDSEC;\nDATA;\n{}\nENDSEC;\nEND-ISO-10303-21;",
+                records.join("\n")
+            );
+            let mut scanner = EntityScanner::new(&content);
+            let mut ids = Vec::new();
+            while let Some((id, _, start, end)) = scanner.next_entity() {
+                assert_eq!(&content[start..end], records[ids.len()], "{}", vector["name"]);
+                ids.push(id);
+            }
+            assert_eq!(ids, [20, 21, 22, 30, 31], "{}", vector["name"]);
+            assert_eq!(scanner.malformed_record_start(), None);
+        }
+    }
+}
+
+#[test]
+fn unterminated_string_after_page_quote_still_reports_7540() {
+    let content = r"#20=X('Para \S\' no closing quote);";
+    let mut scanner = EntityScanner::new(&content);
+    assert!(scanner.next_entity().is_none());
+    assert_eq!(scanner.malformed_record_start(), Some(0));
+}
+
+/// The shared #7541 vectors (`rust/core/tests/fixtures/step-stray-apostrophe.json`, also
+/// read by the TypeScript scanners): an unescaped apostrophe drops its own
+/// record and no other, every legal quote shape keeps every record, and the
+/// span and malformed-record start of each record are exact.
+#[test]
+fn stray_apostrophe_vectors_7541() {
+    let vectors: serde_json::Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/step-stray-apostrophe.json"
+    )).unwrap();
+    let ids_of = |v: &serde_json::Value| -> Vec<u32> {
+        v.as_array().unwrap().iter().map(|id| id.as_u64().unwrap() as u32).collect()
+    };
+    for vector in vectors.as_array().unwrap() {
+        let name = vector["name"].as_str().unwrap();
+        let records: Vec<&str> =
+            vector["records"].as_array().unwrap().iter().map(|r| r.as_str().unwrap()).collect();
+        let joiner = vector["joiner"].as_str().unwrap_or("\n");
+        let misframed = vector.get("misframed").map(ids_of).unwrap_or_default();
+        let content = format!(
+            "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\nFILE_NAME('a','',(''),(''),'','','');\n\
+             FILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\n{}{}ENDSEC;\nEND-ISO-10303-21;\n",
+            records.join(joiner),
+            if joiner.is_empty() { "\n" } else { joiner },
+        );
+        // Where `#<id>=` begins in the file, and the record text from there.
+        let declared = |id: u32| -> (usize, &str) {
+            let mut at = content.find("DATA;\n").unwrap() + "DATA;\n".len();
+            for record in &records {
+                if let Some(k) = record.find(&format!("#{id}=")) {
+                    return (at + k, &record[k..]);
+                }
+                at += record.len() + joiner.len();
+            }
+            panic!("{name}: no record declares #{id}");
+        };
+
+        let mut scanner = EntityScanner::new(&content);
+        let mut ids = Vec::new();
+        while let Some((id, _, start, end)) = scanner.next_entity() {
+            if !misframed.contains(&id) {
+                assert_eq!(&content[start..end], declared(id).1, "{name}: span of #{id}");
+                assert_eq!(start, declared(id).0, "{name}: start of #{id}");
+            }
+            ids.push(id);
+        }
+        assert_eq!(ids, ids_of(&vector["ids"]), "{name}: indexed ids");
+        let malformed: Vec<usize> =
+            ids_of(&vector["malformed"]).into_iter().map(|id| declared(id).0).collect();
+        assert_eq!(scanner.malformed_record_starts(), malformed, "{name}: malformed record starts");
+    }
+}
+
 /// The fused ASCII proof must retain the scanner's existing UTF-8 fallback:
 /// valid non-ASCII keywords survive, invalid ones become UNKNOWN, and neither
 /// case changes the original byte spans or prevents reading the next record.
@@ -773,6 +867,10 @@ fn refused_records_do_not_rescan_the_remainder_4179() {
         ("#1=A(\n", ""),
         ("#1=A(\n", ";"),
         ("#1=A(\n", "ENDSEC;\nEND-ISO-10303-21;\n"),
+        // An unescaped apostrophe resumes at the next anchored declaration,
+        // never by re-walking the remainder from its own `)` (#7541).
+        ("#1=A('x'y);\n", "#2=B('q';\n"),
+        ("#1=A('x'y);\n", "ENDSEC;\nEND-ISO-10303-21;\n"),
     ] {
         let mut content = String::from(DATA_PREAMBLE);
         content.push_str(&body.repeat(RECORDS));
