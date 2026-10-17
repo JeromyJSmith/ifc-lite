@@ -31,6 +31,7 @@ import { toast } from '../components/ui/toast.js';
 import { acquireFederationLoadSlot, releaseFederationLoadSlot } from './federationLoadGate.js';
 import { realignFederatedPointClouds } from './ingest/pointCloudFederationLifecycle.js';
 import { showLoadError } from '@/lib/analytics';
+import { recordIfcxLayerColors } from '../components/viewer/layers/ifcxColorMode.js';
 
 /**
  * Extended data store type for IFCX (IFC5) files.
@@ -471,11 +472,14 @@ export function useIfcFederation(
       }
 
       // Partition meshes by winning source layer and color each mesh by its layer
+      const ifcxLayerColors = new Map<number, [number, number, number, number]>();
+      const ifcxMaterialColors = new Map<number, [number, number, number, number]>();
       const meshesByLayerId = new Map<string, MeshData[]>();
       for (const layer of layers) {
         meshesByLayerId.set(layer.id, []);
       }
       for (const mesh of meshes) {
+        ifcxMaterialColors.set(mesh.expressId, [...mesh.color] as [number, number, number, number]);
         const path = result.idToPath?.get(mesh.expressId);
         const contributingLayers = path ? result.pathToLayers?.get(path) : undefined;
         const winningLayerId = contributingLayers && contributingLayers.length > 0
@@ -483,13 +487,11 @@ export function useIfcFederation(
           : fallbackLayer?.id ?? layers[0]?.id;
         const colorInfo = winningLayerId ? layerColorById.get(winningLayerId) : undefined;
         if (colorInfo) {
-          if (mesh.ifcType === 'IfcWindow') {
-            mesh.color = [0.55, 0.82, 0.96, 0.38];
-          } else if (mesh.ifcType === 'IfcRoof') {
-            mesh.color = [0.46, 0.50, 0.54, 1.0];
-          } else {
-            mesh.color = [...colorInfo.rgba];
-          }
+          // Material mode (default) keeps mesh.color from the file (its diffuseColor). The layer colour is only
+          // recorded here and painted on demand (components/viewer/layers/ifcxColorMode.ts, "Layer").
+          ifcxLayerColors.set(mesh.expressId, mesh.ifcType === 'IfcWindow'
+            ? [0.55, 0.82, 0.96, 0.38]
+            : mesh.ifcType === 'IfcRoof' ? [0.46, 0.50, 0.54, 1.0] : [...colorInfo.rgba] as [number, number, number, number]);
           if (path && !entitySourceLayer.has(mesh.expressId)) {
             entitySourceLayer.set(mesh.expressId, {
               layerId: winningLayerId!,
@@ -637,6 +639,8 @@ export function useIfcFederation(
       if (fallbackLayer) {
         useViewerStore.getState().setActiveModel(fallbackLayer.id);
       }
+
+      recordIfcxLayerColors(ifcxLayerColors, ifcxMaterialColors);
 
       setProgress({ phase: 'Complete', percent: 100 });
       setLoading(false);
