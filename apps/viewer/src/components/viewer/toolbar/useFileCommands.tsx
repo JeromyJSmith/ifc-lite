@@ -29,6 +29,7 @@ import { FederationSetupControls } from '../FederationSetupControls';
 
 import { FILE_ACCEPT, isModelSidecarFile, isSupportedModelFile } from '@/services/supported-model-files';
 import { captureModelTags, restoreModelTags } from '@/lib/model-tags/carry-over';
+import { getGlobalRenderer } from '@/hooks/useBCF';
 
 // FILE_ACCEPT offers `.dxf` while `isSupportedModelFile` rejects it: DXF
 // files are 2D reference underlays, not models, and split off to the DXF
@@ -133,6 +134,89 @@ export function useFileCommands(): FileCommands {
       window.removeEventListener('ifc-lite:load-layer-stack', stackHandler);
     };
   }, [loadFile, addModel, loadFederatedIfcx]);
+
+  const autoloadStartedRef = useRef(false);
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      const win = window as unknown as {
+        __MARPA_VIEWER_STORE__?: typeof useViewerStore;
+        __MARPA_GET_RENDERER__?: typeof getGlobalRenderer;
+      };
+      win.__MARPA_VIEWER_STORE__ = useViewerStore;
+      win.__MARPA_GET_RENDERER__ = getGlobalRenderer;
+    }
+    if (autoloadStartedRef.current) return;
+    if (typeof window === 'undefined') return;
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('autoload') === '0') return;
+    if (useViewerStore.getState().models.size > 0 || useViewerStore.getState().loading) return;
+    autoloadStartedRef.current = true;
+
+    void (async () => {
+      try {
+        const res = await fetch('/ifcx-model/workbench-autoload.json', { cache: 'no-store' });
+        if (!res.ok) return;
+        const manifest = (await res.json()) as {
+          project?: string;
+          ifcx_layers?: Array<{ file: string; color?: string; label?: string }>;
+          ifcxLayers?: Array<{ name?: string; file?: string; url?: string }>;
+          point_clouds?: Array<{ id: string; name: string; file: string; visible?: boolean }>;
+          scans?: Array<{ id: string; name: string; filename?: string; file?: string; url?: string; visible?: boolean }>;
+        };
+        const layerSpecs = manifest.ifcx_layers ?? manifest.ifcxLayers ?? [];
+        if (layerSpecs.length > 0) {
+          const layerFiles = await Promise.all(
+            layerSpecs.map(async (spec) => {
+              const fileName = ('file' in spec && spec.file) ? spec.file : (spec as { name?: string }).name!;
+              const url = ('url' in spec && spec.url) ? spec.url : `/ifcx-model/${fileName}`;
+              const r = await fetch(url, { cache: 'no-store' });
+              if (!r.ok) throw new Error(`Failed to fetch IFCX layer ${url}: ${r.status}`);
+              const buf = await r.arrayBuffer();
+              return new File([buf], fileName, { type: 'application/json' });
+            }),
+          );
+          await loadFederatedIfcx(layerFiles);
+        }
+
+        const scanSpecs = manifest.point_clouds ?? manifest.scans ?? [];
+        const scansParam = params.get('scans');
+        if (scansParam !== '0' && scanSpecs.length > 0) {
+          const loadAllScans = scansParam === 'all';
+          const onlyScans = (!loadAllScans && scansParam)
+            ? scansParam.split(',').map((s) => s.trim()).filter(Boolean)
+            : null;
+          for (const scan of scanSpecs) {
+            if (onlyScans && onlyScans.length > 0) {
+              if (!onlyScans.includes(scan.id)) continue;
+            } else if (!loadAllScans && scan.visible === false) {
+              continue;
+            }
+            const relFile = scan.file ?? (scan as { filename?: string }).filename!;
+            const url = ('url' in scan && scan.url) ? scan.url : `/ifcx-model/${relFile}`;
+            const baseFileName = relFile.split('/').pop() || relFile;
+            const r = await fetch(url, { cache: 'no-store' });
+            if (!r.ok) {
+              console.warn(`[workbench-autoload] Skipping scan ${url}: HTTP ${r.status}`);
+              continue;
+            }
+            const buf = await r.arrayBuffer();
+            const scanFile = new File([buf], baseFileName, { type: 'application/octet-stream' });
+            await addModel(scanFile, {
+              name: scan.name,
+              visible: onlyScans ? true : (scan.visible ?? true),
+            });
+          }
+        }
+        if (useViewerStore.getState().layerStack.length >= 2) {
+          useViewerStore.getState().openWorkspacePanel('layers', 'programmatic');
+          useViewerStore.getState().setSidebarSecondaryPanel('properties');
+          useViewerStore.getState().setSidebarSplitRatio(0.42);
+        }
+      } catch (err) {
+        console.warn('[workbench-autoload] Auto-load skipped or failed:', err);
+      }
+    })();
+  }, [loadFederatedIfcx, addModel]);
 
   const hasModelsLoaded = useViewerStore(selectHasModelsLoaded);
 

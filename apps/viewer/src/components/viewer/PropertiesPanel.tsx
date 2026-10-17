@@ -1248,6 +1248,40 @@ export function PropertiesPanel() {
           </div>
         )}
 
+        {/* IFCX Path, Class & Source Layer Attribution */}
+        {(() => {
+          const sourceMap = (activeDataStore as unknown as {
+            _entitySourceLayer?: Map<number, { layerId: string; layerName: string; colorHex: string; path: string }>;
+          } | null)?._entitySourceLayer;
+          const ifcxSource = selectedEntity ? sourceMap?.get(selectedEntity.expressId) : undefined;
+          if (!ifcxSource) return null;
+          return (
+            <div
+              data-testid="ifcx-source-layer-card"
+              className="border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 px-2.5 py-2 space-y-1 text-2xs font-mono"
+            >
+              <div className="flex items-center justify-between gap-2">
+                <span className="uppercase tracking-wider text-zinc-500 dark:text-zinc-400 font-sans font-bold">Source Layer</span>
+                <span className="inline-flex items-center gap-1.5 font-semibold text-zinc-900 dark:text-zinc-100 truncate">
+                  <span
+                    className="inline-block h-2.5 w-2.5 shrink-0 border border-black/20 dark:border-white/20"
+                    style={{ backgroundColor: ifcxSource.colorHex }}
+                  />
+                  <span className="truncate" title={ifcxSource.layerName}>{ifcxSource.layerName}</span>
+                </span>
+              </div>
+              <div className="flex items-center justify-between gap-2">
+                <span className="uppercase tracking-wider text-zinc-500 dark:text-zinc-400 font-sans font-bold">IFCX Path</span>
+                <span className="text-zinc-800 dark:text-zinc-200 truncate select-all" title={ifcxSource.path}>{ifcxSource.path}</span>
+              </div>
+              <div className="flex items-center justify-between gap-2">
+                <span className="uppercase tracking-wider text-zinc-500 dark:text-zinc-400 font-sans font-bold">IFC Class</span>
+                <span className="text-zinc-800 dark:text-zinc-200 truncate">{entityType}</span>
+              </div>
+            </div>
+          );
+        })()}
+
         {/* Spatial Location */}
         <SpatialLocationBadge spatialInfo={renderedSpatialInfo} />
 

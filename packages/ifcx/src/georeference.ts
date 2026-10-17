@@ -5,7 +5,7 @@ import type { ComposedNode } from './types.js';
 
 /** Canonical EXPRESS names on the wire; consumers map to their own georef types. */
 export function extractGeoreference(composed: Map<string, ComposedNode>): {
-  IfcProjectedCRS: { Name: string; MapUnit: 'METRE' };
+  IfcProjectedCRS: { Name: string; MapUnit: 'METRE'; VerticalDatum?: string };
   IfcMapConversion: { Eastings: number; Northings: number; OrthogonalHeight: number;
     XAxisAbscissa: number; XAxisOrdinate: number; Scale: number };
 } | undefined {
@@ -15,11 +15,12 @@ export function extractGeoreference(composed: Map<string, ComposedNode>): {
     if (value === undefined) continue;
     const raw = object(value); const crs = object(raw.IfcProjectedCRS); const map = object(raw.IfcMapConversion);
     if (typeof crs.Name !== 'string' || !/^EPSG:\d+$/.test(crs.Name) || crs.MapUnit !== 'METRE') throw new Error('Invalid IFCX projected CRS.');
+    const VerticalDatum = typeof crs.VerticalDatum === 'string' && crs.VerticalDatum.trim().length > 0 ? crs.VerticalDatum.trim() : undefined;
     const Eastings = number(map.Eastings); const Northings = number(map.Northings);
     const OrthogonalHeight = number(map.OrthogonalHeight); const XAxisAbscissa = number(map.XAxisAbscissa);
     const XAxisOrdinate = number(map.XAxisOrdinate); const Scale = number(map.Scale);
     if (Scale <= 0 || Math.hypot(XAxisAbscissa, XAxisOrdinate) < 1e-12) throw new Error('Invalid IFCX map conversion.');
-    const next = { IfcProjectedCRS: { Name: crs.Name, MapUnit: 'METRE' as const },
+    const next = { IfcProjectedCRS: { Name: crs.Name, MapUnit: 'METRE' as const, ...(VerticalDatum ? { VerticalDatum } : {}) },
       IfcMapConversion: { Eastings, Northings, OrthogonalHeight, XAxisAbscissa, XAxisOrdinate, Scale } };
     const previous = result;
     const coordinates = ['Eastings', 'Northings', 'OrthogonalHeight', 'XAxisAbscissa', 'XAxisOrdinate', 'Scale'] as const;

@@ -46,6 +46,10 @@ export interface LayerStackEntry {
   /** Check evidence attached to the manifest: passed / total. */
   checksPassed?: number;
   checksTotal?: number;
+  /** Distinct layer colour hex (#rrggbb) assigned in federated IFCX composition. */
+  colorHex?: string;
+  /** Number of 3D meshes whose winning opinion comes from this layer. */
+  meshCount?: number;
 }
 
 /** A computed per-layer contribution diff: prefix-below vs prefix-including. */

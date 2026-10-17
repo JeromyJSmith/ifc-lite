@@ -120,6 +120,10 @@ function LayerStratum({
   if (created) subParts.push(created);
   subParts.push(t('layersPanel.panel.nodeCount', { count: entry.nodeCount, countDisplay: String(entry.nodeCount) }));
 
+  if (typeof entry.meshCount === 'number') {
+    subParts.push(`${entry.meshCount} meshes`);
+  }
+
   return (
     <div
       className={`group relative flex animate-in fade-in slide-in-from-top-1 items-stretch gap-2 rounded-md border bg-card/50 py-1.5 pl-0 pr-1.5 transition-colors hover:bg-muted/50 ${
@@ -127,8 +131,12 @@ function LayerStratum({
       }`}
       style={{ animationDelay: `${(position - 1) * 40}ms`, animationFillMode: 'backwards' }}
     >
-      {/* Stratum accent: author-kind tinted, the panel's one signature detail. */}
-      <span className={`w-[3px] shrink-0 self-stretch rounded-full ${accentClass(entry.authorKind)}`} aria-hidden />
+      {/* Stratum accent: layer color when available, otherwise author-kind tinted. */}
+      <span
+        className={`w-[4px] shrink-0 self-stretch rounded-full ${entry.colorHex ? '' : accentClass(entry.authorKind)}`}
+        style={entry.colorHex ? { backgroundColor: entry.colorHex } : undefined}
+        aria-hidden
+      />
       <button
         type="button"
         className="min-w-0 flex-1 text-left"
@@ -140,6 +148,13 @@ function LayerStratum({
           <span className="shrink-0 rounded bg-muted px-1 font-mono text-2xs leading-4 text-muted-foreground">
             {total - position + 1}
           </span>
+          {entry.colorHex && (
+            <span
+              className="inline-block size-2.5 shrink-0 rounded-sm border border-black/20 dark:border-white/20"
+              style={{ backgroundColor: entry.colorHex }}
+              title={`Layer color: ${entry.colorHex}`}
+            />
+          )}
           <span className="truncate text-xs font-medium" title={entry.name}>
             {entry.name}
           </span>

@@ -374,11 +374,11 @@ export function HierarchyNode({
         )}
 
         {isMultiModel && node.type !== 'model-header' && node.modelIds.length === 1 && (
-          <ModelBadge modelId={node.modelId ?? node.modelIds[0]} className="max-w-24 shrink-0" />
+          <ModelBadge modelId={node.modelId ?? node.modelIds[0]} className="hidden @[300px]:inline-flex max-w-24 shrink-0" />
         )}
 
         {node.ifcType && (node.type === 'element' || node.type === 'group-member') && (
-          <span className="text-2xs font-mono text-zinc-400 dark:text-zinc-500 truncate max-w-[90px]">
+          <span className="hidden @[250px]:inline text-2xs font-mono text-zinc-400 dark:text-zinc-500 truncate max-w-[90px]">
             {node.ifcType}
           </span>
         )}

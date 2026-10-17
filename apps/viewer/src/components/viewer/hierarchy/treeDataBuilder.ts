@@ -149,6 +149,7 @@ export function buildUnifiedStoreys(
   const storeysByElevation = new Map<string, UnifiedStorey>();
 
   for (const [modelId, model] of models) {
+    if ((model as FederatedModel & { _isOverlay?: boolean })._isOverlay) continue;
     const dataStore = model.ifcDataStore;
     if (!dataStore?.spatialHierarchy) continue;
 
@@ -700,6 +701,7 @@ export function buildTypeTree(
   // Process all models
   if (models.size > 0) {
     for (const [modelId, model] of models) {
+      if ((model as FederatedModel & { _isOverlay?: boolean })._isOverlay) continue;
       if (model.ifcDataStore) {
         processDataStore(model.ifcDataStore, modelId);
       }
@@ -876,6 +878,7 @@ export function buildIfcTypeTree(
 
   if (models.size > 0) {
     for (const [modelId, model] of models) {
+      if ((model as FederatedModel & { _isOverlay?: boolean })._isOverlay) continue;
       if (model.ifcDataStore) {
         processDataStore(model.ifcDataStore, modelId);
       }

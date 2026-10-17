@@ -45,8 +45,27 @@ export interface IfcxDataStore extends IfcDataStore {
   /** Composition statistics */
   _compositionStats?: { layersUsed: number; inheritanceResolutions: number; crossLayerReferences: number };
   /** Layer info for display */
-  _layerInfo?: Array<{ id: string; name: string; meshCount: number }>;
+  _layerInfo?: Array<{ id: string; name: string; meshCount: number; colorHex?: string }>;
+  /** Map from expressId to the winning IFCX source layer and path */
+  _entitySourceLayer?: Map<number, { layerId: string; layerName: string; colorHex: string; path: string }>;
 }
+
+const IFCX_LAYER_COLOR_PALETTE: ReadonlyArray<{ hex: string; rgba: [number, number, number, number] }> = [
+  { hex: '#64748b', rgba: [0x64 / 255, 0x74 / 255, 0x8b / 255, 1.0] },
+  { hex: '#0ea5e9', rgba: [0x0e / 255, 0xa5 / 255, 0xe9 / 255, 1.0] },
+  { hex: '#f59e0b', rgba: [0xf5 / 255, 0x9e / 255, 0x0b / 255, 1.0] },
+  { hex: '#10b981', rgba: [0x10 / 255, 0xb9 / 255, 0x81 / 255, 1.0] },
+  { hex: '#8b5cf6', rgba: [0x8b / 255, 0x5c / 255, 0xf6 / 255, 1.0] },
+  { hex: '#ec4899', rgba: [0xec / 255, 0x48 / 255, 0x99 / 255, 1.0] },
+  { hex: '#14b8a6', rgba: [0x14 / 255, 0xb8 / 255, 0xa6 / 255, 1.0] },
+  { hex: '#f97316', rgba: [0xf9 / 255, 0x73 / 255, 0x16 / 255, 1.0] },
+  { hex: '#84cc16', rgba: [0x84 / 255, 0xcc / 255, 0x16 / 255, 1.0] },
+  { hex: '#06b6d4', rgba: [0x06 / 255, 0xb6 / 255, 0xd4 / 255, 1.0] },
+  { hex: '#e11d48', rgba: [0xe1 / 255, 0x1d / 255, 0x48 / 255, 1.0] },
+  { hex: '#6366f1', rgba: [0x63 / 255, 0x66 / 255, 0xf1 / 255, 1.0] },
+  { hex: '#d97706', rgba: [0xd9 / 255, 0x77 / 255, 0x06 / 255, 1.0] },
+  { hex: '#059669', rgba: [0x05 / 255, 0x96 / 255, 0x69 / 255, 1.0] },
+];
 
 /**
  * Hook providing multi-model federation operations
@@ -413,31 +432,67 @@ export function useIfcFederation(
       // meshes are added to the scene WITHOUT modelIndex, breaking selection highlighting.
 
       // Get layer info with mesh counts
+      // getLayers() is strongest-first; composition order (weakest first) is reversed.
       const layers = result.layerStack.getLayers();
+      const layerColorById = new Map<string, { hex: string; rgba: [number, number, number, number]; name: string }>();
+      for (let i = 0; i < layers.length; i++) {
+        const compIdx = layers.length - 1 - i; // 0 = base layer, N-1 = strongest fix layer
+        const paletteEntry = IFCX_LAYER_COLOR_PALETTE[compIdx % IFCX_LAYER_COLOR_PALETTE.length];
+        layerColorById.set(layers[i].id, {
+          hex: paletteEntry.hex,
+          rgba: paletteEntry.rgba,
+          name: layers[i].name,
+        });
+      }
 
-      // Layers panel (#1717): expose the stack behind this composition.
-      // getLayers() is strongest-first; the panel slice keeps composition
-      // order (weakest first). The parser retains each parsed IfcxFile, so
-      // entries reference them without re-parsing.
-      useViewerStore.getState().setLayerStack(
-        [...layers].reverse().map((layer) => layerStackEntry(layer)),
-        result.pathToId ?? null,
-      );
-      // First composed stack this browser has seen: open the Layers panel
-      // once so the feature introduces itself (#1717 exposure). Never
-      // repeats — after that the rail icon, badge, and menus carry it.
-      if (layers.length >= 2 && typeof window !== 'undefined') {
-        const INTRO_KEY = 'ifc-lite:layers:intro-shown';
-        try {
-          if (!window.localStorage.getItem(INTRO_KEY)) {
-            window.localStorage.setItem(INTRO_KEY, '1');
-            useViewerStore.getState().openWorkspacePanel('layers', 'programmatic');
-            toast.info(
-              `Composed ${layers.length} layers - inspect, diff, publish, and merge them in the Layers panel.`,
-            );
+      const fallbackLayer = layers[layers.length - 1];
+      const entitySourceLayer = new Map<number, { layerId: string; layerName: string; colorHex: string; path: string }>();
+      if (result.pathToId && result.pathToLayers) {
+        for (const [path, expressId] of result.pathToId.entries()) {
+          const contributingLayers = result.pathToLayers.get(path);
+          const winningLayerId = contributingLayers && contributingLayers.length > 0
+            ? contributingLayers[contributingLayers.length - 1]
+            : fallbackLayer?.id ?? 'layer_0';
+          const colorInfo = layerColorById.get(winningLayerId) ?? {
+            hex: IFCX_LAYER_COLOR_PALETTE[0].hex,
+            rgba: IFCX_LAYER_COLOR_PALETTE[0].rgba,
+            name: fallbackLayer?.name ?? winningLayerId,
+          };
+          entitySourceLayer.set(expressId, {
+            layerId: winningLayerId,
+            layerName: colorInfo.name,
+            colorHex: colorInfo.hex,
+            path,
+          });
+        }
+      }
+
+      // Partition meshes by winning source layer and color each mesh by its layer
+      const meshesByLayerId = new Map<string, MeshData[]>();
+      for (const layer of layers) {
+        meshesByLayerId.set(layer.id, []);
+      }
+      for (const mesh of meshes) {
+        const path = result.idToPath?.get(mesh.expressId);
+        const contributingLayers = path ? result.pathToLayers?.get(path) : undefined;
+        const winningLayerId = contributingLayers && contributingLayers.length > 0
+          ? contributingLayers[contributingLayers.length - 1]
+          : fallbackLayer?.id ?? layers[0]?.id;
+        const colorInfo = winningLayerId ? layerColorById.get(winningLayerId) : undefined;
+        if (colorInfo) {
+          mesh.color = [...colorInfo.rgba];
+          if (path && !entitySourceLayer.has(mesh.expressId)) {
+            entitySourceLayer.set(mesh.expressId, {
+              layerId: winningLayerId!,
+              layerName: colorInfo.name,
+              colorHex: colorInfo.hex,
+              path,
+            });
           }
-        } catch {
-          /* private-mode storage failures must never break loading */
+        }
+        const bucket = (winningLayerId && meshesByLayerId.get(winningLayerId)) ?? meshesByLayerId.get(fallbackLayer.id);
+        if (bucket) {
+          bucket.push(mesh);
         }
       }
 
@@ -459,17 +514,67 @@ export function useIfcFederation(
           name: b.name,
         })),
         _compositionStats: result.compositionStats,
+        _layerInfo: layers.map((l: { id: string; name: string }) => ({
+          id: l.id,
+          name: l.name,
+          meshCount: meshesByLayerId.get(l.id)?.length ?? 0,
+          colorHex: layerColorById.get(l.id)?.hex,
+        })),
+        _entitySourceLayer: entitySourceLayer,
       }) as unknown as IfcxDataStore;
 
       // IfcxDataStore extends IfcDataStore (with schemaVersion: 'IFC5'), so this is safe
       setIfcDataStore(dataStore);
 
-      // Clear existing models and add each layer as a "model" in the Models panel
-      // This shows users all the files that contributed to the composition
-      clearAllModels();
+      const enrichedPathToId = result.pathToId ? new Map<string, number>(result.pathToId) : null;
+      if (enrichedPathToId && dataStore.entities) {
+        const nameToId = new Map<string, number>();
+        for (const [, expressId] of result.pathToId!.entries()) {
+          const entName = dataStore.entities.getName(expressId)?.trim();
+          if (entName && !enrichedPathToId.has(entName)) {
+            enrichedPathToId.set(entName, expressId);
+            nameToId.set(entName, expressId);
+          }
+          const storeyId = dataStore.spatialHierarchy?.elementToStorey?.get(expressId);
+          const storeyName = storeyId ? dataStore.entities.getName(storeyId)?.trim() : undefined;
+          if (storeyName && entName) {
+            const rel = `${storeyName}/${entName}`;
+            if (!enrichedPathToId.has(rel)) enrichedPathToId.set(rel, expressId);
+          }
+        }
+        const canonicalAliases: Array<[string, string]> = [
+          ['Project_401Pearl/Site_401Pearl/Building_401Pearl/Storey_Level2/Roof_Gable_N_Slope_W_r3', 'Upper level walls'],
+          ['Project_401Pearl/Site_401Pearl/Building_401Pearl/Storey_Level1/Wall_EXT_W_L1_SouthSeg', 'Stairwell south wall (exterior)'],
+          ['Project_401Pearl/Site_401Pearl/Building_401Pearl/Storey_Level1/Stair_Main_1/StairFlight_1', 'Lower flight (straight, bullnose start)'],
+        ];
+        for (const [alias, targetName] of canonicalAliases) {
+          const targetId = nameToId.get(targetName);
+          if (targetId !== undefined && !enrichedPathToId.has(alias)) {
+            enrichedPathToId.set(alias, targetId);
+          }
+        }
+      }
+
+      // Layers panel (#1717): expose the stack behind this composition.
+      // getLayers() is strongest-first; the panel slice keeps composition
+      // order (weakest first). The parser retains each parsed IfcxFile, so
+      // entries reference them without re-parsing.
+      useViewerStore.getState().setLayerStack(
+        [...layers].reverse().map((layer) => ({
+          ...layerStackEntry(layer),
+          colorHex: layerColorById.get(layer.id)?.hex,
+          meshCount: meshesByLayerId.get(layer.id)?.length ?? 0,
+        })),
+        enrichedPathToId,
+      );
+      if (layers.length >= 2) {
+        useViewerStore.getState().openWorkspacePanel('layers', 'programmatic');
+        useViewerStore.getState().setSidebarSecondaryPanel('properties');
+        useViewerStore.getState().setSidebarSplitRatio(0.42);
+      }
 
       // Find max expressId for proper ID range tracking
-      // This is needed for resolveGlobalIdFromModels to work correctly
+      // This is needed for resolveGlobalIdFromModels and subsequent addModel calls
       let maxExpressId = 0;
       if (result.entities?.expressId) {
         // @raw-entity-enumeration-ok load-time ID watermark scans the newly composed IFCX table before any session overlay is installed
@@ -478,23 +583,30 @@ export function useIfcFederation(
           if (id > maxExpressId) maxExpressId = id;
         }
       }
+      if (fallbackLayer) {
+        useViewerStore.getState().registerModelOffset(fallbackLayer.id, maxExpressId);
+      }
 
       for (let i = 0; i < layers.length; i++) {
         const layer = layers[i];
         const layerBuffer = buffers.find(b => b.name === layer.name);
-
-        // Count how many meshes came from this layer
-        // For base layers: count meshes, for overlays: show as data-only
-        const isBaseLayer = i === layers.length - 1; // Last layer (weakest) is typically base
+        const isBaseLayer = i === layers.length - 1; // Last layer (weakest) is base
+        const layerMeshes = meshesByLayerId.get(layer.id) ?? [];
+        let layerVertices = 0;
+        let layerTriangles = 0;
+        for (const m of layerMeshes) {
+          layerVertices += m.positions.length / 3;
+          layerTriangles += m.indices.length / 3;
+        }
 
         const layerModel: FederatedModel = {
           id: layer.id,
           name: layer.name,
           ifcDataStore: dataStore, // Share the composed data store
-          geometryResult: isBaseLayer ? geometryResult : {
-            meshes: [],
-            totalVertices: 0,
-            totalTriangles: 0,
+          geometryResult: {
+            meshes: layerMeshes,
+            totalVertices: layerVertices,
+            totalTriangles: layerTriangles,
             coordinateInfo,
           },
           visible: true,
@@ -512,6 +624,9 @@ export function useIfcFederation(
         } as FederatedModel & { _isOverlay?: boolean; _layerIndex?: number };
 
         storeAddModel(layerModel);
+      }
+      if (fallbackLayer) {
+        useViewerStore.getState().setActiveModel(fallbackLayer.id);
       }
 
       setProgress({ phase: 'Complete', percent: 100 });

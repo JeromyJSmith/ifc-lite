@@ -214,6 +214,43 @@ const appVersion = viewerPkg.version || rootPkg.version;
 // GITHUB_SHA; falls back to 'dev' for local builds.
 const buildSha = (process.env.VERCEL_GIT_COMMIT_SHA || process.env.GITHUB_SHA || 'dev').slice(0, 12);
 
+const MARPA_IFCX_MODEL_DIR = process.env.MARPA_IFCX_MODEL_DIR
+  || '/Volumes/MARPA/projects/marpa/0001-401-pearl/02_extract/building-model/ifcx-model';
+
+function marpaIfcxModelStatic() {
+  return {
+    name: 'marpa-ifcx-model-static',
+    configureServer(server: { middlewares: { use: (fn: (req: any, res: any, next: () => void) => void) => void } }) {
+      server.middlewares.use((req, res, next) => {
+        if (!req.url || !req.url.startsWith('/ifcx-model/')) {
+          return next();
+        }
+        const relPath = decodeURIComponent(req.url.split('?')[0].slice('/ifcx-model/'.length));
+        const resolved = path.resolve(MARPA_IFCX_MODEL_DIR, relPath);
+        if (!resolved.startsWith(path.resolve(MARPA_IFCX_MODEL_DIR) + path.sep) || !fs.existsSync(resolved)) {
+          res.statusCode = 404;
+          res.end('Not found');
+          return;
+        }
+        const stat = fs.statSync(resolved);
+        if (!stat.isFile()) {
+          res.statusCode = 404;
+          res.end('Not found');
+          return;
+        }
+        const ext = path.extname(resolved).toLowerCase();
+        const contentType = ext === '.json' || ext === '.ifcx'
+          ? 'application/json; charset=utf-8'
+          : 'application/octet-stream';
+        res.setHeader('Content-Type', contentType);
+        res.setHeader('Content-Length', String(stat.size));
+        res.setHeader('Cache-Control', 'no-store');
+        fs.createReadStream(resolved).pipe(res);
+      });
+    },
+  };
+}
+
 export default defineConfig({
   plugins: [
     react(),
@@ -244,6 +281,7 @@ export default defineConfig({
     // relay. Dev runs the SAME handler production does (#2792), rather than a
     // second proxy config that can drift from it.
     daluxRelayRoute(),
+    marpaIfcxModelStatic(),
   ],
   define: {
     __APP_VERSION__: JSON.stringify(appVersion),

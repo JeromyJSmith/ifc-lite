@@ -163,7 +163,15 @@ export function buildIfcxDataStore(ifcxResult: IfcxStoreInput, buffer: ArrayBuff
     spatialHierarchy: ifcxResult.spatialHierarchy,
     georeferencing: ifcxResult.georeferencing ? {
       hasGeoreference: true, source: 'mapConversion',
-      projectedCRS: { id: 0, name: ifcxResult.georeferencing.IfcProjectedCRS.Name, mapUnit: 'METRE', mapUnitScale: 1 },
+      projectedCRS: {
+        id: 0,
+        name: ifcxResult.georeferencing.IfcProjectedCRS.Name,
+        ...(ifcxResult.georeferencing.IfcProjectedCRS.VerticalDatum
+          ? { verticalDatum: ifcxResult.georeferencing.IfcProjectedCRS.VerticalDatum }
+          : {}),
+        mapUnit: 'METRE',
+        mapUnitScale: 1,
+      },
       mapConversion: { id: 0, sourceCRS: 0, targetCRS: 0,
         eastings: ifcxResult.georeferencing.IfcMapConversion.Eastings,
         northings: ifcxResult.georeferencing.IfcMapConversion.Northings,

@@ -601,7 +601,12 @@ export const createModelSlice: StateCreator<ViewerState, [], [], ModelSlice> = (
     // parse-time id of the second.
     for (const model of sortedModels) {
       const localId = localIdInParseRange(model, globalId);
-      if (localId !== null) return { modelId: model.id, expressId: localId };
+      if (localId !== null) {
+        const winningLayerId = (model.ifcDataStore as { _entitySourceLayer?: Map<number, { layerId: string }> } | null)
+          ?._entitySourceLayer?.get(localId)?.layerId;
+        const resolvedModelId = winningLayerId && models.has(winningLayerId) ? winningLayerId : model.id;
+        return { modelId: resolvedModelId, expressId: localId };
+      }
     }
 
     for (const model of sortedModels) {
