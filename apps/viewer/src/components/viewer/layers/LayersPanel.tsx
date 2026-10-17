@@ -34,6 +34,7 @@ import { loadDemoLayerStack } from '@/lib/layers/demo-stack';
 import { toast } from '@/components/ui/toast';
 import { tourAnchor, TOUR_ANCHORS } from '@/lib/tours/anchors';
 import { AssistantAction } from '@/components/viewer/assistant/AssistantAction';
+import { GaussianSplatToggle } from '@/components/viewer/splat/GaussianSplatToggle';
 
 interface LayersPanelProps {
   onClose: () => void;
@@ -331,6 +332,7 @@ export function LayersPanel(_props: LayersPanelProps) {
       </div>
       <ScrollArea className="min-h-0 flex-1">
         <div className="flex flex-col gap-1 px-2 pb-2">
+          <GaussianSplatToggle />
           <div {...tourAnchor(TOUR_ANCHORS.layersDraft)}>
             <LayerDraftSection />
           </div>
