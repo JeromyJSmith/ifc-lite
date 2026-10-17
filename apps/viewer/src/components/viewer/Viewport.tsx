@@ -1488,6 +1488,36 @@ export function Viewport({
       ? { background: COLORFUL_CANVAS_GRADIENT }
       : undefined;
 
+  const [navHelpExpanded, setNavHelpExpanded] = useState(true);
+
+  const teleportCameraUVZ = useCallback(
+    (eyeU: number, eyeV: number, eyeZ: number, tgtU: number, tgtV: number, tgtZ: number) => {
+      const renderer = rendererRef.current;
+      if (!renderer) return;
+      const cam = renderer.getCamera();
+      const ang = (-14.6547 * Math.PI) / 180;
+      const c = Math.cos(ang);
+      const s = Math.sin(ang);
+      const toGL = (u: number, v: number, z: number) => {
+        const xIfc = c * u + s * v;
+        const yIfc = -s * u + c * v;
+        return { x: xIfc, y: z, z: -yIfc };
+      };
+      const p = toGL(eyeU, eyeV, eyeZ);
+      const tPos = toGL(tgtU, tgtV, tgtZ);
+      cam.stopInertia();
+      cam.setUp(0, 1, 0);
+      cam.setPosition(p.x, p.y, p.z);
+      cam.setTarget(tPos.x, tPos.y, tPos.z);
+      cam.setOrbitCenter(tPos);
+      renderer.requestRender();
+      updateCameraRotationRealtime(cam.getRotation());
+      calculateScale();
+      focusViewportForKeyboardShortcuts();
+    },
+    [calculateScale, focusViewportForKeyboardShortcuts, updateCameraRotationRealtime],
+  );
+
   return (
     <div className="relative w-full h-full">
       <canvas
@@ -1498,6 +1528,83 @@ export function Viewport({
         style={{ touchAction: 'none', ...canvasStyle }}
         onPointerDown={focusViewportForKeyboardShortcuts}
       />
+      {/* Quick-Teleport & Collision-Free Navigation HUD */}
+      <div
+        data-testid="marpa-nav-hud"
+        className="absolute top-2.5 left-2.5 z-20 flex flex-col gap-1.5 rounded-lg border border-white/15 bg-slate-950/85 px-2.5 py-2 text-[11px] text-slate-100 shadow-lg backdrop-blur-md select-none max-w-[540px]"
+      >
+        <div className="flex flex-wrap items-center gap-1">
+          <span className="font-semibold text-emerald-400 mr-1">Go To:</span>
+          <button
+            type="button"
+            onClick={() => teleportCameraUVZ(-1.35, -21.0, 3.8, -1.35, -6.3, 3.8)}
+            className="rounded bg-slate-800 hover:bg-emerald-600/80 px-2 py-0.5 font-medium transition-colors"
+            title="Look perpendicular to South Gable & East Wing"
+          >
+            South Gable (Front)
+          </button>
+          <button
+            type="button"
+            onClick={() => teleportCameraUVZ(-2.03, -8.8, 1.65, -2.03, -2.0, 1.65)}
+            className="rounded bg-slate-800 hover:bg-emerald-600/80 px-2 py-0.5 font-medium transition-colors"
+            title="Stand outside the Front Entry Door looking inside"
+          >
+            Front Door
+          </button>
+          <button
+            type="button"
+            onClick={() => teleportCameraUVZ(-4.2, -5.2, 1.65, -4.0, 1.5, 1.65)}
+            className="rounded bg-slate-800 hover:bg-emerald-600/80 px-2 py-0.5 font-medium transition-colors"
+            title="Teleport inside the Main Level Living Room (no wall collision)"
+          >
+            Inside Living (L1)
+          </button>
+          <button
+            type="button"
+            onClick={() => teleportCameraUVZ(-2.1, -3.7, 1.65, 0.4, -4.2, 1.85)}
+            className="rounded bg-slate-800 hover:bg-emerald-600/80 px-2 py-0.5 font-medium transition-colors"
+            title="Teleport inside the Stairwell looking at the flights & windows"
+          >
+            Inside Stairwell
+          </button>
+          <button
+            type="button"
+            onClick={() => teleportCameraUVZ(-2.9, -4.8, 4.5, -2.9, 1.0, 4.5)}
+            className="rounded bg-slate-800 hover:bg-emerald-600/80 px-2 py-0.5 font-medium transition-colors"
+            title="Teleport inside the Upper Level under the Gable Roof"
+          >
+            Inside Upper (L2)
+          </button>
+          <button
+            type="button"
+            onClick={() => teleportCameraUVZ(10.5, -3.1, 3.5, 1.5, -3.1, 3.5)}
+            className="rounded bg-slate-800 hover:bg-emerald-600/80 px-2 py-0.5 font-medium transition-colors"
+            title="Look at the East Cross-Gable Wing"
+          >
+            East Wing
+          </button>
+          <button
+            type="button"
+            onClick={() => setNavHelpExpanded((v) => !v)}
+            className="ml-auto rounded bg-slate-800/70 hover:bg-slate-700 px-1.5 py-0.5 text-[10px] text-slate-300"
+            title="Toggle controls legend"
+          >
+            {navHelpExpanded ? 'Hide Keys' : 'Controls ?'}
+          </button>
+        </div>
+        {navHelpExpanded && (
+          <div className="flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-[10px] text-slate-300 border-t border-white/10 pt-1">
+            <span><strong className="text-white">Scroll:</strong> Zoom Through Any Door/Wall</span>
+            <span><strong className="text-white">W/S or ↑/↓:</strong> Move Forward/Back</span>
+            <span><strong className="text-white">A/D or ←/→:</strong> Left/Right</span>
+            <span><strong className="text-white">Q/E:</strong> Down/Up</span>
+            <span><strong className="text-white">Shift:</strong> Fast</span>
+            <span><strong className="text-white">L-Drag:</strong> Orbit</span>
+            <span><strong className="text-white">R-Drag:</strong> Look/Fly</span>
+            <span><strong className="text-white">Mid-Drag:</strong> Pan</span>
+          </div>
+        )}
+      </div>
       {initError && (
         <div className="absolute inset-0 flex items-center justify-center bg-background/90 z-50 p-4">
           <div className="text-center max-w-sm space-y-3">
@@ -1512,12 +1619,6 @@ export function Viewport({
           </div>
         </div>
       )}
-      {/* Rectangle-select drag visual. Pointer-events:none so the
-          canvas keeps receiving pointer events during the drag. Its own
-          scene-overlay kernel instance (#5512): a stub-select drag has no
-          natural ancestor `SceneOverlayRoot` this close to the canvas, and
-          the rect is already screen-space so it needs only the shared SVG
-          layer/portal, not the projector. */}
       <SceneOverlayRoot>
         <RectSelectionOverlay rect={rectSelection} />
       </SceneOverlayRoot>

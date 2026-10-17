@@ -50,11 +50,51 @@ export function getViewerSchemaVersion(dataStore: IfcDataStore | null): SchemaVe
   return 'IFC2X3';
 }
 
+function computeIfcxGeometryFingerprint(
+  positions: Float32Array,
+  indices: Uint32Array,
+): { geometryHash: bigint; geometryAabb?: MeshData['geometryAabb'] } {
+  let hash = 0xcbf29ce484222325n;
+  const prime = 0x100000001b3n;
+  const mask = 0xffffffffffffffffn;
+  let minX = Infinity;
+  let minY = Infinity;
+  let minZ = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  let maxZ = -Infinity;
+  for (let i = 0; i + 2 < positions.length; i += 3) {
+    const x = positions[i];
+    const y = positions[i + 1];
+    const z = positions[i + 2];
+    if (x < minX) minX = x;
+    if (y < minY) minY = y;
+    if (z < minZ) minZ = z;
+    if (x > maxX) maxX = x;
+    if (y > maxY) maxY = y;
+    if (z > maxZ) maxZ = z;
+    const qx = BigInt(Math.round(x * 1000)) & 0xffffffffn;
+    const qy = BigInt(Math.round(y * 1000)) & 0xffffffffn;
+    const qz = BigInt(Math.round(z * 1000)) & 0xffffffffn;
+    hash = ((hash ^ qx) * prime) & mask;
+    hash = ((hash ^ qy) * prime) & mask;
+    hash = ((hash ^ qz) * prime) & mask;
+  }
+  for (let i = 0; i < indices.length; i++) {
+    hash = ((hash ^ BigInt(indices[i])) * prime) & mask;
+  }
+  const geometryAabb = Number.isFinite(minX)
+    ? { min: [minX, minY, minZ] as [number, number, number], max: [maxX, maxY, maxZ] as [number, number, number] }
+    : undefined;
+  return { geometryHash: hash, geometryAabb };
+}
+
 export function convertIfcxMeshes(rawMeshes: RawIfcxMesh[]): MeshData[] {
   return rawMeshes.map((mesh) => {
     const positions = mesh.positions instanceof Float32Array ? mesh.positions : new Float32Array(mesh.positions || []);
     const indices = mesh.indices instanceof Uint32Array ? mesh.indices : new Uint32Array(mesh.indices || []);
     const normals = mesh.normals instanceof Float32Array ? mesh.normals : new Float32Array(mesh.normals || []);
+    const { geometryHash, geometryAabb } = computeIfcxGeometryFingerprint(positions, indices);
 
     return {
       expressId: mesh.expressId ?? mesh.express_id ?? mesh.id ?? 0,
@@ -65,6 +105,8 @@ export function convertIfcxMeshes(rawMeshes: RawIfcxMesh[]): MeshData[] {
       texture: mesh.texture,
       color: normalizeColor(mesh.color),
       ifcType: mesh.ifcType ?? mesh.ifc_type ?? 'IfcProduct',
+      geometryHash,
+      geometryAabb,
     };
   }).filter((mesh) => mesh.positions.length > 0 && mesh.indices.length > 0);
 }
@@ -184,7 +226,7 @@ export function buildIfcxDataStore(ifcxResult: IfcxStoreInput, buffer: ArrayBuff
   } as unknown as IfcStoreData);
 
   const entityTable = ifcxResult.entities;
-  const idsByType = new Map<string, number[]>();
+  const idsByType = dataStore.entityIndex.byType;
   const knownIds = new Set<number>();
   for (const id of entityTable.expressId) {
     if (!id) continue;

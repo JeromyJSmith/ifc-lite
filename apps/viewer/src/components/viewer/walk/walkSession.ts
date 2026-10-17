@@ -69,7 +69,7 @@ export type WalkSpawn = 'floor-below' | 'view-target' | 'ground-plane' | 'free';
 
 export class WalkSession {
   readonly character: WalkCharacter;
-  physics = true;
+  physics = false;
   private accumulator = 0;
   private prevX = 0; private prevY = 0; private prevZ = 0;
   private visualY = 0;

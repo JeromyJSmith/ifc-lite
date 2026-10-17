@@ -796,9 +796,9 @@ export function useMouseControls(params: UseMouseControlsParams): void {
       if (wheel.zoom) {
         applyWheelZoom(e, {
           camera, canvas,
-          fastZoom: e.shiftKey || params.fastZoomRef.current,
+          fastZoom: e.shiftKey || params.fastZoomRef.current || camera.getDistance() < 6.0,
           fineModifierHeld: fineZoomModifier.isHeld(),
-          pickSurface: createZoomSurfacePicker(renderer, camera, getPickOptions), // #5393
+          pickSurface: undefined,
         });
       }
       if (!wheel.panX && !wheel.panY && !wheel.zoom) return;

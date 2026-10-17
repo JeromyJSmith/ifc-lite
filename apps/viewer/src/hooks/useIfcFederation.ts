@@ -415,9 +415,12 @@ export function useIfcFederation(
       // Convert IFCX meshes to viewer format
       const meshes: MeshData[] = convertIfcxMeshes(result.meshes);
 
-      // Calculate bounds
+      // Calculate bounds and align ViewCube presets orthogonal to the 401 Pearl house frame (+14.6547 deg)
       const { bounds, stats } = calculateMeshBounds(meshes);
-      const coordinateInfo = createCoordinateInfo(bounds);
+      const coordinateInfo = {
+        ...createCoordinateInfo(bounds),
+        buildingRotation: (14.6547 * Math.PI) / 180,
+      };
 
       const geometryResult = {
         meshes,
@@ -480,7 +483,13 @@ export function useIfcFederation(
           : fallbackLayer?.id ?? layers[0]?.id;
         const colorInfo = winningLayerId ? layerColorById.get(winningLayerId) : undefined;
         if (colorInfo) {
-          mesh.color = [...colorInfo.rgba];
+          if (mesh.ifcType === 'IfcWindow') {
+            mesh.color = [0.55, 0.82, 0.96, 0.38];
+          } else if (mesh.ifcType === 'IfcRoof') {
+            mesh.color = [0.46, 0.50, 0.54, 1.0];
+          } else {
+            mesh.color = [...colorInfo.rgba];
+          }
           if (path && !entitySourceLayer.has(mesh.expressId)) {
             entitySourceLayer.set(mesh.expressId, {
               layerId: winningLayerId!,
@@ -614,10 +623,10 @@ export function useIfcFederation(
           schemaVersion: 'IFC5',
           loadedAt: Date.now() - (layers.length - i) * 100, // Stagger timestamps
           fileSize: layerBuffer?.buffer.byteLength || 0,
-          // For base layer: set proper ID range for resolveGlobalIdFromModels
-          // Overlays share the same data store so they don't need their own range
+          // All federated IFCX layers share idOffset 0 and the composed entity table,
+          // so every layer needs maxExpressId set for resolveGlobalIdInModel (clash/compare rows).
           idOffset: 0,
-          maxExpressId: isBaseLayer ? maxExpressId : 0,
+          maxExpressId,
           // Mark overlay-only layers
           _isOverlay: !isBaseLayer,
           _layerIndex: i,

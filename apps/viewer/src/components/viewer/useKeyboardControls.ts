@@ -43,8 +43,8 @@ export interface UseKeyboardControlsParams {
   calculateScale: () => void;
 }
 
-/** Keys that trigger continuous movement (arrow keys + WASD + shift for sprint) */
-const MOVEMENT_KEYS = new Set([...WALK_MOVEMENT_KEYS, 'shift']);
+/** Keys that trigger continuous movement (arrow keys + WASD + QE + shift for sprint) */
+const MOVEMENT_KEYS = new Set([...WALK_MOVEMENT_KEYS, 'q', 'e', 'pageup', 'pagedown', 'shift']);
 
 export function useKeyboardControls(params: UseKeyboardControlsParams): void {
   const {
@@ -174,15 +174,31 @@ export function useKeyboardControls(params: UseKeyboardControlsParams): void {
         return;
       }
 
-      // Arrow keys pan the view (walking is the walk controller's).
+      // In Orbit/Select mode: Arrow keys and WASD/QE move the camera freely in 3D space
+      // (forward/back through doors & walls, left/right strafe, Q/E down/up) with zero collision.
       let moved = false;
-      const panSpeed = 5;
-      if (keyState['arrowup']) { camera.pan(0, -panSpeed, false); moved = true; }
-      if (keyState['arrowdown']) { camera.pan(0, panSpeed, false); moved = true; }
-      if (keyState['arrowleft']) { camera.pan(panSpeed, 0, false); moved = true; }
-      if (keyState['arrowright']) { camera.pan(-panSpeed, 0, false); moved = true; }
+      const step = keyState['shift'] ? 0.28 : 0.12;
+      const pos = camera.getPosition();
+      const tgt = camera.getTarget();
+      const fx = tgt.x - pos.x;
+      const fy = tgt.y - pos.y;
+      const fz = tgt.z - pos.z;
+      const flen = Math.hypot(fx, fy, fz) || 1;
+      const ux = fx / flen, uy = fy / flen, uz = fz / flen;
+      const hlen = Math.hypot(fx, fz) || 1;
+      const rx = -fz / hlen, rz = fx / hlen;
+
+      let dx = 0, dy = 0, dz = 0;
+      if (keyState['arrowup'] || keyState['w']) { dx += ux * step; dy += uy * step; dz += uz * step; moved = true; }
+      if (keyState['arrowdown'] || keyState['s']) { dx -= ux * step; dy -= uy * step; dz -= uz * step; moved = true; }
+      if (keyState['arrowright'] || keyState['d']) { dx += rx * step; dz += rz * step; moved = true; }
+      if (keyState['arrowleft'] || keyState['a']) { dx -= rx * step; dz -= rz * step; moved = true; }
+      if (keyState['e'] || keyState['pageup']) { dy += step; moved = true; }
+      if (keyState['q'] || keyState['pagedown']) { dy -= step; moved = true; }
 
       if (moved) {
+        camera.setPosition(pos.x + dx, pos.y + dy, pos.z + dz);
+        camera.setTarget(tgt.x + dx, tgt.y + dy, tgt.z + dz);
         renderScene();
       }
       moveFrameId = requestAnimationFrame(keyboardMove);
@@ -190,10 +206,11 @@ export function useKeyboardControls(params: UseKeyboardControlsParams): void {
 
     const isWalkMode = () => activeToolRef.current === 'walk';
     const registrations = [
-      registerKeyboardCommand('walk.move', startMovement, { active: isWalkMode, ignoreModifiers: true }),
+      registerKeyboardCommand('walk.move', startMovement, { active: () => true, ignoreModifiers: true }),
       registerKeyboardCommand('walk.moveArrows', startMovement, { active: isWalkMode, ignoreModifiers: true }),
       registerKeyboardCommand('camera.pan', startMovement, { active: () => !isWalkMode(), ignoreModifiers: true }),
-      registerKeyboardBinding({ id: 'walk.sprint', when: 'tool.walk', layer: 'tool', keys: [{ key: 'shift', shift: true }], active: isWalkMode, run: startMovement }),
+      registerKeyboardBinding({ id: 'nav.upDown', when: 'viewport', layer: 'global', keys: [{ key: 'q' }, { key: 'e' }, { key: 'pageup' }, { key: 'pagedown' }], active: () => !isWalkMode(), run: startMovement }),
+      registerKeyboardBinding({ id: 'walk.sprint', when: 'tool.walk', layer: 'tool', keys: [{ key: 'shift', shift: true }], active: () => true, run: startMovement }),
       // A tap can start and end between two physics ticks: queue it, as well as holding it.
       registerKeyboardCommand('walk.jump', (event) => { if (!event.repeat) walk?.queueJump(); holdWalkKey(' ')(event); }, { active: isWalkMode, ignoreModifiers: true }),
       registerKeyboardCommand('walk.crouch', holdWalkKey('z'), { active: isWalkMode, ignoreModifiers: true }),

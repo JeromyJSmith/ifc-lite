@@ -206,12 +206,12 @@ export function createWalkController(
       eye: camera.getPosition(),
       feet: c ? { x: c.feetX, y: c.feetY, z: c.feetZ } : null,
       grounded: c?.grounded ?? false,
-      physics: session?.physics ?? true,
+      physics: session?.physics ?? false,
       world: world ? { ...world.stats, bounds: world.bounds } : null,
       spawn: lastSpawn,
     };
   };
-  walkStatusStore.set({ active: true, physics: true, crouching: false });
+  walkStatusStore.set({ active: true, physics: false, crouching: false });
   raf = requestAnimationFrame(tick);
 
   return {

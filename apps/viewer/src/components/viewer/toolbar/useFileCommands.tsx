@@ -162,6 +162,7 @@ export function useFileCommands(): FileCommands {
           ifcxLayers?: Array<{ name?: string; file?: string; url?: string }>;
           point_clouds?: Array<{ id: string; name: string; file: string; visible?: boolean }>;
           scans?: Array<{ id: string; name: string; filename?: string; file?: string; url?: string; visible?: boolean }>;
+          contextModels?: Array<{ id: string; name: string; url: string; visible?: boolean }>;
         };
         const layerSpecs = manifest.ifcx_layers ?? manifest.ifcxLayers ?? [];
         if (layerSpecs.length > 0) {
@@ -206,6 +207,18 @@ export function useFileCommands(): FileCommands {
               visible: onlyScans ? true : (scan.visible ?? true),
             });
           }
+        }
+        // Context models (e.g. a neighbour's proposed house): their own federated model, always loaded so the
+        // Models list can toggle them, hidden unless the manifest says visible: true.
+        for (const ctx of manifest.contextModels ?? []) {
+          const r = await fetch(ctx.url, { cache: 'no-store' });
+          if (!r.ok) {
+            console.warn(`[workbench-autoload] Skipping context model ${ctx.url}: HTTP ${r.status}`);
+            continue;
+          }
+          const fileName = ctx.url.split('/').pop() || `${ctx.id}.ifcx`;
+          const ctxFile = new File([await r.arrayBuffer()], fileName, { type: 'application/json' });
+          await addModel(ctxFile, { name: ctx.name, visible: ctx.visible ?? false });
         }
         if (useViewerStore.getState().layerStack.length >= 2) {
           useViewerStore.getState().openWorkspacePanel('layers', 'programmatic');

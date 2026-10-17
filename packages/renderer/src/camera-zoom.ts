@@ -81,14 +81,15 @@ export function zoomOrthographic(state: CameraInternalState, dir: Vec3, nextOrth
  * forward dolly, the camera always makes real progress through the scene.
  */
 export function zoomPerspective(state: CameraInternalState, orbitCenter: Vec3 | null, distance: number, forward: Vec3, zoomFactor: number, fastZoom?: boolean): void {
-  const zoomStep = distance * (1 - zoomFactor); // positive when zooming in
+  const stepBase = fastZoom ? Math.max(distance, 4.0) : distance;
+  const zoomStep = stepBase * (1 - zoomFactor); // positive when zooming in
 
-  // Fast zoom (Shift+scroll or Cesium mode): pure dolly — the full zoom step
-  // translates the rig forward, distance stays constant, no Zeno slow-down.
+  // Fast zoom (Shift+scroll, close-range pass-through, or Cesium mode): pure dolly —
+  // the full zoom step translates the rig forward, distance stays constant, no Zeno slow-down.
   // Normal zoom: half dolly + half distance reduction — gives zoom-to-cursor
   // convergence but decelerates as the camera approaches the target.
   const dolly = fastZoom ? zoomStep : zoomStep * 0.5;
-  const newDistance = fastZoom ? distance : Math.max(CC.MIN_PERSPECTIVE_DISTANCE, distance - zoomStep * 0.5);
+  const newDistance = fastZoom ? Math.max(distance, 2.5) : Math.max(CC.MIN_PERSPECTIVE_DISTANCE, distance - zoomStep * 0.5);
 
   // Move target (and orbit center) forward to traverse the scene
   const dollyOffset = { x: forward.x * dolly, y: forward.y * dolly, z: forward.z * dolly };
