@@ -838,6 +838,8 @@ export function useIfcLoader() {
           format,
           blob,
           fileName: file.name,
+          // fix31 C7: the hierarchy row shows the model's display name, not the raw "splat_...laz" file name.
+          displayName: 'name' in target && typeof target.name === 'string' && target.name ? target.name : undefined,
           fileSize: file.size,
           renderer,
           onProgress: setProgress,

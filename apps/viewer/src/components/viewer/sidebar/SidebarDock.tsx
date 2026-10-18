@@ -23,7 +23,7 @@ import { useTranslation } from '@/i18n';
 import { ActivityBar } from './ActivityBar';
 import { SidebarPanelHost } from './SidebarPanelHost';
 
-const ACTIVITY_BAR_PX = 48; // w-12
+const ACTIVITY_BAR_PX = 72; // fix31 C5: matches ActivityBar w-[72px] (was 48 while the bar rendered w-16)
 // Mirrors the clamp in sidebarSlice so the live drag matches what is persisted.
 const MIN_WIDTH_PCT = 14;
 const MAX_WIDTH_PCT = 60;

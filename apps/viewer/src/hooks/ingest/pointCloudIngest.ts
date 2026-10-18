@@ -89,6 +89,9 @@ export interface PointCloudIngestOptions {
   format: PointCloudFormat;
   blob: Blob;
   fileName: string;
+  /** fix31 C7: label for the synthetic scan entity shown in the hierarchy (defaults to `fileName`, which stays the
+   *  format/extension source). */
+  displayName?: string;
   /** Source file size in bytes — used only for the synthetic data store.
    *  Point clouds stream from `blob`; the whole file is never read into
    *  memory here, so we take the size rather than an ArrayBuffer. */
@@ -498,7 +501,7 @@ export function ingestPointCloud(opts: PointCloudIngestOptions): PointCloudInges
   };
 
   return {
-    dataStore: emptyDataStore(opts.fileSize, expressId, opts.fileName),
+    dataStore: emptyDataStore(opts.fileSize, expressId, opts.displayName ?? opts.fileName),
     geometryResult,
     schemaVersion: 'IFC4',
     rendererHandle: handle,

@@ -2,110 +2,69 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-import { useEffect, useRef, useCallback } from 'react';
-import { ThemeToggle } from 'beautiful-theme-toggle';
+import { useCallback } from 'react';
+import { Moon, Sun, Sparkles } from 'lucide-react';
 import { useViewerStore } from '@/store';
+import { cn } from '@/lib/utils';
 
 /**
- * Animated SVG theme toggle (sun/moon) powered by beautiful-theme-toggle.
+ * Dark mode switch for the ribbon.
  *
- * Bidirectional sync:
- *  - User clicks the widget  → onChange → store.setTheme
- *  - External change (keyboard shortcut / command palette) → store updates → widget.setTheme
- *
- * Secret colorful mode:
- *  - Hold Shift while clicking → toggles the hidden "colorful" theme
- *  - The sun/moon widget can't represent a third state, so it shows "sun" (day vibes)
- *    while the colorful gradient takes over the world.
+ * fix31 C5: this replaces the 80 px animated beautiful-theme-toggle widget, which was squeezed into the 32 px ribbon
+ * row and read as "stuck between states". It is now a plain switch whose state always comes from the store:
+ *  - `role="switch"` + `aria-checked` = dark mode on/off, and a visible "Dark on" / "Dark off" label
+ *  - click → store.toggleTheme (dark ↔ light; colorful drops to dark, as before)
+ *  - Shift+click → store.toggleColorful (the hidden "colorful" theme, as before)
+ * Keyboard shortcut / command palette changes re-render it through the store subscription.
  */
 export function ThemeSwitch() {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const toggleRef = useRef<ThemeToggle | null>(null);
-  // Track whether Shift was held during the click so we can intercept in onChange
-  const shiftHeldRef = useRef(false);
-
-  // Capture shift key state on pointerdown (fires before the widget's internal click handler)
-  const handlePointerDown = useCallback((e: React.PointerEvent) => {
-    shiftHeldRef.current = e.shiftKey;
-  }, []);
-
-  useEffect(() => {
-    if (!containerRef.current) return;
-
-    const currentTheme = useViewerStore.getState().theme;
-
-    const toggle = new ThemeToggle({
-      element: containerRef.current,
-      size: 80,
-      // Colorful → show sun (it's a bright/day-ish theme)
-      initialState: currentTheme === 'dark' ? 'dark' : 'light',
-      onChange: (widgetState) => {
-        const store = useViewerStore.getState();
-
-        if (shiftHeldRef.current) {
-          // Secret shift-click: toggle colorful mode
-          shiftHeldRef.current = false;
-          store.toggleColorful();
-
-          // Sync widget visual: colorful → sun, otherwise follow the new theme
-          const newTheme = useViewerStore.getState().theme;
-          const widgetTarget = newTheme === 'dark' ? 'dark' : 'light';
-          if (toggleRef.current && toggleRef.current.getTheme() !== widgetTarget) {
-            toggleRef.current.setTheme(widgetTarget, false);
-          }
-          return;
-        }
-
-        // Normal click: dark ↔ light (if colorful, drops to dark)
-        shiftHeldRef.current = false;
-        store.toggleTheme();
-
-        // The widget already animated to widgetState, but toggleTheme may have
-        // produced a different result (e.g. colorful → dark). Reconcile:
-        const newTheme = useViewerStore.getState().theme;
-        const expectedWidget = newTheme === 'dark' ? 'dark' : 'light';
-        if (toggleRef.current && widgetState !== expectedWidget) {
-          toggleRef.current.setTheme(expectedWidget, false);
-        }
-      },
-    });
-
-    toggleRef.current = toggle;
-
-    // Subscribe to external theme changes so the widget stays in sync
-    let prevTheme = currentTheme;
-    const unsub = useViewerStore.subscribe((state) => {
-      if (state.theme !== prevTheme) {
-        prevTheme = state.theme;
-        const widgetTarget = state.theme === 'dark' ? 'dark' : 'light';
-        if (toggleRef.current && toggleRef.current.getTheme() !== widgetTarget) {
-          toggleRef.current.setTheme(widgetTarget, false);
-        }
-      }
-    });
-
-    return () => {
-      unsub();
-      toggle.destroy();
-      toggleRef.current = null;
-    };
-  }, []);
-
   const theme = useViewerStore((s) => s.theme);
+  const isDark = theme === 'dark';
   const isColorful = theme === 'colorful';
 
+  const handleClick = useCallback((e: React.MouseEvent<HTMLButtonElement>) => {
+    const store = useViewerStore.getState();
+    if (e.shiftKey) store.toggleColorful();
+    else store.toggleTheme();
+  }, []);
+
+  const Icon = isColorful ? Sparkles : isDark ? Moon : Sun;
+  const label = isColorful ? 'Colorful' : isDark ? 'Dark on' : 'Dark off';
+
   return (
-    <div
-      ref={containerRef}
-      onPointerDown={handlePointerDown}
-      className={`flex items-center cursor-pointer transition-all duration-300 ${
-        isColorful
-          ? 'opacity-100 scale-110'
-          : 'opacity-80 hover:opacity-100'
-      }`}
-      style={isColorful ? {
-        filter: 'drop-shadow(0 0 6px rgba(157,124,216,0.5)) drop-shadow(0 0 12px rgba(255,158,100,0.25))',
-      } : undefined}
-    />
+    <button
+      type="button"
+      role="switch"
+      aria-checked={isDark}
+      aria-label={`Dark mode ${isDark ? 'on' : 'off'}`}
+      data-testid="theme-switch"
+      data-theme-state={theme}
+      onClick={handleClick}
+      className={cn(
+        'inline-flex h-8 items-center gap-1.5 rounded-md border px-2 text-xs font-medium whitespace-nowrap transition-colors',
+        isDark
+          ? 'border-sky-500/60 bg-sky-500/15 text-sky-300'
+          : isColorful
+            ? 'border-fuchsia-400/60 bg-fuchsia-400/15 text-fuchsia-600'
+            : 'border-border bg-background text-muted-foreground hover:bg-muted',
+      )}
+    >
+      <span
+        aria-hidden="true"
+        className={cn(
+          'relative inline-flex h-4 w-7 shrink-0 items-center rounded-full transition-colors',
+          isDark ? 'bg-sky-500' : 'bg-muted-foreground/30',
+        )}
+      >
+        <span
+          className={cn(
+            'absolute top-0.5 h-3 w-3 rounded-full bg-white shadow transition-transform',
+            isDark ? 'translate-x-3.5' : 'translate-x-0.5',
+          )}
+        />
+      </span>
+      <Icon className="h-3.5 w-3.5" aria-hidden="true" />
+      {label}
+    </button>
   );
 }

@@ -1539,39 +1539,44 @@ export function Viewport({
             type="button"
             onClick={() => teleportCameraUVZ(-1.35, -21.0, 3.8, -1.35, -6.3, 3.8)}
             className="rounded bg-slate-800 hover:bg-emerald-600/80 px-2 py-0.5 font-medium transition-colors"
-            title="Look perpendicular to South Gable & East Wing"
+            title="From the south, looking north at the porch and south gable (ViewCube: SOUTH)"
           >
-            South Gable (Front)
+            South Porch (Front)
           </button>
           <button
             type="button"
-            onClick={() => teleportCameraUVZ(-2.03, -8.8, 1.65, -2.03, -2.0, 1.65)}
+            // fix31 C4: centred between the two south entry doors (u -1.26 / +0.88), on the path 0.76 m south of the porch edge.
+            onClick={() => teleportCameraUVZ(-0.2, -9.6, 1.75, -0.2, -6.4, 1.2)}
             className="rounded bg-slate-800 hover:bg-emerald-600/80 px-2 py-0.5 font-medium transition-colors"
-            title="Stand outside the Front Entry Door looking inside"
+            title="On the front path south of the porch, looking north at both entry doors (ViewCube: SOUTH)"
           >
             Front Door
           </button>
           <button
             type="button"
-            onClick={() => teleportCameraUVZ(-4.2, -5.2, 1.65, -4.0, 1.5, 1.65)}
+            // fix31 C4: inside AptA Living area, 1.0 m clear of every solid, 5 m clear view NW (ray-tested on 401-pearl-composed.ifcx).
+            onClick={() => teleportCameraUVZ(-4.48, -1.93, 1.8, -5.56, 2.07, 1.4)}
             className="rounded bg-slate-800 hover:bg-emerald-600/80 px-2 py-0.5 font-medium transition-colors"
-            title="Teleport inside the Main Level Living Room (no wall collision)"
+            title="Inside the main-level living area, looking north toward the kitchen (ViewCube: SOUTH)"
           >
             Inside Living (L1)
           </button>
           <button
             type="button"
-            onClick={() => teleportCameraUVZ(-2.1, -3.7, 1.65, 0.4, -4.2, 1.85)}
+            // fix31 C4: in the stairwell east of the west partition, 1.05 m above the lower flight (2d1bd50d), clear line of
+            // sight to both the lower flight and the winder flight (2f04409a); 0.47 m from the nearest solid.
+            onClick={() => teleportCameraUVZ(-1.7, -3.33, 1.75, -1.16, -4.27, 1.5)}
             className="rounded bg-slate-800 hover:bg-emerald-600/80 px-2 py-0.5 font-medium transition-colors"
-            title="Teleport inside the Stairwell looking at the flights & windows"
+            title="Inside the stairwell over the lower flight, looking south-east at the winder and stairwell windows (ViewCube: NORTH)"
           >
             Inside Stairwell
           </button>
           <button
             type="button"
-            onClick={() => teleportCameraUVZ(-2.9, -4.8, 4.5, -2.9, 1.0, 4.5)}
+            // fix31 C4: upper level at eye height (floor 3.09 + 1.6), 0.98 m clear of every solid, 6.7 m clear view south-west.
+            onClick={() => teleportCameraUVZ(0.24, -2.23, 4.69, -4.19, -5.73, 4.0)}
             className="rounded bg-slate-800 hover:bg-emerald-600/80 px-2 py-0.5 font-medium transition-colors"
-            title="Teleport inside the Upper Level under the Gable Roof"
+            title="Inside the upper level under the gable roof, looking south-west (ViewCube: NORTH/EAST corner)"
           >
             Inside Upper (L2)
           </button>
@@ -1579,9 +1584,17 @@ export function Viewport({
             type="button"
             onClick={() => teleportCameraUVZ(10.5, -3.1, 3.5, 1.5, -3.1, 3.5)}
             className="rounded bg-slate-800 hover:bg-emerald-600/80 px-2 py-0.5 font-medium transition-colors"
-            title="Look at the East Cross-Gable Wing"
+            title="From the neighbour driveway on the east, looking west at the east cross-gable wing (ViewCube: EAST)"
           >
-            East Wing
+            East Side (Driveway)
+          </button>
+          <button
+            type="button"
+            onClick={() => teleportCameraUVZ(-21.0, -0.6, 3.5, -1.1, -0.6, 3.0)}
+            className="rounded bg-slate-800 hover:bg-emerald-600/80 px-2 py-0.5 font-medium transition-colors"
+            title="From the street on the west, looking east at the west wall (ViewCube: WEST)"
+          >
+            West Side (Street)
           </button>
           <button
             type="button"

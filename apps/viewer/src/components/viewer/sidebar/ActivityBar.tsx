@@ -106,10 +106,12 @@ export function ActivityBar() {
 
   let prevGroup: PanelGroup | null = null;
 
+  // fix31 C5: 72 px (was w-16) plus a thin scrollbar so group labels such as "Coordinate" and "Check" are not
+  // clipped by the scrollbar gutter.
   return (
-    <div data-activity-bar className="relative flex flex-col items-center w-16 shrink-0 h-full border-l border-border bg-background">
+    <div data-activity-bar className="relative flex flex-col items-center w-[72px] shrink-0 h-full border-l border-border bg-background">
       {/* Panels */}
-      <div className="flex-1 min-h-0 w-full overflow-y-auto overflow-x-hidden py-1.5 flex flex-col items-center gap-0.5">
+      <div className="flex-1 min-h-0 w-full overflow-y-auto overflow-x-hidden [scrollbar-width:thin] py-1.5 flex flex-col items-center gap-0.5">
         {visibleIds.map((id) => {
           const def = getPanelDef(id);
           if (!def) return null;
@@ -139,7 +141,7 @@ export function ActivityBar() {
                 <h3
                   data-panel-group={def.group}
                   title={t(panelGroupDefinition(def.group).descriptionKey)}
-                  className="w-full border-t border-border/70 px-0.5 pt-1.5 pb-0.5 text-center text-2xs font-medium leading-tight text-muted-foreground"
+                  className="w-full border-t border-border/70 px-0.5 pt-1.5 pb-0.5 text-center text-2xs font-medium leading-tight tracking-tight whitespace-normal [overflow-wrap:anywhere] text-muted-foreground"
                 >
                   {t(panelGroupDefinition(def.group).labelKey)}
                 </h3>

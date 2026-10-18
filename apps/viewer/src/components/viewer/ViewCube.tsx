@@ -27,12 +27,14 @@ const FACE_VIEWS: Record<string, { rx: number; ry: number }> = {
 };
 
 const FACES = [
-  { id: 'front', label: 'FRONT', transform: (h: number) => `translateZ(${h}px)` },
-  { id: 'back', label: 'BACK', transform: (h: number) => `translateZ(${-h}px) rotateY(180deg)` },
+  // fix31 C4: compass labels. IFC +Y is project north and the house frame is applied as buildingRotation, so the
+  // 'front' face (camera at GL +Z = IFC -Y) is SOUTH, 'right' (+X) is EAST, 'left' is WEST, 'back' is NORTH.
+  { id: 'front', label: 'SOUTH', transform: (h: number) => `translateZ(${h}px)` },
+  { id: 'back', label: 'NORTH', transform: (h: number) => `translateZ(${-h}px) rotateY(180deg)` },
   { id: 'top', label: 'TOP', transform: (h: number) => `translateY(${-h}px) rotateX(90deg)` },
   { id: 'bottom', label: 'BTM', transform: (h: number) => `translateY(${h}px) rotateX(-90deg)` },
-  { id: 'right', label: 'RIGHT', transform: (h: number) => `translateX(${h}px) rotateY(90deg)` },
-  { id: 'left', label: 'LEFT', transform: (h: number) => `translateX(${-h}px) rotateY(-90deg)` },
+  { id: 'right', label: 'EAST', transform: (h: number) => `translateX(${h}px) rotateY(90deg)` },
+  { id: 'left', label: 'WEST', transform: (h: number) => `translateX(${-h}px) rotateY(-90deg)` },
 ];
 
 export const ViewCube = forwardRef<ViewCubeRef, ViewCubeProps>(

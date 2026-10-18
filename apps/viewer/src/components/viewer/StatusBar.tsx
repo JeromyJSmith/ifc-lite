@@ -87,6 +87,10 @@ export function StatusBar() {
       const resolveInModel = useViewerStore.getState().resolveGlobalIdInModel;
       for (const model of models.values()) {
         if (!model.ifcDataStore) continue;
+        // fix31 C6: a hidden model (e.g. the 2010 4th St context massing, loaded hidden by the 401 Pearl autoload)
+        // is not on screen, so it must not add to the element count: 39 house meshes + 16 hidden context objects
+        // read "55 elements" while the hierarchy showed the house.
+        if (model.visible === false) continue;
         const toLocalId = (id: number): number => {
           const ref = resolveInModel(model.id, id);
           return ref?.expressId ?? id;

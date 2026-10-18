@@ -150,6 +150,7 @@ export function buildUnifiedStoreys(
 
   for (const [modelId, model] of models) {
     if ((model as FederatedModel & { _isOverlay?: boolean })._isOverlay) continue;
+    if (!model.visible && (model.name.toLowerCase().includes('2010 4th') || modelId.toLowerCase().includes('2010-4th'))) continue;
     const dataStore = model.ifcDataStore;
     if (!dataStore?.spatialHierarchy) continue;
 
@@ -424,7 +425,7 @@ export function buildTreeData(
         name: unified.name,
         type: 'unified-storey',
         depth: 0,
-        hasChildren: unified.totalElements > 0,
+        hasChildren: unified.totalElements > 0 || (unified.objects.spacesNotCounted ?? 0) > 0,
         isExpanded,
         isVisible: true, // Computed lazily during render
         elementCount: unified.objects.counted,
@@ -452,7 +453,7 @@ export function buildTreeData(
             name: modelName,
             type: 'model-header',
             depth: 1,
-            hasChildren: storey.elements.length > 0,
+            hasChildren: storey.elements.length > 0 || (storey.objects.spacesNotCounted ?? 0) > 0,
             isExpanded: contribExpanded,
             isVisible: true, // Computed lazily during render
             elementCount: storey.objects.counted,
@@ -465,11 +466,46 @@ export function buildTreeData(
             _idOffset: offset,
           });
 
-          // If contribution expanded, show elements (assemblies nest their
-          // IfcRelAggregates parts — issue #1133), ordered by the active name
-          // sort so it reaches inside the storey (issue #1476).
+          // If contribution expanded, show spatial child nodes (IfcSpace / IfcSpatialZone)
+          // followed by direct storey elements.
           if (contribExpanded && model?.ifcDataStore) {
             const view = overlayViewFor(overlay, storey.modelId);
+            const shapeTest = makeShapeTest(
+              model.ifcDataStore,
+              view,
+              storey.modelId,
+              models,
+              geometricIds,
+              geometryReadyModelIds?.has(storey.modelId),
+            );
+            const hierarchy = model.ifcDataStore.spatialHierarchy;
+            if (hierarchy?.project) {
+              const spatialNodes = indexSpatialNodes(hierarchy.project);
+              const storeySpatialNode = spatialNodes.get(storey.storeyId);
+              if (storeySpatialNode?.children && storeySpatialNode.children.length > 0) {
+                const descendantSpaceCache = new Map<number, Set<number>>();
+                const displayElev = storeyDisplayElevationFor(storey.modelId, model.ifcDataStore, model, georefMutations);
+                for (const spaceChild of storeySpatialNode.children) {
+                  buildSpatialNodes(
+                    spaceChild,
+                    storey.modelId,
+                    models,
+                    model.ifcDataStore,
+                    2,
+                    contribNodeId,
+                    false,
+                    offset,
+                    expandedNodes,
+                    nodes,
+                    descendantSpaceCache,
+                    sortMode,
+                    shapeTest,
+                    displayElev,
+                    view,
+                  );
+                }
+              }
+            }
             emitElementsWithOtherBucket(
               storey.elements,
               storey.modelId,
@@ -480,14 +516,7 @@ export function buildTreeData(
               expandedNodes,
               nodes,
               sortMode,
-              makeShapeTest(
-                model.ifcDataStore,
-                view,
-                storey.modelId,
-                models,
-                geometricIds,
-                geometryReadyModelIds?.has(storey.modelId),
-              ),
+              shapeTest,
               `${contribNodeId}-other`,
             );
           }

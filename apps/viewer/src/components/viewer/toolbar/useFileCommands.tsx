@@ -161,7 +161,7 @@ export function useFileCommands(): FileCommands {
           ifcx_layers?: Array<{ file: string; color?: string; label?: string }>;
           ifcxLayers?: Array<{ name?: string; file?: string; url?: string }>;
           point_clouds?: Array<{ id: string; name: string; file: string; visible?: boolean }>;
-          scans?: Array<{ id: string; name: string; filename?: string; file?: string; url?: string; visible?: boolean }>;
+          scans?: Array<{ id: string; name: string; filename?: string; file?: string; url?: string; visible?: boolean; preload?: boolean }>;
           contextModels?: Array<{ id: string; name: string; url: string; visible?: boolean }>;
         };
         const layerSpecs = manifest.ifcx_layers ?? manifest.ifcxLayers ?? [];
@@ -179,6 +179,19 @@ export function useFileCommands(): FileCommands {
           await loadFederatedIfcx(layerFiles);
         }
 
+        // Context models (e.g. Basement 3D Scan overlay/underlay, neighbour's proposed house): load before heavy LAZ scans
+        // so the Models list can toggle them immediately, hidden unless the manifest says visible: true.
+        for (const ctx of manifest.contextModels ?? []) {
+          const r = await fetch(ctx.url, { cache: 'no-store' });
+          if (!r.ok) {
+            console.warn(`[workbench-autoload] Skipping context model ${ctx.url}: HTTP ${r.status}`);
+            continue;
+          }
+          const fileName = ctx.url.split('/').pop() || `${ctx.id}.ifcx`;
+          const ctxFile = new File([await r.arrayBuffer()], fileName, { type: 'application/json' });
+          await addModel(ctxFile, { name: ctx.name, visible: ctx.visible ?? false });
+        }
+
         const scanSpecs = manifest.point_clouds ?? manifest.scans ?? [];
         const scansParam = params.get('scans');
         if (scansParam !== '0' && scanSpecs.length > 0) {
@@ -189,7 +202,8 @@ export function useFileCommands(): FileCommands {
           for (const scan of scanSpecs) {
             if (onlyScans && onlyScans.length > 0) {
               if (!onlyScans.includes(scan.id)) continue;
-            } else if (!loadAllScans && scan.visible === false) {
+            } else if (!loadAllScans && scan.visible === false && scan.preload !== true) {
+              // Hidden and not preloaded: skipped (load with ?scans=<id> or ?scans=all).
               continue;
             }
             const relFile = scan.file ?? (scan as { filename?: string }).filename!;
@@ -202,29 +216,22 @@ export function useFileCommands(): FileCommands {
             }
             const buf = await r.arrayBuffer();
             const scanFile = new File([buf], baseFileName, { type: 'application/octet-stream' });
+            // fix31 C3: `visible: false` + `preload: true` loads the scan HIDDEN, so it is off on load but still listed in
+            // the Models panel where its eye toggle turns it on (before, a hidden scan was never loaded at all).
             await addModel(scanFile, {
               name: scan.name,
               visible: onlyScans ? true : (scan.visible ?? true),
             });
           }
         }
-        // Context models (e.g. a neighbour's proposed house): their own federated model, always loaded so the
-        // Models list can toggle them, hidden unless the manifest says visible: true.
-        for (const ctx of manifest.contextModels ?? []) {
-          const r = await fetch(ctx.url, { cache: 'no-store' });
-          if (!r.ok) {
-            console.warn(`[workbench-autoload] Skipping context model ${ctx.url}: HTTP ${r.status}`);
-            continue;
-          }
-          const fileName = ctx.url.split('/').pop() || `${ctx.id}.ifcx`;
-          const ctxFile = new File([await r.arrayBuffer()], fileName, { type: 'application/json' });
-          await addModel(ctxFile, { name: ctx.name, visible: ctx.visible ?? false });
-        }
         if (useViewerStore.getState().layerStack.length >= 2) {
           useViewerStore.getState().openWorkspacePanel('layers', 'programmatic');
           useViewerStore.getState().setSidebarSecondaryPanel('properties');
           useViewerStore.getState().setSidebarSplitRatio(0.42);
         }
+        // fix31 C6: start the workbench with nothing selected, so the ribbon reads "SELECTION" (no stale "· 1" left
+        // over from a load-time pick) and agrees with the empty Properties panel.
+        useViewerStore.getState().clearEntitySelection();
       } catch (err) {
         console.warn('[workbench-autoload] Auto-load skipped or failed:', err);
       }

@@ -16,6 +16,7 @@
  */
 
 import { getAggregatedChildren, collectAggregatedDescendants, type AggregationRelationships } from '@/utils/aggregation';
+import { RelationshipType } from '@ifc-lite/data';
 import type { MutablePropertyView } from '@ifc-lite/mutations';
 import type { IfcDataStore } from '@ifc-lite/parser';
 import type { FederatedModel } from '@/store';
@@ -233,7 +234,17 @@ export function emitElementsWithOtherBucket(
   hasShape: ((id: number) => boolean) | null,
   otherNodeId: string,
 ): void {
-  const ordered = orderElementIdsByName(elementIds as number[], dataStore, view, sortMode);
+  // fix31 C7: IFCX spatial nodes list every non-spatial descendant, so an IfcStair's flights / railings arrive here
+  // next to the stair that aggregates them. Emit only the top of each decomposition; the parts nest under their
+  // assembly (emitElementSubtree). STEP storeys never list aggregated parts, so this is a no-op there.
+  const aggregationRels = dataStore.relationships as AggregationRelationships | undefined;
+  const listedIds = new Set(elementIds);
+  const topLevelIds = aggregationRels
+    ? (elementIds as number[]).filter((id) => !aggregationRels
+      .getRelated(id, RelationshipType.Aggregates, 'inverse')
+      .some((parentId) => parentId !== id && listedIds.has(parentId)))
+    : (elementIds as number[]);
+  const ordered = orderElementIdsByName(topLevelIds, dataStore, view, sortMode);
 
   if (!hasShape) {
     for (const elementId of ordered) {

@@ -282,10 +282,17 @@ export function useHierarchyTree({ models, ifcDataStore, isMultiModel, geometryR
         next.delete(nodeId);
       } else {
         next.add(nodeId);
+        if (nodeId.startsWith('unified-')) {
+          const unified = unifiedStoreys.find(u => `unified-${u.key}` === nodeId);
+          if (unified && unified.storeys.length === 1) {
+            const s = unified.storeys[0];
+            next.add(`contrib-${s.modelId}-${s.storeyId}`);
+          }
+        }
       }
       return next;
     });
-  }, [searchQuery]);
+  }, [searchQuery, unifiedStoreys]);
 
   // Get all elements for a node (handles type groups, ifc-type, unified storeys, single storeys, model contributions, and elements)
   const getNodeElements = useCallback((node: TreeNode): number[] => {

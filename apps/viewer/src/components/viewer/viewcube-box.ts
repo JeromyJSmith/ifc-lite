@@ -11,10 +11,12 @@
  */
 
 /** Edge length of the cube, in CSS px. */
-export const VIEW_CUBE_SIZE_PX = 60;
+// fix31 C5: 72 px (was 60) so the compass labels read, and a wider inset (was 24) so the cube's rotated corners
+// clear the viewport's right edge and the sidebar arrow glyph.
+export const VIEW_CUBE_SIZE_PX = 72;
 
 /** Inset of the cube's box from the viewport's top and right edges, in CSS px. */
-export const VIEW_CUBE_INSET_PX = 24;
+export const VIEW_CUBE_INSET_PX = 32;
 
 /** Inset plus size: how far the cube reaches in from the top-right corner. */
 export const VIEW_CUBE_REACH_PX = VIEW_CUBE_INSET_PX + VIEW_CUBE_SIZE_PX;
