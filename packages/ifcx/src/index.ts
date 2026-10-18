@@ -286,8 +286,26 @@ function determineRelationshipType(
     return RelationshipType.Aggregates;
   }
 
+  // fix31 C7: element -> element children are a decomposition (IfcRelAggregates), e.g. an IfcStair whose
+  // IfcStairFlight / stringer / railing parts carry the geometry. As ContainsElements the parts were invisible to
+  // `getAggregatedChildren`, so the geometry-less IfcStair fell into the hierarchy's "Other" bucket. Feature
+  // children (openings) and feature parents (an opening's door/window filling) stay ContainsElements: an opening
+  // voids its host and a filling fills an opening; neither is a part of the other.
+  if (parentClass && childClass && !isFeatureElementClass(childClass) && !isFeatureElementClass(parentClass)) {
+    return RelationshipType.Aggregates;
+  }
+
   // Default to containment
   return RelationshipType.ContainsElements;
+}
+
+const FEATURE_ELEMENT_CLASSES = new Set([
+  'IfcOpeningElement', 'IfcOpeningStandardCase', 'IfcVoidingFeature', 'IfcProjectionElement', 'IfcSurfaceFeature',
+  'IfcFeatureElement', 'IfcFeatureElementAddition', 'IfcFeatureElementSubtraction',
+]);
+
+function isFeatureElementClass(typeCode: string): boolean {
+  return FEATURE_ELEMENT_CLASSES.has(typeCode);
 }
 
 /** The tree builder's gate, not a second copy of it: a hand-written duplicate
