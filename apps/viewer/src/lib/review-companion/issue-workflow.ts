@@ -85,13 +85,17 @@ export function createIssueWorkflow(options: IssueWorkflowOptions) {
       return { ...value, workflowRef: row.id, saved: true };
     } finally { writing = false; }
   }
-  async function investigate(topicId: string) {
+  async function open(topicId: string) {
     const issue = (await list()).find(item => item.topicId === topicId);
     if (!issue) throw new Error('No saved BCF issue has this topic ID.');
     await options.restore(issue.findingId);
+    return issue;
+  }
+  async function investigate(topicId: string) {
+    const issue = await open(topicId);
     return record({ topicId, stage: 'investigating', diagnosis: 'Restored the original issue camera and selected surrounding elements for investigation.', evidenceRefs: [issue.definitionRef] });
   }
-  return { list, record, investigate };
+  return { list, record, investigate, open };
 }
 export function createIssueWorkflowTools(workflow: ReturnType<typeof createIssueWorkflow>) {
   const id = { type: 'string' as const, minLength: 1, maxLength: 200 };

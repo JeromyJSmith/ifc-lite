@@ -28,6 +28,16 @@ test('queue retains original scopes, sorts issues and selects latest event by ti
   for (const [id, stage, time] of [['new', 'needs-evidence', '12'], ['old', 'investigating', '11']]) s.rows.push(s.row(id, { kind: 'review.bcf.workflow', topicId: 'topic', stage, diagnosis: id, evidenceRefs: [], createdAt: `2026-10-19T${time}:00:00Z` }));
   const queue = await s.workflow.list(); assert.deepEqual(queue.map(i => i.topicId), ['topic', 'later']); assert.equal(queue[0].scopeId, 'original-source'); assert.equal(queue[0].stage, 'needs-evidence');
 });
+test('opening a fixed issue restores its view without changing its verified status or history', async () => {
+  const s = setup();
+  s.rows.push(s.row('mutation', { kind: 'native-mutation' }), s.row('after', { kind: 'native-verification' }));
+  await s.workflow.record({ topicId: 'topic', stage: 'fixed', diagnosis: 'Measured repair', evidenceRefs: ['mutation', 'after'], mutationReceiptRef: 'mutation', verificationRef: 'after' });
+  const before = structuredClone(s.rows);
+  const opened = await s.workflow.open('topic');
+  assert.equal(opened.stage, 'fixed'); assert.deepEqual(s.restored, ['finding']);
+  assert.deepEqual(s.rows, before); assert.deepEqual(s.statuses, ['fixed']);
+  assert.equal((await s.workflow.list())[0].verificationRef, 'after');
+});
 test('fixed refuses invented refs, duplicate evidence and failed native verification', async () => {
   const s = setup(), update = { topicId: 'topic', stage: 'fixed' as const, diagnosis: 'Measured and closed opening', evidenceRefs: ['mutation', 'after'], mutationReceiptRef: 'mutation', verificationRef: 'after' };
   await assert.rejects(s.workflow.record(update), /has not been persisted/); assert.equal(s.verified(), 0);

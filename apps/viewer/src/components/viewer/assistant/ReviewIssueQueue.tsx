@@ -2,6 +2,7 @@
  * License, v. 2.0. https://mozilla.org/MPL/2.0/. */
 import { useState } from 'react';
 import { REVIEW_RESOLUTION_SCHEMA } from '@/lib/review-companion/resolution-schema';
+import { investigateSavedIssue } from '@/lib/review-companion/issue-investigation';
 import { downloadBlob } from '@/lib/export/download';
 import { Button } from '@/components/ui/button';
 import type { useReviewCompanion } from '@/hooks/useReviewCompanion';
@@ -21,13 +22,12 @@ export function ReviewIssueQueue({ review, run }: { review: Review; run(action: 
       {issue.diagnosis && <p className="whitespace-pre-wrap">{issue.diagnosis}</p>}
       <div className="flex flex-wrap gap-2">
         <Button size="sm" variant="outline" disabled={review.busy} onClick={() => run(async () => {
-          await review.resolution.workflow.investigate(issue.topicId); await review.resolution.refresh(); review.setStatus('Saved issue restored with its original selection and viewpoint');
+          await review.resolution.workflow.open(issue.topicId); await review.resolution.refresh(); review.setStatus('Saved view restored; issue status preserved');
         })}>Reopen saved view</Button>
         <Button size="sm" disabled={!review.connection || review.busy} onClick={() => run(async () => {
           review.resolution.setActive(issue.topicId);
-          const evidence = await review.prepareIssue(issue.topicId);
-          await review.ask(`Continue issue ${issue.topicId}. Camera navigation and ONE visual inspection have already executed and are saved. Do not repeat image inspection or camera actions before repair. Here is exact source geometry evidence: ${JSON.stringify(evidence)}. You are authorized to fix one supported defect here. If a report contains a candidateId and defective faces, create a BCF subissue titled Mesh integrity: from that candidate, then apply remove_defective_faces to one reported defective meshPath using its modelId and sourceHash. Use the actual returned receiptRef and verificationRef to mark only that mesh subissue fixed. Counts overlap: report the difference in before/after face totals, never add degenerate and duplicate counts. Keep the original architectural concern open unless separately verified. If no measured defect supports repair, use the installed native tools for further diagnosis and record the precise missing evidence. Finish after one verified repair or a precise blocker.`);
-          await review.inspect(undefined, undefined, 'Describe the current scene after the investigation and any applied repair. Do not claim mesh integrity or architectural acceptance from the image. Preserve this actual viewpoint as after-state evidence.');
+          const result = await investigateSavedIssue({ workflow: review.resolution.workflow, prepare: review.prepareIssue, ask: review.ask }, issue.topicId);
+          review.setStatus(`Issue ${result.stage}: ${result.diagnosis}`);
           await review.resolution.refresh();
         })}>Investigate &amp; fix supported defects</Button>
       </div>
@@ -37,7 +37,7 @@ export function ReviewIssueQueue({ review, run }: { review: Review; run(action: 
       <strong>Saved geometry repair · {repair.modelName}</strong>
       {repair.before && repair.after && <p>Faces: {repair.before.faceCount} → {repair.after.faceCount}</p>}
       <div className="flex flex-wrap gap-2">{([['Resume repaired model', 'review_geometry_resume'], ['Undo this repair', 'review_geometry_undo']] as const).map(([label, name]) => <Button key={name} size="sm" variant="outline" disabled={review.busy} onClick={() => run(async () => {
-        const result = await review.resolution.tools.find(t => t.name === name)!.execute({ receiptRef: repair.receiptRef }); review.setStatus(JSON.stringify(result)); await review.resolution.refresh();
+        await review.resolution.tools.find(t => t.name === name)!.execute({ receiptRef: repair.receiptRef }); review.setStatus(name === 'review_geometry_resume' ? 'Repaired model restored and source verified' : 'Original model restored; repair undone and issue reopened'); await review.resolution.refresh();
       })}>{label}</Button>)}</div>
     </div>)}
     <Button size="sm" variant="outline" disabled={review.busy} onClick={() => run(async () => {
