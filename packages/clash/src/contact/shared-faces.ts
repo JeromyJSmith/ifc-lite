@@ -167,9 +167,9 @@ export function clusterSharedFaces(
 
   const out: SharedFaceCluster[] = [];
   for (const { plane, pairs: bucketPairs } of coplanarBuckets.values()) {
-    out.push(
-      classify(buildSurfaceCluster(plane, bucketPairs), surfaceAreaM2, pointAreaM2, lineLengthM),
-    );
+    const base = buildSurfaceCluster(plane, bucketPairs);
+    // Broad-phase coplanarity is not an in-plane intersection. Empty clips have no contact location.
+    if (base.boundary.length) out.push(classify(base, surfaceAreaM2, pointAreaM2, lineLengthM));
   }
   for (const { dir, pairs: bucketPairs } of crossBuckets.values()) {
     out.push(classify(buildLineCluster(dir, bucketPairs), surfaceAreaM2, pointAreaM2, lineLengthM));
@@ -195,10 +195,8 @@ function buildSurfaceCluster(
     // summed clip area ≤ true contact area ≤ the total area of A-triangles
     // whose pair is in the bucket. We take the clipped sum.
     const clipped = sutherlandHodgman(pa, pb);
-    if (clipped.length >= 3) {
-      totalArea += polygonArea(clipped);
-      boundaryPts.push(...clipped);
-    }
+    if (clipped.length >= 3) totalArea += polygonArea(clipped);
+    boundaryPts.push(...clipped); // Real edge/vertex intersections also carry their actual locations.
   }
 
   const boundary2d = boundaryPts.length >= 3 ? convexHull2(boundaryPts) : boundaryPts;
@@ -211,13 +209,15 @@ function buildSurfaceCluster(
   const centroid = liftTo3D(basis, centroid2d);
   const boundary = boundary2d.map((p) => liftTo3D(basis, p));
   const spans = polygonSpans(boundary2d);
+  const line = boundary.length === 2;
+  const normal = line ? normalize3([boundary[1]![0] - boundary[0]![0], boundary[1]![1] - boundary[0]![1], boundary[1]![2] - boundary[0]![2]]) : plane.normal;
 
   return {
     plane,
     centroid,
-    normal: plane.normal,
+    normal,
     area_m2: totalArea,
-    length_m: 0,
+    length_m: line ? spans.max : 0,
     spanMin: spans.min,
     spanMax: spans.max,
     boundary,
@@ -344,11 +344,8 @@ function classify(
 ): SharedFaceCluster {
   if (base.area_m2 >= surfaceAreaM2) return { ...base, kind: "surface" };
   if (base.length_m >= lineLengthM) return { ...base, kind: "line" };
-  // A cluster below the surface-area threshold but still above the point
-  // floor is a small coplanar/surface contact (buildSurfaceCluster always
-  // sets length_m: 0 -- see the field docs above), not a line: it has no
-  // shared-line length to report, only a small real area and a polygon
-  // boundary. Labeling it "line" here would contradict the length_m
+  // A small coplanar patch with real area has length_m: 0, not a shared
+  // line length. Labeling it "line" here would contradict the length_m
   // invariant ("line only -- 0 otherwise") and mislead consumers such as
   // the viewer's contact overlay, which renders "line" clusters as a single
   // 2-point segment (`boundary[0]`/`boundary[1]`) rather than the polygon

@@ -69,6 +69,28 @@ describe('contactClusters (contact interface geometry)', () => {
     expect(contactClusters(a, b)).toEqual([]);
   });
 
+  it('does not invent a point when coplanar faces have a small real in-plane clearance', () => {
+    const a = box('A', [0, 0, 0], [1, 1, 1]);
+    const b = box('B', [1.0004, 0, 0], [2.0004, 1, 1]);
+    expect(narrowPhase(a, b).some(pair => pair.kind === 'coplanar')).toBe(true);
+    expect(contactClusters(a, b)).toEqual([]);
+  });
+
+  it('keeps real coplanar edge and vertex contacts at their actual locations', () => {
+    const triangle = (id: string, points: number[][]): Mesh => ({ id, positions: new Float64Array(points.flat()), indices: new Uint32Array([0, 1, 2]) });
+    const a = triangle('A', [[10, 20, 3], [12, 20, 3], [10, 22, 3]]);
+    const edge = contactClusters(a, triangle('edge', [[10, 20, 3], [12, 20, 3], [10, 18, 3]]));
+    expect(edge).toHaveLength(1);
+    expect(edge[0]?.kind).toBe('line');
+    expect(edge[0]?.length_m).toBeCloseTo(2);
+    expect(edge[0]?.centroid).toEqual([11, 20, 3]);
+    const point = contactClusters(a, triangle('point', [[12, 20, 3], [14, 20, 3], [14, 22, 3]]));
+    expect(point).toHaveLength(1);
+    expect(point[0]?.kind).toBe('point');
+    expect(point[0]?.centroid).toEqual([12, 20, 3]);
+    expect(point[0]?.boundary.length).toBeGreaterThan(0);
+  });
+
   it('reports a line contact for two perpendicular bars that cross', () => {
     const a = box('A', [-5, -0.5, -0.5], [5, 0.5, 0.5]); // along X
     const b = box('B', [-0.5, -5, -0.5], [0.5, 5, 0.5]); // along Y

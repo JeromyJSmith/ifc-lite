@@ -24,6 +24,12 @@ test('disjoint surfaces report measured clearance and no fabricated contact', ()
   assert.equal(result.contactCount, 0); assert.equal(result.nearest?.distance, 0.25);
 });
 
+test('coplanar surfaces separated in-plane by the model clearance have no phantom point', () => {
+  const result = inspectIfcxContact(source(triangle, triangle.map(([x, y, z]) => [x + 2.0004, y, z])), 'a', 'b', 0, 0);
+  assert.equal(result.contactCount, 0);
+  assert.ok(Math.abs(result.nearest!.distance - 0.0004) < 1e-6);
+});
+
 test('a scoped triangle excludes contact elsewhere on the same entity', () => {
   const far = triangle.map(([x, y, z]) => [x + 10, y, z]);
   const buffer = source([...triangle, ...far], far);
