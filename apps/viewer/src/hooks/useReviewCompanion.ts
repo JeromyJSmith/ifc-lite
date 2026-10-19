@@ -13,8 +13,8 @@ import { saveFinding, listFindings, saveEvent, listEvents, listReviewScopes, exp
 import { startLocalDictation } from '@/lib/review-companion/speech';
 import { createConcernVisionTool } from '@/lib/review-companion/concern-vision-tool';
 import { createSurfaceOrbitTool } from '@/lib/review-companion/surface-orbit';
-import { createReviewTools, registerReviewWebMcp, runBonsaiDirective, BonsaiDirectiveError } from '@/lib/review-companion/tools';
-import { createReviewTool } from '@/lib/review-companion/tools';
+import { createReviewTool, createReviewTools, registerReviewWebMcp, runBonsaiDirective, BonsaiDirectiveError } from '@/lib/review-companion/tools';
+import { directiveEvidence } from '@/lib/review-companion/directive-evidence';
 import { createReviewBcfBridge, createBcfReviewTools } from '@/lib/review-companion/bcf';
 import { createPickedFinding } from '@/lib/review-companion/picking';
 import { captureViewportFrame } from '@/lib/viewport-capture';
@@ -378,7 +378,7 @@ export function useReviewCompanion(active: boolean) {
       await stream.start(); await stream.state({ scopeId: context.scopeId, processId: started.id, stage: 'inspecting' });
         setStatus('Bonsai is choosing its next viewer action…');
         const stepTools = singleStep ? tools.filter(tool => tool.name !== 'review_inspect') : tools;
-        const result = await runBonsaiDirective(connection, prompt, stepTools, abort.signal, { evidence, singleStep, maxTurns: singleStep ? 6 : 32, maxCalls: singleStep ? 6 : 48, onToolStart: call => stream!.toolStart(call.id, call.tool, call.args), onStep: async (step, toolCallId) => {
+        const result = await runBonsaiDirective(connection, prompt, stepTools, abort.signal, { evidence: directiveEvidence(context, evidence), singleStep, maxTurns: singleStep ? 6 : 32, maxCalls: singleStep ? 6 : 48, onToolStart: call => stream!.toolStart(call.id, call.tool, call.args), onStep: async (step, toolCallId) => {
           await stream!.toolResult(toolCallId, step.result);
           await persistReviewJson({ ...input!, id: crypto.randomUUID(), provider: { model: connection.model, endpoint: connection.endpoint }, parentId: input!.id }, { stage: 'tool-completed', step }, persist);
         } });

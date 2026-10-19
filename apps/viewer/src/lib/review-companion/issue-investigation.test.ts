@@ -13,6 +13,23 @@ function setup() {
   const prepare = async () => { await workflow.investigate('fascia'); return { summary: 'A corner step is visible; its intent is unknown.', evidenceRefs: ['measurement'] }; };
   return { workflow, rows, row, prepare };
 }
+test('owner-chosen action remains scoped to the selected issue and uses the one-step boundary', async () => {
+  const s = setup();
+  await investigateSavedIssue({ workflow: s.workflow, prepare: s.prepare, ask: async (prompt, _evidence, singleStep) => {
+    assert.match(prompt, /The owner chose this next action: Measure this roof joint/);
+    assert.match(prompt, /saved BCF concern fascia/); assert.equal(singleStep, true);
+    await s.workflow.record({ topicId: 'fascia', stage: 'needs-evidence', diagnosis: 'Measured local clearance', evidenceRefs: ['measurement'] });
+    return { text: 'Measured' };
+  } }, 'fascia', 'Measure this roof joint');
+  assert.equal((await s.workflow.list())[0].diagnosis, 'Measured local clearance');
+});
+test('invalid chosen actions fail before restoring a view or starting investigation', async () => {
+  const s = setup(); let prepared = false;
+  const options = { workflow: s.workflow, prepare: async () => { prepared = true; return s.prepare(); }, ask: async () => ({ text: '' }) };
+  await assert.rejects(investigateSavedIssue(options, 'fascia', '   '), /Choose one/);
+  await assert.rejects(investigateSavedIssue(options, 'fascia', 'x'.repeat(2001)), /2000/);
+  assert.equal(prepared, false); assert.equal((await s.workflow.list())[0].stage, 'open');
+});
 test('the selected original concern and diagnosis reach Bonsai and its precise blocker persists', async () => {
   const s = setup();
   await s.workflow.record({ topicId: 'fascia', stage: 'needs-evidence', diagnosis: 'Need corner section', evidenceRefs: ['measurement'] });

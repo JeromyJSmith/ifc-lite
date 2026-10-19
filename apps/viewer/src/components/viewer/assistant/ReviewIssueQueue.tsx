@@ -10,12 +10,13 @@ import type { useReviewCompanion } from '@/hooks/useReviewCompanion';
 type Review = ReturnType<typeof useReviewCompanion>;
 export function ReviewIssueQueue({ review, run }: { review: Review; run(action: () => Promise<unknown>): void }) {
   const [selected, setSelected] = useState('');
+  const [nextAction, setNextAction] = useState('');
   const issue = review.resolution.issues.find(row => row.topicId === selected) ?? review.resolution.issues[0];
   return <section className="rounded border border-primary p-3 space-y-2" aria-label="Saved issue work queue">
     <strong>Saved issue work queue · {review.resolution.issues.length}</strong>
     <Button size="sm" variant="outline" onClick={() => downloadBlob(new Blob([JSON.stringify(REVIEW_RESOLUTION_SCHEMA, null, 2)], { type: 'application/schema+json' }), 'ifc-review-resolution.schema.json')}>Export resolution schema</Button>
     <p>Use the saved BCF evidence. Take one action, record its result, then continue toward a verified fix.</p>
-    <label className="block">Saved issue<select aria-label="Issue to investigate" className="w-full rounded border bg-background p-2" value={issue?.topicId ?? ''} onChange={e => setSelected(e.target.value)}>
+    <label className="block">Saved issue<select aria-label="Issue to investigate" className="w-full rounded border bg-background p-2" value={issue?.topicId ?? ''} onChange={e => { setSelected(e.target.value); setNextAction(''); }}>
       {!issue && <option value="">No saved BCF issues</option>}
       {review.resolution.issues.map(row => <option key={row.topicId} value={row.topicId}>{row.stage} · {row.title}</option>)}
     </select></label>
@@ -37,6 +38,16 @@ export function ReviewIssueQueue({ review, run }: { review: Review; run(action: 
           await review.resolution.refresh(); review.setStatus(`Saved issue rechecked: ${result.summary}`);
         })}>Recheck this issue in current view</Button>
       </div>
+      <form className="space-y-2" onSubmit={event => { event.preventDefault(); const action = nextAction; run(async () => {
+        review.resolution.setActive(issue.topicId);
+        const result = await investigateSavedIssue({ workflow: review.resolution.workflow, prepare: review.prepareIssue, ask: review.ask }, issue.topicId, action);
+        await review.resolution.refresh(); review.setStatus(`Issue ${result.stage}: ${result.diagnosis}`);
+        setNextAction(current => current === action ? '' : current);
+      }); }}>
+        <label className="block">One next action for this issue<textarea aria-label="One next action for this issue" maxLength={2000} rows={2} value={nextAction} onChange={event => setNextAction(event.target.value)} placeholder="For example: measure the roof-to-wall clearance at the saved corner." className="w-full rounded border bg-background p-2" /></label>
+        <Button size="sm" variant="outline" type="submit" disabled={!review.connection || review.busy || !nextAction.trim()}>Run this issue action</Button>
+        <p className="text-muted-foreground">Restores this issue’s saved view, takes one action, then records its result. Other issues and history are excluded.</p>
+      </form>
       <label className="block">Import geometry repair plan<input aria-label="Import geometry repair plan" type="file" accept="application/json,.json" disabled={review.busy} onChange={event => {
         const file = event.target.files?.[0]; event.target.value = '';
         if (file) run(async () => { const plan = await review.resolution.importPlan(issue.topicId, file); review.setStatus(`Geometry plan saved: ${plan.planRef}. Faces ${plan.beforeFaces} → ${plan.afterFaces}. Ready for Bonsai to apply; no model change yet.`); });

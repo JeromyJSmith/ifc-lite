@@ -90,6 +90,14 @@ well beyond the image location; its remote minimum is not a local gap proof.
 
 ## Selected-region BCF mission
 
+**One next action for this issue** lets the owner choose a specific investigation
+or repair step while retaining the existing saved-issue workflow. It validates
+and restores that concern, carries its prior diagnosis, permits one substantive
+action, then limits the model to recording the result. Global issue/history
+discovery is excluded. The captured native model IDs, source identities, selected
+elements and viewpoint ID accompany directives without duplicating their image;
+supplied source evidence cannot replace those native identities.
+
 **Recheck this issue in current view** runs one focused visual request directly,
 without the tool-selection model round trip or restoring the original camera.
 It validates the current source against the saved issue, preserves the exact
