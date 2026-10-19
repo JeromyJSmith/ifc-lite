@@ -20,9 +20,9 @@ import { saveGeometryPlan, readGeometryPlan } from '@/lib/review-companion/geome
 import { readIfcxWorldGeometry, summarizeWorldGeometry } from '@/lib/review-companion/ifcx-world-geometry';
 import { resolveGeometryTarget } from '@/lib/review-companion/geometry-target';
 import { summarizeIfcxGeometry } from '@/lib/review-companion/geometry-evidence';
-import { saveGeometrySource, readGeometrySource } from '@/lib/review-companion/geometry-sources';
+import { saveGeometrySource, readGeometrySource, loadGeometrySourceRecords } from '@/lib/review-companion/geometry-sources';
 import { verifyGeometryCleanup } from '@/lib/review-companion/geometry-verification';
-import { listReviewScopes, listFindings, saveFinding } from '@/lib/review-companion/storage';
+import { listAllFindings, getFindingsByIds, saveFinding } from '@/lib/review-companion/storage';
 import { rebindReviewRevision, resolveRepairModel } from '@/lib/review-companion/revision-lineage';
 import { sha256Hex } from '@/utils/sourceContentHash';
 import { persistReviewJson } from '@/lib/review-companion/journal';
@@ -32,7 +32,7 @@ import type { ReviewContext, ReviewFinding } from '@/lib/review-companion/types'
 type Options = { scope: string; findings: ReviewFinding[]; capture(): Promise<ReviewContext>; persist(row: ReviewFinding): Promise<string>;
   restore(id: string): Promise<unknown>; open(topicId: string): Promise<unknown>; applyViewpoint(context: ReviewContext): void };
 const encode = (value: unknown) => JSON.stringify(value);
-export async function allReviewRows() { return (await Promise.all((await listReviewScopes()).map(s => listFindings(s.scopeId)))).flat(); }
+export async function allReviewRows() { return listAllFindings(); }
 function payload(row: ReviewFinding | undefined): Record<string, unknown> | null {
   if (!row) return null; try { return JSON.parse(row.text); } catch { return null; }
 }
@@ -76,15 +76,16 @@ export function useReviewResolution(options: Options) {
       if (issue) { activeTopic.current = issue.topicId; await live.current.open(issue.topicId); }
     },
     verify: async (update: IssueUpdate) => {
-      const rows = await allReviewRows(), receipt = payload(rows.find(r => r.id === update.mutationReceiptRef)), verification = payload(rows.find(r => r.id === update.verificationRef));
+      const rows = await getFindingsByIds([update.mutationReceiptRef!, update.verificationRef!]), receipt = payload(rows.find(r => r.id === update.mutationReceiptRef)), verification = payload(rows.find(r => r.id === update.verificationRef));
       if (receipt?.kind !== 'review.geometry.applied' || verification?.kind !== 'review.geometry.verified' || receipt.topicId !== update.topicId || verification.topicId !== update.topicId
         || verification.receiptRef !== update.mutationReceiptRef || verification.matches !== true || receipt.afterHash !== verification.afterHash) throw new Error('This issue has no matching persisted geometry application and verified after-source. Keep the issue open.');
       const current = await source(await resolveRepairModel(String(receipt.afterHash), useViewerStore.getState().models));
       if (current.hash !== receipt.afterHash) throw new Error('The verified corrected revision is no longer loaded. Reopen or verify the current revision.');
-      await verifyGeometryCleanup(receipt, verification, rows, current.buffer);
+      const original = receipt.beforeSource as { manifestRef: string };
+      await verifyGeometryCleanup(receipt, verification, await loadGeometrySourceRecords(original.manifestRef, getFindingsByIds), current.buffer);
       // Numeric mesh cleanup proves only the explicitly diagnosed mesh defect.
       const issue = (await workflowRef.current!.list()).find(i => i.topicId === update.topicId);
-      if (receipt.operation === 'remove_defective_faces' && !issue?.title.startsWith('Mesh integrity:')) throw new Error('Mesh cleanup does not prove the original architectural concern is resolved. Resolve the mesh-integrity subissue and retain the visual concern.');
+      if (['remove_defective_faces', 'replace_mesh'].includes(String(receipt.operation)) && !issue?.title.startsWith('Mesh integrity:')) throw new Error('Mesh cleanup does not prove the original architectural concern is resolved. Resolve the mesh-integrity subissue and retain the visual concern.');
     },
     onStatus: async (topicId, _stage, row) => {
       if (!useViewerStore.getState().bcfProject?.topics.has(topicId)) await live.current.open(topicId);
@@ -92,7 +93,9 @@ export function useReviewResolution(options: Options) {
     },
   }), []);
   workflowRef.current = workflow;
-  useEffect(() => { void workflow.list().then(setIssues); void allReviewRows().then(rows => setRepairs(rows.flatMap(row => { const p = payload(row); return p?.kind === 'review.geometry.applied' ? [{ receiptRef: row.id, topicId: String(p.topicId), modelName: String(p.modelName ?? 'Repaired model'), before: p.before as { faceCount: number } | null, after: p.after as { faceCount: number } | null }] : []; }))); }, [workflow, options.findings, options.scope]);
+  // Source chunks append hundreds of rows; they must not trigger full screenshot-journal reads.
+  const outcomeKey = options.findings.filter(row => /\"kind\":\"review\.(bcf\.(definition|workflow)|geometry\.applied)\"/.test(row.text)).map(row => row.id).join(',');
+  useEffect(() => { void workflow.list().then(setIssues); void allReviewRows().then(rows => setRepairs(rows.flatMap(row => { const p = payload(row); return p?.kind === 'review.geometry.applied' ? [{ receiptRef: row.id, topicId: String(p.topicId), modelName: String(p.modelName ?? 'Repaired model'), before: p.before as { faceCount: number } | null, after: p.after as { faceCount: number } | null }] : []; }))); }, [workflow, outcomeKey, options.scope]);
   const saveView = async (topicId: string, note: string, repair?: Omit<RepairViewBinding, 'sourceIdentity'>) => {
     await live.current.open(topicId);
     const identity = repair ? (await reviewModels(useViewerStore.getState().models)).find(model => model.id === repair.modelId) : undefined;
@@ -250,6 +253,25 @@ export function useReviewResolution(options: Options) {
       useViewerStore.getState().setBcfPanelVisible(false);
       return { applied: true, verified: issueVerified, sourceVerified: matches, workflowRef: disposition.workflowRef, issueRecord: disposition, afterView, removedFaceCount: result.before && result.after ? result.before.faceCount - result.after.faceCount : null, duplicateAndDegenerateCategoriesOverlap: true, receiptRef, verificationRef, beforeHash: before.hash, afterHash: after.hash, before: result.before, after: result.after, previousViewpoint: camera.viewpoint.guid,
         next: 'Inspect the actual corrected view. Close only the diagnosed mesh defect; an architectural concern needs its own verification.' };
+    }),
+    createReviewTool('review_geometry_verify', 'Verify a persisted mesh repair against its archived original, actual current source and canonical loaded triangles. Close only its Mesh integrity issue after the exact cleanup or solid-equivalent normalization passes. Works after an interrupted application without applying it again.', { receiptRef: id }, false, async (input, execution) => {
+      const row = (await getFindingsByIds([String(input.receiptRef)]))[0], receipt = payload(row);
+      if (!row || receipt?.kind !== 'review.geometry.applied') throw new Error('No persisted geometry application has this receipt.');
+      const modelId = await resolveRepairModel(String(receipt.afterHash), useViewerStore.getState().models);
+      const current = await actions.current.source(modelId);
+      const original = receipt.beforeSource as { manifestRef: string };
+      const rows = await loadGeometrySourceRecords(original.manifestRef, getFindingsByIds);
+      const checked = await verifyGeometryCleanup(receipt, { matches: true, afterHash: current.hash }, rows, current.buffer);
+      const parsed = await parseIfcxViewerModel(current.buffer);
+      const expectedTriangles = parsed.geometryResult.meshes.reduce((n, mesh) => n + mesh.indices.length / 3, 0);
+      const loadedTriangles = current.model.geometryResult?.meshes.reduce((n, mesh) => n + mesh.indices.length / 3, 0);
+      if (expectedTriangles !== loadedTriangles) throw new Error('Loaded geometry does not match the verified source.');
+      execution?.signal?.throwIfAborted();
+      if ((await actions.current.source(modelId)).hash !== current.hash) throw new Error('Source changed during verification.');
+      const verificationRef = await actions.current.record({ kind: 'review.geometry.verified', topicId: receipt.topicId, receiptRef: row.id, afterHash: current.hash, matches: true, issueVerified: true, expectedTriangles, loadedTriangles, check: checked }, row);
+      const disposition = await workflow.record({ topicId: String(receipt.topicId), stage: 'fixed', diagnosis: 'Native source/readback and independent exact-source mesh postcondition passed. This resolves the mesh-integrity defect only.', evidenceRefs: [row.id, verificationRef], mutationReceiptRef: row.id, verificationRef });
+      const afterView = await actions.current.saveView(String(receipt.topicId), `Verified mesh repair ${row.id}; verification ${verificationRef}; source ${current.hash}.`, { modelId, sourceHash: current.hash, receiptRef: row.id });
+      return { verified: true, receiptRef: row.id, verificationRef, disposition, afterView, check: checked };
     }),
     createReviewTool('review_geometry_resume', 'Reopen a saved corrected IFCX source from its preserved records, including after browser or server restart. Original source and saved issues remain preserved.', { receiptRef: id }, false, async (input, execution) => {
       const rows = await allReviewRows(), row = rows.find(r => r.id === input.receiptRef), receipt = payload(row);

@@ -5,7 +5,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { IDBFactory } from 'fake-indexeddb';
 import { createReviewStorage } from './storage';
-import { readGeometrySource, saveGeometrySource } from './geometry-sources';
+import { readGeometrySource, saveGeometrySource, loadGeometrySourceRecords } from './geometry-sources';
 import type { ReviewFinding } from './types';
 function base(): ReviewFinding {
   return { schemaVersion: 1, id: 'issue', kind: 'candidate', text: 'Possible mesh defect', createdAt: new Date().toISOString(), context: {
@@ -58,4 +58,15 @@ test('existing IndexedDB archive export/import preserves geometry source and und
   const rows = await destination.listFindings(issue.context.scopeId);
   assert.deepEqual(new Uint8Array(await readGeometrySource(first.manifestRef, rows)), new Uint8Array(original));
   assert.deepEqual(new Uint8Array(await readGeometrySource(second.manifestRef, rows)), new Uint8Array(corrected));
+});
+
+test('targeted source read fetches only the manifest and committed chunk IDs', async () => {
+  const rows: ReviewFinding[] = [base()];
+  const saved = await saveGeometrySource(source(), rows[0], async row => { rows.push(row); return row.id; });
+  const requests: string[][] = [];
+  const selected = await loadGeometrySourceRecords(saved.manifestRef, async ids => { requests.push(ids); return rows.filter(row => ids.includes(row.id)); });
+  assert.deepEqual(requests[0], [saved.manifestRef]);
+  assert.ok(!selected.some(row => row.id === rows[0].id));
+  assert.deepEqual(new Uint8Array(await readGeometrySource(saved.manifestRef, selected)), new Uint8Array(source()));
+  await assert.rejects(loadGeometrySourceRecords('missing', async () => []), /manifest is missing/);
 });

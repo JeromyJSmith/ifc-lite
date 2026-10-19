@@ -79,3 +79,13 @@ export async function readGeometrySource(manifestRef: string, rows: ReviewFindin
   JSON.parse(new TextDecoder().decode(buffer));
   return buffer;
 }
+
+/** Fetch only the committed manifest and its source chunks; readGeometrySource validates their integrity. */
+export async function loadGeometrySourceRecords(manifestRef: string, read: (ids: string[]) => Promise<ReviewFinding[]>) {
+  const rows = await read([manifestRef]), record = rows.find(row => row.id === manifestRef);
+  if (!record) throw new Error('Geometry source manifest is missing');
+  const manifest = payload<SourceManifest>(record, 'review.geometry.source');
+  if (!Array.isArray(manifest.chunks) || !manifest.chunks.length || manifest.chunks.length > 10000
+    || manifest.chunks.some(chunk => !chunk || typeof chunk.id !== 'string' || !chunk.id)) throw new Error('Invalid geometry source manifest');
+  return [...rows, ...await read(manifest.chunks.map(chunk => chunk.id))];
+}

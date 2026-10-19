@@ -169,3 +169,14 @@ test('normalized visual location survives backup roundtrip and invalid coordinat
   await assert.rejects(target.saveFinding({ ...note('invalid-point'), location: { x: -1, y: 0.5 } }), /normalized screenshot location/);
   assert.equal((await target.listFindings(located.context.scopeId)).length, 1);
 });
+
+test('exact-ID reads survive reopen, deduplicate requests and leave all unrelated evidence intact', async () => {
+  const factory = new IDBFactory(), store = createReviewStorage(factory);
+  await store.saveFinding(note('one')); await store.saveFinding(note('other', 'other-scope'));
+  const reopened = createReviewStorage(factory);
+  assert.deepEqual(await reopened.getFindingsByIds(['one', 'missing', 'one']), [note('one')]);
+  assert.deepEqual(await reopened.getFindingsByIds([]), []);
+  assert.equal((await reopened.listAllFindings()).length, 2);
+  await assert.rejects(reopened.getFindingsByIds(['']), /identifier/);
+  await assert.rejects(reopened.getFindingsByIds(Array(10001).fill('one')), /Too many/);
+});

@@ -219,6 +219,25 @@ export function createReviewStorage(factory: IDBFactory = globalThis.indexedDB) 
       result();
     });
   }
+  /** Read exact evidence identities without materializing unrelated screenshots. */
+  async function getFindingsByIds(ids: string[]): Promise<ReviewFinding[]> {
+    if (ids.length > 10000) throw new Error('Too many requested review identities');
+    const keys = [...new Set(ids)]; keys.forEach(id => text(id));
+    return transaction('readonly', (tx, result) => {
+      const rows: ReviewFinding[] = [];
+      result(rows);
+      for (const id of keys) {
+        const request = tx.objectStore('findings').get(id);
+        request.onsuccess = () => { if (request.result) rows.push(request.result as ReviewFinding); };
+      }
+    });
+  }
+  async function listAllFindings(): Promise<ReviewFinding[]> {
+    return transaction('readonly', (tx, result) => {
+      const request = tx.objectStore('findings').getAll();
+      request.onsuccess = () => result(request.result as ReviewFinding[]);
+    });
+  }
   async function listFindings(scopeId: string): Promise<ReviewFinding[]> {
     text(scopeId);
     return transaction('readonly', (tx, result) => {
@@ -275,8 +294,8 @@ export function createReviewStorage(factory: IDBFactory = globalThis.indexedDB) 
       for (const e of archive.events) append(tx, 'events', e, fail, () => { counts.eventsAdded++; });
     });
   }
-  return { saveFinding, listFindings, listReviewScopes, saveEvent, listEvents, exportReviewArchive, importReviewArchive };
+  return { saveFinding, getFindingsByIds, listAllFindings, listFindings, listReviewScopes, saveEvent, listEvents, exportReviewArchive, importReviewArchive };
 }
 
 const defaultStorage = createReviewStorage();
-export const { saveFinding, listFindings, listReviewScopes, saveEvent, listEvents, exportReviewArchive, importReviewArchive } = defaultStorage;
+export const { saveFinding, getFindingsByIds, listAllFindings, listFindings, listReviewScopes, saveEvent, listEvents, exportReviewArchive, importReviewArchive } = defaultStorage;

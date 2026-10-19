@@ -141,6 +141,8 @@ export function patchIfcxGeometry(buffer: ArrayBuffer, operation: IfcxGeometryOp
       if (node.attributes.has(IFCX_APPEARANCE)) throw new Error('Textured mesh face removal requires preserving its face-varying UV mapping');
     }
     after = analyzeIfcxMesh(path, mesh); attribute = ATTR.MESH; value = mesh;
+    if (operation.kind === 'remove_defective_faces' && before.boundaryEdges.length === 0 && after.boundaryEdges.length > 0)
+      throw new Error('Removing these faces would open previously closed topology. Use a solid-preserving topology normalization instead.');
   }
   const previous = node.attributes.get(attribute);
   if (JSON.stringify(previous) === JSON.stringify(value)) throw new Error('Geometry operation is a no-op');

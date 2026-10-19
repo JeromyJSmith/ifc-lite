@@ -59,3 +59,13 @@ test('invalid mesh, invalid transforms and destructive empty repairs refuse a pa
   assert.throws(() => patchIfcxGeometry(source(), { kind: 'set_local_transform', path: 'wall', transform: [[1]] }), /4x4/);
   assert.throws(() => patchIfcxGeometry(source(), { kind: 'translate_mesh_local', meshPath: 'wall-body', delta: [NaN, 0, 0] }), /finite/);
 });
+
+test('removing a zero-area bridge cannot open a previously closed wall shell', () => {
+  const body = { points: [[0,0,0],[1,0,0],[0,1,0],[0,0,1],[0.5,0,0]],
+    faceVertexIndices: [0,2,4,4,2,1,0,1,3,1,2,3,2,0,3,0,4,1] };
+  const buffer = new TextEncoder().encode(JSON.stringify({header:{ifcxVersion:'ifcx_alpha'},imports:[],schemas:{},data:[{path:'body',attributes:{'usd::usdgeom::mesh':body}}]})).buffer;
+  const before = inspectIfcxGeometry(buffer, 'body').meshes[0].analysis;
+  assert.equal(before.boundaryEdges.length, 0);
+  assert.equal(before.degenerateFaces.length, 1);
+  assert.throws(() => patchIfcxGeometry(buffer, {kind:'remove_defective_faces',meshPath:'body'}), /open previously closed topology/);
+});
