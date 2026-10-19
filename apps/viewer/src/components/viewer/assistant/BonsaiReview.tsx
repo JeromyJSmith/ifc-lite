@@ -7,9 +7,13 @@ import { ReviewIssueQueue } from './ReviewIssueQueue';
 import { ReviewPropertyChanges } from './ReviewPropertyChanges';
 import { useReviewCompanion } from '@/hooks/useReviewCompanion';
 import { MAX_RESOLUTION_BACKUP_BYTES } from '@/lib/review-companion/resolution-archive';
+import { runReviewAction, useReviewActionState, ReviewActionBusyError } from '@/lib/review-companion/action-gate';
 
 export function BonsaiReview({ active }: { active: boolean }) {
-  const review = useReviewCompanion(active);
+  const companion = useReviewCompanion(active);
+  const actionBusy = useReviewActionState(s => s.busy);
+  const actionError = useReviewActionState(s => s.error);
+  const review = { ...companion, busy: companion.busy || actionBusy, error: companion.error || actionError };
   const fastActivity = review.fast.events();
   const activity = (fastActivity[0]?.timestamp ?? 0) > (review.activity[0]?.timestamp ?? 0) ? fastActivity : review.activity;
   const [text, setText] = useState('');
@@ -18,7 +22,8 @@ export function BonsaiReview({ active }: { active: boolean }) {
   const file = useRef<HTMLInputElement>(null);
   const run = (operation: () => Promise<unknown>) => {
     review.setError('');
-    void operation().catch(error => {
+    void runReviewAction(operation).catch(error => {
+      if (error instanceof ReviewActionBusyError) return;
       const text = error instanceof Error ? error.message : String(error);
       if (/aborted|aborterror/i.test(text)) { review.setStatus('Review paused; saved observations are preserved'); review.setError(''); }
       else { review.setStatus('Action stopped; see the explanation below. Saved observations are preserved.'); review.setError(text); }
@@ -31,6 +36,7 @@ export function BonsaiReview({ active }: { active: boolean }) {
       <Button size="sm" variant="outline" disabled={!review.scope || review.busy} onClick={() => run(review.dictation)} aria-pressed={review.listening}>{review.listening ? 'Stop dictation' : 'Start local dictation'}</Button>
     </div>
     <p role="status" aria-live="polite" className="text-muted-foreground break-words">{review.status}</p>
+    {actionBusy && !companion.busy && <p role="status">Review action in progress; waiting for its saved result.</p>}
     <p className="text-muted-foreground">{review.webMcp}. Images go to Bonsai on this computer. Dictation uses the browser’s on-device speech pack.</p>
     {review.error && <p role="alert" className="rounded border border-destructive p-2 whitespace-pre-wrap">{review.error}</p>}
     <ReviewIssueQueue review={review} run={run} />
@@ -54,7 +60,7 @@ export function BonsaiReview({ active }: { active: boolean }) {
         onClick={() => { try { review.setDirective({ mode: review.mode === 'observe' ? 'paused' : 'observe', directive: focus }); } catch (e) { review.setError(String(e)); } }}>
         {review.mode === 'observe' ? 'Pause watching' : 'Watch as I explore'}
       </Button>
-      {review.busy && <Button size="sm" variant="outline" onClick={review.cancel}>Stop</Button>}
+      {companion.busy && <Button size="sm" variant="outline" onClick={review.cancel}>Stop</Button>}
     </div>
     <div className="rounded border p-2 space-y-2" aria-label="Fast visible tour">
       <p>Fast tour visits distinct angles once, with 350 ms camera transitions. Bonsai analyses the captured stops separately. Analysis can take tens of seconds per view.</p>
@@ -86,31 +92,31 @@ export function BonsaiReview({ active }: { active: boolean }) {
       </div>
       <ol aria-label="Bonsai live actions" className="space-y-1">{activity.filter(e => e.type === 'TOOL_CALL_START' || e.type === 'TOOL_CALL_RESULT' || e.type === 'RUN_ERROR' || e.type === 'RUN_FINISHED').slice(-10).map((event, index) => <li key={`${event.timestamp}-${index}`}>{event.type === 'TOOL_CALL_START' ? `Started: ${event.toolCallName}` : event.type === 'TOOL_CALL_RESULT' ? 'Action returned; result recorded' : event.type === 'RUN_ERROR' ? event.message : 'Directive finished'}</li>)}</ol>
     </section>
-    <ReviewPropertyChanges properties={review.properties} run={run} />
+    <ReviewPropertyChanges properties={review.properties} run={run} busy={review.busy} />
     {review.pending.length > 0 && <div role="alert" className="rounded border border-destructive p-2 space-y-2">
       <p>{review.pending.length} record(s) are not saved. Keep this panel open until retry or export succeeds.</p>
-      <Button size="sm" onClick={() => run(review.retryPending)}>Retry saving</Button>
+      <Button size="sm" disabled={review.busy} onClick={() => run(review.retryPending)}>Retry saving</Button>
       <Button size="sm" variant="outline" onClick={() => downloadBlob(new Blob([JSON.stringify(review.pending, null, 2)], { type: 'application/json' }), `unsaved-review-${crypto.randomUUID()}.json`)}>Export unsaved records</Button>
     </div>}
     <div className="border-t pt-3 space-y-2">
       <label className="block space-y-1">Saved reviews
-        <select value={review.historyScope} onChange={e => review.setHistoryScope(e.target.value)} className="w-full rounded border bg-background p-2">
+        <select disabled={review.busy} value={review.historyScope} onChange={e => review.setHistoryScope(e.target.value)} className="w-full rounded border bg-background p-2">
           <option value="">Current model revision</option>
           {review.scopes.filter(s => s.scopeId !== review.scope).map(s => <option key={s.scopeId} value={s.scopeId}>{s.models.slice(0, 2).map(m => m.name).join(', ')}{s.models.length > 2 ? ` + ${s.models.length - 2} sources` : ''} · {s.count} records · {s.scopeId.slice(-8)}</option>)}
         </select>
       </label>
       <div className="flex flex-wrap gap-2">
-        <Button size="sm" variant="outline" disabled={!review.findings.length && !review.resolution.issues.length} onClick={() => run(async () => {
+        <Button size="sm" variant="outline" disabled={review.busy || !review.findings.length && !review.resolution.issues.length} onClick={() => run(async () => {
           const archive = await review.exportArchive();
           downloadBlob(archive, `${sanitizeFilename(`building-review-${new Date().toISOString().replaceAll(':', '-')}`)}.json`);
           review.setStatus('Backup exported; keep it with your project files');
         })}>Export backup</Button>
-        <Button size="sm" variant="outline" onClick={() => file.current?.click()}>Import backup</Button>
+        <Button size="sm" variant="outline" disabled={review.busy} onClick={() => file.current?.click()}>Import backup</Button>
         <input ref={file} type="file" accept=".json,application/json" className="hidden" onChange={e => { const selected = e.target.files?.[0]; e.target.value = ''; if (selected) run(async () => {
           if (selected.size > MAX_RESOLUTION_BACKUP_BYTES) throw new Error('This backup is too large to import (256 MiB maximum).');
           const imported = await review.importArchive(JSON.parse(await selected.text())); review.setStatus(`Imported ${imported.findingsAdded} records`);
         }); }} />
-        <Button size="sm" variant="outline" onClick={() => run(async () => {
+        <Button size="sm" variant="outline" disabled={review.busy} onClick={() => run(async () => {
           const granted = await navigator.storage?.persist(); review.setStatus(granted ? 'Browser persistent storage granted. Keep an exported backup too.' : 'Browser persistence was not granted. Export a backup to keep your notes.');
         })}>Keep notes on this device</Button>
       </div>
@@ -124,13 +130,13 @@ export function BonsaiReview({ active }: { active: boolean }) {
           <p className="text-muted-foreground">{finding.context.elements.length ? finding.context.elements.map(e => `${finding.context.models.find(m => m.id === e.modelId)?.name ?? e.modelId} · #${e.expressId}${e.ifcGlobalId ? ` · ${e.ifcGlobalId}` : ''}`).join('; ') : 'Viewpoint only; no exact element identified'}</p>
           {finding.context.models.some(m => m.sourceIdentity.startsWith('session:')) && <p className="text-muted-foreground">Source identity is limited to this load session. This note remains available in saved reviews.</p>}
           <details><summary>Saved image</summary>{finding.context.viewpoint.snapshot && <img src={finding.context.viewpoint.snapshot} alt="Building view captured with this observation" className="w-full rounded" loading="lazy" />}</details>
-          <Button size="sm" variant="outline" onClick={() => run(() => review.restore(finding.id))}>Return to view</Button>
+          <Button size="sm" variant="outline" disabled={review.busy} onClick={() => run(() => review.restore(finding.id))}>Return to view</Button>
           {finding.kind === 'candidate' && <Button size="sm" variant="outline" disabled={review.busy} onClick={() => run(async () => {
             const result = await review.bcf.create({ findingId: finding.id, title: `Review: ${finding.text}`.slice(0, 180), description: finding.text.slice(0, 4000) });
             review.setStatus(`BCF issue saved: ${result.title}`);
           })}>Create BCF issue</Button>}
           {finding.location && <Button size="sm" variant="outline" disabled={review.busy} onClick={() => run(() => review.pickFinding(finding.id))}>Select element at this image location</Button>}
-          {finding.kind === 'candidate' && <div className="flex flex-wrap gap-1">{(['confirmed', 'dismissed', 'resolved'] as const).map(status => <Button key={status} size="sm" variant="outline" onClick={() => run(() => review.setFindingStatus(finding.id, status))}>{status === 'confirmed' ? 'Confirm issue' : status === 'dismissed' ? 'Dismiss' : 'Mark resolved'}</Button>)}</div>}
+          {finding.kind === 'candidate' && <div className="flex flex-wrap gap-1">{(['confirmed', 'dismissed', 'resolved'] as const).map(status => <Button key={status} size="sm" variant="outline" disabled={review.busy} onClick={() => run(() => review.setFindingStatus(finding.id, status))}>{status === 'confirmed' ? 'Confirm issue' : status === 'dismissed' ? 'Dismiss' : 'Mark resolved'}</Button>)}</div>}
         </li>;
       })}
     </ol>

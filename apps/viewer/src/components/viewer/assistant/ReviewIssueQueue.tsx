@@ -17,7 +17,7 @@ export function ReviewIssueQueue({ review, run }: { review: Review; run(action: 
     <strong>Saved issue work queue · {review.resolution.issues.length}</strong>
     <Button size="sm" variant="outline" onClick={() => downloadBlob(new Blob([JSON.stringify(REVIEW_RESOLUTION_SCHEMA, null, 2)], { type: 'application/schema+json' }), 'ifc-review-resolution.schema.json')}>Export resolution schema</Button>
     <p>Use the saved BCF evidence. Take one action, record its result, then continue toward a verified fix.</p>
-    <label className="block">Saved issue<select aria-label="Issue to investigate" className="w-full rounded border bg-background p-2" value={issue?.topicId ?? ''} onChange={e => { setSelected(e.target.value); setNextAction(''); }}>
+    <label className="block">Saved issue<select aria-label="Issue to investigate" disabled={review.busy} className="w-full rounded border bg-background p-2" value={issue?.topicId ?? ''} onChange={e => { setSelected(e.target.value); setNextAction(''); }}>
       {!issue && <option value="">No saved BCF issues</option>}
       {review.resolution.issues.map(row => <option key={row.topicId} value={row.topicId}>{row.stage} · {row.title}</option>)}
     </select></label>
