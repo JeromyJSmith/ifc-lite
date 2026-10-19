@@ -72,6 +72,24 @@ test('review completion permits zero grounded findings and never requires a quot
   assert.throws(() => move(five, { kind: 'inspection', at, inspection: { ...five.inspections[0], id: 'fixture:second-view' }, findings: [{ id: 'fixture:sixth', text: 'Extra' }] }), /five/);
 });
 
+test('a recorded nonvisual directive completes separately without manufacturing a visual inspection', () => {
+  const running = move(fresh(), { kind: 'start', at });
+  const complete = move(running, { kind: 'finish', mode: 'directive', at, evidenceRefs: ['fixture:recorded-native-read-response'] });
+  assert.equal(complete.status, 'directive-completed');
+  assert.deepEqual(complete.inspections, []);
+  assert.deepEqual(complete.findings, []);
+  assert.equal(validateReviewProcess(complete).ok, true);
+  assert.equal(running.status, 'running');
+  assert.throws(() => move(running, { kind: 'finish', mode: 'directive', at, evidenceRefs: [] }), /recorded response/);
+  assert.throws(() => move(inspected(0), { kind: 'finish', mode: 'directive', at, evidenceRefs: ['fixture:response'] }), /visual review completion/);
+  const tampered = { ...complete, status: 'completed' as const };
+  assert.equal(validateReviewProcess(tampered).ok, false);
+  for (const kind of ['fail', 'interrupt'] as const) {
+    const stopped = move(running, { kind, at, reason: 'Fixture stopped', evidenceRefs: [] });
+    assert.throws(() => move(stopped, { kind: 'finish', mode: 'directive', at, evidenceRefs: ['fixture:response'] }), /not running/);
+  }
+});
+
 test('binding requires the exact source revision and imported snapshots must replay their full history', () => {
   assert.throws(() => move(inspected(), { kind: 'bind', at, findingId: 'fixture:f0', element: { modelId: 'fixture:house', expressId: 42, ifcGlobalId: globalId, sourceIdentity: 'different-source' } }), /revision/);
   const tampered: ReviewProcess = structuredClone(previewed());

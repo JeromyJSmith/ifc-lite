@@ -24,7 +24,7 @@ export type ReviewProcessEvent =
   | { kind: 'dismiss'; at: string; findingId: string; reason: string }
   | { kind: 'block'; at: string; findingId: string; stage: string; reason: string; evidenceRefs: string[] }
   | { kind: 'fail' | 'interrupt'; at: string; reason: string; evidenceRefs: string[] }
-  | { kind: 'finish'; at: string; evidenceRefs: string[] };
+  | { kind: 'finish'; at: string; evidenceRefs: string[]; mode?: 'directive' };
 export interface ReviewProcessFinding {
   id: string; text: string; inspectionId: string;
   status: 'candidate' | 'bound' | 'previewed' | 'approved' | 'applied' | 'verified' | 'undone' | 'dismissed' | 'blocked';
@@ -35,7 +35,7 @@ export interface ReviewProcess {
   schemaVersion: 1; id: string; scopeId: string; directive: string;
   models: Array<{ id: string; name: string; sourceIdentity: string }>;
   createdAt: string; updatedAt: string;
-  status: 'not-started' | 'running' | 'completed' | 'blocked' | 'failed' | 'interrupted';
+  status: 'not-started' | 'running' | 'completed' | 'directive-completed' | 'blocked' | 'failed' | 'interrupted';
   inspections: ReviewProcessInspection[]; findings: ReviewProcessFinding[]; events: ReviewProcessEvent[];
   operation?: { operation_id: string; run_id: string; project_id: string; parent_run_id: string | null; qualification: 'unqualified' | 'structurally-valid' | 'execution-observed' | 'independently-verified' };
   artifacts?: Array<{ uri: string; sha256: string; role: string }>;
@@ -75,7 +75,13 @@ function reduce(process: ReviewProcess, event: ReviewProcessEvent): ReviewProces
       next.inspections.push(structuredClone(event.inspection));
       next.findings.push(...event.findings.map(row => ({ ...row, inspectionId: event.inspection.id, status: 'candidate' as const })));
     } else if (event.kind === 'finish') {
-      demand(next.inspections.length > 0, 'Cannot complete a visual review without a recorded inspection.'); next.status = 'completed';
+      if (event.mode === 'directive') {
+        demand(next.inspections.length === 0, 'An inspected review must use visual review completion.');
+        demand(event.evidenceRefs.length > 0, 'Directive completion requires its recorded response reference.');
+        next.status = 'directive-completed';
+      } else {
+        demand(next.inspections.length > 0, 'Cannot complete a visual review without a recorded inspection.'); next.status = 'completed';
+      }
     } else if (event.kind === 'fail' || event.kind === 'interrupt') {
       next.status = event.kind === 'fail' ? 'failed' : 'interrupted';
     } else {

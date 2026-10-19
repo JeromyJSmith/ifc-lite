@@ -196,3 +196,9 @@ unit/type/formula changes, flat mirrors, unresolved paths and room-prefix
 rewrites continue through the existing conversion exporter; source preservation
 is not claimed for those cases. Both serializer roundtrips and the real viewer
 export function are covered by regression tests.
+
+Nonvisual directives finish as `directive-completed` with a persisted response
+reference. The UI says “Directive completed; no visual inspection performed”
+and retains that meaning after recovery. Normal visual-review completion still
+requires a recorded inspection, and failures or actual interruptions remain
+terminal. Pending approval/readback continues to keep its process running.

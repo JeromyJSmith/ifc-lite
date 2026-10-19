@@ -382,11 +382,11 @@ export function useReviewCompanion(active: boolean) {
           await stream!.toolResult(toolCallId, step.result);
           await persistReviewJson({ ...input!, id: crypto.randomUUID(), provider: { model: connection.model, endpoint: connection.endpoint }, parentId: input!.id }, { stage: 'tool-completed', step }, persist);
         } });
-        await persistReviewJson({ ...input, id: crypto.randomUUID(), provider: { model: connection.model, endpoint: connection.endpoint }, parentId: input.id }, result, persist);
+        const responseRef = await persistReviewJson({ ...input, id: crypto.randomUUID(), provider: { model: connection.model, endpoint: connection.endpoint }, parentId: input.id }, result, persist);
         const text = result.text.trim().replace(/^<think>[\s\S]*?<\/think>\s*/, '');
         if (text) await stream.text(text);
         if (process.current()?.status === 'running' && process.current()!.inspections.length) await process.finish([input.id]);
-        else if (process.current()?.status === 'running') await process.interrupt('Directive ended without a visual inspection; no visual validation is claimed.', [input.id]);
+        else if (process.current()?.status === 'running') await process.finish([input.id, responseRef], 'directive');
         await stream.state({ processId: process.current()!.id, stage: process.current()!.status }); await stream.finish();
         setStatus(text); return result;
       } catch (e) {

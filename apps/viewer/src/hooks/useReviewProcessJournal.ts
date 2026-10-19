@@ -7,6 +7,9 @@ import { createReviewProcess, reviewProcessSchema, transitionReviewProcess, vali
 import type { ReviewContext, ReviewFinding } from '@/lib/review-companion/types';
 
 const instant = () => new Date().toISOString();
+const processLabel = (value: ReviewProcess) => value.status === 'directive-completed'
+  ? 'Directive completed; no visual inspection performed'
+  : value.status === 'running' ? 'Review in progress' : `Review ${value.status}`;
 const digest = async (text: string) => {
   const value = await sha256Hex(new TextEncoder().encode(text));
   if (!value) throw new Error('Secure hashing is unavailable; the process remains in memory until it can be saved.');
@@ -92,7 +95,7 @@ export function useReviewProcessJournal(persist: (finding: ReviewFinding) => Pro
     if (!context.current) throw new Error('The review has no captured input context.');
     try { await persistReviewProcessSnapshot(value, context.current, persistLatest.current, parent.current); }
     catch (error) { setStatus('Process snapshot not saved; current state remains available for export'); throw error; }
-    setStatus(value.status === 'running' ? 'Review in progress' : `Review ${value.status}`);
+    setStatus(processLabel(value));
     return value;
   }, []);
   const append = useCallback((event: ReviewProcessEvent) => enqueue(async () => {
@@ -129,7 +132,8 @@ export function useReviewProcessJournal(persist: (finding: ReviewFinding) => Pro
     if (recovered.status === 'running') return record(transitionReviewProcess(recovered, {
       kind: 'interrupt', at: instant(), reason: 'Viewer reloaded; incomplete run preserved without automatic continuation', evidenceRefs: [snapshot.id],
     }));
-    live.current = recovered; setProcess(recovered); setStatus(`Recovered review ${recovered.status}`);
+    live.current = recovered; setProcess(recovered); setStatus(recovered.status === 'directive-completed'
+      ? `Recovered ${processLabel(recovered).toLowerCase()}` : `Recovered review ${recovered.status}`);
     return recovered;
   }), [enqueue, record]);
   const begin = useCallback((input: ReviewContext, prompt: string, parentId?: string) => enqueue(async () => {
@@ -154,12 +158,12 @@ export function useReviewProcessJournal(persist: (finding: ReviewFinding) => Pro
       element: { ...element, ifcGlobalId: element.ifcGlobalId, sourceIdentity: source.sourceIdentity } }));
     bindings.current.set(child.id, originalId); return next;
   }), [enqueue, record]);
-  const finish = useCallback((evidenceRefs: string[] = []) => enqueue(async () => {
+  const finish = useCallback((evidenceRefs: string[] = [], mode?: 'directive') => enqueue(async () => {
     if (!live.current) throw new Error('No review process exists.');
     if (live.current.findings.some(finding => ['previewed', 'approved', 'applied'].includes(finding.status) || (finding.status === 'blocked' && finding.element && !finding.receipt))) {
       setStatus('Review awaits native human approval or native readback'); return live.current;
     }
-    return record(transitionReviewProcess(live.current, { kind: 'finish', at: instant(), evidenceRefs }));
+    return record(transitionReviewProcess(live.current, { kind: 'finish', at: instant(), evidenceRefs, ...(mode ? { mode } : {}) }));
   }), [enqueue, record]);
   const fail = useCallback((reason: string, evidenceRefs: string[] = []) => append({ kind: 'fail', at: instant(), reason, evidenceRefs }), [append]);
   const interrupt = useCallback((reason: string, evidenceRefs: string[] = []) => append({ kind: 'interrupt', at: instant(), reason, evidenceRefs }), [append]);

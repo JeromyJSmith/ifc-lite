@@ -69,6 +69,7 @@
         "not-started",
         "running",
         "completed",
+        "directive-completed",
         "blocked",
         "failed",
         "interrupted"
@@ -1366,6 +1367,9 @@
           "properties": {
             "kind": {
               "const": "finish"
+            },
+            "mode": {
+              "const": "directive"
             },
             "at": {
               "type": "string",

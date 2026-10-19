@@ -20,6 +20,36 @@ function running() {
   return transitionReviewProcess(initial, { kind: 'start', at });
 }
 
+test('nonvisual directive completion persists and recovers without becoming an interruption', async () => {
+  const directiveContext = { ...context, scopeId: 'fixture:nonvisual-completion' };
+  const input: ReviewFinding = { schemaVersion: 1, id: crypto.randomUUID(), kind: 'note',
+    text: 'Fixture raw-value read directive', context: directiveContext, createdAt: at };
+  await persist(input);
+  let api: ReturnType<typeof useReviewProcessJournal> | undefined;
+  function Probe() { api = useReviewProcessJournal(persist); return null; }
+  let root = createRoot(document.createElement('div'));
+  try {
+    await act(async () => root.render(<Probe />));
+    await act(async () => { await api!.begin(directiveContext, input.text, input.id); });
+    await act(async () => { await api!.finish(['fixture:actual-response'], 'directive'); });
+    assert.equal(api!.current()!.status, 'directive-completed');
+    assert.equal(api!.status, 'Directive completed; no visual inspection performed');
+    const complete = api!.current()!;
+    const rows = await listFindings(directiveContext.scopeId);
+    const snapshot = rows.find(row => {
+      try { return JSON.parse(row.text).process?.status === 'directive-completed'; } catch { return false; }
+    })!;
+    assert.deepEqual(await readReviewProcessSnapshot(snapshot, rows), complete);
+    await act(async () => root.unmount());
+    root = createRoot(document.createElement('div'));
+    await act(async () => root.render(<Probe />));
+    await act(async () => { await api!.recover(snapshot, rows); });
+    assert.deepEqual(api!.current(), complete);
+    assert.equal(api!.status, 'Recovered directive completed; no visual inspection performed');
+    assert.equal(api!.current()!.events.some(event => event.kind === 'interrupt'), false);
+  } finally { await act(async () => root.unmount()); }
+});
+
 test('large process snapshots round-trip complete hash-checked chunks in IndexedDB without duplicating screenshots', async () => {
   let process = running();
   for (let i = 0; i < 4; i++) process = transitionReviewProcess(process, { kind: 'inspection', at,
