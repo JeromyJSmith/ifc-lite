@@ -102,7 +102,7 @@ export function BonsaiReview({ active }: { active: boolean }) {
       <div className="flex flex-wrap gap-2">
         <Button size="sm" variant="outline" disabled={!review.findings.length && !review.resolution.issues.length} onClick={() => run(async () => {
           const archive = await review.exportArchive();
-          downloadBlob(new Blob([JSON.stringify(archive, null, 2)], { type: 'application/json' }), `${sanitizeFilename(`building-review-${new Date().toISOString().replaceAll(':', '-')}`)}.json`);
+          downloadBlob(archive, `${sanitizeFilename(`building-review-${new Date().toISOString().replaceAll(':', '-')}`)}.json`);
           review.setStatus('Backup exported; keep it with your project files');
         })}>Export backup</Button>
         <Button size="sm" variant="outline" onClick={() => file.current?.click()}>Import backup</Button>

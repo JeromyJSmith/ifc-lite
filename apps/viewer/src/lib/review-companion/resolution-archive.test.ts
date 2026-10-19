@@ -49,3 +49,34 @@ test('bundle metadata and duplicate scopes are validated before import', async (
   await storage.saveFinding(note('one', 'before')); const bundle = await api.exportBundle(); bundle.archives.push(bundle.archives[0]);
   await assert.rejects(api.importBundle(bundle), /Duplicate review scope/);
 });
+test('row-wise download preserves Unicode, quoted source chunks and events across a fresh storage import', async () => {
+  const source = createReviewStorage(new IDBFactory());
+  const original = { ...note('original', 'before'), text: '屋根 🏠 "source"\n\\ chunk' };
+  await source.saveFinding(original); await source.saveFinding(note('corrected', 'after'));
+  await source.saveEvent({ schemaVersion: 1, id: 'event', findingId: 'original', status: 'confirmed', createdAt: instant });
+  const blob = await createResolutionArchive(source).exportBlob();
+  assert.equal(blob.type, 'application/json');
+  const value = JSON.parse(await blob.text());
+  assert.equal(blob.size, new TextEncoder().encode(await blob.text()).length);
+  const target = createReviewStorage(new IDBFactory());
+  assert.deepEqual(await createResolutionArchive(target).importBundle(value), { scopesImported: 2, findingsAdded: 2, eventsAdded: 1 });
+  assert.deepEqual(await target.listFindings('before'), [original]);
+  assert.deepEqual(await target.listFindings('after'), [note('corrected', 'after')]);
+  assert.equal((await target.listEvents('before'))[0].status, 'confirmed');
+});
+test('download exports scopes serially and does not return a partial backup after a storage failure', async () => {
+  const source = createReviewStorage(new IDBFactory()); await source.saveFinding(note('first', 'before')); await source.saveFinding(note('second', 'after'));
+  let active = 0, maximum = 0; const visited: string[] = [];
+  const api = createResolutionArchive({ ...source, exportReviewArchive: async scope => {
+    active++; maximum = Math.max(maximum, active); visited.push(scope);
+    try { return await source.exportReviewArchive(scope); } finally { active--; }
+  } });
+  assert.equal(JSON.parse(await (await api.exportBlob()).text()).archives.length, 2);
+  assert.equal(maximum, 1); assert.deepEqual(visited, ['after', 'before']);
+  const broken = createResolutionArchive({ ...source, exportReviewArchive: async scope => {
+    if (scope === 'before') throw new Error('Storage read failed');
+    return source.exportReviewArchive(scope);
+  } });
+  await assert.rejects(broken.exportBlob(), /Storage read failed/);
+  assert.equal((await source.listFindings('before')).length, 1);
+});

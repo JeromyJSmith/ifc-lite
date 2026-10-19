@@ -12,6 +12,29 @@ function canonical(value: unknown): string {
   return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonical((value as Record<string, unknown>)[key])}`).join(',')}}`;
 }
 export function createResolutionArchive(storage: ArchiveStorage) {
+  async function exportBlob(): Promise<Blob> {
+    // Serialize one persisted row at a time. Whole-bundle stringify plus the
+    // UI's second pretty-print held several copies of every image/source.
+    const parts: Blob[] = []; let size = 0;
+    const add = (text: string) => {
+      const part = new Blob([text]); size += part.size;
+      if (size > MAX_RESOLUTION_BACKUP_BYTES) throw new Error('Resolution backup exceeds the supported archive size. Existing review data remains saved.');
+      parts.push(part);
+    };
+    add(`{"schemaVersion":1,"kind":"review.resolution.bundle","exportedAt":${JSON.stringify(new Date().toISOString())},"archives":[`);
+    let firstScope = true;
+    for (const scope of await storage.listReviewScopes()) {
+      const archive = await storage.exportReviewArchive(scope.scopeId);
+      if (!firstScope) add(','); firstScope = false;
+      add(`{"schemaVersion":1,"scopeId":${JSON.stringify(archive.scopeId)},"exportedAt":${JSON.stringify(archive.exportedAt)},"findings":[`);
+      for (const [index, row] of archive.findings.entries()) { if (index) add(','); add(JSON.stringify(row)); }
+      add('],"events":[');
+      for (const [index, row] of archive.events.entries()) { if (index) add(','); add(JSON.stringify(row)); }
+      add(']}');
+    }
+    add(']}');
+    return new Blob(parts, { type: 'application/json' });
+  }
   async function exportBundle(): Promise<ResolutionBundle> {
     const archives = await Promise.all((await storage.listReviewScopes()).map(scope => storage.exportReviewArchive(scope.scopeId)));
     const bundle: ResolutionBundle = { schemaVersion: 1, kind: 'review.resolution.bundle', exportedAt: new Date().toISOString(), archives };
@@ -52,8 +75,9 @@ export function createResolutionArchive(storage: ArchiveStorage) {
     for (const archive of archives) { const added = await storage.importReviewArchive(archive); counts.findingsAdded += added.findingsAdded; counts.eventsAdded += added.eventsAdded; }
     return counts;
   }
-  return { exportBundle, importBundle };
+  return { exportBundle, exportBlob, importBundle };
 }
 const defaults = createResolutionArchive({ listReviewScopes, exportReviewArchive, importReviewArchive });
 export const exportResolutionBundle = defaults.exportBundle;
+export const exportResolutionBlob = defaults.exportBlob;
 export const importResolutionBundle = defaults.importBundle;

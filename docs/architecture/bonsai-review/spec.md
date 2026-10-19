@@ -9,7 +9,10 @@ Export/import must preserve screenshots, source identities and provenance; rejec
 conflicting IDs atomically. Reopening identical sources must recover the notes;
 different source revisions must not silently reuse their element references.
 All-scope backup export and file import share a 256 MiB UTF-8 byte limit;
-per-scope storage validation remains bounded separately. Preserved geometry
+the download serializes persisted rows into Blob parts, one scope at a time,
+so it does not construct two full-history JSON strings containing every saved
+image and source revision. The wire format and import validation stay unchanged.
+Per-scope storage validation remains bounded separately. Preserved geometry
 revisions can make a complete bundle exceed the former 128 MiB limit. An identical
 full-history re-import must add no records and must preserve the current model.
 
