@@ -273,3 +273,20 @@ test('a focused BCF step excludes queue discovery and finishes at the persisted 
     assert.equal(result.steps.length, 2);
   }, index => index === 0 ? calls({ id: 'inspect', name: 'review_inspect', args: {} }) : calls({ id: 'record', name: 'review_update_issue', args: { topicId: 'fascia' } }));
 });
+
+test('invalid provider finish retains bounded wire evidence and prior actions without executing the invalid call', async () => {
+  const actions: unknown[] = [];
+  await withServer(async (endpoint) => {
+    await assert.rejects(runBonsaiDirective({ endpoint, model: 'Bonsai' }, 'Inspect one view.', createReviewTools(handlers(actions)), new AbortController().signal), (error: unknown) => {
+      assert.ok(error instanceof BonsaiDirectiveError);
+      assert.match(error.message, /"finishReason":"length"/);
+      assert.match(error.message, /No calls from this response were executed/);
+      assert.ok(error.message.length < 8300);
+      assert.equal(error.steps.length, 1);
+      assert.deepEqual(actions, ['frame']);
+      return true;
+    });
+  }, index => index === 0 ? calls({ id: 'first', name: 'viewer_frame_selection', args: {} }) : {
+    model: 'Bonsai', choices: [{ finish_reason: 'length', message: { content: 'x'.repeat(9000), tool_calls: [{ id: 'invalid', type: 'function', function: { name: 'viewer_frame_selection', arguments: '{}' } }] } }],
+  });
+});

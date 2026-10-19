@@ -169,7 +169,7 @@ export async function runBonsaiDirective(connection: { endpoint: string; model: 
         if (choice.finish_reason !== 'stop' || typeof message.content !== 'string') throw new Error('Bonsai directive was incomplete.');
         return { text: message.content, steps };
       }
-      if (!Array.isArray(calls) || choice.finish_reason !== 'tool_calls') throw new Error('Invalid Bonsai tool response.');
+      if (!Array.isArray(calls) || choice.finish_reason !== 'tool_calls') throw new Error(`Invalid Bonsai tool response. No calls from this response were executed. Provider evidence: ${JSON.stringify({ finishReason: choice.finish_reason, toolCalls: calls, content: message.content }).slice(0, 8000)}`);
       if (turn === maxTurns - 1 || steps.length + calls.length > maxCalls) throw new Error('Bonsai reached its bounded tool limit. Prior actions are preserved.');
       // Validate the entire proposed batch before any handler can change application state.
       const planned = calls.map(call => {
