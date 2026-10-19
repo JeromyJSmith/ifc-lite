@@ -24,7 +24,8 @@ import { useReviewProcessJournal } from './useReviewProcessJournal';
 import { createReviewPropertyProcessEvents } from '@/lib/review-companion/property-process';
 import { useReviewFastMode } from './useReviewFastMode';
 import { rebindReviewRevision } from '@/lib/review-companion/revision-lineage';
-import { prepareSavedIssue } from '@/lib/review-companion/issue-preparation';
+import { createIssuePreparationSession, runIssuePreparation } from '@/lib/review-companion/issue-preparation';
+import { selectReviewElement } from '@/lib/review-companion/selection';
 import { useReviewResolution, allReviewRows } from './useReviewResolution';
 import { useReviewPropertyTools } from './useReviewPropertyTools';
 import type { ReviewContext, ReviewFinding, ReviewEvent } from '@/lib/review-companion/types';
@@ -56,6 +57,7 @@ export function useReviewCompanion(active: boolean) {
   const controller = useRef<AbortController | null>(null);
   const directiveController = useRef<AbortController | null>(null);
   const preparationController = useRef<AbortController | null>(null);
+  const issuePreparation = useRef(createIssuePreparationSession());
   const running = useRef(false);
   const lastView = useRef('');
   const mounted = useRef(true);
@@ -157,6 +159,7 @@ export function useReviewCompanion(active: boolean) {
 
   const fast = useReviewFastMode({ active, scope, connected: !!connection, pauseObservation: () => setMode('paused'), capture, inspect, persist, applyViewpoint, process });
   const restore = useCallback(async (id: string) => {
+    issuePreparation.current.reset();
     const row = findings.find(f => f.id === id) ?? (await import('./useReviewResolution').then(m => m.allReviewRows())).find(f => f.id === id);
     if (!row) throw new Error('This finding is not in the selected review.');
     const state = useViewerStore.getState();
@@ -224,12 +227,7 @@ export function useReviewCompanion(active: boolean) {
     saveNote: (value: { text: string }) => note(value.text, undefined, connection ? { model: connection.model, endpoint: connection.endpoint } : { model: 'external-agent', endpoint: location.origin }), inspect,
     listFindings: async () => findings.filter(f => f.kind === 'candidate').map(f => ({ id: f.id, kind: f.kind, text: f.text, elements: f.context.elements, location: f.location, createdAt: f.createdAt })),
     restoreFinding: (value: { id: string }) => restore(value.id),
-    selectElement: async (value: { modelId: string; expressId: number }) => {
-      const state = useViewerStore.getState(); const model = state.models.get(value.modelId);
-      if (!model?.ifcDataStore?.entities.getTypeName(value.expressId)) throw new Error('Element is not in the loaded model.');
-      state.setSelectedEntity(value); state.setSelectedEntityId(toGlobalIdFromModels(state.models, value.modelId, value.expressId));
-      return value;
-    },
+    selectElement: selectReviewElement,
     frameSelection: async () => { const fn = useViewerStore.getState().cameraCallbacks.frameSelection; if (!fn) throw new Error('Viewer camera is unavailable.'); fn(); return { framed: true }; },
     rotateView: async (value: { azimuthDegrees: number; elevationDegrees: number }) => {
       const renderer = getGlobalRenderer(); if (!renderer) throw new Error('Viewer camera is unavailable.');
@@ -344,14 +342,9 @@ export function useReviewCompanion(active: boolean) {
   return { scope, historyScope, setHistoryScope, scopes, findings, events, pending, connection, error, setError, status, setStatus, busy: busy || directing || fast.running, mode, directive, listening, webMcp,
     connect: async () => { const abort = new AbortController(); controller.current = abort; try { const c = await connectBonsai('http://127.0.0.1:8080', abort.signal); setConnection(c); useViewerStore.getState().setChatActiveModel('local-bonsai-2'); setStatus(`Connected to ${c.model}`); } finally { controller.current = null; } },
     note, inspect, inspectConcern: concernVisionTool.execute, restore, dictation, properties, pickFinding, process, activity, fast, bcf, reviewHere, resolution,
-    prepareIssue: async (topicId: string) => {
-      if (running.current || directiveController.current || preparationController.current) throw new Error('A review is already running.');
-      const abort = new AbortController(); preparationController.current = abort; setDirecting(true); setMode('paused');
-      try {
-        return await prepareSavedIssue({ workflow: resolution.workflow,
-          onStatus: setStatus }, topicId, abort.signal);
-      } finally { preparationController.current = null; setDirecting(false); }
-    },
+    prepareIssue: (topicId: string) => runIssuePreparation({ session: issuePreparation.current, workflow: resolution.workflow,
+      state: useViewerStore.getState, running: running.current || !!directiveController.current, controller: preparationController,
+      onBusy: setDirecting, onPause: () => setMode('paused'), onStatus: setStatus }, topicId),
     setDirective: handlers.setDirective,
     setFindingStatus: async (findingId: string, status: ReviewEvent['status']) => { await saveEvent({ schemaVersion: 1, id: crypto.randomUUID(), findingId, status, createdAt: now() }); await refresh(); },
     retryPending: async () => { for (const row of pending) await persist(row); },

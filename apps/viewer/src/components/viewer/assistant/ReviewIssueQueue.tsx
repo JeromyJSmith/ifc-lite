@@ -68,7 +68,7 @@ export function ReviewIssueQueue({ review, run }: { review: Review; run(action: 
       }); }}>
         <label className="block">One next action for this issue<textarea aria-label="One next action for this issue" maxLength={2000} rows={2} value={nextAction} onChange={event => setNextAction(event.target.value)} placeholder="For example: measure the roof-to-wall clearance at the saved corner." className="w-full rounded border bg-background p-2" /></label>
         <Button size="sm" variant="outline" type="submit" disabled={!review.connection || review.busy || !nextAction.trim()}>Run this issue action</Button>
-        <p className="text-muted-foreground">Restores this issue’s saved view, takes one action, then records its result. Other issues and history are excluded.</p>
+        <p className="text-muted-foreground">Continues this issue’s working view and selection. Changing the issue or model restores its saved view. Each step takes one action and records its result.</p>
       </form>
       <label className="block">Import geometry repair plan<input aria-label="Import geometry repair plan" type="file" accept="application/json,.json" disabled={review.busy} onChange={event => {
         const file = event.target.files?.[0]; event.target.value = '';

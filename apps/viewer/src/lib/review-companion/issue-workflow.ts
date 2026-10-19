@@ -100,7 +100,13 @@ export function createIssueWorkflow(options: IssueWorkflowOptions) {
     const issue = await open(topicId);
     return record({ topicId, stage: 'investigating', diagnosis: 'Restored the original issue camera and selected surrounding elements for investigation.', evidenceRefs: [...new Set([issue.definitionRef, ...issue.evidenceRefs])].slice(0, 100) });
   }
-  return { list, record, investigate, open };
+  async function continueInvestigation(topicId: string) {
+    const issue = (await list()).find(item => item.topicId === topicId);
+    if (!issue) throw new Error('No saved BCF issue has this topic ID.');
+    return record({ topicId, stage: 'investigating', diagnosis: issue.diagnosis || 'Continuing the current issue view and selection.',
+      evidenceRefs: [...new Set([issue.definitionRef, ...issue.evidenceRefs])].slice(0, 100) });
+  }
+  return { list, record, investigate, continueInvestigation, open };
 }
 /** Persist native contact facts without asking a model to restate or approve the measurement. */
 export async function recordContactMeasurement(workflow: Pick<ReturnType<typeof createIssueWorkflow>, 'list' | 'record'>, input: {

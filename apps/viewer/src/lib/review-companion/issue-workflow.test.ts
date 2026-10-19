@@ -16,6 +16,18 @@ function setup() {
   return { workflow, rows, restored, statuses, row, reject: () => { rejectVerification = true; }, fail: () => { failPersist = true; }, verified: () => verified };
 }
 const contact = { topicId: 'topic', expectedWorkflowRef: undefined, evidenceRef: 'contact', sourceHash: 'a'.repeat(64), pathA: 'roof', pathB: 'wall', contactCount: 0, distance: 0.0004, instanceA: 0, triangleA: 5 };
+test('continuing an issue retains its diagnosis and evidence without restoring its original selection', async () => {
+  const s = setup(); s.rows.push(s.row('measurement', { kind: 'native-measurement' }));
+  await s.workflow.record({ topicId: 'topic', stage: 'needs-evidence', diagnosis: 'Door selected; frame it next', evidenceRefs: ['measurement'] });
+  const original = structuredClone(s.rows);
+  await s.workflow.continueInvestigation('topic');
+  assert.deepEqual(s.restored, []);
+  assert.deepEqual(s.rows.slice(0, original.length), original);
+  const issue = (await s.workflow.list())[0];
+  assert.equal(issue.diagnosis, 'Door selected; frame it next');
+  assert.deepEqual(issue.evidenceRefs, ['definition', 'measurement']);
+  await assert.rejects(s.workflow.continueInvestigation('missing'), /No saved/);
+});
 test('direct outcome edits preserve exact measured numbers, status, native evidence and the old record', async () => {
   const s = setup(); s.rows.push(s.row('measurement', { kind: 'native-measurement' }));
   const prior = await s.workflow.record({ topicId: 'topic', stage: 'needs-evidence', diagnosis: 'Incorrect level 3.008', evidenceRefs: ['measurement'] });
