@@ -4,6 +4,7 @@ import { createBCFProject, createBCFTopic, type BCFTopic, type BCFViewpoint } fr
 import { useViewerStore } from '@/store';
 import { reviewModels, reviewScope } from './context';
 import { createReviewTool } from './tools';
+import { projectIssueWorkflowToBcf } from './issue-bcf-projection';
 import type { ReviewFinding } from './types';
 
 const KIND = 'review.bcf.definition';
@@ -54,14 +55,8 @@ export function createReviewBcfBridge(options: { scope(): string; rows(): Promis
       try { const value = JSON.parse(record.text); if (value.kind === 'review.bcf.viewpoint' && value.topicId === d.topicId && !saved.viewpoints.some(view => view.guid === record.context.viewpoint.guid)) useViewerStore.getState().addViewpoint(d.topicId, reviewBcfViewpoint(record.context.viewpoint)); } catch { /* A non-viewpoint note is not BCF evidence. */ }
     }
     saved = useViewerStore.getState().bcfProject!.topics.get(topic.guid)!;
-    const workflow = records.flatMap(record => {
-      if (!record.text.startsWith('{')) return [];
-      try { const value = JSON.parse(record.text); return value.kind === 'review.bcf.workflow' && value.topicId === d.topicId ? [value] : []; } catch { return []; }
-    }).sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt))).at(-1);
-    if (workflow) {
-      useViewerStore.getState().updateTopic(topic.guid, { topicStatus: workflow.stage === 'fixed' ? 'Resolved' : workflow.stage === 'dismissed' ? 'Closed' : 'Open' });
-      saved = useViewerStore.getState().bcfProject!.topics.get(topic.guid)!;
-    }
+    projectIssueWorkflowToBcf(topic.guid, row.context.scopeId, records);
+    saved = useViewerStore.getState().bcfProject!.topics.get(topic.guid)!;
     useViewerStore.getState().setActiveTopic(topic.guid);
     return { topicId: saved.guid, title: saved.title, status: saved.topicStatus, viewpointId: topic.viewpoints[0].guid,
       definitionRef: row.id, contextElementCount: row.context.elements.length, hasSnapshot: !!topic.viewpoints[0].snapshot, findingId: d.findingId, saved: true,

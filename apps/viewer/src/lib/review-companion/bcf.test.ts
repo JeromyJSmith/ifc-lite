@@ -102,3 +102,52 @@ test('reopening a native BCF project projects latest durable fixed and reopened 
   assert.equal(useViewerStore.getState().bcfProject!.topics.get(created.topicId)!.topicStatus, 'Open');
   assert.equal(useViewerStore.getState().bcfProject!.topics.size, 1);
 });
+
+test('recovery and native BCF export retain diagnoses and evidence without duplicate comments', async () => {
+  const { bridge, finding, rows } = await setup();
+  const created = await bridge.create({ findingId: finding.id, title: 'Apparent divider spacing', description: 'Original edge-on observation; preserve it.' });
+  const add = (stage: string, diagnosis: string, createdAt: string, scope = finding.context.scopeId) => {
+    const row: ReviewFinding = { ...structuredClone(finding), id: crypto.randomUUID(), kind: 'note', createdAt,
+      context: { ...structuredClone(finding.context), scopeId: scope },
+      text: JSON.stringify({ kind: 'review.bcf.workflow', topicId: created.topicId, stage, diagnosis, evidenceRefs: [finding.id], createdAt }) };
+    rows.push(row); return row;
+  };
+  const measured = add('needs-evidence', 'Measured twelve separate panes; 0.025 source-unit gaps.', '2026-10-19T12:00:00Z');
+  add('investigating', 'Preparation only', '2026-10-19T13:00:00Z');
+  const dismissed = add('dismissed', 'Regular 3-by-4 grid; no spacing defect supported. No as-built certification.', '2026-10-19T14:00:00Z');
+  add('reopened', 'Wrong-source event must not change this topic', '2026-10-19T15:00:00Z', 'different-source');
+  const originals = structuredClone(rows);
+  useViewerStore.getState().setBcfProject(null);
+  await bridge.open(created.topicId);
+  await bridge.open(created.topicId);
+  const topic = useViewerStore.getState().bcfProject!.topics.get(created.topicId)!;
+  assert.equal(topic.topicStatus, 'Closed');
+  assert.deepEqual(topic.comments.map(comment => comment.guid), [measured.id, dismissed.id]);
+  assert.match(topic.comments[0].comment, /0.025/);
+  assert.ok(topic.comments.every(comment => comment.comment.includes(finding.id)));
+  assert.equal(topic.comments[1].date, '2026-10-19T14:00:00Z');
+  assert.equal(topic.comments[1].author, 'IFC-Lite review workflow');
+  assert.deepEqual(rows, originals);
+  const restored = await readBCF(await writeBCF(useViewerStore.getState().bcfProject!));
+  const exported = restored.topics.get(created.topicId)!;
+  assert.equal(exported.topicStatus, 'Closed');
+  assert.deepEqual(exported.comments, topic.comments.map(comment => ({
+    ...comment, viewpointGuid: undefined, modifiedDate: undefined, modifiedAuthor: undefined,
+  })));
+  assert.equal(exported.description, topic.description);
+  assert.equal(exported.viewpoints[0].snapshot, finding.context.viewpoint.snapshot);
+});
+
+test('a conflicting native comment is preserved and prevents a false projection success', async () => {
+  const { bridge, finding, rows } = await setup();
+  const created = await bridge.create({ findingId: finding.id, title: 'Conflict', description: 'Original' });
+  const id = crypto.randomUUID(), createdAt = '2026-10-19T14:00:00Z';
+  rows.push({ ...structuredClone(finding), id, kind: 'note', createdAt,
+    text: JSON.stringify({ kind: 'review.bcf.workflow', topicId: created.topicId, stage: 'dismissed', diagnosis: 'Saved diagnosis', evidenceRefs: [], createdAt }) });
+  useViewerStore.getState().addComment(created.topicId, { guid: id, date: createdAt, author: 'Existing author', comment: 'Preserve this different comment' });
+  await assert.rejects(bridge.open(created.topicId), /conflicts/);
+  const topic = useViewerStore.getState().bcfProject!.topics.get(created.topicId)!;
+  assert.equal(topic.comments.length, 1);
+  assert.equal(topic.comments[0].comment, 'Preserve this different comment');
+  assert.equal(topic.topicStatus, 'Open');
+});

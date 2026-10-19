@@ -27,7 +27,7 @@ function definition(row: ReviewFinding): Definition | null {
   return p?.kind === 'review.bcf.definition' && typeof p.topicId === 'string' && typeof p.findingId === 'string' && typeof p.title === 'string'
     && typeof p.description === 'string' && typeof p.createdAt === 'string' && Number.isFinite(Date.parse(p.createdAt)) ? p as unknown as Definition : null;
 }
-function event(row: ReviewFinding): WorkflowEvent | null {
+export function readIssueWorkflowEvent(row: ReviewFinding): WorkflowEvent | null {
   const p = payload(row);
   return p?.kind === 'review.bcf.workflow' && typeof p.topicId === 'string' && ISSUE_STAGES.includes(p.stage as IssueStage)
     && typeof p.diagnosis === 'string' && Array.isArray(p.evidenceRefs) && p.evidenceRefs.every(ref => typeof ref === 'string')
@@ -41,13 +41,13 @@ export interface IssueWorkflowOptions {
   restore(findingId: string): Promise<unknown>;
   /** Trusted native adapter checks receipt type, issue association, actual mutation and after-state. */
   verify(update: IssueUpdate): Promise<void>;
-  onStatus?(topicId: string, stage: IssueStage): void | Promise<void>;
+  onStatus?(topicId: string, stage: IssueStage, record: ReviewFinding): void | Promise<void>;
 }
 export function createIssueWorkflow(options: IssueWorkflowOptions) {
   let writing = false;
   async function list() {
     const rows = await options.rows();
-    const events = rows.flatMap(row => { const value = event(row); return value ? [{ row, value }] : []; })
+    const events = rows.flatMap(row => { const value = readIssueWorkflowEvent(row); return value ? [{ row, value }] : []; })
       .sort((a, b) => Date.parse(a.value.createdAt) - Date.parse(b.value.createdAt));
     const seen = new Set<string>();
     return rows.flatMap(row => {
@@ -84,9 +84,9 @@ export function createIssueWorkflow(options: IssueWorkflowOptions) {
       const value: WorkflowEvent = { ...structuredClone(update), kind: 'review.bcf.workflow', createdAt };
       const row: ReviewFinding = { schemaVersion: 1, id: crypto.randomUUID(), kind: 'note', parentId: original.id,
         text: JSON.stringify(value), createdAt, context: structuredClone(original.context), provider: original.provider };
-      await options.persist(row);
+      if (await options.persist(row) !== row.id) throw new Error('Issue workflow storage returned a different record identity.');
       // Native BCF status is a projection; the durable event always precedes it.
-      await options.onStatus?.(update.topicId, update.stage);
+      await options.onStatus?.(update.topicId, update.stage, row);
       return { ...value, workflowRef: row.id, saved: true };
     } finally { writing = false; }
   }

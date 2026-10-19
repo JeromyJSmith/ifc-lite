@@ -26,6 +26,7 @@ import { listReviewScopes, listFindings, saveFinding } from '@/lib/review-compan
 import { rebindReviewRevision, resolveRepairModel } from '@/lib/review-companion/revision-lineage';
 import { sha256Hex } from '@/utils/sourceContentHash';
 import { persistReviewJson } from '@/lib/review-companion/journal';
+import { projectIssueWorkflowToBcf } from '@/lib/review-companion/issue-bcf-projection';
 import type { ReviewContext, ReviewFinding } from '@/lib/review-companion/types';
 
 type Options = { scope: string; findings: ReviewFinding[]; capture(): Promise<ReviewContext>; persist(row: ReviewFinding): Promise<string>;
@@ -85,7 +86,10 @@ export function useReviewResolution(options: Options) {
       const issue = (await workflowRef.current!.list()).find(i => i.topicId === update.topicId);
       if (receipt.operation === 'remove_defective_faces' && !issue?.title.startsWith('Mesh integrity:')) throw new Error('Mesh cleanup does not prove the original architectural concern is resolved. Resolve the mesh-integrity subissue and retain the visual concern.');
     },
-    onStatus: async (topicId, stage) => { if (!useViewerStore.getState().bcfProject?.topics.has(topicId)) await live.current.open(topicId); const state = useViewerStore.getState(); if (state.bcfProject?.topics.has(topicId)) state.updateTopic(topicId, { topicStatus: stage === 'fixed' ? 'Resolved' : stage === 'dismissed' ? 'Closed' : 'Open' }); },
+    onStatus: async (topicId, _stage, row) => {
+      if (!useViewerStore.getState().bcfProject?.topics.has(topicId)) await live.current.open(topicId);
+      projectIssueWorkflowToBcf(topicId, row.context.scopeId, [row]);
+    },
   }), []);
   workflowRef.current = workflow;
   useEffect(() => { void workflow.list().then(setIssues); void allReviewRows().then(rows => setRepairs(rows.flatMap(row => { const p = payload(row); return p?.kind === 'review.geometry.applied' ? [{ receiptRef: row.id, topicId: String(p.topicId), modelName: String(p.modelName ?? 'Repaired model'), before: p.before as { faceCount: number } | null, after: p.after as { faceCount: number } | null }] : []; }))); }, [workflow, options.findings, options.scope]);

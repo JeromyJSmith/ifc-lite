@@ -147,3 +147,16 @@ test('native geometry completion retains actual evidence and updates the issue w
   await assert.rejects(recordGeometryApplication(s.workflow, { topicId: 'topic', operation: 'replace_mesh', receiptRef: 'applied', verificationRef: 'readback', sourceHash: 'bad-source', sourceVerified: false, beforeFaces: 2415, afterFaces: 2417, diagnosis: 'Mismatch' }), /disk unavailable/);
   assert.match((await s.workflow.list())[0].diagnosis, /new-source/);
 });
+
+test('native projection receives the exact persisted event and never runs for a mismatched storage identity', async () => {
+  const s = setup(), projected: ReviewFinding[] = [];
+  let mismatch = false;
+  const workflow = createIssueWorkflow({ rows: async () => s.rows, restore: async () => {}, verify: async () => {},
+    persist: async row => { s.rows.push(structuredClone(row)); return mismatch ? 'different-id' : row.id; },
+    onStatus: (_topic, _stage, row) => { assert.deepEqual(s.rows.at(-1), row); projected.push(row); } });
+  const first = await workflow.record({ topicId: 'topic', stage: 'needs-evidence', diagnosis: 'Actual measured result', evidenceRefs: [] });
+  assert.equal(projected[0].id, first.workflowRef);
+  mismatch = true;
+  await assert.rejects(workflow.record({ topicId: 'topic', stage: 'dismissed', diagnosis: 'Not projected', evidenceRefs: [] }), /different record identity/);
+  assert.equal(projected.length, 1);
+});
