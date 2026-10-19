@@ -73,6 +73,16 @@ offset around that surface, preserving radius and projection scale. The returned
 pivot, radius and native element identify what moved; they do not verify a defect.
 `viewer_rotate` continues to mean rotation around the existing camera target.
 
+`review_geometry_contact` exposes the installed native clash contact solver for
+one exact IFCX entity pair. It returns located shared-face patches, crossing
+lines or points, plus the nearest triangle witnesses. It can scope entity A to
+one composed instance and triangle; those indices are not source polygon face
+indices, and a rendered pick requires verified correspondence. Results retain
+source hash and journal evidence reference, cap output at 64 contact clusters
+and 256 boundary points per cluster, and report truncation. Contact does not
+measure solid penetration or establish a defect. A whole triangle may extend
+well beyond the image location; its remote minimum is not a local gap proof.
+
 
 ## Selected-region BCF mission
 
