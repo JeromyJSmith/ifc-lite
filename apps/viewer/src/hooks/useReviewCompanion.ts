@@ -11,6 +11,7 @@ import { exportResolutionBundle, importResolutionBundle } from '@/lib/review-com
 import { reviewModels, reviewScope, rebindReviewModels, candidateContext } from '@/lib/review-companion/context';
 import { saveFinding, listFindings, saveEvent, listEvents, listReviewScopes, exportReviewArchive, importReviewArchive } from '@/lib/review-companion/storage';
 import { startLocalDictation } from '@/lib/review-companion/speech';
+import { createConcernVisionTool } from '@/lib/review-companion/concern-vision-tool';
 import { createReviewTools, registerReviewWebMcp, runBonsaiDirective, BonsaiDirectiveError } from '@/lib/review-companion/tools';
 import { createReviewTool } from '@/lib/review-companion/tools';
 import { createReviewBcfBridge, createBcfReviewTools } from '@/lib/review-companion/bcf';
@@ -257,7 +258,16 @@ export function useReviewCompanion(active: boolean) {
   const bcf = useMemo(() => createReviewBcfBridge({ scope: () => scope, rows: allReviewRows, persist, canRestore: async row => { await rebindReviewRevision(row.context.models, useViewerStore.getState().models); return true; } }), [scope, persist]);
   const bcfTools = useMemo(() => createBcfReviewTools(bcf), [bcf]);
   const resolution = useReviewResolution({ scope, findings, capture, persist, restore, open: bcf.open, applyViewpoint: context => applyViewpoint(context.viewpoint) });
-  const tools = useMemo(() => [...viewerTools, pickTool, ...properties.tools, ...bcfTools, ...resolution.tools], [viewerTools, pickTool, properties.tools, bcfTools, resolution.tools]);
+  const concernVisionTool = useMemo(() => createConcernVisionTool({
+    issues: () => resolution.workflow.list(),
+    validate: async topicId => {
+      const issue = (await resolution.workflow.list()).find(row => row.topicId === topicId);
+      if (!issue) throw new Error('Saved issue not found.');
+      await rebindReviewRevision(issue.context.models, useViewerStore.getState().models);
+    },
+    inspect: (question, signal) => inspect(undefined, signal, question, 1),
+  }), [resolution.workflow, inspect]);
+  const tools = useMemo(() => [...viewerTools, pickTool, concernVisionTool, ...properties.tools, ...bcfTools, ...resolution.tools], [viewerTools, pickTool, concernVisionTool, properties.tools, bcfTools, resolution.tools]);
   const reviewHere = async (observation: string) => {
     if (!connection || running.current || directiveController.current || fast.running) throw new Error('Connect Bonsai and wait for the current action to finish.');
     const abort = new AbortController(); directiveController.current = abort; setDirecting(true); setMode('paused'); setError('');
@@ -365,7 +375,7 @@ export function useReviewCompanion(active: boolean) {
       } });
       await stream.start(); await stream.state({ scopeId: context.scopeId, processId: started.id, stage: 'inspecting' });
         setStatus('Bonsai is choosing its next viewer action…');
-        const stepTools = singleStep ? tools.map(tool => tool.name === 'review_inspect' ? createReviewTool('review_inspect', 'Answer one explicit visual question about this saved BCF concern; do not search for other issues.', { question: { type: 'string', minLength: 1, maxLength: 1000 } }, false, input => inspect(undefined, abort.signal, `Saved concern: ${JSON.stringify((evidence as { issue?: { title?: string } } | undefined)?.issue?.title)}. Specific unanswered question: ${input.question}. Return at most one finding about this concern only.`, 1)) : tool) : tools;
+        const stepTools = singleStep ? tools.filter(tool => tool.name !== 'review_inspect') : tools;
         const result = await runBonsaiDirective(connection, prompt, stepTools, abort.signal, { evidence, singleStep, maxTurns: singleStep ? 6 : 32, maxCalls: singleStep ? 6 : 48, onToolStart: call => stream!.toolStart(call.id, call.tool, call.args), onStep: async (step, toolCallId) => {
           await stream!.toolResult(toolCallId, step.result);
           await persistReviewJson({ ...input!, id: crypto.randomUUID(), provider: { model: connection.model, endpoint: connection.endpoint }, parentId: input!.id }, { stage: 'tool-completed', step }, persist);
