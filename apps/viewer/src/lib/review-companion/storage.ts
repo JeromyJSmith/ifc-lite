@@ -64,6 +64,10 @@ function finding(value: unknown): asserts value is ReviewFinding {
     if (typeof point.x !== 'number' || !Number.isFinite(point.x) || point.x < 0 || point.x > 1 ||
       typeof point.y !== 'number' || !Number.isFinite(point.y) || point.y < 0 || point.y > 1) throw new Error('Invalid normalized screenshot location');
   }
+  if (f.surfaceHit !== undefined) {
+    const hit = record(f.surfaceHit); vector(hit.point);
+    if (hit.coordinateSpace !== 'rendered-viewer-world' || !Number.isSafeInteger(hit.triangleIndex) || Number(hit.triangleIndex) < 0) throw new Error('Invalid native surface evidence');
+  }
   const context = record(f.context);
   text(context.scopeId); date(context.capturedAt);
   if (context.mutationVersion !== undefined && (!Number.isSafeInteger(context.mutationVersion) || Number(context.mutationVersion) < 0)) throw new Error('Invalid model edit revision');

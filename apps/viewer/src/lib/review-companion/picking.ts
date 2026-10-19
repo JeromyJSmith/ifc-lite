@@ -11,7 +11,7 @@ export interface ReviewPickingHost {
   /** CSS canvas size. Signature must include camera, visibility, cuts, model and mutation identity. */
   frame(): { width: number; height: number; signature: string };
   /** Renderer.pick uses CSS coordinates relative to the canvas; include current visibility options. */
-  pick(x: number, y: number): Promise<{ expressId: number } | null>;
+  pick(x: number, y: number): Promise<{ expressId: number; surfaceHit?: ReviewFinding['surfaceHit'] } | null>;
   currentModels(): Promise<ReviewContext['models']>;
   /** Tests may inject the native boundary; production defaults to canonical viewer resolution. */
   resolvePick?(globalId: number): Promise<ReviewContext['elements'][number] | null>;
@@ -56,6 +56,8 @@ export async function createPickedFinding(finding: ReviewFinding, host: ReviewPi
   const hit = await host.pick(Math.min(point.x * frame.width, frame.width - 0.001), Math.min(point.y * frame.height, frame.height - 0.001));
   signal?.throwIfAborted();
   if (!hit || !Number.isSafeInteger(hit.expressId) || hit.expressId < 1) throw new Error('No IFC element was hit at this screenshot point; the observation remains unbound');
+  if (hit.surfaceHit && (hit.surfaceHit.coordinateSpace !== 'rendered-viewer-world' ||
+    ![hit.surfaceHit.point.x, hit.surfaceHit.point.y, hit.surfaceHit.point.z].every(Number.isFinite) || !Number.isSafeInteger(hit.surfaceHit.triangleIndex) || hit.surfaceHit.triangleIndex < 0)) throw new Error('Native surface location is invalid');
   const element = await (host.resolvePick ?? resolveNativePick)(hit.expressId);
   const after = await host.currentModels();
   const latest = host.frame();
@@ -65,7 +67,7 @@ export async function createPickedFinding(finding: ReviewFinding, host: ReviewPi
   if (!element || !element.ifcGlobalId || !after.some(model => model.id === element.modelId) || !Number.isSafeInteger(element.expressId) || element.expressId < 1) {
     throw new Error('The native hit has no exact IFC model and GlobalId identity; it cannot authorize an edit');
   }
-  return { ...structuredClone(finding), id: crypto.randomUUID(), parentId: finding.id, createdAt: new Date().toISOString(),
+  return { ...structuredClone(finding), surfaceHit: hit.surfaceHit ? structuredClone(hit.surfaceHit) : undefined, id: crypto.randomUUID(), parentId: finding.id, createdAt: new Date().toISOString(),
     context: { ...structuredClone(finding.context), models: after, elements: [element],
       viewpoint: { ...structuredClone(viewpoint), guid: crypto.randomUUID(), components: {
         ...structuredClone(viewpoint.components), selection: [{ ifcGuid: element.ifcGlobalId }],

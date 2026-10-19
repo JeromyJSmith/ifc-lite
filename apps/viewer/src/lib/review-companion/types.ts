@@ -27,6 +27,8 @@ export interface ReviewFinding {
   parentId?: string;
   /** A visual location is not an IFC element identity until native picking resolves it. */
   location?: ReviewPoint;
+  /** Native rendered surface evidence; viewer coordinates include active placements/recentering. */
+  surfaceHit?: { point: { x: number; y: number; z: number }; triangleIndex: number; coordinateSpace: 'rendered-viewer-world'; };
 }
 
 /** Status changes append events; the original finding is never rewritten. */

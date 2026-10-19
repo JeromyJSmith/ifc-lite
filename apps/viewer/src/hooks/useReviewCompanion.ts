@@ -196,7 +196,7 @@ export function useReviewCompanion(active: boolean) {
         const presented = await captureViewportFrame(renderer, { read: () => true });
         if (!presented) throw new Error('The saved view could not be presented for picking.');
       }, frame,
-      pick: (x, y) => captureViewportFrame(renderer, { read: (_canvas, options) => renderer.pick(x, y, { hiddenIds: options.hiddenIds, isolatedIds: options.isolatedIds }) }),
+      pick: (x, y) => captureViewportFrame(renderer, { read: async (_canvas, options) => { const filters = { hiddenIds: options.hiddenIds, isolatedIds: options.isolatedIds }; const hit = await renderer.pick(x, y, filters); const surface = renderer.raycastScene(x, y, filters)?.intersection; return hit ? { ...hit, surfaceHit: surface?.expressId === hit.expressId ? { point: { ...surface.point }, triangleIndex: surface.triangleIndex, coordinateSpace: 'rendered-viewer-world' as const } : undefined } : null; } }),
       currentModels: () => reviewModels(useViewerStore.getState().models),
     }, directiveController.current?.signal);
     await persist(child);
@@ -205,7 +205,7 @@ export function useReviewCompanion(active: boolean) {
     const element = child.context.elements[0], state = useViewerStore.getState();
     state.setSelectedEntity(element); state.setSelectedEntityId(toGlobalIdFromModels(state.models, element.modelId, element.expressId));
     setStatus('Image location selected; exact IFC element saved with a linked observation');
-    return { id: child.id, parentId: finding.id, element, note: 'Native hit identifies the visible element at the suggested location; it does not confirm the suspected defect.' };
+    return { id: child.id, parentId: finding.id, element, surfaceHit: child.surfaceHit, note: 'Native hit identifies the visible element at the suggested location; it does not confirm the suspected defect. Surface coordinates are rendered viewer world, not survey coordinates.' };
   };
 
   const handlers = {

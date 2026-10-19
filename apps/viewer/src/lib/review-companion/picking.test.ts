@@ -108,3 +108,16 @@ test('invalid point and cancellation cannot create a guessed element association
   await assert.rejects(createPickedFinding(finding, host, controller.signal), { name: 'AbortError' });
   assert.deepEqual(calls, []);
 });
+
+test('native surface evidence survives binding without mutating the original and rejects nonfinite hits', async () => {
+  const { finding, host } = await fixture();
+  const surfaceHit = { point: { x: 1.25, y: -2, z: 3.5 }, triangleIndex: 19, coordinateSpace: 'rendered-viewer-world' as const };
+  host.pick = async () => ({ expressId: 1042, surfaceHit });
+  const bound = await createPickedFinding(finding, host);
+  assert.deepEqual(bound.surfaceHit, surfaceHit);
+  surfaceHit.point.x = 99;
+  assert.equal(bound.surfaceHit?.point.x, 1.25);
+  assert.equal(finding.surfaceHit, undefined);
+  surfaceHit.point.z = NaN;
+  await assert.rejects(createPickedFinding(finding, host), /surface location/);
+});
