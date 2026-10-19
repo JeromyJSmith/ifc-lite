@@ -1,11 +1,11 @@
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. https://mozilla.org/MPL/2.0/. */
-import { createReviewStorage, listReviewScopes, exportReviewArchive, importReviewArchive, validateReviewArchive } from './storage';
+import { createReviewStorage, listReviewScopes, exportReviewArchive, importReviewArchive, validateReviewArchive, MAX_REVIEW_ARCHIVE_BYTES } from './storage';
 import type { ReviewArchive } from './types';
 export interface ResolutionBundle { schemaVersion: 1; kind: 'review.resolution.bundle'; exportedAt: string; archives: ReviewArchive[] }
 type ArchiveStorage = Pick<ReturnType<typeof createReviewStorage>, 'listReviewScopes' | 'exportReviewArchive' | 'importReviewArchive'>;
 /** All scopes include preserved source revisions; keep UI import and bundle export on one bound. */
-export const MAX_RESOLUTION_BACKUP_BYTES = 256 * 1024 * 1024;
+export const MAX_RESOLUTION_BACKUP_BYTES = MAX_REVIEW_ARCHIVE_BYTES;
 function canonical(value: unknown): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
@@ -34,6 +34,32 @@ export function createResolutionArchive(storage: ArchiveStorage) {
     }
     add(']}');
     return new Blob(parts, { type: 'application/json' });
+  }
+  async function exportParts(maxBytes = MAX_RESOLUTION_BACKUP_BYTES): Promise<Blob[]> {
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 512 || maxBytes > MAX_RESOLUTION_BACKUP_BYTES) throw new Error('Invalid backup part size.');
+    const exportedAt = new Date().toISOString();
+    const header = new Blob([`{"schemaVersion":1,"kind":"review.resolution.bundle","exportedAt":${JSON.stringify(exportedAt)},"archives":[`]);
+    const tail = new Blob([']}']);
+    const output: Blob[] = []; let archives: Blob[] = [], size = header.size + tail.size;
+    const finish = () => { output.push(new Blob([header, ...archives, tail], { type: 'application/json' })); archives = []; size = header.size + tail.size; };
+    // Preserve complete scopes, including parents/events/source chunks. All
+    // storage reads finish before any download can begin, so read failure never
+    // presents a partial set as a finished backup.
+    for (const scope of await storage.listReviewScopes()) {
+      const archive = await storage.exportReviewArchive(scope.scopeId);
+      const chunks: Blob[] = [new Blob([`{"schemaVersion":1,"scopeId":${JSON.stringify(archive.scopeId)},"exportedAt":${JSON.stringify(archive.exportedAt)},"findings":[`])];
+      for (const [index, row] of archive.findings.entries()) chunks.push(new Blob([index ? ',' : '', JSON.stringify(row)]));
+      chunks.push(new Blob(['],"events":[']));
+      for (const [index, row] of archive.events.entries()) chunks.push(new Blob([index ? ',' : '', JSON.stringify(row)]));
+      chunks.push(new Blob([']}']));
+      const blob = new Blob(chunks);
+      if (header.size + blob.size + tail.size > maxBytes) throw new Error(`Review scope ${scope.scopeId} exceeds the backup part limit. Existing review data remains saved.`);
+      if (size + blob.size + (archives.length ? 1 : 0) > maxBytes) finish();
+      if (archives.length) { archives.push(new Blob([','])); size++; }
+      archives.push(blob); size += blob.size;
+    }
+    if (archives.length || !output.length) finish();
+    return output;
   }
   async function exportBundle(): Promise<ResolutionBundle> {
     const archives = await Promise.all((await storage.listReviewScopes()).map(scope => storage.exportReviewArchive(scope.scopeId)));
@@ -75,9 +101,11 @@ export function createResolutionArchive(storage: ArchiveStorage) {
     for (const archive of archives) { const added = await storage.importReviewArchive(archive); counts.findingsAdded += added.findingsAdded; counts.eventsAdded += added.eventsAdded; }
     return counts;
   }
-  return { exportBundle, exportBlob, importBundle };
+  return { exportBundle, exportBlob, exportParts, importBundle };
 }
 const defaults = createResolutionArchive({ listReviewScopes, exportReviewArchive, importReviewArchive });
 export const exportResolutionBundle = defaults.exportBundle;
 export const exportResolutionBlob = defaults.exportBlob;
 export const importResolutionBundle = defaults.importBundle;
+
+export const exportResolutionParts = defaults.exportParts;

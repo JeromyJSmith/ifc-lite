@@ -80,3 +80,31 @@ test('download exports scopes serially and does not return a partial backup afte
   await assert.rejects(broken.exportBlob(), /Storage read failed/);
   assert.equal((await source.listFindings('before')).length, 1);
 });
+
+test('bounded backup parts restore complete scopes, parent records and events without dropping history', async () => {
+  const source = createReviewStorage(new IDBFactory());
+  for (const scope of ['before', 'middle', 'after']) {
+    await source.saveFinding(note(`${scope}-parent`, scope));
+    await source.saveFinding({ ...note(`${scope}-child`, scope), parentId: `${scope}-parent`, text: '屋根'.repeat(100) });
+    await source.saveEvent({ schemaVersion: 1, id: `${scope}-event`, findingId: `${scope}-child`, status: 'confirmed', createdAt: instant });
+  }
+  const parts = await createResolutionArchive(source).exportParts(2400);
+  assert.ok(parts.length > 1);
+  const target = createReviewStorage(new IDBFactory()), restore = createResolutionArchive(target);
+  let findings = 0, events = 0;
+  for (const blob of parts.reverse()) {
+    assert.ok(blob.size <= 2400);
+    const added = await restore.importBundle(JSON.parse(await blob.text())); findings += added.findingsAdded; events += added.eventsAdded;
+  }
+  assert.equal(findings, 6); assert.equal(events, 3);
+  for (const scope of ['before', 'middle', 'after']) assert.deepEqual(await target.exportReviewArchive(scope).then(a => ({ findings: a.findings, events: a.events })), await source.exportReviewArchive(scope).then(a => ({ findings: a.findings, events: a.events })));
+  for (const blob of parts) assert.equal((await restore.importBundle(JSON.parse(await blob.text()))).findingsAdded, 0);
+});
+test('part preparation fails without producing a partial set on oversized scopes or storage errors', async () => {
+  const source = createReviewStorage(new IDBFactory());
+  await source.saveFinding(note('one', 'before')); await source.saveFinding({ ...note('big', 'after'), text: 'x'.repeat(3000) });
+  await assert.rejects(createResolutionArchive(source).exportParts(2000), /scope.*limit/);
+  const broken = createResolutionArchive({ ...source, exportReviewArchive: async scope => { if (scope === 'before') throw new Error('Read failed'); return source.exportReviewArchive(scope); } });
+  await assert.rejects(broken.exportParts(6000), /Read failed/);
+  assert.equal((await source.listFindings('after')).length, 1);
+});

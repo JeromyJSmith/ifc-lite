@@ -7,7 +7,7 @@ import { resolveEntityRef } from '@/store/resolveEntityRef';
 import { resolveEntityRefGlobalIdFromState } from '@/store/resolveEntityRef';
 import { toGlobalIdFromModels } from '@/store/globalId';
 import { connectBonsai, inspectBonsaiView, parseVisualReview, type BonsaiConnection } from '@/lib/review-companion/bonsai';
-import { exportResolutionBlob, importResolutionBundle } from '@/lib/review-companion/resolution-archive';
+import { exportResolutionBlob, exportResolutionParts, importResolutionBundle } from '@/lib/review-companion/resolution-archive';
 import { reviewModels, reviewScope, rebindReviewModels, candidateContext } from '@/lib/review-companion/context';
 import { saveFinding, listFindings, saveEvent, listEvents, listReviewScopes, exportReviewArchive, importReviewArchive } from '@/lib/review-companion/storage';
 import { startLocalDictation } from '@/lib/review-companion/speech';
@@ -349,6 +349,7 @@ export function useReviewCompanion(active: boolean) {
     setFindingStatus: async (findingId: string, status: ReviewEvent['status']) => { await saveEvent({ schemaVersion: 1, id: crypto.randomUUID(), findingId, status, createdAt: now() }); await refresh(); },
     retryPending: async () => { for (const row of pending) await persist(row); },
     exportArchive: () => exportResolutionBlob(),
+    exportBackupParts: () => exportResolutionParts(),
     importArchive: async (value: unknown) => { const result = await importResolutionBundle(value); await refresh(); return result; },
     cancel: () => { preparationController.current?.abort(); fast.stop(); controller.current?.abort(); directiveController.current?.abort(); setMode('paused'); setStatus('Review paused'); },
     ask: async (prompt: string, evidence?: unknown, singleStep = false, issueTopicId?: string) => {

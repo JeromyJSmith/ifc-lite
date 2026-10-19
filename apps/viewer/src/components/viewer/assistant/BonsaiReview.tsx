@@ -11,6 +11,7 @@ import { runReviewAction, useReviewActionState, ReviewActionBusyError } from '@/
 
 export function BonsaiReview({ active }: { active: boolean }) {
   const companion = useReviewCompanion(active);
+  const [backupParts, setBackupParts] = useState<Array<{ blob: Blob; filename: string }>>([]);
   const actionBusy = useReviewActionState(s => s.busy);
   const actionError = useReviewActionState(s => s.error);
   const review = { ...companion, busy: companion.busy || actionBusy, error: companion.error || actionError };
@@ -107,10 +108,14 @@ export function BonsaiReview({ active }: { active: boolean }) {
       </label>
       <div className="flex flex-wrap gap-2">
         <Button size="sm" variant="outline" disabled={review.busy || !review.findings.length && !review.resolution.issues.length} onClick={() => run(async () => {
-          const archive = await review.exportArchive();
-          downloadBlob(archive, `${sanitizeFilename(`building-review-${new Date().toISOString().replaceAll(':', '-')}`)}.json`);
-          review.setStatus('Backup exported; keep it with your project files');
+          const archives = await review.exportBackupParts();
+          const stem = sanitizeFilename(`building-review-${new Date().toISOString().replaceAll(':', '-')}`);
+          const parts = archives.map((blob, index) => ({ blob, filename: `${stem}${archives.length > 1 ? `-part-${index + 1}-of-${archives.length}` : ''}.json` }));
+          setBackupParts(parts);
+          if (parts.length === 1) { downloadBlob(parts[0].blob, parts[0].filename); review.setStatus('Backup exported; keep it with your project files'); }
+          else review.setStatus(`Backup prepared in ${parts.length} parts. Download every part below and keep them together. Import every part to restore the complete repair history.`);
         })}>Export backup</Button>
+        {backupParts.length > 1 && backupParts.map((part, index) => <Button key={part.filename} size="sm" variant="outline" onClick={() => downloadBlob(part.blob, part.filename)}>Download backup part {index + 1} of {backupParts.length}</Button>)}
         <Button size="sm" variant="outline" disabled={review.busy} onClick={() => file.current?.click()}>Import backup</Button>
         <input ref={file} type="file" accept=".json,application/json" className="hidden" onChange={e => { const selected = e.target.files?.[0]; e.target.value = ''; if (selected) run(async () => {
           if (selected.size > MAX_RESOLUTION_BACKUP_BYTES) throw new Error('This backup is too large to import (256 MiB maximum).');

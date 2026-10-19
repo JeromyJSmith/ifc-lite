@@ -5,7 +5,7 @@ import type { ReviewArchive, ReviewContext, ReviewEvent, ReviewFinding } from '.
 
 export const REVIEW_DATABASE_NAME = 'ifc-lite-review-companion';
 const MAX_IMAGE = 16 * 1024 * 1024;
-const MAX_ARCHIVE = 128 * 1024 * 1024;
+export const MAX_REVIEW_ARCHIVE_BYTES = 256 * 1024 * 1024;
 type RecordValue = Record<string, unknown>;
 
 function record(value: unknown): RecordValue {
@@ -135,7 +135,7 @@ function canonical(value: unknown): string {
 function checked<T>(value: T, validate: (value: unknown) => void): T {
   // Optional fields emitted as undefined by TypeScript callers are absent in JSON.
   const encoded = JSON.stringify(value);
-  if (encoded.length > MAX_ARCHIVE) throw new Error('Review archive is too large');
+  if (new Blob([encoded]).size > MAX_REVIEW_ARCHIVE_BYTES) throw new Error('Review archive is too large');
   const clone: T = JSON.parse(encoded);
   jsonSafe(clone); validate(clone);
   return clone;
