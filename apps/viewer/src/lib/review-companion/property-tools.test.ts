@@ -38,7 +38,7 @@ test('native parser refuses invented operations, absent expected values, invalid
     { ...base, op: 'execute.javascript', value: 'window.eval()' },
     { ...base, expected: undefined },
     { ...base, target: { globalId: base.target.globalId } },
-    { ...base, target: { modelId: 'house', globalId: 'invented' } },
+    { ...base, target: { modelId: 'house', globalId: 'invalid\npath' } },
     { ...base, value: 'true', dataType: 'IfcBoolean' },
     { op: 'attribute.set', target: base.target, name: 'GlobalId', expected: base.target.globalId, value: 'replacement' },
   ];

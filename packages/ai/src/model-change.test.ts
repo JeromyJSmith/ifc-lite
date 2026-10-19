@@ -9,6 +9,17 @@ const target = { globalId: '0000000000000000000001' };
 const change = (pset: string, name: string): ModelChange => ({ op: 'property.set', target, pset, name, expected: null, value: true });
 const batch = (changes: ModelChange[]) => parseModelChangeBatch(JSON.stringify({ version: 1, kind: 'model.changes', title: 'Native identities', changes }));
 
+it('accepts exact model-scoped IFCX paths while retaining unscoped IFC identity validation', () => {
+  for (const globalId of ['1a16362b-af72-5c77-97df-6b8c0a4ca597', 'Building/Wall_01']) {
+    const scoped = { ...change('P', 'X'), target: { modelId: 'ifcx-model', globalId } };
+    expect(batch([scoped]).changes[0].target).toEqual(scoped.target);
+    expect(() => batch([{ ...scoped, target: { globalId } }])).toThrow(/GlobalId/);
+  }
+  for (const globalId of ['', ' ', 'x'.repeat(201), 'wall\nother', 'wall\u0000other']) {
+    expect(() => batch([{ ...change('P', 'X'), target: { modelId: 'ifcx-model', globalId } }])).toThrow(/GlobalId/);
+  }
+});
+
 it('accepts distinct native property and quantity names containing identity delimiters', () => {
   const properties = [change('A:B', 'C'), change('A', 'B:C')];
   expect(batch(properties).changes).toHaveLength(2);

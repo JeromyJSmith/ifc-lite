@@ -102,7 +102,12 @@ export function configureMutationView(
   dataStore: IfcDataStore
 ): void {
   baseStoreByView.set(mutationView, dataStore);
-  if (dataStore.source?.length > 0) {
+  if (dataStore.schemaVersion === 'IFC5') {
+    // IFCX source is JSON, not STEP. Its canonical import already populated
+    // these tables; STEP on-demand readers cannot recover values from it.
+    mutationView.setOnDemandExtractor(entityId => dataStore.getProperties(entityId));
+    mutationView.setQuantityExtractor(entityId => dataStore.getQuantities(entityId));
+  } else if (dataStore.source?.length > 0) {
     mutationView.setOnDemandExtractor((entityId: number) => {
       const typeName = dataStore.entities?.getTypeName(entityId) ?? '';
       if (isTypeObjectClass(typeName)) {
@@ -112,7 +117,7 @@ export function configureMutationView(
     });
   }
 
-  if (dataStore.onDemandQuantityMap && dataStore.source?.length > 0) {
+  if (dataStore.schemaVersion !== 'IFC5' && dataStore.onDemandQuantityMap && dataStore.source?.length > 0) {
     mutationView.setQuantityExtractor((entityId: number) => {
       return extractQuantitiesOnDemand(dataStore, entityId, mutationView);
     });

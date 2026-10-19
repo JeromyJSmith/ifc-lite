@@ -154,3 +154,19 @@ local Bonsai executor otherwise. These are local BCF operations, not remote
 publication. Definitions are written to append-only review storage before topic
 installation; receipts follow actual native readback. Existing projects are
 merged into, never replaced. Repeated creation for the same finding is idempotent.
+
+`review_read_element` exposes bounded native quantity sets with their current
+numeric values, types and units. `review_preview_changes` accepts the existing
+native `quantity.set` operation alongside scalar properties and descriptive
+attributes. IFCX editable views read the canonical parsed property and quantity
+tables, rather than attempting STEP extraction on JSON source. Reviewed change
+targets may use the exact IFCX authoring path in `globalId` only with an explicit
+`modelId`; native lookup and finding binding still prove the actual target.
+Unscoped targets retain the 22-character IFC GlobalId requirement.
+The original finding/model binding, expected-before conflict checks,
+visible owner Apply, native readback and undo remain in force. A quantity edit
+does not alter mesh geometry or independently verify a BCF repair. Corrective
+values require measured evidence: IFC net wall volume includes openings and
+connection geometry; gross volume does not. A bounding-box or convex-hull volume
+must not be presented as an interchangeable gross or net measurement.
+Reference: buildingSMART IFC 4.3 `Qto_WallBaseQuantities`.

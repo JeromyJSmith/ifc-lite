@@ -19,7 +19,7 @@ export const EDITABLE_ATTRIBUTES = ['Name', 'Description', 'ObjectType', 'Tag'] 
 export type EditableAttribute = typeof EDITABLE_ATTRIBUTES[number];
 
 export interface ChangeTarget {
-  /** IFC GlobalId of the element. */
+  /** IFC GlobalId, or an exact IFCX authoring path when modelId is supplied. */
   globalId: string;
   /** Restrict resolution to one loaded model; required when the GlobalId exists in several. */
   modelId?: string;
@@ -54,8 +54,9 @@ const scalar = (value: unknown): value is ChangeScalar =>
 const GLOBAL_ID = /^[0-9A-Za-z_$]{22}$/;
 
 function target(value: unknown): ChangeTarget {
-  if (!record(value) || typeof value.globalId !== 'string' || !GLOBAL_ID.test(value.globalId)) {
-    throw new Error('Each change needs a 22-character IFC GlobalId target');
+  if (!record(value) || typeof value.globalId !== 'string'
+    || !(GLOBAL_ID.test(value.globalId) || (text(value.modelId) && text(value.globalId) && !/[\u0000-\u001f\u007f]/.test(value.globalId)))) {
+    throw new Error('Each change needs a 22-character IFC GlobalId or an exact model-scoped IFCX authoring path');
   }
   if (value.modelId !== undefined && !text(value.modelId)) throw new Error('A target model id must be text');
   return value.modelId === undefined ? { globalId: value.globalId } : { globalId: value.globalId, modelId: value.modelId as string };

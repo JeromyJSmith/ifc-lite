@@ -54,12 +54,16 @@ export function createReviewPropertyBridge(options: {
     const resolved = resolveGlobalId(state, { modelId: input.modelId, globalId });
     if (typeof resolved === 'string' || resolved.expressId !== input.expressId) throw new Error('Element identity is missing or ambiguous');
     const sets = reader.view.getForEntity(input.expressId);
+    const quantities = reader.view.getQuantitiesForEntity(input.expressId);
     return { scopeId: scope.scopeId, modelId: input.modelId, expressId: input.expressId, ifcGlobalId: globalId,
       mutationVersion: state.mutationVersion,
       attributes: Object.fromEntries(EDITABLE_ATTRIBUTES.map(name => [name, effectiveAttribute(reader, input.expressId, name)])),
       properties: sets.slice(0, 50).map(set => ({ name: set.name, properties: set.properties.slice(0, 100),
         totalProperties: set.properties.length, truncated: set.properties.length > 100 })),
       totalPropertySets: sets.length, truncated: sets.length > 50,
+      quantities: quantities.slice(0, 50).map(set => ({ name: set.name, quantities: set.quantities.slice(0, 100),
+        totalQuantities: set.quantities.length, truncated: set.quantities.length > 100 })),
+      totalQuantitySets: quantities.length, quantitiesTruncated: quantities.length > 50,
       limitation: 'Scalar IFC data only. Property or quantity names do not establish editable geometry or measured dimensions.' };
   }
   async function bind(findingId: string, batch: ModelChangeBatch) {
@@ -83,7 +87,7 @@ export function createReviewPropertyBridge(options: {
     const batch = parseModelChangeBatch(JSON.stringify(input.batch));
     if (batch.changes.length > 5) throw new Error('A review property proposal may contain at most five explicit data edits');
     for (const change of batch.changes) {
-      if (change.op !== 'property.set' && change.op !== 'attribute.set') throw new Error('Review supports scalar property and descriptive attribute edits only');
+      if (change.op !== 'property.set' && change.op !== 'attribute.set' && change.op !== 'quantity.set') throw new Error('Review supports scalar property, existing quantity and descriptive attribute edits only');
       if (change.op === 'property.set' && DIMENSION_FIELD.test(change.name)) throw new Error('Dimension or geometry fields require native authoring and independently supplied measurements; a data property must not masquerade as a geometry fix');
     }
     const finding = await bind(input.findingId, batch);
