@@ -26,6 +26,12 @@ application, source readback, issue record and attached image agree. Saving the
 current issue view and saving a source-qualified repaired view are also available directly without a model request. Images
 and source agreement do not themselves certify architectural acceptance.
 
+Outcome notes can be saved directly without model rewriting. Preserve the exact
+entered text, issue stage, native evidence and prior records. Bind edits to the
+workflow revision seen when typing began; reject a newer outcome without losing
+the draft. The owner can review the current outcome and explicitly rebase the
+retained wording before saving. This path records no inferred geometry facts.
+
 Dictation starts only on an explicit button press and uses on-device speech
 recognition, with supported language-pack installation. Capture context when speech
 starts, before asynchronous transcription completes. Stop on panel close/unmount.

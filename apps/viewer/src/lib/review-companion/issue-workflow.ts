@@ -127,6 +127,15 @@ export async function recordGeometryApplication(workflow: Pick<ReturnType<typeof
       'Application and readback records are attached. Issue-specific architectural acceptance remains pending.',
     ].join(' ') });
 }
+/** Owner edits are exact text, preserving the current stage and all native evidence. */
+export async function saveIssueDiagnosis(workflow: Pick<ReturnType<typeof createIssueWorkflow>, 'list' | 'record'>, input: {
+  topicId: string; expectedWorkflowRef: string | undefined; diagnosis: string;
+}) {
+  const issue = (await workflow.list()).find(row => row.topicId === input.topicId);
+  if (!issue || issue.workflowRef !== input.expectedWorkflowRef) throw new Error('Issue changed while its note was being edited. Your text is retained; review the current outcome before saving.');
+  return workflow.record({ topicId: issue.topicId, stage: issue.stage, diagnosis: input.diagnosis,
+    evidenceRefs: [...issue.evidenceRefs], mutationReceiptRef: issue.mutationReceiptRef, verificationRef: issue.verificationRef });
+}
 export function createIssueWorkflowTools(workflow: ReturnType<typeof createIssueWorkflow>) {
   const id = { type: 'string' as const, minLength: 1, maxLength: 200 };
   return [

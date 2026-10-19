@@ -2,7 +2,7 @@
  * License, v. 2.0. https://mozilla.org/MPL/2.0/. */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createIssueWorkflow, createIssueWorkflowTools, recordGeometryApplication, recordContactMeasurement } from './issue-workflow';
+import { createIssueWorkflow, createIssueWorkflowTools, recordGeometryApplication, recordContactMeasurement, saveIssueDiagnosis } from './issue-workflow';
 import type { ReviewFinding } from './types';
 function setup() {
   const context = { scopeId: 'original-source', models: [], elements: [], capturedAt: '2026-10-19T10:00:00Z', viewpoint: { guid: 'view', snapshot: 'original-image' } };
@@ -16,6 +16,22 @@ function setup() {
   return { workflow, rows, restored, statuses, row, reject: () => { rejectVerification = true; }, fail: () => { failPersist = true; }, verified: () => verified };
 }
 const contact = { topicId: 'topic', expectedWorkflowRef: undefined, evidenceRef: 'contact', sourceHash: 'a'.repeat(64), pathA: 'roof', pathB: 'wall', contactCount: 0, distance: 0.0004, instanceA: 0, triangleA: 5 };
+test('direct outcome edits preserve exact measured numbers, status, native evidence and the old record', async () => {
+  const s = setup(); s.rows.push(s.row('measurement', { kind: 'native-measurement' }));
+  const prior = await s.workflow.record({ topicId: 'topic', stage: 'needs-evidence', diagnosis: 'Incorrect level 3.008', evidenceRefs: ['measurement'] });
+  const old = structuredClone(s.rows), text = 'Verified slab top 3.088; gap 0.007211043 → 0. Quantity recomputation remains pending.\nNo architectural acceptance claimed.';
+  const saved = await saveIssueDiagnosis(s.workflow, { topicId: 'topic', expectedWorkflowRef: prior.workflowRef, diagnosis: text });
+  assert.equal(saved.diagnosis, text); assert.equal(saved.stage, 'needs-evidence'); assert.deepEqual(saved.evidenceRefs, ['measurement']);
+  assert.deepEqual(s.rows.slice(0, old.length), old); assert.equal((await s.workflow.list())[0].diagnosis, text);
+});
+test('a stale edit or failed persistence cannot overwrite a newer issue outcome', async () => {
+  const s = setup();
+  const old = await s.workflow.record({ topicId: 'topic', stage: 'needs-evidence', diagnosis: 'Earlier', evidenceRefs: [] });
+  const current = await s.workflow.record({ topicId: 'topic', stage: 'ready-to-fix', diagnosis: 'Newer decision', evidenceRefs: [] });
+  await assert.rejects(saveIssueDiagnosis(s.workflow, { topicId: 'topic', expectedWorkflowRef: old.workflowRef, diagnosis: 'Stale edit' }), /Issue changed/);
+  s.fail(); await assert.rejects(saveIssueDiagnosis(s.workflow, { topicId: 'topic', expectedWorkflowRef: current.workflowRef, diagnosis: 'Unsaved edit' }), /disk unavailable/);
+  assert.equal((await s.workflow.list())[0].diagnosis, 'Newer decision'); assert.equal((await s.workflow.list())[0].stage, 'ready-to-fix');
+});
 test('native contact facts persist directly, retain previous evidence, and never close the concern', async () => {
   const s = setup(); s.rows.push(s.row('contact', { kind: 'review.geometry.contact' }));
   await s.workflow.record({ topicId: 'topic', stage: 'needs-evidence', diagnosis: 'Prior evidence', evidenceRefs: ['contact'] });

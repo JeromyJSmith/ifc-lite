@@ -10,7 +10,7 @@ import { reviewBcfViewpoint } from '@/lib/review-companion/bcf';
 import { saveIssueViewpoint, type RepairViewBinding } from '@/lib/review-companion/issue-viewpoint';
 import { reviewModels } from '@/lib/review-companion/context';
 import { toGlobalIdFromModels } from '@/store/globalId';
-import { createIssueWorkflow, createIssueWorkflowTools, recordGeometryApplication, recordContactMeasurement, type IssueUpdate } from '@/lib/review-companion/issue-workflow';
+import { createIssueWorkflow, createIssueWorkflowTools, recordGeometryApplication, recordContactMeasurement, saveIssueDiagnosis, type IssueUpdate } from '@/lib/review-companion/issue-workflow';
 import { createReviewTool } from '@/lib/review-companion/tools';
 import { inspectIfcxGeometry, patchIfcxGeometry, type IfcxGeometryOperation } from '@/lib/review-companion/ifcx-geometry';
 import { measureIfcxEntityDistance } from '@/lib/review-companion/geometry-distance';
@@ -285,6 +285,7 @@ export function useReviewResolution(options: Options) {
   }), [geometryTools]);
   const tools = useMemo(() => [...nativeTools, ...workspaceTools, ...geometryTools, planTool, ...issueTools], [nativeTools, workspaceTools, geometryTools, planTool, issueTools]);
   return { issues, repairs, workflow, tools, saveView,
+    saveDiagnosis: (input: { topicId: string; expectedWorkflowRef: string | undefined; diagnosis: string }) => saveIssueDiagnosis(workflow, input),
     saveRepairView: async (receiptRef: string) => {
       const receipt = payload((await allReviewRows()).find(row => row.id === receiptRef));
       if (receipt?.kind !== 'review.geometry.applied') throw new Error('Choose a saved geometry application.');

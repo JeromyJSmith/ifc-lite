@@ -11,6 +11,7 @@ type Review = ReturnType<typeof useReviewCompanion>;
 export function ReviewIssueQueue({ review, run }: { review: Review; run(action: () => Promise<unknown>): void }) {
   const [selected, setSelected] = useState('');
   const [nextAction, setNextAction] = useState('');
+  const [outcome, setOutcome] = useState<{ topicId: string; workflowRef: string | undefined; text: string } | null>(null);
   const issue = review.resolution.issues.find(row => row.topicId === selected) ?? review.resolution.issues[0];
   return <section className="rounded border border-primary p-3 space-y-2" aria-label="Saved issue work queue">
     <strong>Saved issue work queue · {review.resolution.issues.length}</strong>
@@ -22,6 +23,22 @@ export function ReviewIssueQueue({ review, run }: { review: Review; run(action: 
     </select></label>
     {issue && <><p role="status">{issue.stage} · {issue.contextElementCount} surrounding elements</p>
       {issue.diagnosis && <p className="whitespace-pre-wrap">{issue.diagnosis}</p>}
+      <details className="space-y-2"><summary>Update issue outcome</summary>
+        <form className="space-y-2" onSubmit={event => { event.preventDefault(); const edited = outcome?.topicId === issue.topicId ? outcome : null; run(async () => {
+          await review.resolution.saveDiagnosis({ topicId: issue.topicId, expectedWorkflowRef: edited ? edited.workflowRef : issue.workflowRef, diagnosis: edited?.text ?? issue.diagnosis });
+          await review.resolution.refresh(); setOutcome(null); review.setStatus('Issue outcome saved exactly as entered; status and evidence preserved');
+        }); }}>
+          <label className="block">Recorded outcome<textarea aria-label="Issue outcome note" rows={4} maxLength={8000} className="w-full rounded border bg-background p-2"
+            value={outcome?.topicId === issue.topicId ? outcome.text : issue.diagnosis}
+            onChange={event => { const text = event.target.value; setOutcome(previous => previous?.topicId === issue.topicId ? { ...previous, text } : { topicId: issue.topicId, workflowRef: issue.workflowRef, text }); }} /></label>
+          <Button size="sm" variant="outline" type="submit" disabled={review.busy || outcome?.topicId !== issue.topicId || !outcome.text.trim() || outcome.text === issue.diagnosis}>Save outcome note</Button>
+          {outcome?.topicId === issue.topicId && outcome.workflowRef !== issue.workflowRef && <div>
+            <p>The issue changed. Review its current outcome above before saving your text.</p>
+            <Button size="sm" variant="outline" type="button" disabled={review.busy} onClick={() => setOutcome(previous => previous?.topicId === issue.topicId ? { ...previous, workflowRef: issue.workflowRef } : previous)}>Keep my text for the current issue version</Button>
+          </div>}
+          <p className="text-muted-foreground">Saves your exact wording without a model request. Keeps the issue status and all saved evidence.</p>
+        </form>
+      </details>
       <div className="flex flex-wrap gap-2">
         <Button size="sm" variant="outline" disabled={review.busy} onClick={() => run(async () => {
           await review.resolution.workflow.open(issue.topicId); await review.resolution.refresh(); review.setStatus('Saved view restored; issue status preserved');
