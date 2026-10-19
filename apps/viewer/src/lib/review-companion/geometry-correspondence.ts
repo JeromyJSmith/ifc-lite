@@ -3,15 +3,16 @@
 import { readIfcxWorldGeometry, readIfcxEntityIdentities } from './ifcx-world-geometry';
 export interface PointCorrespondence { pathA: string; pointIndexA: number; pathB: string; pointIndexB: number }
 /** Explicit point pairs in the existing native composed frame, never inferred correspondences. */
-export function measureIfcxPointCorrespondence(buffer: ArrayBuffer, input: unknown) {
+export function measureIfcxPointCorrespondence(buffer: ArrayBuffer, input: unknown, resolveTarget: (target: string) => string = target => target) {
   if (!Array.isArray(input) || !input.length || input.length > 32) throw new Error('Choose 1–32 explicit point pairs.');
   const pairs: PointCorrespondence[] = input.map(value => {
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid point correspondence.');
     const { pathA, pointIndexA, pathB, pointIndexB } = value;
     if (typeof pathA !== 'string' || !pathA || typeof pathB !== 'string' || !pathB
       || !Number.isSafeInteger(pointIndexA) || pointIndexA < 0 || !Number.isSafeInteger(pointIndexB) || pointIndexB < 0) throw new Error('Invalid point correspondence.');
-    if (pathA === pathB && pointIndexA === pointIndexB) throw new Error('A point cannot independently check itself.');
-    return { pathA, pointIndexA, pathB, pointIndexB };
+    const resolvedA = resolveTarget(pathA), resolvedB = resolveTarget(pathB);
+    if (resolvedA === resolvedB && pointIndexA === pointIndexB) throw new Error('A point cannot independently check itself.');
+    return { pathA: resolvedA, pointIndexA, pathB: resolvedB, pointIndexB };
   });
   const paths = [...new Set(pairs.flatMap(pair => [pair.pathA, pair.pathB]))];
   const identities = new Map(readIfcxEntityIdentities(buffer, paths).map(entity => [entity.path, entity]));

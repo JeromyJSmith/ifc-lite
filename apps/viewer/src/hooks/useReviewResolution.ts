@@ -146,7 +146,7 @@ export function useReviewResolution(options: Options) {
       const evidenceRef = await actions.current.record({ kind: 'review.geometry.component', modelId, topicId: activeTopic.current, sourceHash: before.hash, result });
       return { sourceHash: before.hash, evidenceRef, ...result };
     }),
-    createReviewTool('review_geometry_correspondence', 'Measure 1–32 explicit native worldPoints pairs for a localized endpoint or junction check. pairsJson is an array of {pathA,pointIndexA,pathB,pointIndexB}; use exact entity paths and indices read from review_geometry_read worldPoints or a preserved source-backed plan. Never infer indices from rendered triangles. Returns canonical names/classes, coordinates, each distance and the maximum; does not edit or close the issue.', { modelId: id, pairsJson: { type: 'string', minLength: 1, maxLength: 8000 } }, false, async (input, execution) => {
+    createReviewTool('review_geometry_correspondence', 'Measure 1–32 explicit native worldPoints pairs for a localized endpoint or junction check. pairsJson is an array of {pathA,pointIndexA,pathB,pointIndexB}; use entity geometryTargets (#17) or exact entity paths and indices read from review_geometry_read worldPoints or a preserved source-backed plan. Never infer indices from rendered triangles. Returns canonical names/classes, coordinates, each distance and the maximum; does not edit or close the issue.', { modelId: id, pairsJson: { type: 'string', minLength: 1, maxLength: 8000 } }, false, async (input, execution) => {
       const modelId = input.modelId as string, before = await actions.current.source(modelId);
       const topicId = execution?.issueTopicId ?? activeTopic.current;
       const issue = execution?.issueTopicId ? (await workflow.list()).find(row => row.topicId === topicId) : undefined;
@@ -155,7 +155,7 @@ export function useReviewResolution(options: Options) {
         const bindings = await rebindReviewRevision(issue.context.models, useViewerStore.getState().models);
         if (![...bindings.values()].includes(modelId)) throw new Error('The measured model does not belong to this saved issue.');
       }
-      const result = measureIfcxPointCorrespondence(before.buffer, JSON.parse(input.pairsJson as string));
+      const result = measureIfcxPointCorrespondence(before.buffer, JSON.parse(input.pairsJson as string), target => resolveGeometryTarget(target, id => useViewerStore.getState().models.get(modelId)?.ifcDataStore?.entities.getGlobalId(id)));
       if ((await actions.current.source(modelId)).hash !== before.hash) throw new Error('Source changed during endpoint measurement.');
       const evidenceRef = await actions.current.record({ kind: 'review.geometry.correspondence', topicId, modelId, sourceHash: before.hash, result });
       execution?.signal?.throwIfAborted();
