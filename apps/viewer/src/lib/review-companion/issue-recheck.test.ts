@@ -23,10 +23,28 @@ test('one direct inspection attaches real input/response to original BCF without
   } }, 'fascia');
   const issue = (await s.workflow.list())[0];
   assert.equal(calls, 1); assert.equal(s.restores(), 0);
-  assert.equal(issue.stage, 'needs-evidence');
+  assert.equal(issue.stage, 'open');
   assert.deepEqual(issue.evidenceRefs, ['input', 'response']);
-  assert.match(issue.diagnosis, /No visible open gap/);
+  assert.match(issue.visualObservation ?? '', /No visible open gap/);
   assert.equal(s.rows.filter(row => row.text.includes('review.bcf.definition')).length, 1);
+});
+
+test('visual rechecks preserve exact repair outcome, readiness and native receipt links', async () => {
+  const s = setup();
+  const diagnosis = 'Four wall vertices lowered 0.004 to slab top 3.088; native distance 0.';
+  await s.workflow.record({ topicId: 'fascia', stage: 'ready-to-fix', diagnosis,
+    evidenceRefs: ['definition', 'input', 'response'], mutationReceiptRef: 'input', verificationRef: 'response' });
+  for (const summary of ['Possible shading line', 'No remaining visible line']) {
+    await recheckSavedConcern({ workflow: s.workflow, inspect: async () => ({ summary, evidenceRefs: ['input', 'response'] }) }, 'fascia');
+    const current = (await s.workflow.list())[0];
+    assert.equal(current.diagnosis, diagnosis);
+    assert.equal(current.stage, 'ready-to-fix');
+    assert.equal(current.mutationReceiptRef, 'input');
+    assert.equal(current.verificationRef, 'response');
+    assert.match(current.visualObservation ?? '', new RegExp(summary));
+  }
+  assert.equal(s.rows.filter(row => row.text.includes('Possible shading line')).length, 1);
+  assert.equal((await s.workflow.list())[0].visualObservation?.includes('Possible shading line'), false);
 });
 
 test('provider failure or missing persisted evidence cannot advance the issue', async () => {
@@ -43,4 +61,18 @@ test('a concurrent disposition survives an older visual inference', async () => 
     return { summary: 'Older image', evidenceRefs: ['input', 'response'] };
   } }, 'fascia'), /Issue changed/);
   assert.equal((await s.workflow.list())[0].stage, 'ready-to-fix');
+});
+
+test('full evidence capacity rejects the projection without evicting native evidence', async () => {
+  const s = setup();
+  const template = s.rows[0];
+  const refs = Array.from({ length: 100 }, (_, index) => `native-${index}`);
+  for (const id of refs) s.rows.push({ ...template, id, text: '{}' });
+  await s.workflow.record({ topicId: 'fascia', stage: 'needs-evidence', diagnosis: 'Repair readback', evidenceRefs: refs,
+    mutationReceiptRef: refs[98], verificationRef: refs[99] });
+  const before = (await s.workflow.list())[0];
+  await assert.rejects(recheckSavedConcern({ workflow: s.workflow, inspect: async () => ({ summary: 'New image', evidenceRefs: ['input', 'response'] }) }, 'fascia'), /evidence limit/);
+  assert.deepEqual((await s.workflow.list())[0], before);
+  assert.ok(s.rows.some(row => row.id === 'input'));
+  assert.ok(s.rows.some(row => row.id === 'response'));
 });

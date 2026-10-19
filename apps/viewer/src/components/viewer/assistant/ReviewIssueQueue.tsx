@@ -23,6 +23,7 @@ export function ReviewIssueQueue({ review, run }: { review: Review; run(action: 
     </select></label>
     {issue && <><p role="status">{issue.stage} · {issue.contextElementCount} surrounding elements</p>
       {issue.diagnosis && <p className="whitespace-pre-wrap">{issue.diagnosis}</p>}
+      {issue.visualObservation && <p className="whitespace-pre-wrap"><strong>Latest visual observation: </strong>{issue.visualObservation}</p>}
       <details className="space-y-2"><summary>Update issue outcome</summary>
         <form className="space-y-2" onSubmit={event => { event.preventDefault(); const edited = outcome?.topicId === issue.topicId ? outcome : null; run(async () => {
           await review.resolution.saveDiagnosis({ topicId: issue.topicId, expectedWorkflowRef: edited ? edited.workflowRef : issue.workflowRef, diagnosis: edited?.text ?? issue.diagnosis });

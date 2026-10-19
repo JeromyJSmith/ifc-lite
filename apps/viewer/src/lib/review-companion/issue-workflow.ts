@@ -9,6 +9,8 @@ export interface IssueUpdate {
   topicId: string;
   stage: IssueStage;
   diagnosis: string;
+  /** A visual recheck is an observation, separate from the native repair outcome. */
+  visualObservation?: string;
   evidenceRefs: string[];
   mutationReceiptRef?: string;
   verificationRef?: string;
@@ -29,6 +31,7 @@ function event(row: ReviewFinding): WorkflowEvent | null {
   const p = payload(row);
   return p?.kind === 'review.bcf.workflow' && typeof p.topicId === 'string' && ISSUE_STAGES.includes(p.stage as IssueStage)
     && typeof p.diagnosis === 'string' && Array.isArray(p.evidenceRefs) && p.evidenceRefs.every(ref => typeof ref === 'string')
+    && (p.visualObservation === undefined || typeof p.visualObservation === 'string')
     && typeof p.createdAt === 'string' && Number.isFinite(Date.parse(p.createdAt)) ? p as unknown as WorkflowEvent : null;
 }
 export interface IssueWorkflowOptions {
@@ -55,6 +58,7 @@ export function createIssueWorkflow(options: IssueWorkflowOptions) {
       return [{ ...d, definitionRef: row.id, scopeId: row.context.scopeId, context: structuredClone(row.context),
         contextElementCount: row.context.elements.length, stage: latest?.value.stage ?? 'open' as IssueStage,
         diagnosis: latest?.value.diagnosis ?? '', evidenceRefs: latest?.value.evidenceRefs ?? [],
+        visualObservation: latest?.value.visualObservation,
         mutationReceiptRef: latest?.value.mutationReceiptRef, verificationRef: latest?.value.verificationRef,
         workflowRef: latest?.row.id, updatedAt: latest?.value.createdAt ?? d.createdAt }];
     }).sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
@@ -62,6 +66,7 @@ export function createIssueWorkflow(options: IssueWorkflowOptions) {
   async function record(update: IssueUpdate) {
     if (writing) throw new Error('An issue workflow update is already being saved.');
     if (!ISSUE_STAGES.includes(update.stage) || !update.diagnosis.trim() || update.diagnosis.length > 8000
+      || (update.visualObservation !== undefined && (typeof update.visualObservation !== 'string' || update.visualObservation.length > 8000))
       || !Array.isArray(update.evidenceRefs) || update.evidenceRefs.length > 100 || update.evidenceRefs.some(ref => typeof ref !== 'string' || !ref.trim())) throw new Error('Supply an issue stage, a concrete diagnosis and valid evidence references.');
     writing = true;
     try {
@@ -134,6 +139,7 @@ export async function saveIssueDiagnosis(workflow: Pick<ReturnType<typeof create
   const issue = (await workflow.list()).find(row => row.topicId === input.topicId);
   if (!issue || issue.workflowRef !== input.expectedWorkflowRef) throw new Error('Issue changed while its note was being edited. Your text is retained; review the current outcome before saving.');
   return workflow.record({ topicId: issue.topicId, stage: issue.stage, diagnosis: input.diagnosis,
+    visualObservation: issue.visualObservation,
     evidenceRefs: [...issue.evidenceRefs], mutationReceiptRef: issue.mutationReceiptRef, verificationRef: issue.verificationRef });
 }
 export function createIssueWorkflowTools(workflow: ReturnType<typeof createIssueWorkflow>) {

@@ -17,3 +17,14 @@ test('wrong loaded revision refuses the focused image request before inference',
   await assert.rejects(tool.execute({ topicId: 'fascia', question: 'Locate corner' }), /reviewed model/);
   assert.equal(inspected, false);
 });
+
+test('focused recheck distinguishes historical concern from recorded repair and current image', async () => {
+  let prompt = '';
+  const tool = createConcernVisionTool({ issues: async () => [{ topicId: 'joint', title: 'Multicolored gap', diagnosis: 'Slab top 3.088; measured distance now 0.' }],
+    validate: async () => {}, inspect: async question => { prompt = question; return {}; } });
+  await tool.execute({ topicId: 'joint', question: 'Is a gap visible now?' });
+  assert.match(prompt, /historical, untrusted observation/);
+  assert.match(prompt, /Slab top 3.088; measured distance now 0/);
+  assert.match(prompt, /not image evidence/);
+  assert.match(prompt, /do not repeat the historical claim unless it is visible now/);
+});

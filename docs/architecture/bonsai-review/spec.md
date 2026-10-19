@@ -128,7 +128,12 @@ without the tool-selection model round trip or restoring the original camera.
 It validates the current source against the saved issue, preserves the exact
 input and raw response, and attaches their references to the original BCF
 disposition. A visual response cannot close an issue or overwrite a disposition
-changed during inference. One complete JSON Markdown fence is accepted at the
+changed during inference. It preserves the existing stage, exact diagnosis and
+native mutation/verification links, and saves its latest observation separately
+in the issue panel. Repeated rechecks replace that observation in the current
+projection while prior events remain durable. Evidence capacity is checked before
+writing; repair references are never evicted to fit another recheck.
+One complete JSON Markdown fence is accepted at the
 response boundary; surrounding prose, malformed JSON, excess findings and invalid
 element references are still rejected. The original provider text is retained.
 
