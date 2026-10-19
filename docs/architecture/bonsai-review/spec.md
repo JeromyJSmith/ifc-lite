@@ -86,6 +86,12 @@ source hash and journal evidence reference, cap output at 64 contact clusters
 and 256 boundary points per cluster, and report truncation. Contact does not
 measure solid penetration or establish a defect. A whole triangle may extend
 well beyond the image location; its remote minimum is not a local gap proof.
+In a host-scoped single-issue action, the contact handler validates the issue's
+source lineage, persists the measurement, then records typed facts on that BCF
+as `needs-evidence`. It preserves earlier references and refuses to replace a
+newer disposition. Only a matching successful native issue record ends this
+scoped run immediately; no extra model request is needed to restate the result.
+Generic measurements outside that scoped action do not auto-update a BCF.
 
 
 ## Selected-region BCF mission

@@ -21,7 +21,7 @@ export interface ReviewTool {
   description: string;
   inputSchema: { type: 'object'; properties: Record<string, Field>; required: string[]; additionalProperties: false };
   annotations: { readOnlyHint: boolean; consequentialHint: false; untrustedContentHint: true };
-  execute(input: unknown, context?: { signal?: AbortSignal }): Promise<unknown>;
+  execute(input: unknown, context?: { signal?: AbortSignal; issueTopicId?: string }): Promise<unknown>;
 }
 function record(input: unknown): Record<string, unknown> {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('Expected an object.');
@@ -44,7 +44,7 @@ function validate(input: unknown, schema: ReviewTool['inputSchema']): Record<str
   return value;
 }
 export function createReviewTool(name: string, description: string, properties: Record<string, Field>, readOnly: boolean,
-    run: (input: Record<string, unknown>, context?: { signal?: AbortSignal }) => unknown | Promise<unknown>): ReviewTool {
+    run: (input: Record<string, unknown>, context?: { signal?: AbortSignal; issueTopicId?: string }) => unknown | Promise<unknown>): ReviewTool {
     const inputSchema: ReviewTool['inputSchema'] = { type: 'object', properties, required: Object.keys(properties), additionalProperties: false };
     return { name, description, inputSchema, annotations: { readOnlyHint: readOnly, consequentialHint: false, untrustedContentHint: true },
       async execute(input, context) {
@@ -104,6 +104,17 @@ export async function registerReviewWebMcp(tools: ReviewTool[], documentLike?: {
 }
 
 export interface ReviewToolStep { tool: string; args: unknown; result: unknown }
+function recordedContactText(result: unknown, topicId: string): string | null {
+  if (!result || typeof result !== 'object' || !('issueRecord' in result) || !('evidenceRef' in result)) return null;
+  const saved = result.issueRecord;
+  if (!saved || typeof saved !== 'object' || !('topicId' in saved) || saved.topicId !== topicId
+    || !('saved' in saved) || saved.saved !== true || !('stage' in saved) || saved.stage !== 'needs-evidence'
+    || !('workflowRef' in saved) || typeof saved.workflowRef !== 'string' || !saved.workflowRef
+    || !('diagnosis' in saved) || typeof saved.diagnosis !== 'string' || !saved.diagnosis.trim()
+    || !('evidenceRefs' in saved) || !Array.isArray(saved.evidenceRefs) || typeof result.evidenceRef !== 'string'
+    || !saved.evidenceRefs.includes(result.evidenceRef)) return null;
+  return saved.diagnosis;
+}
 export class BonsaiDirectiveError extends Error {
   constructor(message: string, readonly steps: ReviewToolStep[], options?: ErrorOptions) { super(message, options); this.name = 'BonsaiDirectiveError'; }
 }
@@ -121,7 +132,7 @@ Do not claim a tool action succeeded unless its result confirms success. Be brie
 
 // OpenAI-compatible tool_calls contract: PrismML-Eng/llama.cpp/docs/function-calling.md
 // and tools/server/README.md, read 2026-10-19. Requires a tool-capable server chat template.
-export async function runBonsaiDirective(connection: { endpoint: string; model: string }, prompt: string, tools: ReviewTool[], signal: AbortSignal, options: { evidence?: unknown; singleStep?: boolean; maxTurns?: number; maxCalls?: number; onStep?: (step: ReviewToolStep, toolCallId: string) => Promise<void>; onToolStart?: (call: { id: string; tool: string; args: unknown }) => Promise<void> } = {}): Promise<{ text: string; steps: ReviewToolStep[] }> {
+export async function runBonsaiDirective(connection: { endpoint: string; model: string }, prompt: string, tools: ReviewTool[], signal: AbortSignal, options: { evidence?: unknown; singleStep?: boolean; issueTopicId?: string; maxTurns?: number; maxCalls?: number; onStep?: (step: ReviewToolStep, toolCallId: string) => Promise<void>; onToolStart?: (call: { id: string; tool: string; args: unknown }) => Promise<void> } = {}): Promise<{ text: string; steps: ReviewToolStep[] }> {
   const steps: ReviewToolStep[] = [];
   try {
     signal.throwIfAborted();
@@ -188,7 +199,7 @@ export async function runBonsaiDirective(connection: { endpoint: string; model: 
         signal.throwIfAborted();
         await options.onToolStart?.({ id: call.id, tool: call.tool.name, args: call.args });
         let result: unknown;
-        try { result = await call.tool.execute(call.args, { signal }); }
+        try { result = await call.tool.execute(call.args, { signal, issueTopicId: options.singleStep ? options.issueTopicId : undefined }); }
         catch (error) {
           signal.throwIfAborted();
           // A failed read has no model effect to reconcile. Preserve its real
@@ -201,6 +212,10 @@ export async function runBonsaiDirective(connection: { endpoint: string; model: 
         steps.push(step);
         await options.onStep?.(step, call.id);
         signal.throwIfAborted();
+        if (options.singleStep && options.issueTopicId && call.tool.name === 'review_geometry_contact') {
+          const text = recordedContactText(result, options.issueTopicId);
+          if (text) return { text, steps };
+        }
         // Native issue persistence is the completion boundary. Another model
         // request adds latency and can repeat the same update without new facts.
         if (options.singleStep && call.tool.name === 'review_update_issue') {

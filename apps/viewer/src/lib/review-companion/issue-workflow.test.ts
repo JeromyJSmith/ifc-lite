@@ -2,7 +2,7 @@
  * License, v. 2.0. https://mozilla.org/MPL/2.0/. */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createIssueWorkflow, createIssueWorkflowTools, recordGeometryApplication } from './issue-workflow';
+import { createIssueWorkflow, createIssueWorkflowTools, recordGeometryApplication, recordContactMeasurement } from './issue-workflow';
 import type { ReviewFinding } from './types';
 function setup() {
   const context = { scopeId: 'original-source', models: [], elements: [], capturedAt: '2026-10-19T10:00:00Z', viewpoint: { guid: 'view', snapshot: 'original-image' } };
@@ -15,6 +15,28 @@ function setup() {
     verify: async update => { verified++; if (rejectVerification || JSON.parse(rows.find(r => r.id === update.mutationReceiptRef)!.text).kind !== 'native-mutation') throw new Error('native verification rejected'); } });
   return { workflow, rows, restored, statuses, row, reject: () => { rejectVerification = true; }, fail: () => { failPersist = true; }, verified: () => verified };
 }
+const contact = { topicId: 'topic', expectedWorkflowRef: undefined, evidenceRef: 'contact', sourceHash: 'a'.repeat(64), pathA: 'roof', pathB: 'wall', contactCount: 0, distance: 0.0004, instanceA: 0, triangleA: 5 };
+test('native contact facts persist directly, retain previous evidence, and never close the concern', async () => {
+  const s = setup(); s.rows.push(s.row('contact', { kind: 'review.geometry.contact' }));
+  await s.workflow.record({ topicId: 'topic', stage: 'needs-evidence', diagnosis: 'Prior evidence', evidenceRefs: ['contact'] });
+  await s.workflow.investigate('topic');
+  const issue = (await s.workflow.list())[0];
+  assert.deepEqual(issue.evidenceRefs, ['definition', 'contact']);
+  const saved = await recordContactMeasurement(s.workflow, { ...contact, expectedWorkflowRef: issue.workflowRef });
+  assert.equal(saved.saved, true); assert.equal(saved.stage, 'needs-evidence');
+  assert.match(saved.diagnosis, /0 contact clusters; nearest distance 0.0004/);
+  assert.match(saved.diagnosis, /acceptance remain unverified/);
+  assert.deepEqual(saved.evidenceRefs, ['contact', 'definition']); assert.equal(s.verified(), 0);
+});
+test('a newer issue disposition or persistence failure cannot become a successful native completion', async () => {
+  const s = setup(); s.rows.push(s.row('contact', { kind: 'review.geometry.contact' }));
+  await s.workflow.record({ topicId: 'topic', stage: 'ready-to-fix', diagnosis: 'Newer decision', evidenceRefs: ['contact'] });
+  await assert.rejects(recordContactMeasurement(s.workflow, contact), /Issue changed/);
+  const issue = (await s.workflow.list())[0]; assert.equal(issue.stage, 'ready-to-fix');
+  s.fail();
+  await assert.rejects(recordContactMeasurement(s.workflow, { ...contact, expectedWorkflowRef: issue.workflowRef }), /disk unavailable/);
+  assert.equal((await s.workflow.list())[0].stage, 'ready-to-fix');
+});
 test('investigation restores original context and appends durable state without rewriting evidence', async () => {
   const s = setup(), original = structuredClone(s.rows[0]);
   await s.workflow.investigate('topic');

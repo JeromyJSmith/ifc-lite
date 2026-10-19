@@ -20,6 +20,25 @@ function handlers(actions: unknown[] = []): ReviewToolHandlers {
     zoomView: async value => { actions.push(value); return { zoomed: value }; },
   };
 }
+test('scoped native contact completion stops after durable BCF recording with no second model request', async () => {
+  const result = { evidenceRef: 'native-contact', issueRecord: { topicId: 'chosen', saved: true, stage: 'needs-evidence', workflowRef: 'workflow', diagnosis: 'Measured clearance; acceptance pending', evidenceRefs: ['native-contact'] } };
+  const tool = createReviewTool('review_geometry_contact', 'Native measurement', {}, false, async (_input, context) => { assert.equal(context?.issueTopicId, 'chosen'); return result; });
+  const journal: unknown[] = [];
+  await withServer(async (endpoint, requests) => {
+    const run = await runBonsaiDirective({ endpoint, model: 'Bonsai' }, 'Measure one joint', [tool], new AbortController().signal, { singleStep: true, issueTopicId: 'chosen', onStep: async step => { journal.push(step); } });
+    assert.equal(requests.length, 1); assert.equal(run.steps.length, 1); assert.equal(journal.length, 1);
+    assert.equal(run.text, result.issueRecord.diagnosis);
+  }, () => calls({ id: 'measure', name: 'review_geometry_contact', args: {} }));
+});
+test('wrong-topic or unrecorded native output cannot use the selected-issue completion shortcut', async () => {
+  for (const issueRecord of [{ topicId: 'other', saved: true, stage: 'needs-evidence', workflowRef: 'row', diagnosis: 'Other issue', evidenceRefs: ['contact'] }, { topicId: 'chosen', saved: false, stage: 'needs-evidence', workflowRef: 'row', diagnosis: 'Not saved', evidenceRefs: ['contact'] }]) {
+    const tool = createReviewTool('review_geometry_contact', 'Native measurement', {}, false, async () => ({ evidenceRef: 'contact', issueRecord }));
+    await withServer(async (endpoint, requests) => {
+      await runBonsaiDirective({ endpoint, model: 'Bonsai' }, 'Measure', [tool], new AbortController().signal, { singleStep: true, issueTopicId: 'chosen' });
+      assert.equal(requests.length, 2);
+    }, index => index === 0 ? calls({ id: 'measure', name: 'review_geometry_contact', args: {} }) : completion('No selected-issue completion claim.'));
+  }
+});
 test('tools dispatch bounded inputs and reject unknown fields, invalid modes, oversized notes and invalid IFC IDs', async () => {
   const actions: unknown[] = [], tools = createReviewTools(handlers(actions));
   const execute = (name: string, args: unknown) => tools.find(tool => tool.name === name)!.execute(args);

@@ -8,7 +8,7 @@ import { createWorkspaceTools } from '@/lib/review-companion/workspace-tools';
 import { createNativeTools } from '@/lib/review-companion/native-tools';
 import { reviewBcfViewpoint } from '@/lib/review-companion/bcf';
 import { toGlobalIdFromModels } from '@/store/globalId';
-import { createIssueWorkflow, createIssueWorkflowTools, recordGeometryApplication, type IssueUpdate } from '@/lib/review-companion/issue-workflow';
+import { createIssueWorkflow, createIssueWorkflowTools, recordGeometryApplication, recordContactMeasurement, type IssueUpdate } from '@/lib/review-companion/issue-workflow';
 import { createReviewTool } from '@/lib/review-companion/tools';
 import { inspectIfcxGeometry, patchIfcxGeometry, type IfcxGeometryOperation } from '@/lib/review-companion/ifcx-geometry';
 import { measureIfcxEntityDistance } from '@/lib/review-companion/geometry-distance';
@@ -95,13 +95,22 @@ export function useReviewResolution(options: Options) {
   const workspaceTools = useMemo(() => createWorkspaceTools({ record: event => actions.current.record({ ...event, topicId: activeTopic.current }) }), []);
   const id = { type: 'string' as const, minLength: 1, maxLength: 200 };
   const geometryTools = useMemo(() => [
-    createReviewTool('review_geometry_contact', 'Inspect native shared surface patches, intersection lines and nearest distance between two IFCX entities. Use exact geometryTargets. instanceA=-1 and triangleA=-1 inspect all instances; otherwise choose an exact composed instance and triangle (triangleA=-1 means its whole mesh). Rendered hit indices require checking correspondence to the composed instance; they are not source polygon indices. Returns bounded located contact geometry. Does not edit or close issues.', { modelId: id, targetA: id, targetB: id, instanceA: { type: 'integer', minimum: -1, maximum: Number.MAX_SAFE_INTEGER }, triangleA: { type: 'integer', minimum: -1, maximum: Number.MAX_SAFE_INTEGER } }, false, async input => {
-      const modelId = input.modelId as string, source = await actions.current.source(modelId);
+    createReviewTool('review_geometry_contact', 'Inspect native shared surface patches, intersection lines and nearest distance between two IFCX entities. Use exact geometryTargets. instanceA=-1 and triangleA=-1 inspect all instances; otherwise choose an exact composed instance and triangle (triangleA=-1 means its whole mesh). Rendered hit indices require checking correspondence to the composed instance; they are not source polygon indices. Returns bounded located contact geometry. Does not edit or close issues.', { modelId: id, targetA: id, targetB: id, instanceA: { type: 'integer', minimum: -1, maximum: Number.MAX_SAFE_INTEGER }, triangleA: { type: 'integer', minimum: -1, maximum: Number.MAX_SAFE_INTEGER } }, false, async (input, execution) => {
+      const modelId = input.modelId as string, source = await actions.current.source(modelId), topicId = execution?.issueTopicId ?? activeTopic.current;
+      const issue = execution?.issueTopicId ? (await workflow.list()).find(row => row.topicId === topicId) : undefined;
+      if (execution?.issueTopicId && !issue) throw new Error('Selected issue disappeared before measurement.');
+      if (issue) {
+        const bindings = await rebindReviewRevision(issue.context.models, useViewerStore.getState().models);
+        if (![...bindings.values()].includes(modelId)) throw new Error('The measured model does not belong to this saved issue.');
+      }
       const resolve = (target: string) => resolveGeometryTarget(target, id => useViewerStore.getState().models.get(modelId)?.ifcDataStore?.entities.getGlobalId(id));
       const result = inspectIfcxContact(source.buffer, resolve(input.targetA as string), resolve(input.targetB as string), input.instanceA as number, input.triangleA as number);
       if ((await actions.current.source(modelId)).hash !== source.hash) throw new Error('Source changed during contact analysis. Inspect the current revision.');
-      const evidenceRef = await actions.current.record({ kind: 'review.geometry.contact', topicId: activeTopic.current, modelId, sourceHash: source.hash, result });
-      return { sourceHash: source.hash, evidenceRef, ...result };
+      const evidenceRef = await actions.current.record({ kind: 'review.geometry.contact', topicId, modelId, sourceHash: source.hash, result });
+      const issueRecord = issue ? await recordContactMeasurement(workflow, { topicId: issue.topicId, expectedWorkflowRef: issue.workflowRef,
+        evidenceRef, sourceHash: source.hash, pathA: result.pathA, pathB: result.pathB, contactCount: result.contactCount,
+        distance: result.nearest?.distance ?? null, instanceA: result.scope.instanceA, triangleA: result.scope.triangleA }) : null;
+      return { sourceHash: source.hash, evidenceRef, issueRecord, ...result };
     }),
     createReviewTool('review_geometry_component', 'Inspect one connected component of an exact IFCX source mesh by source face index. Exact coincident vertices connect faces. Returns bounds, face count, and a bounded remove_faces plan when this is a proper subset of the mesh. A rendered triangle index is not a source face index for polygon meshes. This analysis does not establish a defect or authorize a change.', { modelId: id, meshPath: id, seedFaceIndex: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER } }, false, async input => {
       const modelId = input.modelId as string, before = await actions.current.source(modelId);

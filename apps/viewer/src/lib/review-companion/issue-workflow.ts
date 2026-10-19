@@ -93,9 +93,22 @@ export function createIssueWorkflow(options: IssueWorkflowOptions) {
   }
   async function investigate(topicId: string) {
     const issue = await open(topicId);
-    return record({ topicId, stage: 'investigating', diagnosis: 'Restored the original issue camera and selected surrounding elements for investigation.', evidenceRefs: [issue.definitionRef] });
+    return record({ topicId, stage: 'investigating', diagnosis: 'Restored the original issue camera and selected surrounding elements for investigation.', evidenceRefs: [...new Set([issue.definitionRef, ...issue.evidenceRefs])].slice(0, 100) });
   }
   return { list, record, investigate, open };
+}
+/** Persist native contact facts without asking a model to restate or approve the measurement. */
+export async function recordContactMeasurement(workflow: Pick<ReturnType<typeof createIssueWorkflow>, 'list' | 'record'>, input: {
+  topicId: string; expectedWorkflowRef: string | undefined; evidenceRef: string; sourceHash: string;
+  pathA: string; pathB: string; contactCount: number; distance: number | null; instanceA: number; triangleA: number;
+}) {
+  const issue = (await workflow.list()).find(row => row.topicId === input.topicId);
+  if (!issue || issue.workflowRef !== input.expectedWorkflowRef || issue.stage === 'fixed' || issue.stage === 'dismissed') throw new Error('Issue changed during measurement. Native evidence is preserved; newer disposition was not overwritten.');
+  if (!/^[a-f0-9]{64}$/.test(input.sourceHash) || !Number.isSafeInteger(input.contactCount) || input.contactCount < 0
+    || (input.distance !== null && (!Number.isFinite(input.distance) || input.distance < 0))) throw new Error('Native contact facts are invalid.');
+  return workflow.record({ topicId: input.topicId, stage: 'needs-evidence',
+    diagnosis: `Native contact measurement of ${input.pathA} against ${input.pathB}, composed instance ${input.instanceA}, triangle ${input.triangleA}: ${input.contactCount} contact clusters; nearest distance ${input.distance ?? 'unavailable'} source units. Source ${input.sourceHash}. This records measured model surfaces; architectural intent and issue-specific repair acceptance remain unverified.`,
+    evidenceRefs: [...new Set([input.evidenceRef, ...issue.evidenceRefs])].slice(0, 100) });
 }
 /** Record native effects before another model turn can fail or misstate them. */
 export async function recordGeometryApplication(workflow: Pick<ReturnType<typeof createIssueWorkflow>, 'list' | 'record'>, applied: {
