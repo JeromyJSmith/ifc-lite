@@ -177,7 +177,7 @@
               },
               "ifcGlobalId": {
                 "type": "string",
-                "pattern": "^[0-9A-Za-z_$]{22}$"
+                "pattern": "^(?:[0-9A-Za-z_$]{22}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$"
               },
               "sourceIdentity": {
                 "type": "string",
@@ -350,7 +350,7 @@
               },
               "globalId": {
                 "type": "string",
-                "pattern": "^[0-9A-Za-z_$]{22}$"
+                "pattern": "^(?:[0-9A-Za-z_$]{22}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$"
               },
               "changes": {
                 "type": "array",
@@ -433,7 +433,7 @@
               },
               "globalId": {
                 "type": "string",
-                "pattern": "^[0-9A-Za-z_$]{22}$"
+                "pattern": "^(?:[0-9A-Za-z_$]{22}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$"
               },
               "values": {
                 "type": "array",
@@ -738,7 +738,7 @@
                 },
                 "ifcGlobalId": {
                   "type": "string",
-                  "pattern": "^[0-9A-Za-z_$]{22}$"
+                  "pattern": "^(?:[0-9A-Za-z_$]{22}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$"
                 },
                 "sourceIdentity": {
                   "type": "string",
@@ -961,7 +961,7 @@
                 },
                 "globalId": {
                   "type": "string",
-                  "pattern": "^[0-9A-Za-z_$]{22}$"
+                  "pattern": "^(?:[0-9A-Za-z_$]{22}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$"
                 },
                 "changes": {
                   "type": "array",
@@ -1069,7 +1069,7 @@
                 },
                 "globalId": {
                   "type": "string",
-                  "pattern": "^[0-9A-Za-z_$]{22}$"
+                  "pattern": "^(?:[0-9A-Za-z_$]{22}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$"
                 },
                 "values": {
                   "type": "array",
@@ -1154,7 +1154,7 @@
                 },
                 "globalId": {
                   "type": "string",
-                  "pattern": "^[0-9A-Za-z_$]{22}$"
+                  "pattern": "^(?:[0-9A-Za-z_$]{22}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$"
                 },
                 "values": {
                   "type": "array",

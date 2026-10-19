@@ -102,3 +102,11 @@ test('a refused un-applied preview can be refreshed, while an applied failure ca
   assert.throws(() => move(appliedBlock, { kind: 'preview', at, findingId: 'fixture:f0', preview }), /explicit recovery/);
   assert.deepEqual(appliedBlock.findings[0].receipt, receipt);
 });
+
+test('native IFCX UUID identities bind and survive process validation; arbitrary labels remain invalid', () => {
+  const element = { modelId: 'fixture:house', expressId: 7, ifcGlobalId: '077a235f-f9ba-5a58-8ea5-30d3992aee32', sourceIdentity: 'sha256:' + 'a'.repeat(64) };
+  const bound = move(inspected(), { kind: 'bind', at, findingId: 'fixture:f0', element });
+  validateReviewProcess(bound);
+  assert.equal(bound.findings[0].element?.ifcGlobalId, element.ifcGlobalId);
+  assert.throws(() => move(inspected(), { kind: 'bind', at, findingId: 'fixture:f0', element: { ...element, ifcGlobalId: 'ceiling-label' } }));
+});
