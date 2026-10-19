@@ -345,7 +345,7 @@ export function useReviewCompanion(active: boolean) {
     exportArchive: () => exportResolutionBundle(),
     importArchive: async (value: unknown) => { const result = await importResolutionBundle(value); await refresh(); return result; },
     cancel: () => { preparationController.current?.abort(); fast.stop(); controller.current?.abort(); directiveController.current?.abort(); setMode('paused'); setStatus('Review paused'); },
-    ask: async (prompt: string, evidence?: unknown) => {
+    ask: async (prompt: string, evidence?: unknown, singleStep = false) => {
       if (!connection) throw new Error('Connect Bonsai first.');
       if (running.current || directiveController.current || fast.running) throw new Error('A review is already running.');
       const abort = new AbortController(); directiveController.current = abort; setDirecting(true);
@@ -366,7 +366,7 @@ export function useReviewCompanion(active: boolean) {
       } });
       await stream.start(); await stream.state({ scopeId: context.scopeId, processId: started.id, stage: 'inspecting' });
         setStatus('Bonsai is choosing its next viewer action…');
-        const result = await runBonsaiDirective(connection, prompt, tools, abort.signal, { evidence, maxTurns: 32, maxCalls: 48, onToolStart: call => stream!.toolStart(call.id, call.tool, call.args), onStep: async (step, toolCallId) => {
+        const result = await runBonsaiDirective(connection, prompt, tools, abort.signal, { evidence, singleStep, maxTurns: singleStep ? 6 : 32, maxCalls: singleStep ? 6 : 48, onToolStart: call => stream!.toolStart(call.id, call.tool, call.args), onStep: async (step, toolCallId) => {
           await stream!.toolResult(toolCallId, step.result);
           await persistReviewJson({ ...input!, id: crypto.randomUUID(), provider: { model: connection.model, endpoint: connection.endpoint }, parentId: input!.id }, { stage: 'tool-completed', step }, persist);
         } });
