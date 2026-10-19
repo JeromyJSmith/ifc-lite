@@ -19,7 +19,8 @@
  *   const walls = bim.query().byType('IfcWall').toArray();
  */
 
-import { createContext, useContext, type ReactNode } from 'react';
+import { useContext, type ReactNode } from 'react';
+import { createHotContext } from '@/lib/hmr-context';
 import type { BimContext } from '@ifc-lite/sdk';
 import { useBimHost } from './useBimHost.js';
 
@@ -30,7 +31,7 @@ import { useBimHost } from './useBimHost.js';
  * (`--experimental-test-module-mocks`) on Node 22. `apps/viewer` is a
  * private, unpublished app, so exporting this widens no public API.
  */
-export const BimReactContext = createContext<BimContext | null>(null);
+export const BimReactContext = createHotContext<BimContext | null>(null, import.meta.hot ? import.meta.hot.data : undefined);
 
 /** Provider that initializes the SDK and makes it available via useBim() */
 export function BimProvider({ children }: { children: ReactNode }) {

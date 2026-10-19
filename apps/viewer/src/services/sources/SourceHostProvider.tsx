@@ -2,11 +2,12 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-import { createContext, useContext, useState, type ReactNode } from 'react';
+import { useContext, useState, type ReactNode } from 'react';
+import { createHotContext } from '@/lib/hmr-context';
 import { SourceHost, type FileSourceProviderFactory } from './source-host';
 import { BUILT_IN_PROVIDER_FACTORIES } from './registered-providers';
 
-const SourceHostContext = createContext<SourceHost | null>(null);
+const SourceHostContext = createHotContext<SourceHost | null>(null, import.meta.hot ? import.meta.hot.data : undefined);
 
 export function useSourceHost(): SourceHost {
   const host = useContext(SourceHostContext);

@@ -18,7 +18,8 @@
  * `useSlotContributions(slot)` and `useInstalledExtensions()`.
  */
 
-import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { createHotContext } from '@/lib/hmr-context';
 import { useBim } from './BimProvider.js';
 import { ExtensionHostService } from '@/services/extensions/host.js';
 import { isSafeMode } from '@/lib/safe-mode';
@@ -30,7 +31,7 @@ import { toast } from '@/components/ui/toast';
  * (`--experimental-test-module-mocks`) on Node 22. `apps/viewer` is a
  * private, unpublished app, so exporting this widens no public API.
  */
-export const ExtensionHostContext = createContext<ExtensionHostService | null>(null);
+export const ExtensionHostContext = createHotContext<ExtensionHostService | null>(null, import.meta.hot ? import.meta.hot.data : undefined);
 
 interface ExtensionHostProviderProps {
   children: ReactNode;
