@@ -238,7 +238,15 @@ const OPENAI_BYOK_MODELS: LLMModel[] = [
 ];
 
 export const BYOK_MODELS: LLMModel[] = [...ANTHROPIC_BYOK_MODELS, ...OPENAI_BYOK_MODELS];
-export const ALL_MODELS = [...FREE_MODELS, ...BYOK_MODELS];
+export const LOCAL_BONSAI_MODEL_ID = 'local-bonsai-2';
+export const LOCAL_BONSAI_ENDPOINT = 'http://127.0.0.1:8080';
+export const LOCAL_MODELS: LLMModel[] = [{
+  id: LOCAL_BONSAI_MODEL_ID, name: 'Bonsai 2 (local vision)', provider: 'Local',
+  tier: 'free', source: 'local-bonsai', contextWindow: 0,
+  supportsImages: true, supportsFileAttachments: true,
+  notes: 'Requires a local Bonsai vision server at 127.0.0.1:8080. No cloud fallback.',
+}];
+export const ALL_MODELS = [...FREE_MODELS, ...BYOK_MODELS, ...LOCAL_MODELS];
 
 export const UNCONFIGURED_MODEL_ID = 'llm-model-missing';
 const FALLBACK_MODEL: LLMModel = {

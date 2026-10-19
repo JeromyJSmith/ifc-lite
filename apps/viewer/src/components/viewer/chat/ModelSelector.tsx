@@ -21,7 +21,7 @@ import {
 } from '@/components/ui/select';
 import { useViewerStore } from '@/store';
 import { useTranslation } from '@/i18n';
-import { FREE_MODELS, DEFAULT_FREE_MODEL, getModelById, getByokModelsForSource } from '@/lib/llm/models';
+import { FREE_MODELS, LOCAL_MODELS, DEFAULT_FREE_MODEL, getModelById, getByokModelsForSource } from '@/lib/llm/models';
 import type { LLMModel } from '@/lib/llm/types';
 import { hasAnthropicKey, hasOpenaiKey, subscribeApiKeys } from '@/services/api-keys';
 
@@ -73,6 +73,8 @@ export function ModelSelector() {
         </SelectValue>
       </SelectTrigger>
       <SelectContent>
+        <div className="px-2 py-1 text-2xs font-semibold text-muted-foreground">Local · on this computer</div>
+        {LOCAL_MODELS.map(model => <SelectItem key={model.id} value={model.id} className="text-xs">{model.name}</SelectItem>)}
         {/* Free tier */}
         {FREE_MODELS.length > 0 && (
           <>

@@ -36,7 +36,7 @@ interface CaptureRequest<T> {
   prepare?: () => void | (() => void);
   /** Camera metadata belongs to the rendered frame, before asynchronous input can change it. */
   afterRender?: () => void;
-  read: (canvas: HTMLCanvasElement) => T | Promise<T>;
+  read: (canvas: HTMLCanvasElement, options: RenderOptions) => T | Promise<T>;
 }
 
 function presentation(signal: AbortSignal): Promise<boolean> {
@@ -108,7 +108,7 @@ export function captureViewportFrame<T>(renderer: Renderer, request: CaptureRequ
       const device = renderer.getGPUDevice();
       if (device && !await completion(device.queue.onSubmittedWorkDone(), signal)) return null;
       if (signal.aborted || !await presentation(signal)) return null;
-      const value = await request.read(session.canvas);
+      const value = await request.read(session.canvas, options);
       return signal.aborted ? null : value;
     } catch (error) {
       console.error('[capture] Viewport capture failed:', error);

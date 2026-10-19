@@ -21,9 +21,10 @@ import { createAnthropicClient } from '@/lib/llm/anthropic-client';
 import { resolveStreamRoute } from '@/lib/llm/byok-guard';
 import { UNCONFIGURED_MODEL_ID } from '@/lib/llm/models';
 import { getApiKeys } from '@/services/api-keys';
+import { localBonsaiToolTransport } from '@/lib/llm/local-bonsai-tools';
 
 export type AgentRoute =
-  | { kind: 'ready'; route: 'anthropic' | 'openai'; model: string; transport: ToolTurnTransport }
+  | { kind: 'ready'; route: 'anthropic' | 'openai' | 'local-bonsai'; model: string; transport: ToolTurnTransport }
   | { kind: 'missing-model' }
   | { kind: 'missing-key'; provider: 'anthropic' | 'openai' }
   /** The hosted free models do not offer tool calling through the proxy. */
@@ -34,6 +35,7 @@ export function idsAgentRoute(model: string | null | undefined): AgentRoute {
   const route = resolveStreamRoute(model, getApiKeys());
   if (route.kind === 'missing-key') return route;
   if (route.kind === 'proxy') return { kind: 'needs-key' };
+  if (route.kind === 'local-bonsai') return { kind: 'ready', route: 'local-bonsai', model: route.model, transport: localBonsaiToolTransport() };
   if (route.kind === 'anthropic') {
     return { kind: 'ready', route: 'anthropic', model: route.model, transport: anthropicTransport(createAnthropicClient(route.credentials)) };
   }

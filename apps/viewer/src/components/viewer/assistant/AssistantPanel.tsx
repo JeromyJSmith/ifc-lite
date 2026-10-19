@@ -50,6 +50,7 @@ const ArtifactProposalReview = lazy(() => import('./ArtifactProposalReview').the
 const SemanticProposalReview = lazy(() => import('./SemanticProposalReview').then(m => ({ default: m.SemanticProposalReview })));
 const RecipeLibrary = lazy(() => import('./RecipeLibrary').then(m => ({ default: m.RecipeLibrary })));
 const ProjectPreferences = lazy(() => import('./ProjectPreferences').then(m => ({ default: m.ProjectPreferences })));
+const BonsaiReview = lazy(() => import('./BonsaiReview').then(m => ({ default: m.BonsaiReview })));
 
 export function AssistantPanel() {
   const { t } = useTranslation();
@@ -71,6 +72,8 @@ export function AssistantPanel() {
   const [sent, setSent] = useState(0);
   const [recipesOpen, setRecipesOpen] = useState(false);
   const [prefsOpen, setPrefsOpen] = useState(false);
+  const [reviewOpen, setReviewOpen] = useState(false);
+  const [reviewMounted, setReviewMounted] = useState(false);
   usePreferredModel();
   const { confirmDialog } = useDialogs();
   // Recipe prompts are taken once, but an unsent question requires approval.
@@ -149,6 +152,12 @@ export function AssistantPanel() {
         <IconButton label={t('assistant.keys')} className="h-7 w-7" onClick={() => setKeysOpen(true)}><Key className="h-4 w-4" /></IconButton>
       </div>
     </div>
+    <div className="flex gap-1 border-b p-2" aria-label="Assistant mode">
+      <Button size="sm" variant={reviewOpen ? 'outline' : 'secondary'} aria-pressed={!reviewOpen} onClick={() => setReviewOpen(false)}>Conversation</Button>
+      <Button size="sm" variant={reviewOpen ? 'secondary' : 'outline'} aria-pressed={reviewOpen} onClick={() => { setReviewMounted(true); setReviewOpen(true); }}>Bonsai review</Button>
+    </div>
+    {reviewMounted && <Suspense fallback={<p role="status">Opening review…</p>}><BonsaiReview active={reviewOpen} /></Suspense>}
+    <div style={{ display: reviewOpen ? 'none' : 'contents' }}>
     {/* Short hosts scroll the whole panel; reserve readable space for evidence above the composer. */}
     <div ref={scrollRef} className="flex-1 min-h-40 overflow-auto">
       {libraryOpen && <TransientSurface label={t('assistant.savedConversations')} onClose={() => setLibraryOpen(false)}
@@ -206,6 +215,7 @@ export function AssistantPanel() {
       <FreeQuotaNote model={model} proxyUrl={ASSISTANT_PROXY_URL} />
     </form>
     <AssistantAnnouncer />
+    </div>
     <ByokKeyModal open={keysOpen} onOpenChange={setKeysOpen} />
   </section>;
 }

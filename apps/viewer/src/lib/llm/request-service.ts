@@ -21,6 +21,7 @@ import { modelCapabilities } from './model-capabilities.js';
 import { recordReceipt, recordRequestStart } from './request-receipts.js';
 import { streamChat, type StreamMessage, type StreamOptions, type UsageInfo } from './stream-client.js';
 import { anthropicSchemaLimitation } from './anthropic-schema.js';
+import { localBonsaiTransport } from './local-bonsai.js';
 
 export type SendableRoute = Exclude<StreamRoute, { kind: 'missing-key' }>;
 
@@ -77,6 +78,7 @@ function loadDirectStreams(signal: AbortSignal): Promise<DirectStreams | null> {
 
 /** The viewer's stream clients for one route, as a shared-core transport. */
 function viewerTransport(route: SendableRoute, proxyUrl: string, onUsageInfo?: (usage: UsageInfo) => void): AiTransport<StreamMessage> {
+  if (route.kind === 'local-bonsai') return localBonsaiTransport();
   return async (call) => {
     const options: StreamOptions = { ...call, proxyUrl, messages: [...call.messages], onUsageInfo, allowProxyFallback: false, useParentDeadline: true };
     if (route.kind === 'proxy') { await streamChat(options); return; }
@@ -86,7 +88,7 @@ function viewerTransport(route: SendableRoute, proxyUrl: string, onUsageInfo?: (
     const direct = await loadDirectStreams(call.signal);
     if (!direct || call.signal.aborted) return;
     if (route.kind === 'anthropic') await direct.streamAnthropicChat(route.credentials, options);
-    else await direct.streamOpenAiChat(route.apiKey, options);
+    else if (route.kind === 'openai') await direct.streamOpenAiChat(route.apiKey, options);
   };
 }
 

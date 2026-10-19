@@ -18,8 +18,8 @@ import { posthog } from '../analytics.js';
 import { getModelById } from './models.js';
 
 /** Which way the request went: the hosted proxy, or the user's own key. */
-export type ChatRouteKind = 'proxy' | 'anthropic' | 'openai';
-export type ChatProviderKind = 'built_in' | 'byok';
+export type ChatRouteKind = 'proxy' | 'anthropic' | 'openai' | 'local-bonsai';
+export type ChatProviderKind = 'built_in' | 'byok' | 'local';
 export type ChatOutcome = 'success' | 'error' | 'aborted';
 export type ChatErrorClass =
   | 'auth' | 'rate_limit' | 'timeout' | 'network' | 'provider' | 'http' | 'other'
@@ -100,7 +100,7 @@ function finishReasonBucket(reason: string | null | undefined): 'stop' | 'length
 /** Capture `ai_chat_message_sent` now and return the handle that settles the turn. */
 export function startChatTurnTelemetry(start: ChatTurnStart, deps: ChatTelemetryDeps = defaultDeps): ChatTurnTelemetry {
   const base = {
-    provider_kind: (start.route === 'proxy' ? 'built_in' : 'byok') as ChatProviderKind,
+    provider_kind: (start.route === 'proxy' ? 'built_in' : start.route === 'local-bonsai' ? 'local' : 'byok') as ChatProviderKind,
     provider: start.route,
     llm_family: llmFamily(start.modelId),
     turn_kind: start.kind,

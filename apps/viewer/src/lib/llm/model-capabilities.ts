@@ -40,6 +40,7 @@ const OUTPUT_CEILING: Record<LLMModel['source'], number> = {
   proxy: PROXY_OUTPUT_TOKEN_CEILING,
   openai: OPENAI_OUTPUT_TOKEN_CEILING,
   anthropic: ANTHROPIC_OUTPUT_TOKEN_CEILING,
+  'local-bonsai': 2048,
 };
 
 export function modelCapabilities(modelId: string): ModelCapabilities {
@@ -54,6 +55,6 @@ export function modelCapabilities(modelId: string): ModelCapabilities {
     structuredOutput: route !== 'proxy',
     // Anthropic always reports usage; OpenAI does when `include_usage` is sent,
     // which the direct client does. The proxy forwards whatever its upstream sends.
-    usageReporting: route === 'proxy' ? 'upstream-dependent' : 'provider',
+    usageReporting: route === 'proxy' || route === 'local-bonsai' ? 'upstream-dependent' : 'provider',
   };
 }

@@ -209,7 +209,7 @@ export function useKeyboardControls(params: UseKeyboardControlsParams): void {
       registerKeyboardCommand('walk.move', startMovement, { active: () => true, ignoreModifiers: true }),
       registerKeyboardCommand('walk.moveArrows', startMovement, { active: isWalkMode, ignoreModifiers: true }),
       registerKeyboardCommand('camera.pan', startMovement, { active: () => !isWalkMode(), ignoreModifiers: true }),
-      registerKeyboardBinding({ id: 'nav.upDown', when: 'viewport', layer: 'global', keys: [{ key: 'q' }, { key: 'e' }, { key: 'pageup' }, { key: 'pagedown' }], active: () => !isWalkMode(), run: startMovement }),
+      registerKeyboardBinding({ id: 'nav.upDown', when: 'global', layer: 'global', keys: [{ key: 'q' }, { key: 'e' }, { key: 'pageup' }, { key: 'pagedown' }], active: () => !isWalkMode(), run: startMovement }),
       registerKeyboardBinding({ id: 'walk.sprint', when: 'tool.walk', layer: 'tool', keys: [{ key: 'shift', shift: true }], active: () => true, run: startMovement }),
       // A tap can start and end between two physics ticks: queue it, as well as holding it.
       registerKeyboardCommand('walk.jump', (event) => { if (!event.repeat) walk?.queueJump(); holdWalkKey(' ')(event); }, { active: isWalkMode, ignoreModifiers: true }),

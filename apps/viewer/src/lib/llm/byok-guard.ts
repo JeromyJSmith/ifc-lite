@@ -20,11 +20,13 @@ export type StreamRoute =
   | { kind: 'proxy'; model: string }
   | { kind: 'anthropic'; model: string; credentials: AnthropicCredentials }
   | { kind: 'openai'; model: string; apiKey: string }
+  | { kind: 'local-bonsai'; model: string }
   | { kind: 'missing-key'; provider: 'anthropic' | 'openai' };
 
 export function resolveStreamRoute(modelId: string, keys: ApiKeyConfig): StreamRoute {
   const model = getModelById(modelId);
   const source = model?.source ?? 'proxy';
+  if (source === 'local-bonsai') return { kind: 'local-bonsai', model: model!.id };
 
   if (source === 'anthropic') {
     const apiKey = keys.anthropicKey.trim();

@@ -147,7 +147,7 @@ export type ModelTier = 'free' | 'byok';
  * - 'anthropic': direct browser-to-Anthropic API (user's own key)
  * - 'openai': direct browser-to-OpenAI API (user's own key)
  */
-export type ModelSource = 'proxy' | 'anthropic' | 'openai';
+export type ModelSource = 'proxy' | 'anthropic' | 'openai' | 'local-bonsai';
 
 /** Relative cost indicator for paid models */
 export type ModelCost = '$' | '$$' | '$$$';
