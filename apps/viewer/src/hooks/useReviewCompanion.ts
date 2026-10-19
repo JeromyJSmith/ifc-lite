@@ -174,6 +174,8 @@ export function useReviewCompanion(active: boolean) {
     for (const ref of refs) live.addEntityToSelection(ref);
     live.setSelectedEntityIds(refs.map(ref => toGlobalIdFromModels(live.models, ref.modelId, ref.expressId)));
     live.setSelectedEntityId(refs[0] ? toGlobalIdFromModels(live.models, refs[0].modelId, refs[0].expressId) : null);
+    setError('');
+    setStatus(`Saved view restored; ${refs.length} surrounding element(s) selected`);
     return { restored: id };
   }, [applyViewpoint, findings]);
 

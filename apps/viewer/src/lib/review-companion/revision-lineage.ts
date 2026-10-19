@@ -5,6 +5,7 @@ import { sha256Hex } from '@/utils/sourceContentHash';
 import { rebindReviewModels, reviewModels } from './context';
 import { listFindings, listReviewScopes } from './storage';
 import type { ReviewContext, ReviewFinding } from './types';
+import { verifiedQuantityPredecessors } from './quantity-revision-lineage';
 const hashPattern = /^[0-9a-f]{64}$/;
 function value(row: ReviewFinding): Record<string, unknown> | null {
   if (!row.text.startsWith('{')) return null;
@@ -29,10 +30,14 @@ export async function rebindReviewRevision(saved: ReviewContext['models'], curre
   if (new Set(records.map(row => row.id)).size !== records.length) throw new Error('Duplicate repair evidence record identities.');
   const events = records.map(row => ({ row, data: value(row) }));
   const hashes = await sourceHashes(current);
+  const quantityPredecessors = await verifiedQuantityPredecessors(records, hashes);
   const result = new Map<string, string>(), used = new Set<string>();
   for (const original of saved) {
     const direct = sources.filter(model => model.sourceIdentity === original.sourceIdentity).map(model => model.id);
     const eligible = new Set(direct);
+    for (const model of hashes) {
+      if (quantityPredecessors.get(model.id)?.identities.has(original.sourceIdentity)) eligible.add(model.id);
+    }
     for (const { row, data } of events) {
       if (data?.kind !== 'review.geometry.applied' || typeof data.afterHash !== 'string' || !hashPattern.test(data.afterHash)
         || typeof data.beforeHash !== 'string' || !hashPattern.test(data.beforeHash) || data.beforeHash === data.afterHash
@@ -44,7 +49,8 @@ export async function rebindReviewRevision(saved: ReviewContext['models'], curre
         && candidate.data.topicId === data.topicId && candidate.data.matches === true && candidate.data.afterHash === data.afterHash
         && candidate.row.context.scopeId === row.context.scopeId);
       if (!verified) continue;
-      for (const model of hashes) if (model.hash === data.afterHash) eligible.add(model.id);
+      for (const model of hashes) if (model.hash === data.afterHash
+        || quantityPredecessors.get(model.id)?.hashes.has(data.afterHash)) eligible.add(model.id);
     }
     if (eligible.size !== 1) throw new Error('The original review has no unique loaded source or persisted verified corrected revision.');
     const id = [...eligible][0];

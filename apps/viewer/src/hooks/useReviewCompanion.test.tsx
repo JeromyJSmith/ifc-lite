@@ -26,6 +26,8 @@ const renderer = {
     getPosition: () => position, getTarget: () => target, getUp: () => ({ x: 0, y: 1, z: 0 }),
     getFOV: () => Math.PI / 4, getAspect: () => 16 / 9, getDistance: () => Math.hypot(29, 18, 22),
     animateTo: (p: typeof position, t: typeof target) => { applied = { position: p, target: t }; },
+    setPosition: (x: number, y: number, z: number) => { applied = { position: { x, y, z }, target }; },
+    setTarget: (x: number, y: number, z: number) => { applied = { position: applied!.position, target: { x, y, z } }; },
   }),
   renderWithResult: () => { renders++; return true; },
   getGPUDevice: () => gpuCompletion ? { queue: { onSubmittedWorkDone: () => gpuCompletion } } : null,
@@ -79,7 +81,9 @@ test('a note persists exact source identity, element, owned screenshot and camer
   await mount();
   for (let i = 0; i < 100 && !api!.findings.some(row => row.id === id); i++) await act(async () => { await new Promise(resolve => setTimeout(resolve, 5)); });
   assert.equal(api!.scope, scope);
-  await act(async () => { await api!.restore(id); });
+  await act(async () => { api!.setError('Earlier restoration failed'); await api!.restore(id); });
+  assert.equal(api!.error, '');
+  assert.equal(api!.status, 'Saved view restored; 1 surrounding element(s) selected');
   assert.deepEqual(useViewerStore.getState().selectedEntity, { modelId: 'reopened-load', expressId: 42 });
   assert.deepEqual([...useViewerStore.getState().selectedEntityIds], [42]);
   assert.equal(useViewerStore.getState().selectedEntityId, 42);
@@ -119,6 +123,6 @@ test('no screenshot means no fabricated saved note, while model revision mismatc
   await act(async () => { api!.setHistoryScope(scope); });
   for (let i = 0; i < 100 && !api!.findings.some(row => row.id === id); i++) await act(async () => { await new Promise(resolve => setTimeout(resolve, 5)); });
   applied = undefined;
-  await act(async () => { await assert.rejects(api!.restore(id), /same model revision/); });
+  await act(async () => { await assert.rejects(api!.restore(id), /no unique loaded source/); });
   assert.equal(applied, undefined);
 });
