@@ -98,6 +98,33 @@ test('local HTTP directive executes the shared tools and returns complete step p
     assert.deepEqual(requests[1].messages.at(-1), { role: 'tool', tool_call_id: 'note-call', content: JSON.stringify({ id: 'note-1', text: 'Check sill' }) });
   }, index => index === 0 ? calls({ id: 'note-call', name: 'review_save_note', args: { text: 'Check sill' } }) : completion('Saved the note.'));
 });
+test('a failed read is journaled and returned so Bonsai can choose a supported reader', async () => {
+  const custom = handlers(); custom.state = () => { throw new Error('STEP reader unavailable for IFCX'); };
+  const journal: unknown[] = [];
+  await withServer(async (endpoint, requests) => {
+    const result = await runBonsaiDirective({ endpoint, model: 'Bonsai' }, 'Read the concern.', createReviewTools(custom), new AbortController().signal, { onStep: async step => { journal.push(step); } });
+    assert.equal(requests.length, 3); assert.equal(result.steps.length, 2);
+    assert.deepEqual(result.steps[0].result, { success: false, error: { tool: 'review_state', message: 'STEP reader unavailable for IFCX' } });
+    assert.deepEqual(JSON.parse(requests[1].messages.at(-1).content), result.steps[0].result);
+    assert.deepEqual(result.steps[1].result, [{ id: 'note-1', text: 'Measure sill height' }]);
+    assert.deepEqual(journal, result.steps);
+  }, index => index === 0 ? calls({ id: 'unsupported-read', name: 'review_state', args: {} }) : index === 1 ? calls({ id: 'supported-read', name: 'review_findings', args: {} }) : completion('Supported reader returned the concern.'));
+});
+test('a failed mutation stops instead of being treated as a recoverable read', async () => {
+  const custom = handlers(); custom.saveNote = async () => { throw new Error('Durable write failed'); };
+  await withServer(async (endpoint, requests) => {
+    await assert.rejects(runBonsaiDirective({ endpoint, model: 'Bonsai' }, 'Save.', createReviewTools(custom), new AbortController().signal), /Durable write failed/);
+    assert.equal(requests.length, 1);
+  }, () => calls({ id: 'write-failed', name: 'review_save_note', args: { text: 'Observation' } }));
+});
+test('cancellation during a failed read stops without another model request', async () => {
+  const controller = new AbortController(), custom = handlers();
+  custom.state = () => { controller.abort(); throw new Error('Read interrupted'); };
+  await withServer(async (endpoint, requests) => {
+    await assert.rejects(runBonsaiDirective({ endpoint, model: 'Bonsai' }, 'Read.', createReviewTools(custom), controller.signal), /abort/i);
+    assert.equal(requests.length, 1);
+  }, () => calls({ id: 'cancelled-read', name: 'review_state', args: {} }));
+});
 
 test('an unknown or schema-invalid tool in a batch prevents every action in that batch', async () => {
   for (const invalid of [

@@ -1,20 +1,16 @@
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. https://mozilla.org/MPL/2.0/. */
 import type { FederatedModel } from '@/store/types';
-import type { ReviewContext, ReviewFinding } from './types';
+import type { ReviewContext } from './types';
 import type { ReviewTool } from './tools';
 import { rebindReviewRevision } from './revision-lineage';
-import { persistReviewJson } from './journal';
 interface SavedIssue { topicId: string; context: ReviewContext }
 interface GeometryResult { candidateId?: string | null; sourceHash: string; evidenceRef: string; meshes: Array<{ analysis: { path: string; faceCount: number; degenerateFaces: number[]; duplicateFaces: number[] } }> }
 export interface IssuePreparationOptions {
   workflow: { list(): Promise<SavedIssue[]>; investigate(topicId: string): Promise<unknown> };
-  capture(): Promise<ReviewContext>;
-  viewerTools: readonly ReviewTool[];
   geometryTool: ReviewTool;
   inspect(signal: AbortSignal, instruction: string): Promise<unknown>;
   models(): ReadonlyMap<string, FederatedModel>;
-  persist(row: ReviewFinding): Promise<string>;
   onStatus(text: string): void;
 }
 export type PreparedIssueReport = { modelId: string; sourceHash: string; candidateId?: string | null; evidenceRef: string;
@@ -27,20 +23,11 @@ export async function prepareSavedIssue(options: IssuePreparationOptions, topicI
   signal.throwIfAborted();
   if (!issue) throw new Error('Saved issue not found.');
   await options.workflow.investigate(topicId); signal.throwIfAborted();
-  const context = await options.capture(); signal.throwIfAborted();
-  async function camera(name: string, args: Record<string, number>) {
-    signal.throwIfAborted();
-    const tool = options.viewerTools.find(tool => tool.name === name);
-    if (!tool) throw new Error(`Viewer tool ${name} is unavailable.`);
-    const result = await tool.execute(args, { signal });
-    // Preserve a completed visible movement before honoring a subsequent cancel.
-    await persistReviewJson({ schemaVersion: 1, id: crypto.randomUUID(), context, kind: 'note', text: '', createdAt: new Date().toISOString() },
-      { kind: 'review.issue.camera', topicId, tool: name, args, result }, options.persist);
-    signal.throwIfAborted();
-  }
-  await camera('viewer_rotate', { azimuthDegrees: 30, elevationDegrees: 8 });
-  await camera('viewer_zoom', { factor: 1.15 });
-  await options.inspect(signal, 'Inspect this saved concern once. Describe visible evidence and uncertainty. The next phase reads exact geometry; do not infer corrective dimensions.');
+  // A BCF perspective camera stores a direction, not its original orbit pivot.
+  // Blindly orbiting that reconstructed target can move a close-up off the building.
+  // Inspect the actual restored concern first; native navigation remains available
+  // when a particular unanswered question calls for another measured viewpoint.
+  await options.inspect(signal, 'Inspect this original saved concern once, at its restored viewpoint. Describe visible evidence and uncertainty. The next phase reads exact geometry; do not infer corrective dimensions.');
   signal.throwIfAborted();
   const models = options.models(), bindings = await rebindReviewRevision(issue.context.models, models);
   signal.throwIfAborted();

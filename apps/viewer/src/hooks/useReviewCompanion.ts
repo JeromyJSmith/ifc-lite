@@ -164,7 +164,9 @@ export function useReviewCompanion(active: boolean) {
       const ref = { modelId: remap.get(element.modelId)!, expressId: element.expressId };
       if (element.ifcGlobalId && resolveEntityRefGlobalIdFromState(state, ref) !== element.ifcGlobalId) throw new Error('The saved element has changed. Its original image is still available.');
     }
-    applyViewpoint(row.context.viewpoint);
+    // Restoration must be settled before the following awaited rotate/capture.
+    // The BCF animation API returns void, so awaiting this callback cannot wait for its tween.
+    applyViewpoint(row.context.viewpoint, false);
     const refs = row.context.elements.map(e => ({ modelId: remap.get(e.modelId)!, expressId: e.expressId }));
     const live = useViewerStore.getState(); live.clearSelection();
     for (const ref of refs) live.addEntityToSelection(ref);
@@ -332,10 +334,10 @@ export function useReviewCompanion(active: boolean) {
       if (running.current || directiveController.current || preparationController.current) throw new Error('A review is already running.');
       const abort = new AbortController(); preparationController.current = abort; setDirecting(true); setMode('paused');
       try {
-        return await prepareSavedIssue({ workflow: resolution.workflow, capture, viewerTools,
+        return await prepareSavedIssue({ workflow: resolution.workflow,
           geometryTool: resolution.tools.find(tool => tool.name === 'review_geometry_inspect')!,
           inspect: (signal, instruction) => inspect(undefined, signal, instruction),
-          models: () => useViewerStore.getState().models, persist, onStatus: setStatus }, topicId, abort.signal);
+          models: () => useViewerStore.getState().models, onStatus: setStatus }, topicId, abort.signal);
       } finally { preparationController.current = null; setDirecting(false); }
     },
     setDirective: handlers.setDirective,

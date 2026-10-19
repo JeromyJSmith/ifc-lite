@@ -172,7 +172,16 @@ export async function runBonsaiDirective(connection: { endpoint: string; model: 
       for (const call of planned) {
         signal.throwIfAborted();
         await options.onToolStart?.({ id: call.id, tool: call.tool.name, args: call.args });
-        const result = await call.tool.execute(call.args, { signal });
+        let result: unknown;
+        try { result = await call.tool.execute(call.args, { signal }); }
+        catch (error) {
+          signal.throwIfAborted();
+          // A failed read has no model effect to reconcile. Preserve its real
+          // error and let Bonsai choose an applicable reader instead of ending the mission.
+          // Mutations and persistence failures still stop: their effects may need recovery.
+          if (!call.tool.annotations.readOnlyHint) throw error;
+          result = { success: false, error: { tool: call.tool.name, message: error instanceof Error ? error.message : String(error) } };
+        }
         const step = { tool: call.tool.name, args: call.args, result };
         steps.push(step);
         await options.onStep?.(step, call.id);
