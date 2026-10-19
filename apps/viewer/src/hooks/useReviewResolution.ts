@@ -8,7 +8,7 @@ import { createWorkspaceTools } from '@/lib/review-companion/workspace-tools';
 import { createNativeTools } from '@/lib/review-companion/native-tools';
 import { reviewBcfViewpoint } from '@/lib/review-companion/bcf';
 import { toGlobalIdFromModels } from '@/store/globalId';
-import { createIssueWorkflow, createIssueWorkflowTools, type IssueUpdate } from '@/lib/review-companion/issue-workflow';
+import { createIssueWorkflow, createIssueWorkflowTools, recordGeometryApplication, type IssueUpdate } from '@/lib/review-companion/issue-workflow';
 import { createReviewTool } from '@/lib/review-companion/tools';
 import { inspectIfcxGeometry, patchIfcxGeometry, type IfcxGeometryOperation } from '@/lib/review-companion/ifcx-geometry';
 import { measureIfcxEntityDistance } from '@/lib/review-companion/geometry-distance';
@@ -206,9 +206,10 @@ export function useReviewResolution(options: Options) {
       const matches = after.hash === afterSource.hash && loadedTriangles === expectedTriangles;
       const issueVerified = matches && result.operation === 'remove_defective_faces' && actual.meshes.every(m => !m.analysis.degenerateFaces.length && !m.analysis.duplicateFaces.length);
       const verificationRef = await actions.current.record({ kind: 'review.geometry.verified', topicId, receiptRef, afterHash: after.hash, matches, issueVerified, canonicalMeshCount: parsed.geometryResult.meshes.length, expectedTriangles, loadedTriangles, actual: actual.meshes.map(m => ({ path: m.path, faceCount: m.analysis.faceCount, degenerateCount: m.analysis.degenerateFaces.length, duplicateCount: m.analysis.duplicateFaces.length, bounds: m.analysis.bounds })) }, original);
+      const disposition = await recordGeometryApplication(workflow, { topicId, operation: result.operation, receiptRef, verificationRef, sourceHash: after.hash, sourceVerified: matches, beforeFaces: result.before?.faceCount ?? null, afterFaces: result.after?.faceCount ?? null, diagnosis: input.diagnosis as string });
       // Loader owns render/identity; the issue's original image remains untouched.
       useViewerStore.getState().setBcfPanelVisible(false);
-      return { applied: true, verified: issueVerified, sourceVerified: matches, removedFaceCount: result.before && result.after ? result.before.faceCount - result.after.faceCount : null, duplicateAndDegenerateCategoriesOverlap: true, receiptRef, verificationRef, beforeHash: before.hash, afterHash: after.hash, before: result.before, after: result.after, previousViewpoint: camera.viewpoint.guid,
+      return { applied: true, verified: issueVerified, sourceVerified: matches, workflowRef: disposition.workflowRef, removedFaceCount: result.before && result.after ? result.before.faceCount - result.after.faceCount : null, duplicateAndDegenerateCategoriesOverlap: true, receiptRef, verificationRef, beforeHash: before.hash, afterHash: after.hash, before: result.before, after: result.after, previousViewpoint: camera.viewpoint.guid,
         next: 'Inspect the actual corrected view. Close only the diagnosed mesh defect; an architectural concern needs its own verification.' };
     }),
     createReviewTool('review_geometry_resume', 'Reopen a saved corrected IFCX source from its preserved records, including after browser or server restart. Original source and saved issues remain preserved.', { receiptRef: id }, false, async (input, execution) => {

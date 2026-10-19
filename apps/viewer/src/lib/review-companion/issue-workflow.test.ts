@@ -2,7 +2,7 @@
  * License, v. 2.0. https://mozilla.org/MPL/2.0/. */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createIssueWorkflow, createIssueWorkflowTools } from './issue-workflow';
+import { createIssueWorkflow, createIssueWorkflowTools, recordGeometryApplication } from './issue-workflow';
 import type { ReviewFinding } from './types';
 function setup() {
   const context = { scopeId: 'original-source', models: [], elements: [], capturedAt: '2026-10-19T10:00:00Z', viewpoint: { guid: 'view', snapshot: 'original-image' } };
@@ -78,4 +78,20 @@ test('automatic receipt evidence inclusion still refuses unknown refs and failed
   s.rows.push(s.row('mutation', { kind: 'fabricated-agent-note' }), s.row('after', { kind: 'native-verification' }));
   await assert.rejects(tool.execute(input), /native verification rejected/);
   assert.equal(s.verified(), 1); assert.equal((await s.workflow.list())[0].stage, 'open'); assert.deepEqual(s.statuses, []);
+});
+
+test('native geometry completion retains actual evidence and updates the issue without a model completion or false closure', async () => {
+  const s = setup();
+  s.rows.push(s.row('prior', { kind: 'prior-evidence' }), s.row('applied', { kind: 'review.geometry.applied' }), s.row('readback', { kind: 'review.geometry.verified' }));
+  await s.workflow.record({ topicId: 'topic', stage: 'investigating', diagnosis: 'Inspecting old revision', evidenceRefs: ['prior'] });
+  const original = structuredClone(s.rows[0]);
+  const saved = await recordGeometryApplication(s.workflow, { topicId: 'topic', operation: 'replace_mesh', receiptRef: 'applied', verificationRef: 'readback', sourceHash: 'new-source', sourceVerified: true, beforeFaces: 2415, afterFaces: 2417, diagnosis: 'Trimmed to room boundary' });
+  const issue = (await s.workflow.list())[0];
+  assert.equal(saved.saved, true); assert.equal(issue.stage, 'needs-evidence');
+  assert.deepEqual(issue.evidenceRefs, ['applied', 'readback', 'prior']);
+  assert.match(issue.diagnosis, /2415 → 2417/); assert.match(issue.diagnosis, /new-source/);
+  assert.equal(s.verified(), 0); assert.deepEqual(s.rows[0], original);
+  s.fail();
+  await assert.rejects(recordGeometryApplication(s.workflow, { topicId: 'topic', operation: 'replace_mesh', receiptRef: 'applied', verificationRef: 'readback', sourceHash: 'bad-source', sourceVerified: false, beforeFaces: 2415, afterFaces: 2417, diagnosis: 'Mismatch' }), /disk unavailable/);
+  assert.match((await s.workflow.list())[0].diagnosis, /new-source/);
 });

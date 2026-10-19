@@ -97,6 +97,22 @@ export function createIssueWorkflow(options: IssueWorkflowOptions) {
   }
   return { list, record, investigate, open };
 }
+/** Record native effects before another model turn can fail or misstate them. */
+export async function recordGeometryApplication(workflow: Pick<ReturnType<typeof createIssueWorkflow>, 'list' | 'record'>, applied: {
+  topicId: string; operation: string; receiptRef: string; verificationRef: string; sourceHash: string;
+  sourceVerified: boolean; beforeFaces: number | null; afterFaces: number | null; diagnosis: string;
+}) {
+  const issue = (await workflow.list()).find(row => row.topicId === applied.topicId);
+  if (!issue) throw new Error('Applied geometry issue is missing; native receipts remain preserved.');
+  const refs = [...new Set([applied.receiptRef, applied.verificationRef, ...issue.evidenceRefs])].slice(0, 100);
+  return workflow.record({ topicId: applied.topicId, stage: 'needs-evidence', evidenceRefs: refs,
+    diagnosis: [
+      'Native geometry ' + applied.operation + ' applied. Faces ' + applied.beforeFaces + ' → ' + applied.afterFaces + '.',
+      'Current source: ' + applied.sourceHash + '. Source readback ' + (applied.sourceVerified ? 'matched.' : 'DID NOT MATCH; investigate before further edits.'),
+      applied.diagnosis.slice(0, 6000),
+      'Application and readback records are attached. Issue-specific architectural acceptance remains pending.',
+    ].join(' ') });
+}
 export function createIssueWorkflowTools(workflow: ReturnType<typeof createIssueWorkflow>) {
   const id = { type: 'string' as const, minLength: 1, maxLength: 200 };
   return [
