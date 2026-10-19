@@ -83,7 +83,10 @@ export async function inspectBonsaiView(connection: BonsaiConnection, context: R
 export function parseVisualReview(raw: string, elementCount: number, maximumFindings = 5): { summary: string; findings: VisualSuggestion[] } {
   // The verified runtime can emit a leading think block even with thinking disabled.
   // Preserve raw separately; remove only a complete leading block before JSON parsing.
-  const parsed = object(JSON.parse(raw.trim().replace(/^<think>[\s\S]*?<\/think>\s*/, '')));
+  const content = raw.trim().replace(/^<think>[\s\S]*?<\/think>\s*/, '');
+  // Accept one complete presentation wrapper, never extract JSON from surrounding prose.
+  const fenced = /^```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n```\s*$/i.exec(content);
+  const parsed = object(JSON.parse(fenced ? fenced[1] : content));
   if (typeof parsed.summary !== 'string' || parsed.summary.length > 8000 || !Array.isArray(parsed.findings) || parsed.findings.length > maximumFindings) {
     throw new Error('Bonsai review did not match the review format. Raw response was preserved.');
   }

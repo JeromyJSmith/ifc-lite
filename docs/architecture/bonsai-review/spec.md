@@ -76,6 +76,15 @@ pivot, radius and native element identify what moved; they do not verify a defec
 
 ## Selected-region BCF mission
 
+**Recheck this issue in current view** runs one focused visual request directly,
+without the tool-selection model round trip or restoring the original camera.
+It validates the current source against the saved issue, preserves the exact
+input and raw response, and attaches their references to the original BCF
+disposition. A visual response cannot close an issue or overwrite a disposition
+changed during inference. One complete JSON Markdown fence is accepted at the
+response boundary; surrounding prose, malformed JSON, excess findings and invalid
+element references are still rejected. The original provider text is retained.
+
 The owner initiates a review with **Describe & log BCF issue** after framing the
 concern and optionally selecting surrounding elements. Readiness is explicit;
 no background observation is required. The mission captures the image and full

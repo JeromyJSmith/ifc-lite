@@ -151,7 +151,7 @@ export function useReviewCompanion(active: boolean) {
       }
       if (ownsProcess) await process.finish([input.id, raw.id]);
       setStatus(candidates.length ? `${candidates.length} possible issue(s) saved for review` : `Bonsai: ${review.summary}`);
-      return { summary: review.summary, candidates: candidates.length, findings: candidates };
+      return { summary: review.summary, candidates: candidates.length, findings: candidates, evidenceRefs: [input.id, raw.id, ...candidates.map(candidate => candidate.id)] };
     } finally { running.current = false; setBusy(false); controller.current = null; }
   }, [capture, connection, directive, persist]);
 
@@ -341,7 +341,7 @@ export function useReviewCompanion(active: boolean) {
   };
   return { scope, historyScope, setHistoryScope, scopes, findings, events, pending, connection, error, setError, status, setStatus, busy: busy || directing || fast.running, mode, directive, listening, webMcp,
     connect: async () => { const abort = new AbortController(); controller.current = abort; try { const c = await connectBonsai('http://127.0.0.1:8080', abort.signal); setConnection(c); useViewerStore.getState().setChatActiveModel('local-bonsai-2'); setStatus(`Connected to ${c.model}`); } finally { controller.current = null; } },
-    note, inspect, restore, dictation, properties, pickFinding, process, activity, fast, bcf, reviewHere, resolution,
+    note, inspect, inspectConcern: concernVisionTool.execute, restore, dictation, properties, pickFinding, process, activity, fast, bcf, reviewHere, resolution,
     prepareIssue: async (topicId: string) => {
       if (running.current || directiveController.current || preparationController.current) throw new Error('A review is already running.');
       const abort = new AbortController(); preparationController.current = abort; setDirecting(true); setMode('paused');

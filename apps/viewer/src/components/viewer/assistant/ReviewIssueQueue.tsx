@@ -3,6 +3,7 @@
 import { useState } from 'react';
 import { REVIEW_RESOLUTION_SCHEMA } from '@/lib/review-companion/resolution-schema';
 import { investigateSavedIssue } from '@/lib/review-companion/issue-investigation';
+import { recheckSavedConcern } from '@/lib/review-companion/issue-recheck';
 import { downloadBlob } from '@/lib/export/download';
 import { Button } from '@/components/ui/button';
 import type { useReviewCompanion } from '@/hooks/useReviewCompanion';
@@ -30,6 +31,11 @@ export function ReviewIssueQueue({ review, run }: { review: Review; run(action: 
           review.setStatus(`Issue ${result.stage}: ${result.diagnosis}`);
           await review.resolution.refresh();
         })}>Run next issue step</Button>
+        <Button size="sm" variant="outline" disabled={!review.connection || review.busy || issue.stage === 'fixed'} onClick={() => run(async () => {
+          review.resolution.setActive(issue.topicId);
+          const result = await recheckSavedConcern({ workflow: review.resolution.workflow, inspect: input => review.inspectConcern(input) }, issue.topicId);
+          await review.resolution.refresh(); review.setStatus(`Saved issue rechecked: ${result.summary}`);
+        })}>Recheck this issue in current view</Button>
       </div>
       <label className="block">Import geometry repair plan<input aria-label="Import geometry repair plan" type="file" accept="application/json,.json" disabled={review.busy} onChange={event => {
         const file = event.target.files?.[0]; event.target.value = '';

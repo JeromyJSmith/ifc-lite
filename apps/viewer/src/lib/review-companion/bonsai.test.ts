@@ -38,3 +38,14 @@ test('a focused BCF visual response rejects extra findings instead of saving unr
   assert.throws(() => parseVisualReview(raw, 0, 1), /format/);
   assert.equal(parseVisualReview(raw, 0).findings.length, 2);
 });
+
+test('one complete JSON presentation fence is accepted without relaxing response validation', () => {
+  const json = '{"summary":"Board faces meet; no visible opening","findings":[]}';
+  for (const raw of ['```json\n' + json + '\n```', '<think>Review</think>\n```JSON\r\n' + json + '\r\n```', '```\n' + json + '\n```']) {
+    assert.deepEqual(parseVisualReview(raw, 0, 1), JSON.parse(json));
+  }
+  for (const raw of ['Here is the answer:\n```json\n' + json + '\n```', '```json\n' + json, '```json\n' + json + '\n```\nextra', '```javascript\n' + json + '\n```', '```json\n' + json + '\n```\n```json\n' + json + '\n```']) {
+    assert.throws(() => parseVisualReview(raw, 0, 1), SyntaxError);
+  }
+  assert.throws(() => parseVisualReview('```json\n{"summary":"Gap","findings":[{"text":"Maybe","elementIndices":[2]}]}\n```', 0, 1), /unknown element/);
+});
