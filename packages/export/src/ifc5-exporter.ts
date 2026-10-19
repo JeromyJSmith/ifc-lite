@@ -539,7 +539,24 @@ export class Ifc5Exporter {
     const psets = this.mutationView && options.applyMutations !== false
       ? this.mutationView.getForEntity(entityId)
       : this.dataStore.properties?.getForEntity(entityId) ?? [];
-    return writePsetProperties(attributes, entityId, psets, options.onlyKnownProperties !== false, sinks);
+    let written = writePsetProperties(attributes, entityId, psets, options.onlyKnownProperties !== false, sinks);
+    // Full-fidelity exports use the existing set-qualified numeric dialect
+    // consumed by ifcx/buildQuantityTable and collab snapshots. Quantity
+    // edits live in a separate overlay from properties; omitting that overlay
+    // made a successful quantity correction disappear on export/re-import.
+    if (options.onlyKnownProperties === false) {
+      const base = (id: number) => this.dataStore.quantities?.getForEntity(id) ?? [];
+      const qsets = this.mutationView && options.applyMutations !== false
+        ? this.mutationView.getQuantitiesForEntity(entityId, base)
+        : base(entityId);
+      for (const qset of qsets) {
+        for (const quantity of qset.quantities) {
+          attributes[`bsi::ifc::v5a::${qset.name}::${quantity.name}`] = quantity.value;
+          written++;
+        }
+      }
+    }
+    return written;
   }
 
   // --------------------------------------------------------------------------

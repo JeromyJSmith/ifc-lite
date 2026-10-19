@@ -176,3 +176,13 @@ native preview, application receipt, after-value readback and undo readback.
 The review-process adapter accepts these numeric corrections for a matching
 bound element and records the existing human approval and verification events;
 it does not substitute a metadata correction for geometry acceptance.
+
+Full-fidelity IFCX export (`onlyKnownProperties: false`, as used by Export
+Changes) writes effective quantity values using the existing set-qualified
+numeric `bsi::ifc::v5a::<Set>::<Name>` dialect read by the IFCX importer.
+It reads the quantity overlay separately from properties and preserves unedited
+siblings. `applyMutations: false` exports the source quantities. The importer
+continues to infer quantity types from member names; this does not add unit,
+formula or quantity-set GlobalId roundtrip support. The roundtrip regression
+checks the corrected NetVolume and unchanged GrossVolume, independently of the
+live owner-approval workflow.
