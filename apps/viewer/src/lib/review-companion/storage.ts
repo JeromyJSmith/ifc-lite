@@ -137,6 +137,28 @@ function checked<T>(value: T, validate: (value: unknown) => void): T {
   return clone;
 }
 
+/** Validate a complete inert archive before any storage transaction begins. */
+export function validateReviewArchive(input: unknown): ReviewArchive {
+  return checked(input, value => {
+    const a = record(value);
+    if (a.schemaVersion !== 1) throw new Error('Unsupported review archive version');
+    text(a.scopeId); date(a.exportedAt);
+    const ids = new Set<string>();
+    for (const f of array(a.findings)) {
+      finding(f);
+      if (f.context.scopeId !== a.scopeId || ids.has(f.id)) throw new Error('Mixed review scope or duplicate finding ID');
+      ids.add(f.id);
+    }
+    for (const f of a.findings as ReviewFinding[]) if (f.parentId && !ids.has(f.parentId)) throw new Error('Archive parent finding is missing');
+    const eventIds = new Set<string>();
+    for (const e of array(a.events)) {
+      event(e);
+      if (!ids.has(e.findingId) || eventIds.has(e.id)) throw new Error('Orphan event or duplicate event ID');
+      eventIds.add(e.id);
+    }
+  }) as ReviewArchive;
+}
+
 export function createReviewStorage(factory: IDBFactory = globalThis.indexedDB) {
   function open(): Promise<IDBDatabase> {
     return new Promise((resolve, reject) => {
@@ -241,24 +263,7 @@ export function createReviewStorage(factory: IDBFactory = globalThis.indexedDB) 
     return (await exportReviewArchive(scopeId)).events.sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
   }
   async function importReviewArchive(input: unknown) {
-    const archive = checked(input, value => {
-      const a = record(value);
-      if (a.schemaVersion !== 1) throw new Error('Unsupported review archive version');
-      text(a.scopeId); date(a.exportedAt);
-      const ids = new Set<string>();
-      for (const f of array(a.findings)) {
-        finding(f);
-        if (f.context.scopeId !== a.scopeId || ids.has(f.id)) throw new Error('Mixed review scope or duplicate finding ID');
-        ids.add(f.id);
-      }
-      for (const f of a.findings as ReviewFinding[]) if (f.parentId && !ids.has(f.parentId)) throw new Error('Archive parent finding is missing');
-      const eventIds = new Set<string>();
-      for (const e of array(a.events)) {
-        event(e);
-        if (!ids.has(e.findingId) || eventIds.has(e.id)) throw new Error('Orphan event or duplicate event ID');
-        eventIds.add(e.id);
-      }
-    }) as ReviewArchive;
+    const archive = validateReviewArchive(input);
     return transaction<{ findingsAdded: number; eventsAdded: number }>('readwrite', (tx, result, fail) => {
       const counts = { findingsAdded: 0, eventsAdded: 0 };
       result(counts);

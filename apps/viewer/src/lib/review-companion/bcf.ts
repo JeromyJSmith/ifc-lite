@@ -36,18 +36,32 @@ function topicFrom(row: ReviewFinding, d: Definition): BCFTopic {
 }
 
 /** Durable definitions precede native topic installation; receipts follow actual store readback. */
-export function createReviewBcfBridge(options: { scope(): string; rows(): Promise<ReviewFinding[]>; persist(row: ReviewFinding): Promise<string> }) {
+export function createReviewBcfBridge(options: { scope(): string; rows(): Promise<ReviewFinding[]>; persist(row: ReviewFinding): Promise<string>; canRestore?(row: ReviewFinding): Promise<boolean> }) {
   let writing = false;
   async function install(row: ReviewFinding, d: Definition) {
     const state = useViewerStore.getState();
     const currentScope = await reviewScope(await reviewModels(state.models));
-    if (currentScope !== row.context.scopeId || useViewerStore.getState().models !== state.models) throw new Error('Load the reviewed model revision before opening its BCF issue.');
+    if ((currentScope !== row.context.scopeId && !await options.canRestore?.(row)) || useViewerStore.getState().models !== state.models) throw new Error('Load the reviewed model revision before opening its BCF issue.');
     const topic = topicFrom(row, d), live = useViewerStore.getState();
     if (!live.bcfProject) live.setBcfProject(createBCFProject({ name: 'Bonsai visual review' }));
     const current = useViewerStore.getState();
     if (!current.bcfProject?.topics.has(topic.guid)) current.addTopic(topic);
-    const saved = useViewerStore.getState().bcfProject?.topics.get(topic.guid);
+    let saved = useViewerStore.getState().bcfProject?.topics.get(topic.guid);
     if (!saved || !saved.viewpoints.some(v => v.guid === topic.viewpoints[0].guid && v.snapshot === topic.viewpoints[0].snapshot)) throw new Error('The native BCF topic readback did not match its saved viewpoint.');
+    const records = await options.rows();
+    for (const record of records) {
+      if (!record.text.startsWith('{')) continue;
+      try { const value = JSON.parse(record.text); if (value.kind === 'review.bcf.viewpoint' && value.topicId === d.topicId && !saved.viewpoints.some(view => view.guid === record.context.viewpoint.guid)) useViewerStore.getState().addViewpoint(d.topicId, reviewBcfViewpoint(record.context.viewpoint)); } catch { /* A non-viewpoint note is not BCF evidence. */ }
+    }
+    saved = useViewerStore.getState().bcfProject!.topics.get(topic.guid)!;
+    const workflow = records.flatMap(record => {
+      if (!record.text.startsWith('{')) return [];
+      try { const value = JSON.parse(record.text); return value.kind === 'review.bcf.workflow' && value.topicId === d.topicId ? [value] : []; } catch { return []; }
+    }).sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt))).at(-1);
+    if (workflow) {
+      useViewerStore.getState().updateTopic(topic.guid, { topicStatus: workflow.stage === 'fixed' ? 'Resolved' : workflow.stage === 'dismissed' ? 'Closed' : 'Open' });
+      saved = useViewerStore.getState().bcfProject!.topics.get(topic.guid)!;
+    }
     useViewerStore.getState().setActiveTopic(topic.guid);
     return { topicId: saved.guid, title: saved.title, status: saved.topicStatus, viewpointId: topic.viewpoints[0].guid,
       definitionRef: row.id, contextElementCount: row.context.elements.length, hasSnapshot: !!topic.viewpoints[0].snapshot, findingId: d.findingId, saved: true,

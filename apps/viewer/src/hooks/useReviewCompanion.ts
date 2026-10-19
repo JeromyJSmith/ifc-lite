@@ -7,6 +7,7 @@ import { resolveEntityRef } from '@/store/resolveEntityRef';
 import { resolveEntityRefGlobalIdFromState } from '@/store/resolveEntityRef';
 import { toGlobalIdFromModels } from '@/store/globalId';
 import { connectBonsai, inspectBonsaiView, parseVisualReview, type BonsaiConnection } from '@/lib/review-companion/bonsai';
+import { exportResolutionBundle, importResolutionBundle } from '@/lib/review-companion/resolution-archive';
 import { reviewModels, reviewScope, rebindReviewModels, candidateContext } from '@/lib/review-companion/context';
 import { saveFinding, listFindings, saveEvent, listEvents, listReviewScopes, exportReviewArchive, importReviewArchive } from '@/lib/review-companion/storage';
 import { startLocalDictation } from '@/lib/review-companion/speech';
@@ -20,6 +21,9 @@ import { createReviewEventStream, type ReviewAgUiEvent } from '@/lib/review-comp
 import { useReviewProcessJournal } from './useReviewProcessJournal';
 import { createReviewPropertyProcessEvents } from '@/lib/review-companion/property-process';
 import { useReviewFastMode } from './useReviewFastMode';
+import { rebindReviewRevision } from '@/lib/review-companion/revision-lineage';
+import { prepareSavedIssue } from '@/lib/review-companion/issue-preparation';
+import { useReviewResolution, allReviewRows } from './useReviewResolution';
 import { useReviewPropertyTools } from './useReviewPropertyTools';
 import type { ReviewContext, ReviewFinding, ReviewEvent } from '@/lib/review-companion/types';
 
@@ -49,6 +53,7 @@ export function useReviewCompanion(active: boolean) {
   const speechContext = useRef<Promise<ReviewContext | null> | null>(null);
   const controller = useRef<AbortController | null>(null);
   const directiveController = useRef<AbortController | null>(null);
+  const preparationController = useRef<AbortController | null>(null);
   const running = useRef(false);
   const lastView = useRef('');
   const mounted = useRef(true);
@@ -117,6 +122,8 @@ export function useReviewCompanion(active: boolean) {
       if (context.scopeId !== await reviewScope(await reviewModels(useViewerStore.getState().models)) || context.mutationVersion !== useViewerStore.getState().mutationVersion) throw new Error('Model revision changed before analysing this saved view.');
       const input: ReviewFinding = { schemaVersion: 1, id: crypto.randomUUID(), context, kind: 'note', text: `Visual review requested: ${instruction}`, createdAt: now() };
       await persist(input);
+      let ownsProcess = process.current()?.status !== 'running';
+      if (ownsProcess) await process.begin(context, instruction, input.id);
       const signal = AbortSignal.any([abort.signal, ...(directiveController.current ? [directiveController.current.signal] : []), ...(parentSignal ? [parentSignal] : [])]);
       const response = await inspectBonsaiView(connection, context, instruction, signal);
       const raw: ReviewFinding = { schemaVersion: 1, id: crypto.randomUUID(), context, kind: 'note', text: response.raw, createdAt: now(), parentId: input.id, provider: { model: response.model, endpoint: connection.endpoint } };
@@ -129,6 +136,10 @@ export function useReviewCompanion(active: boolean) {
         const candidate: ReviewFinding = { ...raw, id: crypto.randomUUID(), context: candidateContext(context, f.elementIndices), kind: 'candidate', text: f.text, parentId: raw.id, ...(f.point ? { location: f.point } : {}) };
         await persist(candidate); candidates.push({ id: candidate.id, text: candidate.text, elements: candidate.context.elements, location: candidate.location });
       }
+      if (process.current()?.status === 'running' && process.current()!.scopeId !== context.scopeId) {
+        await process.interrupt('Native model source changed after repair; continuing verification in the corrected source scope.', [input.id, raw.id]);
+        await process.begin(context, instruction, input.id); ownsProcess = true;
+      }
       if (process.current()?.status === 'running') {
         await process.inspection(context, input.id, raw.id, review.summary, response.model, candidates);
         for (const candidate of candidates) {
@@ -136,6 +147,7 @@ export function useReviewCompanion(active: boolean) {
           if (saved.context.elements.length === 1 && saved.context.elements[0].ifcGlobalId) await process.bind(candidate.id, saved);
         }
       }
+      if (ownsProcess) await process.finish([input.id, raw.id]);
       setStatus(candidates.length ? `${candidates.length} possible issue(s) saved for review` : `Bonsai: ${review.summary}`);
       return { summary: review.summary, candidates: candidates.length, findings: candidates };
     } finally { running.current = false; setBusy(false); controller.current = null; }
@@ -143,10 +155,10 @@ export function useReviewCompanion(active: boolean) {
 
   const fast = useReviewFastMode({ active, scope, connected: !!connection, pauseObservation: () => setMode('paused'), capture, inspect, persist, applyViewpoint, process });
   const restore = useCallback(async (id: string) => {
-    const row = findings.find(f => f.id === id);
+    const row = findings.find(f => f.id === id) ?? (await import('./useReviewResolution').then(m => m.allReviewRows())).find(f => f.id === id);
     if (!row) throw new Error('This finding is not in the selected review.');
     const state = useViewerStore.getState();
-    const remap = rebindReviewModels(row.context.models, await reviewModels(state.models));
+    const remap = await rebindReviewRevision(row.context.models, state.models);
     if (useViewerStore.getState().models !== state.models) throw new Error('Loaded models changed while restoring.');
     for (const element of row.context.elements) {
       const ref = { modelId: remap.get(element.modelId)!, expressId: element.expressId };
@@ -220,7 +232,7 @@ export function useReviewCompanion(active: boolean) {
       camera.setRotation(before.azimuth + value.azimuthDegrees, before.elevation + value.elevationDegrees);
       const destination = { ...camera.getPosition() };
       camera.setPosition(p.x, p.y, p.z);
-      await camera.animateTo(destination, t, 2400); renderer.requestRender();
+      await camera.animateTo(destination, t, 350); renderer.requestRender();
       setStatus('Bonsai finished rotating the model');
       return { before, after: camera.getRotation(), position: camera.getPosition(), target: camera.getTarget() };
     },
@@ -228,7 +240,7 @@ export function useReviewCompanion(active: boolean) {
       const renderer = getGlobalRenderer(); if (!renderer) throw new Error('Viewer camera is unavailable.');
       setStatus('Bonsai is zooming the model…');
       const camera = renderer.getCamera(); const p = camera.getPosition(), t = camera.getTarget(); const before = camera.getDistance();
-      await camera.animateTo({ x: t.x + (p.x - t.x) / value.factor, y: t.y + (p.y - t.y) / value.factor, z: t.z + (p.z - t.z) / value.factor }, t, 2000); renderer.requestRender();
+      await camera.animateTo({ x: t.x + (p.x - t.x) / value.factor, y: t.y + (p.y - t.y) / value.factor, z: t.z + (p.z - t.z) / value.factor }, t, 350); renderer.requestRender();
       setStatus('Bonsai finished zooming the model');
       return { before, after: camera.getDistance(), position: camera.getPosition(), target: camera.getTarget() };
     },
@@ -240,9 +252,10 @@ export function useReviewCompanion(active: boolean) {
     rotateView: v => latest.current.rotateView(v), zoomView: v => latest.current.zoomView(v),
   }), []);
   const pickTool = useMemo(() => createReviewTool('viewer_pick_finding', 'Restore a saved finding view and visibly select the IFC element at its normalized image location. Returns a new bound finding ID and exact element. Picking does not prove the visual error or authorize a correction.', { findingId: { type: 'string', minLength: 1, maxLength: 200 } }, false, input => latest.current.pickFinding(input.findingId as string)), []);
-  const bcf = useMemo(() => createReviewBcfBridge({ scope: () => scope, rows: () => listFindings(scope), persist }), [scope, persist]);
+  const bcf = useMemo(() => createReviewBcfBridge({ scope: () => scope, rows: allReviewRows, persist, canRestore: async row => { await rebindReviewRevision(row.context.models, useViewerStore.getState().models); return true; } }), [scope, persist]);
   const bcfTools = useMemo(() => createBcfReviewTools(bcf), [bcf]);
-  const tools = useMemo(() => [...viewerTools, pickTool, ...properties.tools, ...bcfTools], [viewerTools, pickTool, properties.tools, bcfTools]);
+  const resolution = useReviewResolution({ scope, findings, capture, persist, restore, open: bcf.open, applyViewpoint: context => applyViewpoint(context.viewpoint) });
+  const tools = useMemo(() => [...viewerTools, pickTool, ...properties.tools, ...bcfTools, ...resolution.tools], [viewerTools, pickTool, properties.tools, bcfTools, resolution.tools]);
   const reviewHere = async (observation: string) => {
     if (!connection || running.current || directiveController.current || fast.running) throw new Error('Connect Bonsai and wait for the current action to finish.');
     const abort = new AbortController(); directiveController.current = abort; setDirecting(true); setMode('paused'); setError('');
@@ -314,13 +327,23 @@ export function useReviewCompanion(active: boolean) {
   };
   return { scope, historyScope, setHistoryScope, scopes, findings, events, pending, connection, error, setError, status, setStatus, busy: busy || directing || fast.running, mode, directive, listening, webMcp,
     connect: async () => { const abort = new AbortController(); controller.current = abort; try { const c = await connectBonsai('http://127.0.0.1:8080', abort.signal); setConnection(c); useViewerStore.getState().setChatActiveModel('local-bonsai-2'); setStatus(`Connected to ${c.model}`); } finally { controller.current = null; } },
-    note, inspect, restore, dictation, properties, pickFinding, process, activity, fast, bcf, reviewHere,
+    note, inspect, restore, dictation, properties, pickFinding, process, activity, fast, bcf, reviewHere, resolution,
+    prepareIssue: async (topicId: string) => {
+      if (running.current || directiveController.current || preparationController.current) throw new Error('A review is already running.');
+      const abort = new AbortController(); preparationController.current = abort; setDirecting(true); setMode('paused');
+      try {
+        return await prepareSavedIssue({ workflow: resolution.workflow, capture, viewerTools,
+          geometryTool: resolution.tools.find(tool => tool.name === 'review_geometry_inspect')!,
+          inspect: (signal, instruction) => inspect(undefined, signal, instruction),
+          models: () => useViewerStore.getState().models, persist, onStatus: setStatus }, topicId, abort.signal);
+      } finally { preparationController.current = null; setDirecting(false); }
+    },
     setDirective: handlers.setDirective,
     setFindingStatus: async (findingId: string, status: ReviewEvent['status']) => { await saveEvent({ schemaVersion: 1, id: crypto.randomUUID(), findingId, status, createdAt: now() }); await refresh(); },
     retryPending: async () => { for (const row of pending) await persist(row); },
-    exportArchive: () => exportReviewArchive(selectedScope),
-    importArchive: async (value: unknown) => { const result = await importReviewArchive(value); await refresh(); return result; },
-    cancel: () => { fast.stop(); controller.current?.abort(); directiveController.current?.abort(); setMode('paused'); setStatus('Review paused'); },
+    exportArchive: () => exportResolutionBundle(),
+    importArchive: async (value: unknown) => { const result = await importResolutionBundle(value); await refresh(); return result; },
+    cancel: () => { preparationController.current?.abort(); fast.stop(); controller.current?.abort(); directiveController.current?.abort(); setMode('paused'); setStatus('Review paused'); },
     ask: async (prompt: string) => {
       if (!connection) throw new Error('Connect Bonsai first.');
       if (running.current || directiveController.current || fast.running) throw new Error('A review is already running.');
@@ -348,9 +371,9 @@ export function useReviewCompanion(active: boolean) {
         await persistReviewJson({ ...input, id: crypto.randomUUID(), provider: { model: connection.model, endpoint: connection.endpoint }, parentId: input.id }, result, persist);
         const text = result.text.trim().replace(/^<think>[\s\S]*?<\/think>\s*/, '');
         if (text) await stream.text(text);
-        if (process.current()!.inspections.length) await process.finish([input.id]);
-        else await process.interrupt('Directive ended without a visual inspection; no visual validation is claimed.', [input.id]);
-        await stream.state({ processId: started.id, stage: process.current()!.status }); await stream.finish();
+        if (process.current()?.status === 'running' && process.current()!.inspections.length) await process.finish([input.id]);
+        else if (process.current()?.status === 'running') await process.interrupt('Directive ended without a visual inspection; no visual validation is claimed.', [input.id]);
+        await stream.state({ processId: process.current()!.id, stage: process.current()!.status }); await stream.finish();
         setStatus(text); return result;
       } catch (e) {
         if (stream) { try { await stream.error(e); } catch (deliveryError) { setError(`Activity journal could not finish: ${message(deliveryError)}`); } }

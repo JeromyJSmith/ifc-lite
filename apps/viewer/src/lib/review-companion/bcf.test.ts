@@ -81,3 +81,24 @@ test('WebMCP tools expose bounded local BCF creation, list and open without publ
   const result = await tools[0].execute({ findingId: finding.id, title: 'Review', description: 'Check' }) as { topicId: string };
   assert.ok(result.topicId); assert.equal((await bridge.list()).length, 1);
 });
+test('reopening a native BCF project projects latest durable fixed and reopened workflow states', async () => {
+  const { bridge, finding, rows } = await setup();
+  const created = await bridge.create({ findingId: finding.id, title: 'Mesh integrity: duplicate face', description: 'Measured duplicate face was repaired.' });
+  const appendStage = (stage: string, createdAt: string) => rows.push({ ...structuredClone(finding), id: crypto.randomUUID(), kind: 'note', createdAt,
+    text: JSON.stringify({ kind: 'review.bcf.workflow', topicId: created.topicId, stage, diagnosis: stage, evidenceRefs: [], createdAt }) });
+  appendStage('fixed', '2026-10-19T14:00:00Z');
+  // Simulate a reopened application: the persisted definition and workflow survive the native project.
+  useViewerStore.getState().setBcfProject(null);
+  const fixed = await bridge.open(created.topicId);
+  assert.equal(fixed.status, 'Resolved');
+  assert.equal(useViewerStore.getState().bcfProject!.topics.get(created.topicId)!.topicStatus, 'Resolved');
+  assert.equal(useViewerStore.getState().bcfProject!.topics.get(created.topicId)!.viewpoints[0].snapshot, finding.context.viewpoint.snapshot);
+  appendStage('reopened', '2026-10-19T15:00:00Z');
+  // Storage iteration order is not the chronological order of workflow events.
+  appendStage('fixed', '2026-10-19T13:00:00Z');
+  useViewerStore.getState().setBcfProject(null);
+  const reopened = await bridge.open(created.topicId);
+  assert.equal(reopened.status, 'Open');
+  assert.equal(useViewerStore.getState().bcfProject!.topics.get(created.topicId)!.topicStatus, 'Open');
+  assert.equal(useViewerStore.getState().bcfProject!.topics.size, 1);
+});

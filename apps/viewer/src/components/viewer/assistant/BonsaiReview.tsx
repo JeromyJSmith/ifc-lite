@@ -3,6 +3,7 @@
 import { useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { downloadBlob, sanitizeFilename } from '@/lib/export/download';
+import { ReviewIssueQueue } from './ReviewIssueQueue';
 import { ReviewPropertyChanges } from './ReviewPropertyChanges';
 import { useReviewCompanion } from '@/hooks/useReviewCompanion';
 
@@ -31,6 +32,7 @@ export function BonsaiReview({ active }: { active: boolean }) {
     <p role="status" aria-live="polite" className="text-muted-foreground break-words">{review.status}</p>
     <p className="text-muted-foreground">{review.webMcp}. Images go to Bonsai on this computer. Dictation uses the browser’s on-device speech pack.</p>
     {review.error && <p role="alert" className="rounded border border-destructive p-2 whitespace-pre-wrap">{review.error}</p>}
+    <ReviewIssueQueue review={review} run={run} />
     <section className="rounded border border-primary p-3 space-y-2" aria-label="Selected-region issue mission">
       <p role="status">{review.busy ? 'Working — your captured view is being reviewed' : review.connection && review.scope ? 'Ready — select surrounding elements and frame the concern' : 'Connect Bonsai and load a model to begin'}</p>
       <p>A hole or missing piece need not be selectable. Select what surrounds it, or use the viewpoint alone.</p>
@@ -97,7 +99,7 @@ export function BonsaiReview({ active }: { active: boolean }) {
         </select>
       </label>
       <div className="flex flex-wrap gap-2">
-        <Button size="sm" variant="outline" disabled={!review.findings.length} onClick={() => run(async () => {
+        <Button size="sm" variant="outline" disabled={!review.findings.length && !review.resolution.issues.length} onClick={() => run(async () => {
           const archive = await review.exportArchive();
           downloadBlob(new Blob([JSON.stringify(archive, null, 2)], { type: 'application/json' }), `${sanitizeFilename(`building-review-${new Date().toISOString().replaceAll(':', '-')}`)}.json`);
           review.setStatus('Backup exported; keep it with your project files');
@@ -113,7 +115,7 @@ export function BonsaiReview({ active }: { active: boolean }) {
       </div>
     </div>
     <ol className="space-y-3">
-      {review.findings.map(finding => {
+      {review.findings.filter(f => !f.text.startsWith('{"kind":"review.geometry.source.chunk"')).map(finding => {
         const state = review.events.filter(e => e.findingId === finding.id).at(-1)?.status ?? (finding.kind === 'candidate' ? 'needs review' : 'note');
         return <li key={finding.id} className="rounded border p-2 space-y-2">
           <div className="flex justify-between gap-2"><strong>{finding.kind === 'candidate' ? `Possible issue · ${state}` : finding.provider ? 'Bonsai response' : finding.text.startsWith('{') ? 'Recorded process / activity' : 'Your note / review input'}</strong><time dateTime={finding.createdAt}>{new Date(finding.createdAt).toLocaleTimeString()}</time></div>
