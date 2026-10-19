@@ -15,7 +15,8 @@ export interface AppearanceAssetLimits {
 export const DEFAULT_APPEARANCE_ASSET_LIMITS: Readonly<AppearanceAssetLimits> = Object.freeze({
   maxImageBytes: 32 * 1024 * 1024,
   maxDimension: 8192,
-  maxPixels: 16 * 1024 * 1024,
+  // Full 8192² captured atlases fit as one 256 MiB bitmap under the shared decode budget.
+  maxPixels: 64 * 1024 * 1024,
   maxEncodedBytes: 128 * 1024 * 1024,
   // Convento carries six 4096² textures (384 MiB); retain room for authoring previews.
   maxDecodedBytes: 512 * 1024 * 1024,

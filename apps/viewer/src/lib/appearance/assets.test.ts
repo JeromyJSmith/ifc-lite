@@ -182,3 +182,28 @@ it('reads real JPEG dimensions lazily and rejects a truncated scan header before
   assets.releaseOwner(source);
   assert.equal(decoded.closes, 1);
 });
+
+it('full 8K capture atlases retain the original bytes and obey the shared decode budget', async () => {
+  let calls = 0;
+  const assets = new AppearanceAssetInventory({ decode: async () => { calls++; return bitmap(8192, 8192); } });
+  const atlas = (variant: number) => {
+    const bytes = png(), header = new DataView(bytes.buffer);
+    header.setUint32(16, 8192); header.setUint32(20, 8192); bytes[45] ^= variant;
+    return bytes;
+  };
+  const a = await assets.add(atlas(0), { owner: source });
+  const b = await assets.add(atlas(1), { owner: draft });
+  const owner = { kind: 'model' as const, id: 'third-atlas' };
+  const c = await assets.add(atlas(2), { owner });
+  assert.equal(a.width,8192); assert.equal(a.height,8192);
+  await assets.decode(a.id,source); await assets.decode(b.id,draft);
+  await assert.rejects(assets.decode(c.id,owner), /Decoded image budget/);
+  assert.equal(calls,2);
+  assets.release(a.id,source);
+  await assets.decode(c.id,owner); assert.equal(calls,3);
+  const tooWide = atlas(3); new DataView(tooWide.buffer).setUint32(16,8193);
+  await assert.rejects(assets.add(tooWide,{owner}), /Resize this image/);
+  const constrained = new AppearanceAssetInventory({decode:async()=>bitmap(),limits:{maxPixels:16*1024*1024}});
+  await assert.rejects(constrained.add(atlas(0),{owner}), /Resize this image/);
+  assets.clear();
+});
