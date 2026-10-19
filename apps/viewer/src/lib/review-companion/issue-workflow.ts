@@ -113,16 +113,17 @@ export async function recordContactMeasurement(workflow: Pick<ReturnType<typeof 
 /** Record native effects before another model turn can fail or misstate them. */
 export async function recordGeometryApplication(workflow: Pick<ReturnType<typeof createIssueWorkflow>, 'list' | 'record'>, applied: {
   topicId: string; operation: string; receiptRef: string; verificationRef: string; sourceHash: string;
-  sourceVerified: boolean; beforeFaces: number | null; afterFaces: number | null; diagnosis: string;
+  sourceVerified: boolean; beforeFaces: number | null; afterFaces: number | null; diagnosis: string; viewpointRef?: string;
 }) {
   const issue = (await workflow.list()).find(row => row.topicId === applied.topicId);
   if (!issue) throw new Error('Applied geometry issue is missing; native receipts remain preserved.');
-  const refs = [...new Set([applied.receiptRef, applied.verificationRef, ...issue.evidenceRefs])].slice(0, 100);
+  const refs = [...new Set([applied.receiptRef, applied.verificationRef, ...(applied.viewpointRef ? [applied.viewpointRef] : []), ...issue.evidenceRefs])].slice(0, 100);
   return workflow.record({ topicId: applied.topicId, stage: 'needs-evidence', evidenceRefs: refs,
     diagnosis: [
       'Native geometry ' + applied.operation + ' applied. Faces ' + applied.beforeFaces + ' → ' + applied.afterFaces + '.',
       'Current source: ' + applied.sourceHash + '. Source readback ' + (applied.sourceVerified ? 'matched.' : 'DID NOT MATCH; investigate before further edits.'),
       applied.diagnosis.slice(0, 6000),
+      applied.viewpointRef ? 'Actual repaired image and camera are attached.' : 'The repaired after-view still needs to be saved.',
       'Application and readback records are attached. Issue-specific architectural acceptance remains pending.',
     ].join(' ') });
 }

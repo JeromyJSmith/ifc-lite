@@ -39,6 +39,33 @@ test('wrong-topic or unrecorded native output cannot use the selected-issue comp
     }, index => index === 0 ? calls({ id: 'measure', name: 'review_geometry_contact', args: {} }) : completion('No selected-issue completion claim.'));
   }
 });
+const repairResult = () => ({ applied: true, sourceVerified: true, afterHash: 'a'.repeat(64), receiptRef: 'repair', verificationRef: 'readback',
+  issueRecord: { saved: true, topicId: 'chosen', stage: 'needs-evidence', workflowRef: 'workflow', diagnosis: 'Repair and after-view saved; architectural acceptance pending.', evidenceRefs: ['repair', 'readback', 'image'] },
+  afterView: { saved: true, topicId: 'chosen', receiptRef: 'repair', sourceHash: 'a'.repeat(64), viewpointRef: 'image' } });
+test('source-verified repair and matching attached after-view finish one scoped action without another model request', async () => {
+  for (const name of ['review_geometry_repair', 'review_geometry_repair_plan']) {
+    const result = repairResult(), journal: unknown[] = [];
+    const tool = createReviewTool(name, 'Native repair', {}, false, async () => result);
+    await withServer(async (endpoint, requests) => {
+      const run = await runBonsaiDirective({ endpoint, model: 'Bonsai' }, 'Apply chosen repair', [tool], new AbortController().signal,
+        { singleStep: true, issueTopicId: 'chosen', onStep: async step => { journal.push(step); } });
+      assert.equal(requests.length, 1); assert.equal(journal.length, 1); assert.equal(run.text, result.issueRecord.diagnosis);
+    }, () => calls({ id: 'apply', name, args: {} }));
+  }
+});
+test('partial, wrong-source or unlinked repair records cannot claim native repair completion', async () => {
+  const valid = repairResult();
+  for (const result of [undefined, { applied: true }, { ...valid, sourceVerified: false }, { ...valid, afterView: { saved: false } },
+    { ...valid, afterView: { ...valid.afterView, sourceHash: 'b'.repeat(64) } },
+    { ...valid, afterView: { ...valid.afterView, topicId: 'other' } },
+    { ...valid, issueRecord: { ...valid.issueRecord, evidenceRefs: ['repair', 'readback'] } }]) {
+    const tool = createReviewTool('review_geometry_repair_plan', 'Repair', {}, false, async () => result);
+    await withServer(async (endpoint, requests) => {
+      await runBonsaiDirective({ endpoint, model: 'Bonsai' }, 'Apply chosen repair', [tool], new AbortController().signal, { singleStep: true, issueTopicId: 'chosen' });
+      assert.equal(requests.length, 2);
+    }, index => index === 0 ? calls({ id: 'apply', name: 'review_geometry_repair_plan', args: {} }) : completion('Repair evidence needs recovery.'));
+  }
+});
 test('tools dispatch bounded inputs and reject unknown fields, invalid modes, oversized notes and invalid IFC IDs', async () => {
   const actions: unknown[] = [], tools = createReviewTools(handlers(actions));
   const execute = (name: string, args: unknown) => tools.find(tool => tool.name === name)!.execute(args);

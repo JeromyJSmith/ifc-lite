@@ -16,6 +16,16 @@ Per-scope storage validation remains bounded separately. Preserved geometry
 revisions can make a complete bundle exceed the former 128 MiB limit. An identical
 full-history re-import must add no records and must preserve the current model.
 
+Native geometry applications capture and attach their actual after-view in the
+same action after canonical source readback. The image is bound to the repaired
+file-content hash, placed model identity and application reference, persisted before its native BCF projection,
+and included in the issue's evidence. Failed capture or projection retains the
+actual application/readback and reports the missing after-view without claiming
+it was saved. A scoped repair ends without another model request only when its
+application, source readback, issue record and attached image agree. Saving the
+current issue view and saving a source-qualified repaired view are also available directly without a model request. Images
+and source agreement do not themselves certify architectural acceptance.
+
 Dictation starts only on an explicit button press and uses on-device speech
 recognition, with supported language-pack installation. Capture context when speech
 starts, before asynchronous transcription completes. Stop on panel close/unmount.

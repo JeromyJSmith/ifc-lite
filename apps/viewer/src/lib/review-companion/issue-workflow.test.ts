@@ -107,10 +107,12 @@ test('native geometry completion retains actual evidence and updates the issue w
   s.rows.push(s.row('prior', { kind: 'prior-evidence' }), s.row('applied', { kind: 'review.geometry.applied' }), s.row('readback', { kind: 'review.geometry.verified' }));
   await s.workflow.record({ topicId: 'topic', stage: 'investigating', diagnosis: 'Inspecting old revision', evidenceRefs: ['prior'] });
   const original = structuredClone(s.rows[0]);
-  const saved = await recordGeometryApplication(s.workflow, { topicId: 'topic', operation: 'replace_mesh', receiptRef: 'applied', verificationRef: 'readback', sourceHash: 'new-source', sourceVerified: true, beforeFaces: 2415, afterFaces: 2417, diagnosis: 'Trimmed to room boundary' });
+  s.rows.push(s.row('after-view', { kind: 'review.bcf.viewpoint' }));
+  const saved = await recordGeometryApplication(s.workflow, { topicId: 'topic', operation: 'replace_mesh', receiptRef: 'applied', verificationRef: 'readback', sourceHash: 'new-source', sourceVerified: true, beforeFaces: 2415, afterFaces: 2417, diagnosis: 'Trimmed to room boundary', viewpointRef: 'after-view' });
   const issue = (await s.workflow.list())[0];
   assert.equal(saved.saved, true); assert.equal(issue.stage, 'needs-evidence');
-  assert.deepEqual(issue.evidenceRefs, ['applied', 'readback', 'prior']);
+  assert.deepEqual(issue.evidenceRefs, ['applied', 'readback', 'after-view', 'prior']);
+  assert.match(issue.diagnosis, /Actual repaired image and camera are attached/);
   assert.match(issue.diagnosis, /2415 → 2417/); assert.match(issue.diagnosis, /new-source/);
   assert.equal(s.verified(), 0); assert.deepEqual(s.rows[0], original);
   s.fail();

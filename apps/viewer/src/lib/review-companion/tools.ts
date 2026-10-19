@@ -115,6 +115,22 @@ function recordedContactText(result: unknown, topicId: string): string | null {
     || !saved.evidenceRefs.includes(result.evidenceRef)) return null;
   return saved.diagnosis;
 }
+function recordedRepairText(result: unknown, topicId: string): string | null {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return null;
+  const value = record(result);
+  if (!value.issueRecord || typeof value.issueRecord !== 'object' || Array.isArray(value.issueRecord)
+    || !value.afterView || typeof value.afterView !== 'object' || Array.isArray(value.afterView)) return null;
+  const saved = record(value.issueRecord), view = record(value.afterView);
+  const refs = saved.evidenceRefs;
+  if (value.applied !== true || value.sourceVerified !== true || typeof value.afterHash !== 'string' || !/^[a-f0-9]{64}$/.test(value.afterHash)
+    || saved.saved !== true || saved.topicId !== topicId || saved.stage !== 'needs-evidence' || typeof saved.workflowRef !== 'string' || !saved.workflowRef
+    || typeof saved.diagnosis !== 'string' || !saved.diagnosis.trim() || !Array.isArray(refs)
+    || typeof value.receiptRef !== 'string' || !value.receiptRef || typeof value.verificationRef !== 'string' || !value.verificationRef || value.receiptRef === value.verificationRef
+    || !refs.includes(value.receiptRef) || !refs.includes(value.verificationRef)
+    || view.saved !== true || view.topicId !== topicId || view.receiptRef !== value.receiptRef || view.sourceHash !== value.afterHash
+    || typeof view.viewpointRef !== 'string' || !view.viewpointRef || !refs.includes(view.viewpointRef)) return null;
+  return saved.diagnosis;
+}
 export class BonsaiDirectiveError extends Error {
   constructor(message: string, readonly steps: ReviewToolStep[], options?: ErrorOptions) { super(message, options); this.name = 'BonsaiDirectiveError'; }
 }
@@ -214,6 +230,10 @@ export async function runBonsaiDirective(connection: { endpoint: string; model: 
         signal.throwIfAborted();
         if (options.singleStep && options.issueTopicId && call.tool.name === 'review_geometry_contact') {
           const text = recordedContactText(result, options.issueTopicId);
+          if (text) return { text, steps };
+        }
+        if (options.singleStep && options.issueTopicId && ['review_geometry_repair', 'review_geometry_repair_plan'].includes(call.tool.name)) {
+          const text = recordedRepairText(result, options.issueTopicId);
           if (text) return { text, steps };
         }
         // Native issue persistence is the completion boundary. Another model

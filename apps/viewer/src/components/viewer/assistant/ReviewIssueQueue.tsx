@@ -26,6 +26,10 @@ export function ReviewIssueQueue({ review, run }: { review: Review; run(action: 
         <Button size="sm" variant="outline" disabled={review.busy} onClick={() => run(async () => {
           await review.resolution.workflow.open(issue.topicId); await review.resolution.refresh(); review.setStatus('Saved view restored; issue status preserved');
         })}>Reopen saved view</Button>
+        <Button size="sm" variant="outline" disabled={review.busy} onClick={() => run(async () => {
+          await review.resolution.saveView(issue.topicId, 'Current issue view saved by the owner. This image is an observation, not independent architectural acceptance.');
+          review.setStatus('Current image and camera saved on this issue');
+        })}>Save current issue view</Button>
         <Button size="sm" disabled={!review.connection || review.busy} onClick={() => run(async () => {
           review.resolution.setActive(issue.topicId);
           const result = await investigateSavedIssue({ workflow: review.resolution.workflow, prepare: review.prepareIssue, ask: review.ask }, issue.topicId);
@@ -59,7 +63,9 @@ export function ReviewIssueQueue({ review, run }: { review: Review; run(action: 
       {repair.before && repair.after && <p>Faces: {repair.before.faceCount} → {repair.after.faceCount}</p>}
       <div className="flex flex-wrap gap-2">{([['Resume repaired model', 'review_geometry_resume'], ['Undo this repair', 'review_geometry_undo']] as const).map(([label, name]) => <Button key={name} size="sm" variant="outline" disabled={review.busy} onClick={() => run(async () => {
         await review.resolution.tools.find(t => t.name === name)!.execute({ receiptRef: repair.receiptRef }); review.setStatus(name === 'review_geometry_resume' ? 'Repaired model restored and source verified' : 'Original model restored; repair undone and issue reopened'); await review.resolution.refresh();
-      })}>{label}</Button>)}</div>
+      })}>{label}</Button>)}<Button size="sm" variant="outline" disabled={review.busy} onClick={() => run(async () => {
+        await review.resolution.saveRepairView(repair.receiptRef); review.setStatus('Repaired image and camera saved with matching source and application');
+      })}>Save repaired view</Button></div>
     </div>)}
     <Button size="sm" variant="outline" disabled={review.busy} onClick={() => run(async () => {
       const tools = review.resolution.tools.find(t => t.name === 'review_native_tools')!;

@@ -7,6 +7,8 @@ import { parseIfcxViewerModel } from './ingest/viewerModelIngest';
 import { createWorkspaceTools } from '@/lib/review-companion/workspace-tools';
 import { createNativeTools } from '@/lib/review-companion/native-tools';
 import { reviewBcfViewpoint } from '@/lib/review-companion/bcf';
+import { saveIssueViewpoint, type RepairViewBinding } from '@/lib/review-companion/issue-viewpoint';
+import { reviewModels } from '@/lib/review-companion/context';
 import { toGlobalIdFromModels } from '@/store/globalId';
 import { createIssueWorkflow, createIssueWorkflowTools, recordGeometryApplication, recordContactMeasurement, type IssueUpdate } from '@/lib/review-companion/issue-workflow';
 import { createReviewTool } from '@/lib/review-companion/tools';
@@ -87,7 +89,23 @@ export function useReviewResolution(options: Options) {
   }), []);
   workflowRef.current = workflow;
   useEffect(() => { void workflow.list().then(setIssues); void allReviewRows().then(rows => setRepairs(rows.flatMap(row => { const p = payload(row); return p?.kind === 'review.geometry.applied' ? [{ receiptRef: row.id, topicId: String(p.topicId), modelName: String(p.modelName ?? 'Repaired model'), before: p.before as { faceCount: number } | null, after: p.after as { faceCount: number } | null }] : []; }))); }, [workflow, options.findings, options.scope]);
-  const actions = useRef({ record, source, load }); actions.current = { record, source, load };
+  const saveView = async (topicId: string, note: string, repair?: Omit<RepairViewBinding, 'sourceIdentity'>) => {
+    await live.current.open(topicId);
+    const identity = repair ? (await reviewModels(useViewerStore.getState().models)).find(model => model.id === repair.modelId) : undefined;
+    if (repair && !identity) throw new Error('The repaired model is no longer loaded.');
+    const binding = repair && identity ? { ...repair, sourceIdentity: identity.sourceIdentity } : undefined;
+    return saveIssueViewpoint({ topicId, note, binding, capture: () => live.current.capture(), persist: row => live.current.persist(row),
+      qualify: async () => {
+        if (!binding) return;
+        if ((await source(binding.modelId)).hash !== binding.sourceHash) throw new Error('The repaired source changed before its after-view was saved.');
+        if (!(await reviewModels(useViewerStore.getState().models)).some(model => model.id === binding.modelId && model.sourceIdentity === binding.sourceIdentity)) throw new Error('The repaired placement changed before its after-view was saved.');
+      },
+      install: async context => {
+        const viewpoint = reviewBcfViewpoint(context.viewpoint); useViewerStore.getState().addViewpoint(topicId, viewpoint);
+        return !!useViewerStore.getState().bcfProject?.topics.get(topicId)?.viewpoints.some(view => view.guid === viewpoint.guid && view.snapshot === viewpoint.snapshot);
+      } });
+  };
+  const actions = useRef({ record, source, load, saveView }); actions.current = { record, source, load, saveView };
   const nativeTools = useMemo(() => createNativeTools({
     record: event => actions.current.record({ ...event, topicId: activeTopic.current }),
     readback: () => { const s = useViewerStore.getState(); return { mutationVersion: s.mutationVersion, modelIds: [...s.models.keys()], selection: [...s.selectedEntityIds] }; },
@@ -151,13 +169,7 @@ export function useReviewResolution(options: Options) {
       return { sourceHash: hash, path: input.path, component: input.component, total: data.length, offset: input.offset, values: data.slice(input.offset as number, (input.offset as number) + (input.limit as number)), transform: report.transform, coordinateSpace: 'Source mesh-local IFCX Z-up; verify declared units before changing dimensions.' };
     }),
     createReviewTool('review_attach_issue_view', 'Save the current actual image, camera and selected element identities as an additional BCF issue viewpoint. Preserves the original view. Use after selecting the repaired element and checking the corrected scene.', { topicId: id, note: { type: 'string', minLength: 1, maxLength: 8000 } }, false, async input => {
-      await live.current.open(input.topicId as string);
-      const context = await live.current.capture();
-      const row: ReviewFinding = { schemaVersion: 1, id: crypto.randomUUID(), kind: 'note', context, createdAt: new Date().toISOString(), text: JSON.stringify({ kind: 'review.bcf.viewpoint', topicId: input.topicId, note: input.note }) };
-      await live.current.persist(row);
-      const viewpoint = reviewBcfViewpoint(context.viewpoint);
-      useViewerStore.getState().addViewpoint(input.topicId as string, viewpoint);
-      return { saved: true, viewpointRef: row.id, viewpointId: viewpoint.guid, elementCount: context.elements.length };
+      return actions.current.saveView(input.topicId as string, input.note as string);
     }),
     createReviewTool('review_geometry_repairs', 'List actual persisted geometry applications and their matching verification records, including IDs needed to finish issue resolution or Undo. These are source/readback facts, not blanket architectural acceptance.', {}, true, async () => {
       const rows = await allReviewRows();
@@ -224,10 +236,15 @@ export function useReviewResolution(options: Options) {
       const matches = after.hash === afterSource.hash && loadedTriangles === expectedTriangles;
       const issueVerified = matches && result.operation === 'remove_defective_faces' && actual.meshes.every(m => !m.analysis.degenerateFaces.length && !m.analysis.duplicateFaces.length);
       const verificationRef = await actions.current.record({ kind: 'review.geometry.verified', topicId, receiptRef, afterHash: after.hash, matches, issueVerified, canonicalMeshCount: parsed.geometryResult.meshes.length, expectedTriangles, loadedTriangles, actual: actual.meshes.map(m => ({ path: m.path, faceCount: m.analysis.faceCount, degenerateCount: m.analysis.degenerateFaces.length, duplicateCount: m.analysis.duplicateFaces.length, bounds: m.analysis.bounds })) }, original);
-      const disposition = await recordGeometryApplication(workflow, { topicId, operation: result.operation, receiptRef, verificationRef, sourceHash: after.hash, sourceVerified: matches, beforeFaces: result.before?.faceCount ?? null, afterFaces: result.after?.faceCount ?? null, diagnosis: input.diagnosis as string });
+      let afterView;
+      if (matches) {
+        try { afterView = await actions.current.saveView(topicId, `Actual after-view of native ${result.operation}. Application ${receiptRef}; readback ${verificationRef}; source ${after.hash}. ${String(input.diagnosis).slice(0, 6000)}`, { modelId, sourceHash: after.hash, receiptRef }); }
+        catch (error) { afterView = { saved: false, error: error instanceof Error ? error.message : String(error) }; }
+      }
+      const disposition = await recordGeometryApplication(workflow, { topicId, operation: result.operation, receiptRef, verificationRef, sourceHash: after.hash, sourceVerified: matches, beforeFaces: result.before?.faceCount ?? null, afterFaces: result.after?.faceCount ?? null, diagnosis: input.diagnosis as string, viewpointRef: afterView && 'viewpointRef' in afterView ? afterView.viewpointRef : undefined });
       // Loader owns render/identity; the issue's original image remains untouched.
       useViewerStore.getState().setBcfPanelVisible(false);
-      return { applied: true, verified: issueVerified, sourceVerified: matches, workflowRef: disposition.workflowRef, removedFaceCount: result.before && result.after ? result.before.faceCount - result.after.faceCount : null, duplicateAndDegenerateCategoriesOverlap: true, receiptRef, verificationRef, beforeHash: before.hash, afterHash: after.hash, before: result.before, after: result.after, previousViewpoint: camera.viewpoint.guid,
+      return { applied: true, verified: issueVerified, sourceVerified: matches, workflowRef: disposition.workflowRef, issueRecord: disposition, afterView, removedFaceCount: result.before && result.after ? result.before.faceCount - result.after.faceCount : null, duplicateAndDegenerateCategoriesOverlap: true, receiptRef, verificationRef, beforeHash: before.hash, afterHash: after.hash, before: result.before, after: result.after, previousViewpoint: camera.viewpoint.guid,
         next: 'Inspect the actual corrected view. Close only the diagnosed mesh defect; an architectural concern needs its own verification.' };
     }),
     createReviewTool('review_geometry_resume', 'Reopen a saved corrected IFCX source from its preserved records, including after browser or server restart. Original source and saved issues remain preserved.', { receiptRef: id }, false, async (input, execution) => {
@@ -267,7 +284,14 @@ export function useReviewResolution(options: Options) {
     return geometryTools.find(tool => tool.name === 'review_geometry_repair')!.execute({ topicId: input.topicId, modelId, expectedSourceHash: plan.sourceHash, operationJson: JSON.stringify(plan.operation), diagnosis: input.diagnosis }, execution);
   }), [geometryTools]);
   const tools = useMemo(() => [...nativeTools, ...workspaceTools, ...geometryTools, planTool, ...issueTools], [nativeTools, workspaceTools, geometryTools, planTool, issueTools]);
-  return { issues, repairs, workflow, tools,
+  return { issues, repairs, workflow, tools, saveView,
+    saveRepairView: async (receiptRef: string) => {
+      const receipt = payload((await allReviewRows()).find(row => row.id === receiptRef));
+      if (receipt?.kind !== 'review.geometry.applied') throw new Error('Choose a saved geometry application.');
+      const modelId = await resolveRepairModel(String(receipt.afterHash), useViewerStore.getState().models);
+      return actions.current.saveView(String(receipt.topicId), `Actual after-view of saved geometry application ${receiptRef}. Source ${receipt.afterHash}. Architectural acceptance remains separate.`,
+        { modelId, sourceHash: String(receipt.afterHash), receiptRef });
+    },
     importPlan: async (topicId: string, file: File) => {
       const rows = await allReviewRows(), base = rows.find(row => payload(row)?.kind === 'review.bcf.definition' && payload(row)?.topicId === topicId);
       if (!base) throw new Error('Choose a saved issue before importing a geometry plan.');
