@@ -31,6 +31,10 @@ export function ReviewIssueQueue({ review, run }: { review: Review; run(action: 
           await review.resolution.refresh();
         })}>Run next issue step</Button>
       </div>
+      <label className="block">Import geometry repair plan<input aria-label="Import geometry repair plan" type="file" accept="application/json,.json" disabled={review.busy} onChange={event => {
+        const file = event.target.files?.[0]; event.target.value = '';
+        if (file) run(async () => { const plan = await review.resolution.importPlan(issue.topicId, file); review.setStatus(`Geometry plan saved: ${plan.planRef}. Faces ${plan.beforeFaces} → ${plan.afterFaces}. Ready for Bonsai to apply; no model change yet.`); });
+      }} /></label>
       <p className="text-muted-foreground">Original images stay unchanged. Repairs keep both source revisions and an Undo receipt. Unresolved architectural questions stay open.</p>
     </>}
     {review.resolution.repairs.map(repair => <div key={repair.receiptRef} className="rounded border p-2 space-y-2">

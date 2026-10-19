@@ -13,6 +13,7 @@ import { createReviewTool } from '@/lib/review-companion/tools';
 import { inspectIfcxGeometry, patchIfcxGeometry, type IfcxGeometryOperation } from '@/lib/review-companion/ifcx-geometry';
 import { measureIfcxEntityDistance } from '@/lib/review-companion/geometry-distance';
 import { inspectGeometryComponent } from '@/lib/review-companion/geometry-component';
+import { saveGeometryPlan, readGeometryPlan } from '@/lib/review-companion/geometry-plans';
 import { readIfcxWorldGeometry, summarizeWorldGeometry } from '@/lib/review-companion/ifcx-world-geometry';
 import { resolveGeometryTarget } from '@/lib/review-companion/geometry-target';
 import { summarizeIfcxGeometry } from '@/lib/review-companion/geometry-evidence';
@@ -241,8 +242,21 @@ export function useReviewResolution(options: Options) {
     }),
   ], [workflow]);
   const issueTools = useMemo(() => createIssueWorkflowTools(workflow), [workflow]);
-  const tools = useMemo(() => [...nativeTools, ...workspaceTools, ...geometryTools, ...issueTools], [nativeTools, workspaceTools, geometryTools, issueTools]);
+  const planTool = useMemo(() => createReviewTool('review_geometry_repair_plan', 'Apply a previously imported geometry repair plan by its exact saved reference. Large mesh arrays stay in native storage. Requires owner-authorized issue-specific intent. Uses the same source-revision checks, preserved sources, canonical reload, readback and undo as review_geometry_repair.', { topicId: id, planRef: id, diagnosis: { type: 'string', minLength: 1, maxLength: 8000 } }, false, async (input, execution) => {
+    const plan = await readGeometryPlan(input.planRef as string, input.topicId as string, await allReviewRows());
+    const modelId = await resolveRepairModel(plan.sourceHash, useViewerStore.getState().models);
+    return geometryTools.find(tool => tool.name === 'review_geometry_repair')!.execute({ topicId: input.topicId, modelId, expectedSourceHash: plan.sourceHash, operationJson: JSON.stringify(plan.operation), diagnosis: input.diagnosis }, execution);
+  }), [geometryTools]);
+  const tools = useMemo(() => [...nativeTools, ...workspaceTools, ...geometryTools, planTool, ...issueTools], [nativeTools, workspaceTools, geometryTools, planTool, issueTools]);
   return { issues, repairs, workflow, tools,
+    importPlan: async (topicId: string, file: File) => {
+      const rows = await allReviewRows(), base = rows.find(row => payload(row)?.kind === 'review.bcf.definition' && payload(row)?.topicId === topicId);
+      if (!base) throw new Error('Choose a saved issue before importing a geometry plan.');
+      if (file.size > 2_000_000) throw new Error('Geometry plan exceeds 2 MB.');
+      const bytes = await file.arrayBuffer(), plan = JSON.parse(new TextDecoder().decode(bytes));
+      const modelId = await resolveRepairModel(plan.sourceHash, useViewerStore.getState().models);
+      return saveGeometryPlan(bytes, (await actions.current.source(modelId)).buffer, base, topicId, live.current.persist);
+    },
     setActive: (topicId: string) => { activeTopic.current = topicId; },
     refresh: async () => setIssues(await workflow.list()) };
 }
