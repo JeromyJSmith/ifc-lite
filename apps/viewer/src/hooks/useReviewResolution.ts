@@ -11,6 +11,7 @@ import { toGlobalIdFromModels } from '@/store/globalId';
 import { createIssueWorkflow, createIssueWorkflowTools, type IssueUpdate } from '@/lib/review-companion/issue-workflow';
 import { createReviewTool } from '@/lib/review-companion/tools';
 import { inspectIfcxGeometry, patchIfcxGeometry, type IfcxGeometryOperation } from '@/lib/review-companion/ifcx-geometry';
+import { resolveGeometryTarget } from '@/lib/review-companion/geometry-target';
 import { summarizeIfcxGeometry } from '@/lib/review-companion/geometry-evidence';
 import { saveGeometrySource, readGeometrySource } from '@/lib/review-companion/geometry-sources';
 import { verifyGeometryCleanup } from '@/lib/review-companion/geometry-verification';
@@ -93,7 +94,8 @@ export function useReviewResolution(options: Options) {
       modelId: id, path: id, component: { type: 'string', enum: ['points', 'faceVertexIndices', 'faceVertexCounts', 'normals', 'boundaryEdges', 'nonManifoldEdges', 'degenerateFaces', 'duplicateFaces'] }, offset: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER }, limit: { type: 'integer', minimum: 1, maximum: 256 },
     }, true, async input => {
       const { buffer, hash } = await actions.current.source(input.modelId as string);
-      const report = inspectIfcxGeometry(buffer, input.path as string);
+      const path = resolveGeometryTarget(input.path as string, id => useViewerStore.getState().models.get(input.modelId as string)?.ifcDataStore?.entities.getGlobalId(id));
+      const report = inspectIfcxGeometry(buffer, path);
       const entry = report.meshes.find(m => m.analysis.path === input.path);
       if (!entry) return { sourceHash: hash, meshPaths: report.meshes.map(m => m.analysis.path), next: 'Choose an exact mesh path.' };
       const component = input.component as string;
@@ -119,10 +121,11 @@ export function useReviewResolution(options: Options) {
         return [{ topicId: r.topicId, receiptRef: row.id, verificationRef: checked?.id, operation: r.operation, path: r.path, modelId: r.modelId, modelName: r.modelName, beforeHash: r.beforeHash, afterHash: r.afterHash, before: r.before, after: r.after, matches: v?.matches, loadedTriangles: v?.loadedTriangles, actual: v?.actual }];
       });
     }),
-    createReviewTool('review_geometry_inspect', 'Read exact IFCX source geometry at an entity or mesh prim path. Report actual topology, mesh-local coordinates and transforms; persist a measured mesh-integrity candidate when exact zero-area or same-winding duplicate faces exist. Architectural holes are not automatically defects.', { modelId: id, path: id }, false, async input => {
+    createReviewTool('review_geometry_inspect', 'Read one IFCX element using the geometryTarget returned by review_state (such as #176), or an exact mesh prim path returned by this tool. Never invent /IFCRoot/ paths. Report actual topology, mesh-local coordinates and transforms; persist a measured mesh-integrity candidate when exact zero-area or same-winding duplicate faces exist. Architectural holes are not automatically defects.', { modelId: id, path: id }, false, async input => {
       const { buffer, hash } = await actions.current.source(input.modelId as string);
-      const report = inspectIfcxGeometry(buffer, input.path as string);
-      const state = useViewerStore.getState(), entityId = state.models.get(input.modelId as string)?.ifcDataStore?.entities.getExpressIdByGlobalId(input.path as string);
+      const path = resolveGeometryTarget(input.path as string, id => useViewerStore.getState().models.get(input.modelId as string)?.ifcDataStore?.entities.getGlobalId(id));
+      const report = inspectIfcxGeometry(buffer, path);
+      const state = useViewerStore.getState(), entityId = state.models.get(input.modelId as string)?.ifcDataStore?.entities.getExpressIdByGlobalId(path);
       if (entityId && entityId > 0) {
         const ref = { modelId: input.modelId as string, expressId: entityId }, globalId = toGlobalIdFromModels(state.models, ref.modelId, ref.expressId);
         state.clearSelection(); state.setSelectedEntity(ref); state.setSelectedEntityIds([globalId]); state.setSelectedEntityId(globalId);

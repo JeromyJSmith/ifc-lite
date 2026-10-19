@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, type IncomingMessage } from 'node:http';
 import { once } from 'node:events';
-import { BonsaiDirectiveError, createReviewTools, registerReviewWebMcp, runBonsaiDirective, type ReviewToolHandlers } from './tools.js';
+import { BonsaiDirectiveError, createReviewTool, createReviewTools, registerReviewWebMcp, runBonsaiDirective, type ReviewToolHandlers } from './tools.js';
 
 function handlers(actions: unknown[] = []): ReviewToolHandlers {
   return {
@@ -122,13 +122,13 @@ test('a short directive carries separately supplied single-issue evidence to the
 });
 test('one BCF action leaves only result recording tools and rejects another read before execution', async () => {
   let reads = 0; const custom = handlers();
-  custom.listFindings = async () => { reads++; return [{ id: 'one-result' }]; };
+  custom.inspect = async () => { reads++; return { summary: 'one-result' }; };
   await withServer(async (endpoint, requests) => {
     await assert.rejects(runBonsaiDirective({ endpoint, model: 'Bonsai' }, 'Answer one question.', createReviewTools(custom), new AbortController().signal, { singleStep: true }), /step is complete/);
     assert.equal(reads, 1);
     assert.deepEqual(requests[1].tools.map((tool: Payload) => tool.function.name), ['review_save_note']);
     assert.match(requests[1].messages.at(-1).content, /Record what this result establishes/);
-  }, index => calls({ id: `read-${index}`, name: 'review_findings', args: {} }));
+  }, index => calls({ id: `read-${index}`, name: 'review_inspect', args: {} }));
 });
 test('a multi-action BCF batch has no partial effects', async () => {
   const actions: unknown[] = [];
@@ -261,4 +261,15 @@ test('each completed action is journaled before another request, and a failed jo
     assert.equal(requests.length, 1); assert.equal(actions.length, 1);
     assert.deepEqual(journal, [{ tool: 'viewer_frame_selection', args: {}, result: { framed: true } }]);
   }, () => calls({ id: 'journal-frame', name: 'viewer_frame_selection', args: {} }));
+});
+
+test('a focused BCF step excludes queue discovery and finishes at the persisted issue update', async () => {
+  let updates = 0;
+  const update = createReviewTool('review_update_issue', 'Persist issue diagnosis', { topicId: { type: 'string' } }, false, async () => { updates++; return { diagnosis: 'Need corner return measurement', saved: true }; });
+  await withServer(async (endpoint, requests) => {
+    const result = await runBonsaiDirective({ endpoint, model: 'Bonsai' }, 'One question.', [...createReviewTools(handlers()), update], new AbortController().signal, { singleStep: true });
+    assert.equal(result.text, 'Need corner return measurement'); assert.equal(updates, 1); assert.equal(requests.length, 2);
+    assert.equal(requests[0].tools.some((tool: Payload) => tool.function.name === 'review_findings'), false);
+    assert.equal(result.steps.length, 2);
+  }, index => index === 0 ? calls({ id: 'inspect', name: 'review_inspect', args: {} }) : calls({ id: 'record', name: 'review_update_issue', args: { topicId: 'fascia' } }));
 });

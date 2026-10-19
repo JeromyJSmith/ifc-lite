@@ -13,7 +13,7 @@ export function ReviewIssueQueue({ review, run }: { review: Review; run(action: 
   return <section className="rounded border border-primary p-3 space-y-2" aria-label="Saved issue work queue">
     <strong>Saved issue work queue · {review.resolution.issues.length}</strong>
     <Button size="sm" variant="outline" onClick={() => downloadBlob(new Blob([JSON.stringify(REVIEW_RESOLUTION_SCHEMA, null, 2)], { type: 'application/schema+json' }), 'ifc-review-resolution.schema.json')}>Export resolution schema</Button>
-    <p>Reopen a concern, inspect the actual model, repair supported defects and retain the original evidence.</p>
+    <p>Use the saved BCF evidence. Take one action, record its result, then continue toward a verified fix.</p>
     <label className="block">Saved issue<select aria-label="Issue to investigate" className="w-full rounded border bg-background p-2" value={issue?.topicId ?? ''} onChange={e => setSelected(e.target.value)}>
       {!issue && <option value="">No saved BCF issues</option>}
       {review.resolution.issues.map(row => <option key={row.topicId} value={row.topicId}>{row.stage} · {row.title}</option>)}
@@ -29,7 +29,7 @@ export function ReviewIssueQueue({ review, run }: { review: Review; run(action: 
           const result = await investigateSavedIssue({ workflow: review.resolution.workflow, prepare: review.prepareIssue, ask: review.ask }, issue.topicId);
           review.setStatus(`Issue ${result.stage}: ${result.diagnosis}`);
           await review.resolution.refresh();
-        })}>Investigate &amp; fix supported defects</Button>
+        })}>Run next issue step</Button>
       </div>
       <p className="text-muted-foreground">Original images stay unchanged. Repairs keep both source revisions and an Undo receipt. Unresolved architectural questions stay open.</p>
     </>}

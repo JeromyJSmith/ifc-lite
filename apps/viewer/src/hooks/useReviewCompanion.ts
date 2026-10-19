@@ -112,7 +112,7 @@ export function useReviewCompanion(active: boolean) {
     const record: ReviewFinding = { schemaVersion: 1, id: crypto.randomUUID(), context: context ?? await capture(), kind: 'note', text, createdAt: now(), ...(provider ? { provider } : {}) };
     await persist(record); setStatus('Note saved on this device'); return { id: record.id };
   }, [capture, persist]);
-  const inspect = useCallback(async (captured?: ReviewContext, parentSignal?: AbortSignal, instruction = directive) => {
+  const inspect = useCallback(async (captured?: ReviewContext, parentSignal?: AbortSignal, instruction = directive, maximumFindings = 5) => {
     if (!connection) throw new Error('Connect Bonsai vision first.');
     if (running.current) throw new Error('A review is already in progress.');
     running.current = true; setBusy(true); setError(''); setStatus(captured ? 'Bonsai is analysing a saved tour view…' : 'Bonsai is inspecting this view…');
@@ -125,11 +125,11 @@ export function useReviewCompanion(active: boolean) {
       let ownsProcess = process.current()?.status !== 'running';
       if (ownsProcess) await process.begin(context, instruction, input.id);
       const signal = AbortSignal.any([abort.signal, ...(directiveController.current ? [directiveController.current.signal] : []), ...(parentSignal ? [parentSignal] : [])]);
-      const response = await inspectBonsaiView(connection, context, instruction, signal);
+      const response = await inspectBonsaiView(connection, context, instruction, signal, maximumFindings);
       const raw: ReviewFinding = { schemaVersion: 1, id: crypto.randomUUID(), context, kind: 'note', text: response.raw, createdAt: now(), parentId: input.id, provider: { model: response.model, endpoint: connection.endpoint } };
       await persist(raw);
       if (!response.complete) throw new Error('Bonsai review was incomplete. Its input and raw response were saved; no candidates were accepted.');
-      const review = parseVisualReview(response.raw, context.elements.length);
+      const review = parseVisualReview(response.raw, context.elements.length, maximumFindings);
       const candidates = [];
       const remaining = process.current()?.status === 'running' ? 5 - process.current()!.findings.length : 5;
       for (const f of review.findings.slice(0, remaining)) {
@@ -211,7 +211,7 @@ export function useReviewCompanion(active: boolean) {
     pickFinding,
     state: () => {
       const state = useViewerStore.getState(); const ids = new Set(state.selectedEntityIds); if (state.selectedEntityId !== null) ids.add(state.selectedEntityId);
-      const selected = [...ids].map(id => resolveEntityRef(id)).map(ref => ({ ...ref, ifcGlobalId: resolveEntityRefGlobalIdFromState(state, ref) }));
+      const selected = [...ids].map(id => resolveEntityRef(id)).map(ref => ({ ...ref, ifcGlobalId: resolveEntityRefGlobalIdFromState(state, ref), geometryTarget: `#${ref.expressId}` }));
       const camera = getGlobalRenderer()?.getCamera();
       return { mode, directive, connected: !!connection, model: connection?.model, scope, busy, models: [...models.values()].map(m => ({ id: m.id, name: m.name })), selected,
         camera: camera ? { position: camera.getPosition(), target: camera.getTarget(), rotation: camera.getRotation(), distance: camera.getDistance() } : null };
@@ -335,7 +335,6 @@ export function useReviewCompanion(active: boolean) {
       const abort = new AbortController(); preparationController.current = abort; setDirecting(true); setMode('paused');
       try {
         return await prepareSavedIssue({ workflow: resolution.workflow,
-          inspect: (signal, instruction) => inspect(undefined, signal, instruction),
           onStatus: setStatus }, topicId, abort.signal);
       } finally { preparationController.current = null; setDirecting(false); }
     },
@@ -366,7 +365,8 @@ export function useReviewCompanion(active: boolean) {
       } });
       await stream.start(); await stream.state({ scopeId: context.scopeId, processId: started.id, stage: 'inspecting' });
         setStatus('Bonsai is choosing its next viewer action…');
-        const result = await runBonsaiDirective(connection, prompt, tools, abort.signal, { evidence, singleStep, maxTurns: singleStep ? 6 : 32, maxCalls: singleStep ? 6 : 48, onToolStart: call => stream!.toolStart(call.id, call.tool, call.args), onStep: async (step, toolCallId) => {
+        const stepTools = singleStep ? tools.map(tool => tool.name === 'review_inspect' ? createReviewTool('review_inspect', 'Answer one explicit visual question about this saved BCF concern; do not search for other issues.', { question: { type: 'string', minLength: 1, maxLength: 1000 } }, false, input => inspect(undefined, abort.signal, `Saved concern: ${JSON.stringify((evidence as { issue?: { title?: string } } | undefined)?.issue?.title)}. Specific unanswered question: ${input.question}. Return at most one finding about this concern only.`, 1)) : tool) : tools;
+        const result = await runBonsaiDirective(connection, prompt, stepTools, abort.signal, { evidence, singleStep, maxTurns: singleStep ? 6 : 32, maxCalls: singleStep ? 6 : 48, onToolStart: call => stream!.toolStart(call.id, call.tool, call.args), onStep: async (step, toolCallId) => {
           await stream!.toolResult(toolCallId, step.result);
           await persistReviewJson({ ...input!, id: crypto.randomUUID(), provider: { model: connection.model, endpoint: connection.endpoint }, parentId: input!.id }, { stage: 'tool-completed', step }, persist);
         } });

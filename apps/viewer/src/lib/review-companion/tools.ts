@@ -141,7 +141,10 @@ export async function runBonsaiDirective(connection: { endpoint: string; model: 
       signal.throwIfAborted();
       const current = await connectBonsai(endpoint, signal);
       if (current.model !== connection.model) throw new Error('Bonsai model changed. Reconnect before sending a directive.');
-      const available = options.singleStep && stepTaken ? tools.filter(tool => bookkeeping.has(tool.name)) : tools;
+      // The caller already supplied and restored this exact concern. Global
+      // queue/history discovery would spend the step rereading unrelated work.
+      const redundant = new Set(['review_issue_queue', 'review_investigate_issue', 'review_bcf_issues', 'review_open_bcf_issue', 'review_findings', 'review_restore', 'review_set_directive']);
+      const available = options.singleStep ? tools.filter(tool => stepTaken ? bookkeeping.has(tool.name) : !redundant.has(tool.name)) : tools;
       const response = await fetch(`${endpoint}/v1/chat/completions`, {
         method: 'POST', credentials: 'omit', redirect: 'error',
         signal: AbortSignal.any([signal, AbortSignal.timeout(120_000)]), headers: { 'Content-Type': 'application/json' },
@@ -197,6 +200,12 @@ export async function runBonsaiDirective(connection: { endpoint: string; model: 
         steps.push(step);
         await options.onStep?.(step, call.id);
         signal.throwIfAborted();
+        // Native issue persistence is the completion boundary. Another model
+        // request adds latency and can repeat the same update without new facts.
+        if (options.singleStep && call.tool.name === 'review_update_issue') {
+          const saved = record(result);
+          return { text: typeof saved.diagnosis === 'string' ? saved.diagnosis : 'BCF step recorded.', steps };
+        }
         const content = JSON.stringify(result ?? null);
         // Preserve full results in steps; bound only the context returned to the model.
         messages.push({ role: 'tool', tool_call_id: call.id, content: content.length <= 64_000 ? content : JSON.stringify({ truncated: true, preview: content.slice(0, 60_000) }) });

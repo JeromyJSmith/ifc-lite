@@ -32,3 +32,9 @@ test('optional visual point is normalized screenshot evidence and never an inven
     assert.throws(() => parseVisualReview(JSON.stringify({ ...output, findings: [{ ...output.findings[0], point }] }), 0), /invalid normalized screenshot point/);
   }
 });
+
+test('a focused BCF visual response rejects extra findings instead of saving unrelated concerns', () => {
+  const raw = JSON.stringify({ summary: 'Corner', findings: [{ text: 'One', elementIndices: [] }, { text: 'Other', elementIndices: [] }] });
+  assert.throws(() => parseVisualReview(raw, 0, 1), /format/);
+  assert.equal(parseVisualReview(raw, 0).findings.length, 2);
+});

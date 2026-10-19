@@ -29,8 +29,8 @@ test('the request contains only the chosen BCF concern and one observation, not 
   const s = setup();
   s.rows.push(s.row('other', { kind: 'review.bcf.definition', topicId: 'other', findingId: 'other-finding', title: 'UNRELATED_ISSUE', description: 'UNRELATED_EVIDENCE'.repeat(1000), createdAt: '2026-10-19T10:00:00Z' }));
   await investigateSavedIssue({ workflow: s.workflow, prepare: s.prepare, ask: async (_directive, evidence) => {
-    const data = evidence as { issue: { topicId: string }; currentObservation: unknown };
-    assert.equal(data.issue.topicId, 'fascia'); assert.deepEqual(data.currentObservation, { summary: 'A corner step is visible; its intent is unknown.', evidenceRefs: ['measurement'] });
+    const data = evidence as { issue: { topicId: string }; savedObservation: unknown };
+    assert.equal(data.issue.topicId, 'fascia'); assert.deepEqual(data.savedObservation, { summary: 'A corner step is visible; its intent is unknown.', evidenceRefs: ['measurement'] });
     const wire = JSON.stringify(data); assert.ok(wire.length < 1500); assert.equal(wire.includes('UNRELATED'), false); assert.equal('geometry' in data, false);
     return { text: 'Need the corner return measurement.' };
   } }, 'fascia');
