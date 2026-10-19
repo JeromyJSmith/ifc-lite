@@ -131,10 +131,28 @@ function recordedRepairText(result: unknown, topicId: string): string | null {
     || typeof view.viewpointRef !== 'string' || !view.viewpointRef || !refs.includes(view.viewpointRef)) return null;
   return saved.diagnosis;
 }
+export function recordedAlignmentText(result: unknown, topicId: string): string | null {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return null;
+  for (const field of ['disposition', 'afterView', 'check']) {
+    const nested = (result as Record<string, unknown>)[field];
+    if (!nested || typeof nested !== 'object' || Array.isArray(nested)) return null;
+  }
+  const value = record(result), saved = record(value.disposition), view = record(value.afterView), check = record(value.check);
+  const refs = saved.evidenceRefs;
+  if (value.verified !== true || value.geometryApplied !== false || check.verified !== true || check.kind !== 'edge-board-alignment'
+    || typeof check.currentHash !== 'string' || !/^[a-f0-9]{64}$/.test(check.currentHash)
+    || saved.saved !== true || saved.topicId !== topicId || saved.stage !== 'fixed'
+    || typeof saved.workflowRef !== 'string' || !saved.workflowRef || typeof saved.diagnosis !== 'string' || !saved.diagnosis.trim()
+    || typeof value.receiptRef !== 'string' || !value.receiptRef || typeof value.verificationRef !== 'string' || !value.verificationRef
+    || value.receiptRef === value.verificationRef || !Array.isArray(refs) || !refs.includes(value.receiptRef) || !refs.includes(value.verificationRef)
+    || view.saved !== true || view.topicId !== topicId || view.receiptRef !== value.receiptRef || view.sourceHash !== check.currentHash
+    || typeof view.viewpointRef !== 'string' || !view.viewpointRef) return null;
+  return saved.diagnosis;
+}
 export class BonsaiDirectiveError extends Error {
   constructor(message: string, readonly steps: ReviewToolStep[], options?: ErrorOptions) { super(message, options); this.name = 'BonsaiDirectiveError'; }
 }
-const allowedNames = new Set(['review_geometry_contact', 'viewer_rotate_at', 'review_state', 'review_set_directive', 'review_save_note', 'review_inspect', 'review_inspect_concern', 'review_findings', 'review_restore', 'viewer_select_element', 'viewer_frame_selection', 'viewer_rotate', 'viewer_zoom', 'viewer_pick_finding', 'review_read_element', 'review_preview_changes', 'review_apply_changes', 'review_undo_changes', 'review_create_bcf_issue', 'review_bcf_issues', 'review_open_bcf_issue', 'review_native_tools', 'review_native_describe', 'review_native_call', 'review_issue_queue', 'review_investigate_issue', 'review_update_issue', 'review_geometry_inspect', 'review_geometry_component', 'review_geometry_measure', 'review_geometry_correspondence', 'review_geometry_repair', 'review_geometry_repair_plan', 'review_geometry_plans', 'review_geometry_undo', 'review_geometry_resume', 'review_geometry_repairs', 'review_geometry_verify', 'review_geometry_read', 'review_attach_issue_view', 'review_workspace_tools', 'review_workspace_command', 'review_workspace_evidence']);
+const allowedNames = new Set(['review_geometry_contact', 'viewer_rotate_at', 'review_state', 'review_set_directive', 'review_save_note', 'review_inspect', 'review_inspect_concern', 'review_findings', 'review_restore', 'viewer_select_element', 'viewer_frame_selection', 'viewer_rotate', 'viewer_zoom', 'viewer_pick_finding', 'review_read_element', 'review_preview_changes', 'review_apply_changes', 'review_undo_changes', 'review_create_bcf_issue', 'review_bcf_issues', 'review_open_bcf_issue', 'review_native_tools', 'review_native_describe', 'review_native_call', 'review_issue_queue', 'review_investigate_issue', 'review_update_issue', 'review_geometry_inspect', 'review_geometry_component', 'review_geometry_measure', 'review_geometry_correspondence', 'review_geometry_repair', 'review_geometry_repair_plan', 'review_geometry_plans', 'review_geometry_undo', 'review_geometry_resume', 'review_geometry_repairs', 'review_geometry_verify', 'review_geometry_verify_alignment', 'review_geometry_read', 'review_attach_issue_view', 'review_workspace_tools', 'review_workspace_command', 'review_workspace_evidence']);
 const directiveSystem = `You are the local IFC-Lite review assistant. Follow only the explicit user directive.
 Use the exact loaded model IDs in currentViewer when supplied. Read review_state only when live context needs refreshing; never invent an ID or fetch history just to discover the loaded model.
 Use the supplied installed native BIM tools for investigation and owner-authorized model repair. Discover the full native catalogue with review_native_tools and exact signatures with review_native_describe, then call review_native_call. Do not execute arbitrary code. Native geometry operations and IFCX source repair are available; read exact geometry, units, source hash and evidence before changing it.
@@ -234,6 +252,10 @@ export async function runBonsaiDirective(connection: { endpoint: string; model: 
         }
         if (options.singleStep && options.issueTopicId && ['review_geometry_repair', 'review_geometry_repair_plan'].includes(call.tool.name)) {
           const text = recordedRepairText(result, options.issueTopicId);
+          if (text) return { text, steps };
+        }
+        if (options.singleStep && options.issueTopicId && call.tool.name === 'review_geometry_verify_alignment') {
+          const text = recordedAlignmentText(result, options.issueTopicId);
           if (text) return { text, steps };
         }
         // Native issue persistence is the completion boundary. Another model

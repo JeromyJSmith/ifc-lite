@@ -22,6 +22,7 @@ import { readIfcxWorldGeometry, summarizeWorldGeometry } from '@/lib/review-comp
 import { resolveGeometryTarget } from '@/lib/review-companion/geometry-target';
 import { summarizeIfcxGeometry } from '@/lib/review-companion/geometry-evidence';
 import { saveGeometrySource, readGeometrySource, loadGeometrySourceRecords } from '@/lib/review-companion/geometry-sources';
+import { createAlignmentVerificationTool, verifyRecordedAlignment, qualifyLoadedAlignment } from '@/lib/review-companion/alignment-verification-tool';
 import { verifyGeometryCleanup } from '@/lib/review-companion/geometry-verification';
 import { listAllFindings, getFindingsByIds, saveFinding } from '@/lib/review-companion/storage';
 import { rebindReviewRevision, resolveRepairModel } from '@/lib/review-companion/revision-lineage';
@@ -80,7 +81,14 @@ export function useReviewResolution(options: Options) {
     verify: async (update: IssueUpdate) => {
       const rows = await getFindingsByIds([update.mutationReceiptRef!, update.verificationRef!]), receipt = payload(rows.find(r => r.id === update.mutationReceiptRef)), verification = payload(rows.find(r => r.id === update.verificationRef));
       if (receipt?.kind !== 'review.geometry.applied' || verification?.kind !== 'review.geometry.verified' || receipt.topicId !== update.topicId || verification.topicId !== update.topicId
-        || verification.receiptRef !== update.mutationReceiptRef || verification.matches !== true || receipt.afterHash !== verification.afterHash) throw new Error('This issue has no matching persisted geometry application and verified after-source. Keep the issue open.');
+        || verification.receiptRef !== update.mutationReceiptRef || verification.matches !== true) throw new Error('This issue has no matching persisted geometry application and verified after-source. Keep the issue open.');
+      if (verification.postcondition === 'edge-board-alignment') {
+        const current = await source(await resolveRepairModel(String(verification.afterHash),useViewerStore.getState().models));
+        const check = await verifyRecordedAlignment(receipt,verification,current.buffer,getFindingsByIds);
+        await qualifyLoadedAlignment(current.model,current.buffer,[check.path,...new Set(check.components.map(c=>c.referencePath))]);
+        return;
+      }
+      if (receipt.afterHash !== verification.afterHash) throw new Error('Cleanup verification source does not match its application.');
       const current = await source(await resolveRepairModel(String(receipt.afterHash), useViewerStore.getState().models));
       if (current.hash !== receipt.afterHash) throw new Error('The verified corrected revision is no longer loaded. Reopen or verify the current revision.');
       const original = receipt.beforeSource as { manifestRef: string };
@@ -328,7 +336,8 @@ export function useReviewResolution(options: Options) {
     return geometryTools.find(tool => tool.name === 'review_geometry_repair')!.execute({ topicId: input.topicId, modelId, expectedSourceHash: plan.sourceHash, operationJson: JSON.stringify(plan.operation), diagnosis: input.diagnosis }, execution);
   }), [geometryTools]);
   const planListTool = useMemo(() => createReviewTool('review_geometry_plans', 'List persisted geometry repair plans for a saved issue. Returns exact plan references, source hashes and mesh summaries without large payloads. Listing does not approve or apply a plan; use review_geometry_repair_plan for source-checked application.', { topicId: id }, true, async input => ({ plans: listGeometryPlans(await allReviewRows(), input.topicId as string) })), []);
-  const tools = useMemo(() => [...nativeTools, ...workspaceTools, ...geometryTools, planTool, planListTool, ...issueTools], [nativeTools, workspaceTools, geometryTools, planTool, planListTool, issueTools]);
+  const alignmentTool = useMemo(() => createAlignmentVerificationTool({ models: () => useViewerStore.getState().models, rows: allReviewRows, lookup: getFindingsByIds, source: modelId => actions.current.source(modelId), record: (value,base) => actions.current.record(value,base), workflow, saveView: (topic,note,binding) => actions.current.saveView(topic,note,binding) }),[workflow]);
+  const tools = useMemo(() => [...nativeTools, ...workspaceTools, ...geometryTools, planTool, planListTool, alignmentTool, ...issueTools], [nativeTools, workspaceTools, geometryTools, planTool, planListTool, alignmentTool, issueTools]);
   return { issues, repairs, plans, workflow, tools, saveView,
     saveDiagnosis: (input: { topicId: string; expectedWorkflowRef: string | undefined; diagnosis: string }) => saveIssueDiagnosis(workflow, input),
     saveRepairView: async (receiptRef: string) => {
