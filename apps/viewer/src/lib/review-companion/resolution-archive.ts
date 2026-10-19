@@ -4,7 +4,8 @@ import { createReviewStorage, listReviewScopes, exportReviewArchive, importRevie
 import type { ReviewArchive } from './types';
 export interface ResolutionBundle { schemaVersion: 1; kind: 'review.resolution.bundle'; exportedAt: string; archives: ReviewArchive[] }
 type ArchiveStorage = Pick<ReturnType<typeof createReviewStorage>, 'listReviewScopes' | 'exportReviewArchive' | 'importReviewArchive'>;
-const MAX_BYTES = 128 * 1024 * 1024;
+/** All scopes include preserved source revisions; keep UI import and bundle export on one bound. */
+export const MAX_RESOLUTION_BACKUP_BYTES = 256 * 1024 * 1024;
 function canonical(value: unknown): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
@@ -14,12 +15,12 @@ export function createResolutionArchive(storage: ArchiveStorage) {
   async function exportBundle(): Promise<ResolutionBundle> {
     const archives = await Promise.all((await storage.listReviewScopes()).map(scope => storage.exportReviewArchive(scope.scopeId)));
     const bundle: ResolutionBundle = { schemaVersion: 1, kind: 'review.resolution.bundle', exportedAt: new Date().toISOString(), archives };
-    if (JSON.stringify(bundle).length > MAX_BYTES) throw new Error('Resolution backup exceeds the supported archive size. Existing review data remains saved.');
+    if (new Blob([JSON.stringify(bundle)]).size > MAX_RESOLUTION_BACKUP_BYTES) throw new Error('Resolution backup exceeds the supported archive size. Existing review data remains saved.');
     return bundle;
   }
   async function importBundle(input: unknown) {
     const encoded = JSON.stringify(input);
-    if (!encoded || encoded.length > MAX_BYTES) throw new Error('Resolution backup is unavailable or exceeds the supported archive size.');
+    if (!encoded || new Blob([encoded]).size > MAX_RESOLUTION_BACKUP_BYTES) throw new Error('Resolution backup is unavailable or exceeds the supported archive size.');
     const clone: unknown = JSON.parse(encoded);
     const object = clone as Partial<ResolutionBundle> | null;
     let archives: ReviewArchive[];

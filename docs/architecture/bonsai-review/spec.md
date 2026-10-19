@@ -8,6 +8,10 @@ identity. Never evict findings. Failed writes remain visible and retryable.
 Export/import must preserve screenshots, source identities and provenance; reject
 conflicting IDs atomically. Reopening identical sources must recover the notes;
 different source revisions must not silently reuse their element references.
+All-scope backup export and file import share a 256 MiB UTF-8 byte limit;
+per-scope storage validation remains bounded separately. Preserved geometry
+revisions can make a complete bundle exceed the former 128 MiB limit. An identical
+full-history re-import must add no records and must preserve the current model.
 
 Dictation starts only on an explicit button press and uses on-device speech
 recognition, with supported language-pack installation. Capture context when speech

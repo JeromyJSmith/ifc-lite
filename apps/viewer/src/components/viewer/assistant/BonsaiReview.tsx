@@ -6,6 +6,7 @@ import { downloadBlob, sanitizeFilename } from '@/lib/export/download';
 import { ReviewIssueQueue } from './ReviewIssueQueue';
 import { ReviewPropertyChanges } from './ReviewPropertyChanges';
 import { useReviewCompanion } from '@/hooks/useReviewCompanion';
+import { MAX_RESOLUTION_BACKUP_BYTES } from '@/lib/review-companion/resolution-archive';
 
 export function BonsaiReview({ active }: { active: boolean }) {
   const review = useReviewCompanion(active);
@@ -106,7 +107,7 @@ export function BonsaiReview({ active }: { active: boolean }) {
         })}>Export backup</Button>
         <Button size="sm" variant="outline" onClick={() => file.current?.click()}>Import backup</Button>
         <input ref={file} type="file" accept=".json,application/json" className="hidden" onChange={e => { const selected = e.target.files?.[0]; e.target.value = ''; if (selected) run(async () => {
-          if (selected.size > 128 * 1024 * 1024) throw new Error('This backup is too large to import (128 MB maximum).');
+          if (selected.size > MAX_RESOLUTION_BACKUP_BYTES) throw new Error('This backup is too large to import (256 MiB maximum).');
           const imported = await review.importArchive(JSON.parse(await selected.text())); review.setStatus(`Imported ${imported.findingsAdded} records`);
         }); }} />
         <Button size="sm" variant="outline" onClick={() => run(async () => {
