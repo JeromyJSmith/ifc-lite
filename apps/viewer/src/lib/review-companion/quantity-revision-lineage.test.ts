@@ -80,6 +80,17 @@ test('BCF restoration follows verified geometry then quantity, rejecting duplica
   view.setQuantity(id, 'Qto_WallBaseQuantities', 'NetVolume', 4, view.getQuantitiesForEntity(id)[0].quantities[0].type);
   const current = new Map([['current', { ...fixtureModel('current'), sourceFile: new Blob([exportSourceQuantityEdits(parsed.dataStore, view)!]) as File, sourceContentHash: 'corrected' }]]);
   assert.deepEqual(await rebindReviewRevision(original, current, f.rows), new Map([['original', 'current']]));
+  // A subsequent verified geometry revision must retain the earlier quantity bridge.
+  const quantityFile = current.get('current')!.sourceFile!;
+  const quantityHash = (await sha256Hex(await quantityFile.arrayBuffer()))!;
+  const finalFile = new Blob([await quantityFile.text(), '\n']);
+  const finalHash = (await sha256Hex(await finalFile.arrayBuffer()))!;
+  const intermediateContext = { ...context, models: [{ id: 'quantity-session', name: 'quantity.ifcx', sourceIdentity: 'sha256:quantity-placement' }] };
+  f.rows.push({ ...base, id: 'last-geometry', context: intermediateContext, text: JSON.stringify({ kind: 'review.geometry.applied', modelId: 'quantity-session', topicId: 'mesh-issue', beforeHash: quantityHash, afterHash: finalHash }) },
+    { ...base, id: 'last-verified', context: intermediateContext, text: JSON.stringify({ kind: 'review.geometry.verified', receiptRef: 'last-geometry', topicId: 'mesh-issue', afterHash: finalHash, matches: true }) });
+  current.get('current')!.sourceFile = finalFile as File;
+  assert.deepEqual(await rebindReviewRevision(original, current, f.rows), new Map([['original', 'current']]));
+  await assert.rejects(rebindReviewRevision(original, current, f.rows.filter(row => row.id !== 'last-verified')), /no unique/);
   current.set('duplicate', { ...current.get('current')!, id: 'duplicate' });
   await assert.rejects(rebindReviewRevision(original, current, f.rows), /no unique/);
 });

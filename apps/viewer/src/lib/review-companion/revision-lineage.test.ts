@@ -53,3 +53,17 @@ test('a subsequent repair after restart binds its explicit original federation m
   assert.deepEqual(await rebindReviewRevision(s.saved, s.current, [s.row('receipt', receipt), s.rows[1]]), new Map([['old-id', 'new-id']]));
   await assert.rejects(rebindReviewRevision(s.saved, s.current, [s.row('receipt', { ...receipt, originalModelId: 'unrelated' }), s.rows[1]]), /no unique/);
 });
+
+test('verified geometry descendants remain reachable across subsequent source revisions', async () => {
+  const s = await setup();
+  const final = new Blob(['second corrected geometry']);
+  const finalHash = (await sha256Hex(await final.arrayBuffer()))!;
+  s.current.get('new-id')!.sourceFile = final as File;
+  const context = { ...s.rows[0].context, models: [{ id: 'intermediate', name: 'Intermediate', sourceIdentity: 'sha256:intermediate-placement' }] };
+  const applied = { ...s.row('second', { kind: 'review.geometry.applied', topicId: 'second-issue', modelId: 'intermediate', beforeHash: s.hash, afterHash: finalHash }), context };
+  const verified = { ...s.row('second-check', { kind: 'review.geometry.verified', topicId: 'second-issue', receiptRef: 'second', matches: true, afterHash: finalHash }), context };
+  assert.deepEqual(await rebindReviewRevision(s.saved, s.current, [...s.rows, applied, verified]), new Map([['old-id', 'new-id']]));
+  await assert.rejects(rebindReviewRevision(s.saved, s.current, [...s.rows, applied]), /no unique/);
+  const broken = { ...applied, text: JSON.stringify({ ...JSON.parse(applied.text), beforeHash: 'e'.repeat(64) }) };
+  await assert.rejects(rebindReviewRevision(s.saved, s.current, [...s.rows, broken, verified]), /no unique/);
+});

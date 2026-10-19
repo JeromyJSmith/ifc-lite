@@ -30,13 +30,34 @@ export async function rebindReviewRevision(saved: ReviewContext['models'], curre
   if (new Set(records.map(row => row.id)).size !== records.length) throw new Error('Duplicate repair evidence record identities.');
   const events = records.map(row => ({ row, data: value(row) }));
   const hashes = await sourceHashes(current);
-  const quantityPredecessors = await verifiedQuantityPredecessors(records, hashes);
+  const verifiedGeometry = events.filter(({ row, data }) => data?.kind === 'review.geometry.applied'
+    && typeof data.beforeHash === 'string' && hashPattern.test(data.beforeHash)
+    && typeof data.afterHash === 'string' && hashPattern.test(data.afterHash) && data.beforeHash !== data.afterHash
+    && events.some(candidate => candidate.data?.kind === 'review.geometry.verified' && candidate.data.receiptRef === row.id
+      && candidate.data.topicId === data.topicId && candidate.data.matches === true && candidate.data.afterHash === data.afterHash
+      && candidate.row.context.scopeId === row.context.scopeId));
+  // Quantity edits may precede a later geometry repair. Qualify those intermediate
+  // hashes too, rather than requiring the loaded file to be the quantity output.
+  const targets = [...new Set([...hashes.map(model => model.hash), ...verifiedGeometry.flatMap(event => [event.data!.beforeHash, event.data!.afterHash])])]
+    .filter((hash): hash is string => typeof hash === 'string').map(hash => ({ id: hash, hash }));
+  const quantities = await verifiedQuantityPredecessors(records, targets);
+  const predecessors = new Map<string, { hashes: Set<string>; identities: Set<string> }>();
+  for (const model of hashes) {
+    const reachable = new Set<string>(model.hash ? [model.hash] : []), identities = new Set<string>();
+    for (const hash of reachable) {
+      const quantity = quantities.get(hash);
+      for (const identity of quantity?.identities ?? []) identities.add(identity);
+      for (const parent of quantity?.hashes ?? []) reachable.add(parent);
+      for (const event of verifiedGeometry) if (event.data!.afterHash === hash) reachable.add(event.data!.beforeHash as string);
+    }
+    predecessors.set(model.id, { hashes: reachable, identities });
+  }
   const result = new Map<string, string>(), used = new Set<string>();
   for (const original of saved) {
     const direct = sources.filter(model => model.sourceIdentity === original.sourceIdentity).map(model => model.id);
     const eligible = new Set(direct);
     for (const model of hashes) {
-      if (quantityPredecessors.get(model.id)?.identities.has(original.sourceIdentity)) eligible.add(model.id);
+      if (predecessors.get(model.id)?.identities.has(original.sourceIdentity)) eligible.add(model.id);
     }
     for (const { row, data } of events) {
       if (data?.kind !== 'review.geometry.applied' || typeof data.afterHash !== 'string' || !hashPattern.test(data.afterHash)
@@ -50,7 +71,7 @@ export async function rebindReviewRevision(saved: ReviewContext['models'], curre
         && candidate.row.context.scopeId === row.context.scopeId);
       if (!verified) continue;
       for (const model of hashes) if (model.hash === data.afterHash
-        || quantityPredecessors.get(model.id)?.hashes.has(data.afterHash)) eligible.add(model.id);
+        || predecessors.get(model.id)?.hashes.has(data.afterHash)) eligible.add(model.id);
     }
     if (eligible.size !== 1) throw new Error('The original review has no unique loaded source or persisted verified corrected revision.');
     const id = [...eligible][0];
