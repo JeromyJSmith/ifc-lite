@@ -186,3 +186,13 @@ continues to infer quantity types from member names; this does not add unit,
 formula or quantity-set GlobalId roundtrip support. The roundtrip regression
 checks the corrected NetVolume and unchanged GrossVolume, independently of the
 live owner-approval workflow.
+
+Native Export Modified IFC and the full-fidelity whole-model export dialog
+preserve an original IFCX document for existing set-qualified quantity-value
+updates. They append effective values as later IFCX opinions, retaining all
+original nodes, schemas, imports, geometry and unknown provenance attributes.
+The original document is returned after a value reversal or an unedited reopen. Mixed edit classes,
+unit/type/formula changes, flat mirrors, unresolved paths and room-prefix
+rewrites continue through the existing conversion exporter; source preservation
+is not claimed for those cases. Both serializer roundtrips and the real viewer
+export function are covered by regression tests.

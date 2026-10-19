@@ -16,7 +16,7 @@
  * single global schedule into every exported file.
  */
 
-import { StepExporter, Ifc5Exporter } from '@ifc-lite/export';
+import { StepExporter, Ifc5Exporter, exportSourceQuantityEdits } from '@ifc-lite/export';
 import { prepareAppearanceSerialization } from '../appearance/serialization.js';
 import { packagePortableIfcAsync } from './portable-ifc.js';
 import type { IfcDataStore } from '@ifc-lite/parser';
@@ -74,6 +74,10 @@ export async function exportChangedModelToIfcx(
   view: MutablePropertyView | undefined,
   invocation: IfcxExportInvocation,
 ): Promise<ChangesExportArtifact> {
+  if (!invocation.stripPathPrefix) {
+    const preserved = exportSourceQuantityEdits(dataStore, view);
+    if (preserved !== undefined) return { content: preserved, ext: 'ifcx', mime: 'application/json', skippedCount: 0 };
+  }
   const { withInstancedMeshes } = await import('../../utils/instancedExport.js');
   // GPU instancing stopped being primary-only on 2026-08-06 (#2255) — scope by
   // THIS model's `{ idOffset, maxExpressId }` bracket rather than an

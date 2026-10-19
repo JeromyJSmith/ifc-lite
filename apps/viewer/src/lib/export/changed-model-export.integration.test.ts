@@ -18,7 +18,10 @@ import type { IfcDataStore } from '@ifc-lite/parser';
 import { MutablePropertyView } from '@ifc-lite/mutations';
 import type { FederatedModel, SchemaVersion } from '@/store/types';
 import { buildChangedArtifacts, type ChangesExportState, type ArtifactFile } from './model-changes.js';
-import { defaultBuildArtifactsDeps } from './changed-model-export.js';
+import { defaultBuildArtifactsDeps, exportChangedModelToIfcx } from './changed-model-export.js';
+import { parseIfcx } from '@ifc-lite/ifcx';
+import { QuantityType } from '@ifc-lite/data';
+import { buildIfcxDataStore } from '@/hooks/ingest/viewerModelIngest';
 
 type Entry = [number, string, string];
 
@@ -105,6 +108,29 @@ function zipFiles(files: ArtifactFile[]): Uint8Array {
 }
 
 describe('changed-model export (real exporters, #1534)', () => {
+  it('saves IFCX quantity corrections while retaining original source nodes and provenance', async () => {
+    const path = 'retained-wall';
+    const key = 'bsi::ifc::v5a::Qto_WallBaseQuantities::NetVolume';
+    const original = { header: { id: 'native-save-fixture', ifcxVersion: 'ifcx_alpha', dataVersion: '1' },
+      imports: [], schemas: {}, data: [{ path, attributes: {
+        'bsi::ifc::class': { code: 'IfcWall' }, 'owner::provenance': { preserve: 'native source' },
+        [key]: 3.829483,
+        'usd::usdgeom::mesh': { points: [[0,0,0],[1,0,0],[0,0,1]], faceVertexCounts: [3], faceVertexIndices: [0,1,2] },
+      } }] };
+    const buffer = new TextEncoder().encode(JSON.stringify(original)).buffer;
+    const parsed = await parseIfcx(buffer);
+    const store = buildIfcxDataStore(parsed, buffer);
+    const id = store.entities.getExpressIdByGlobalId(path);
+    const view = new MutablePropertyView(store.properties, 'fixture');
+    view.setQuantityExtractor(entity => store.quantities.getForEntity(entity));
+    view.setQuantity(id, 'Qto_WallBaseQuantities', 'NetVolume', 3.832499, QuantityType.Volume);
+    const artifact = await exportChangedModelToIfcx('fixture', store, view, { geometryResult: null, idOffset: 0 });
+    const saved = JSON.parse(decode(artifact.content));
+    assert.deepStrictEqual(saved.data.slice(0, original.data.length), original.data);
+    const reimported = await parseIfcx(new TextEncoder().encode(decode(artifact.content)).buffer);
+    assert.strictEqual(reimported.quantities.getForEntity(reimported.pathToId.get(path)!)[0].quantities[0].value, 3.832499);
+    assert.deepStrictEqual(Array.from(reimported.meshes[0].indices), [0, 1, 2]);
+  });
   it('produces one STEP file per edited model, each carrying its own edit', async () => {
     const { state, resolve } = twoEditedModels();
     const deps = { ...defaultBuildArtifactsDeps, resolveStepDataStore: resolve };

@@ -38,7 +38,7 @@ import { trackExportCompleted } from '@/lib/analytics';
 import { useOptionalExtensionHost } from '@/sdk/ExtensionHostProvider';
 import { configureMutationView } from '@/utils/configureMutationView';
 import { ensureModelExportReady } from '@/services/desktop-export';
-import { MergedExporter, Ifc5Exporter, type MergeModelInput, type ExportProgress } from '@ifc-lite/export';
+import { MergedExporter, Ifc5Exporter, exportSourceQuantityEdits, type MergeModelInput, type ExportProgress } from '@ifc-lite/export';
 import { withInstancedMeshes } from '../../utils/instancedExport.js';
 import { MutablePropertyView } from '@ifc-lite/mutations';
 import type { IfcDataStore } from '@ifc-lite/parser';
@@ -406,6 +406,17 @@ export function ExportDialog({ surface, trigger, initialChangesOnly = false }: E
 
       // ── IFC5 → always IFCX ──────────────────────────────────────────
       if (isIfc5) {
+        if (!changesOnly && !visibleOnly && includeGeometry && applyMutations && !onlyKnownProperties
+          && !roomExportPathPrefix(useViewerStore.getState(), selectedModelId)) {
+          const preserved = exportSourceQuantityEdits(selectedModel.ifcDataStore, mutationView ?? undefined);
+          if (preserved !== undefined) {
+            downloadFile(preserved, modelExportFilename(selectedModel.name, 'ifcx', '_export'), 'application/json');
+            const message = 'Exported IFCX with source metadata and geometry preserved';
+            exportedFormat = 'ifcx';
+            toast.success(message);
+            return { success: true, message };
+          }
+        }
         const federatedModel = models.get(selectedModelId);
         const idOffset = federatedModel?.idOffset ?? 0;
 

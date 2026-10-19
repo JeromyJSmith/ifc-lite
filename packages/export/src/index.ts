@@ -39,6 +39,7 @@ export {
   type EntityConversionKind,
 } from './schema-conversion-loss-report.js';
 export { Ifc5Exporter, type Ifc5ExportOptions, type Ifc5ExportResult } from './ifc5-exporter.js';
+export { exportSourceQuantityEdits } from './ifc5-source-quantity-export.js';
 export { IFC5_KNOWN_PROP_NAMES, stripNodePathPrefix } from './ifc5-export-helpers.js';
 
 // LOD geometry generators (contributed by madsik)
