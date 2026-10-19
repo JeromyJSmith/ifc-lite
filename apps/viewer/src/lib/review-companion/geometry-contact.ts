@@ -1,7 +1,7 @@
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. https://mozilla.org/MPL/2.0/. */
 import { contactClusters, minDistanceBetweenMeshes } from '@ifc-lite/clash/contact';
-import { extractIfcxEntityGeometry } from './ifcx-world-geometry';
+import { extractIfcxEntityGeometry, readIfcxEntityIdentities } from './ifcx-world-geometry';
 
 /** Native contact patches, optionally scoped to one composed triangle of entity A. */
 export function inspectIfcxContact(buffer: ArrayBuffer, pathA: string, pathB: string, instanceA: number, triangleA: number) {
@@ -25,7 +25,8 @@ export function inspectIfcxContact(buffer: ArrayBuffer, pathA: string, pathB: st
       }
     }
   }
-  return { pathA, pathB, scope: { instanceA, triangleA }, contactCount: contacts.length, contacts: contacts.slice(0, 64), truncated: contacts.length > 64,
+  const [entityA, entityB] = readIfcxEntityIdentities(buffer, [pathA, pathB]);
+  return { pathA, pathB, entityA, entityB, scope: { instanceA, triangleA }, contactCount: contacts.length, contacts: contacts.slice(0, 64), truncated: contacts.length > 64,
     nearest: distances.sort((a, b) => a.distance - b.distance)[0] ?? null,
     coordinateSpace: 'Composed model space Y-up, source transforms applied by native extraction at Float32 precision. External placement/recentering not applied.',
     units: 'Source coordinate units; area uses squared units and length uses source units. Metres require independently established model units.',
