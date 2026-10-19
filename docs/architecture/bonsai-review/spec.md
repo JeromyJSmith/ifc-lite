@@ -62,3 +62,24 @@ view explicitly. Each captured image is persisted before enqueueing. User-added
 interior/exterior stops come from actual captured viewpoints, never guessed room
 coordinates. Stop/hide/unmount cancels movement and inference, retains captures,
 and records interruption rather than successful review completion.
+
+
+## Selected-region BCF mission
+
+The owner initiates a review with **Describe & log BCF issue** after framing the
+concern and optionally selecting surrounding elements. Readiness is explicit;
+no background observation is required. The mission captures the image and full
+surrounding selection before inference, asks for one possible issue, then saves a
+native local BCF topic and durable definition/readback receipt. No finding means
+an observation log, without fabricating an issue. Human corrections remain manual.
+A hole or missing piece may have no selected element. Selected neighbors are
+context, not a claim that each is faulty. BCF uses IFCX AuthoringToolId for prim
+paths; native viewpoint restoration resolves it only against a unique loaded
+IFCX model. Issues retain screenshot, camera, source fingerprint and uncertainty.
+
+The shared registry exposes review_create_bcf_issue, review_bcf_issues and
+review_open_bcf_issue through document.modelContext when available and the same
+local Bonsai executor otherwise. These are local BCF operations, not remote
+publication. Definitions are written to append-only review storage before topic
+installation; receipts follow actual native readback. Existing projects are
+merged into, never replaced. Repeated creation for the same finding is idempotent.

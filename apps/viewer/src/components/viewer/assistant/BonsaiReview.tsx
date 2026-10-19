@@ -31,6 +31,17 @@ export function BonsaiReview({ active }: { active: boolean }) {
     <p role="status" aria-live="polite" className="text-muted-foreground break-words">{review.status}</p>
     <p className="text-muted-foreground">{review.webMcp}. Images go to Bonsai on this computer. Dictation uses the browser’s on-device speech pack.</p>
     {review.error && <p role="alert" className="rounded border border-destructive p-2 whitespace-pre-wrap">{review.error}</p>}
+    <section className="rounded border border-primary p-3 space-y-2" aria-label="Selected-region issue mission">
+      <p role="status">{review.busy ? 'Working — your captured view is being reviewed' : review.connection && review.scope ? 'Ready — select surrounding elements and frame the concern' : 'Connect Bonsai and load a model to begin'}</p>
+      <p>A hole or missing piece need not be selectable. Select what surrounds it, or use the viewpoint alone.</p>
+      <Button disabled={!review.connection || !review.scope || review.busy} onClick={() => run(() => review.reviewHere(text.trim() || focus))}>Describe &amp; log BCF issue</Button>
+      <Button variant="outline" disabled={review.busy} onClick={() => run(async () => {
+        const issues = await review.bcf.list();
+        if (!issues.length) { review.setStatus('No BCF issues saved for this model yet'); return; }
+        await review.bcf.open(issues.at(-1)!.topicId);
+        const { useViewerStore } = await import('@/store'); useViewerStore.getState().setBcfPanelVisible(true);
+      })}>Open latest BCF issue</Button>
+    </section>
     <label className="block space-y-1">Review focus
       <textarea rows={2} maxLength={8000} value={focus} onChange={e => { setFocus(e.target.value); review.setDirective({ mode: review.mode, directive: e.target.value }); }} className="w-full rounded border bg-background p-2" />
     </label>
@@ -111,6 +122,10 @@ export function BonsaiReview({ active }: { active: boolean }) {
           {finding.context.models.some(m => m.sourceIdentity.startsWith('session:')) && <p className="text-muted-foreground">Source identity is limited to this load session. This note remains available in saved reviews.</p>}
           <details><summary>Saved image</summary>{finding.context.viewpoint.snapshot && <img src={finding.context.viewpoint.snapshot} alt="Building view captured with this observation" className="w-full rounded" loading="lazy" />}</details>
           <Button size="sm" variant="outline" onClick={() => run(() => review.restore(finding.id))}>Return to view</Button>
+          {finding.kind === 'candidate' && <Button size="sm" variant="outline" disabled={review.busy} onClick={() => run(async () => {
+            const result = await review.bcf.create({ findingId: finding.id, title: `Review: ${finding.text}`.slice(0, 180), description: finding.text.slice(0, 4000) });
+            review.setStatus(`BCF issue saved: ${result.title}`);
+          })}>Create BCF issue</Button>}
           {finding.location && <Button size="sm" variant="outline" disabled={review.busy} onClick={() => run(() => review.pickFinding(finding.id))}>Select element at this image location</Button>}
           {finding.kind === 'candidate' && <div className="flex flex-wrap gap-1">{(['confirmed', 'dismissed', 'resolved'] as const).map(status => <Button key={status} size="sm" variant="outline" onClick={() => run(() => review.setFindingStatus(finding.id, status))}>{status === 'confirmed' ? 'Confirm issue' : status === 'dismissed' ? 'Dismiss' : 'Mark resolved'}</Button>)}</div>}
         </li>;

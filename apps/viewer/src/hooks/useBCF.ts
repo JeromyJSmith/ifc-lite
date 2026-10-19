@@ -11,6 +11,7 @@
  * - Applying viewpoints to the viewer (camera, selection, visibility)
  */
 
+import { resolveIfcxViewpointComponents } from './bcf/ifcx-components';
 import { captureBcfFrame } from './bcf/capture-frame';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useViewerStore } from '@/store';
@@ -554,7 +555,7 @@ export function useBCF(options: UseBCFOptions = {}): UseBCFResult {
 
       // Extract state from viewpoint (once, reused for camera, section plane, and selection)
       const state = extractViewpointState(
-        viewpointFromWorld(viewpoint, getWorldOffset(), bounds), // world -> render frame (#4806)
+        viewpointFromWorld(resolveIfcxViewpointComponents(viewpoint, useViewerStore.getState().models), getWorldOffset(), bounds), // world -> render frame (#4806)
         bounds,
         renderer.getCamera().getDistance() // Use current distance as reference
       );

@@ -12,6 +12,7 @@ import { saveFinding, listFindings, saveEvent, listEvents, listReviewScopes, exp
 import { startLocalDictation } from '@/lib/review-companion/speech';
 import { createReviewTools, registerReviewWebMcp, runBonsaiDirective, BonsaiDirectiveError } from '@/lib/review-companion/tools';
 import { createReviewTool } from '@/lib/review-companion/tools';
+import { createReviewBcfBridge, createBcfReviewTools } from '@/lib/review-companion/bcf';
 import { createPickedFinding } from '@/lib/review-companion/picking';
 import { captureViewportFrame } from '@/lib/viewport-capture';
 import { persistReviewJson } from '@/lib/review-companion/journal';
@@ -106,7 +107,7 @@ export function useReviewCompanion(active: boolean) {
     const record: ReviewFinding = { schemaVersion: 1, id: crypto.randomUUID(), context: context ?? await capture(), kind: 'note', text, createdAt: now(), ...(provider ? { provider } : {}) };
     await persist(record); setStatus('Note saved on this device'); return { id: record.id };
   }, [capture, persist]);
-  const inspect = useCallback(async (captured?: ReviewContext, parentSignal?: AbortSignal) => {
+  const inspect = useCallback(async (captured?: ReviewContext, parentSignal?: AbortSignal, instruction = directive) => {
     if (!connection) throw new Error('Connect Bonsai vision first.');
     if (running.current) throw new Error('A review is already in progress.');
     running.current = true; setBusy(true); setError(''); setStatus(captured ? 'Bonsai is analysing a saved tour view…' : 'Bonsai is inspecting this view…');
@@ -114,10 +115,10 @@ export function useReviewCompanion(active: boolean) {
     try {
       const context = captured ?? await capture();
       if (context.scopeId !== await reviewScope(await reviewModels(useViewerStore.getState().models)) || context.mutationVersion !== useViewerStore.getState().mutationVersion) throw new Error('Model revision changed before analysing this saved view.');
-      const input: ReviewFinding = { schemaVersion: 1, id: crypto.randomUUID(), context, kind: 'note', text: `Visual review requested: ${directive}`, createdAt: now() };
+      const input: ReviewFinding = { schemaVersion: 1, id: crypto.randomUUID(), context, kind: 'note', text: `Visual review requested: ${instruction}`, createdAt: now() };
       await persist(input);
       const signal = AbortSignal.any([abort.signal, ...(directiveController.current ? [directiveController.current.signal] : []), ...(parentSignal ? [parentSignal] : [])]);
-      const response = await inspectBonsaiView(connection, context, directive, signal);
+      const response = await inspectBonsaiView(connection, context, instruction, signal);
       const raw: ReviewFinding = { schemaVersion: 1, id: crypto.randomUUID(), context, kind: 'note', text: response.raw, createdAt: now(), parentId: input.id, provider: { model: response.model, endpoint: connection.endpoint } };
       await persist(raw);
       if (!response.complete) throw new Error('Bonsai review was incomplete. Its input and raw response were saved; no candidates were accepted.');
@@ -239,7 +240,35 @@ export function useReviewCompanion(active: boolean) {
     rotateView: v => latest.current.rotateView(v), zoomView: v => latest.current.zoomView(v),
   }), []);
   const pickTool = useMemo(() => createReviewTool('viewer_pick_finding', 'Restore a saved finding view and visibly select the IFC element at its normalized image location. Returns a new bound finding ID and exact element. Picking does not prove the visual error or authorize a correction.', { findingId: { type: 'string', minLength: 1, maxLength: 200 } }, false, input => latest.current.pickFinding(input.findingId as string)), []);
-  const tools = useMemo(() => [...viewerTools, pickTool, ...properties.tools], [viewerTools, pickTool, properties.tools]);
+  const bcf = useMemo(() => createReviewBcfBridge({ scope: () => scope, rows: () => listFindings(scope), persist }), [scope, persist]);
+  const bcfTools = useMemo(() => createBcfReviewTools(bcf), [bcf]);
+  const tools = useMemo(() => [...viewerTools, pickTool, ...properties.tools, ...bcfTools], [viewerTools, pickTool, properties.tools, bcfTools]);
+  const reviewHere = async (observation: string) => {
+    if (!connection || running.current || directiveController.current || fast.running) throw new Error('Connect Bonsai and wait for the current action to finish.');
+    const abort = new AbortController(); directiveController.current = abort; setDirecting(true); setMode('paused'); setError('');
+    try {
+      setStatus('Capturing your selected surroundings and view…');
+      const context = await capture();
+      const input = await note(`Describe and log BCF issue: ${observation}`, context);
+      if (process.current()?.status === 'running') await process.interrupt('Owner started a new selected-region issue review.');
+      await process.begin(context, observation, input.id);
+      const result = await inspect(context, abort.signal, `${observation}\nDescribe ONE possible issue in this framed region. The selected elements are surrounding context, not a claim they are faulty. A hole or missing piece has no selectable element. Explain visible evidence, what might be wrong, and what a human should check. Do not invent dimensions or force a defect. Return at most one finding.`);
+      abort.signal.throwIfAborted();
+      if (!result.findings.length) { await process.finish([input.id]); setStatus(`Observation saved; Bonsai found no specific issue to log. ${result.summary}`); return null; }
+      setStatus('Saving BCF issue with your surrounding selection…');
+      const candidate = (await listFindings(context.scopeId)).find(row => row.id === result.findings[0].id)!;
+      const contextual = { ...candidate, id: crypto.randomUUID(), parentId: candidate.id, context };
+      await persist(contextual);
+      abort.signal.throwIfAborted();
+      const issue = await bcf.create({ findingId: contextual.id, title: `Review: ${candidate.text}`.slice(0, 180), description: candidate.text.slice(0, 4000) });
+      await process.finish([input.id, issue.definitionRef]);
+      setStatus(`BCF issue saved: ${issue.title}. Ready for your next selection.`);
+      return issue;
+    } catch (error) {
+      if (process.current()?.status === 'running') await process.interrupt(message(error));
+      throw error;
+    } finally { setDirecting(false); directiveController.current = null; }
+  };
   useEffect(() => {
     if (!active) return;
     let disposed = false; let cleanup: (() => void) | undefined;
@@ -285,7 +314,7 @@ export function useReviewCompanion(active: boolean) {
   };
   return { scope, historyScope, setHistoryScope, scopes, findings, events, pending, connection, error, setError, status, setStatus, busy: busy || directing || fast.running, mode, directive, listening, webMcp,
     connect: async () => { const abort = new AbortController(); controller.current = abort; try { const c = await connectBonsai('http://127.0.0.1:8080', abort.signal); setConnection(c); useViewerStore.getState().setChatActiveModel('local-bonsai-2'); setStatus(`Connected to ${c.model}`); } finally { controller.current = null; } },
-    note, inspect, restore, dictation, properties, pickFinding, process, activity, fast,
+    note, inspect, restore, dictation, properties, pickFinding, process, activity, fast, bcf, reviewHere,
     setDirective: handlers.setDirective,
     setFindingStatus: async (findingId: string, status: ReviewEvent['status']) => { await saveEvent({ schemaVersion: 1, id: crypto.randomUUID(), findingId, status, createdAt: now() }); await refresh(); },
     retryPending: async () => { for (const row of pending) await persist(row); },
