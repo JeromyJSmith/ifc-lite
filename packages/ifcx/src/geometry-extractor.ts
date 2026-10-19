@@ -43,10 +43,13 @@ export interface MeshData {
  * ancestor entity that has an expressId.
  *
  * Output geometry is converted to Y-up for the viewer.
+ * onlyExpressIds limits mesh conversion/emission while retaining full ancestor
+ * traversal, entity ownership, instance transforms and native alias deduplication.
  */
 export function extractGeometry(
   composed: Map<string, ComposedNode>,
-  pathToId: Map<string, number>
+  pathToId: Map<string, number>,
+  onlyExpressIds?: ReadonlySet<number>
 ): MeshData[] {
   const meshes: MeshData[] = [];
   const decodeImage = createIfcxImageDecoder();
@@ -79,7 +82,7 @@ export function extractGeometry(
     transformByFrame.set(frame, transform);
 
     const mesh = frame.node.attributes.get(ATTR.MESH) as UsdMesh | undefined;
-    if (mesh && context && !context.isTypeDefinition && !isInvisible(lineage)) {
+    if (mesh && context && (!onlyExpressIds || onlyExpressIds.has(context.expressId)) && !context.isTypeDefinition && !isInvisible(lineage)) {
       const color = resolvePresentation(lineage);
       const emitKey = [
         frame.node.path,

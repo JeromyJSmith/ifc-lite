@@ -11,6 +11,7 @@ import { toGlobalIdFromModels } from '@/store/globalId';
 import { createIssueWorkflow, createIssueWorkflowTools, type IssueUpdate } from '@/lib/review-companion/issue-workflow';
 import { createReviewTool } from '@/lib/review-companion/tools';
 import { inspectIfcxGeometry, patchIfcxGeometry, type IfcxGeometryOperation } from '@/lib/review-companion/ifcx-geometry';
+import { readIfcxWorldGeometry, summarizeWorldGeometry } from '@/lib/review-companion/ifcx-world-geometry';
 import { resolveGeometryTarget } from '@/lib/review-companion/geometry-target';
 import { summarizeIfcxGeometry } from '@/lib/review-companion/geometry-evidence';
 import { saveGeometrySource, readGeometrySource } from '@/lib/review-companion/geometry-sources';
@@ -90,11 +91,16 @@ export function useReviewResolution(options: Options) {
   const workspaceTools = useMemo(() => createWorkspaceTools({ record: event => actions.current.record({ ...event, topicId: activeTopic.current }) }), []);
   const id = { type: 'string' as const, minLength: 1, maxLength: 200 };
   const geometryTools = useMemo(() => [
-    createReviewTool('review_geometry_read', 'Read exact source mesh arrays in pages for native geometric analysis and explicit replacement. No approximate image geometry. component chooses points, faceVertexIndices, faceVertexCounts, normals, boundaryEdges, nonManifoldEdges, degenerateFaces or duplicateFaces; Request only the small page needed for the current question (at most 256 items). offset and limit address that exact source or topology array.', {
-      modelId: id, path: id, component: { type: 'string', enum: ['points', 'faceVertexIndices', 'faceVertexCounts', 'normals', 'boundaryEdges', 'nonManifoldEdges', 'degenerateFaces', 'duplicateFaces'] }, offset: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER }, limit: { type: 'integer', minimum: 1, maximum: 256 },
+    createReviewTool('review_geometry_read', 'Read exact source mesh arrays in pages for native geometric analysis and explicit replacement. No approximate image geometry. Use worldPoints with an entity geometryTarget (for example #17) for composed model-space Y-up points with source transforms applied; these are not georeferenced coordinates. Other components use an exact returned mesh path: points, faceVertexIndices, faceVertexCounts, normals, boundaryEdges, nonManifoldEdges, degenerateFaces or duplicateFaces; Request only the small page needed for the current question (at most 256 items). offset and limit address that exact source or topology array.', {
+      modelId: id, path: id, component: { type: 'string', enum: ['worldPoints', 'points', 'faceVertexIndices', 'faceVertexCounts', 'normals', 'boundaryEdges', 'nonManifoldEdges', 'degenerateFaces', 'duplicateFaces'] }, offset: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER }, limit: { type: 'integer', minimum: 1, maximum: 256 },
     }, true, async input => {
       const { buffer, hash } = await actions.current.source(input.modelId as string);
       const path = resolveGeometryTarget(input.path as string, id => useViewerStore.getState().models.get(input.modelId as string)?.ifcDataStore?.entities.getGlobalId(id));
+      if (input.component === 'worldPoints') {
+        const world = readIfcxWorldGeometry(buffer, path);
+        const offset = input.offset as number, limit = input.limit as number;
+        return { sourceHash: hash, ...summarizeWorldGeometry(world), offset, points: world.points.slice(offset, offset + limit), total: world.points.length };
+      }
       const report = inspectIfcxGeometry(buffer, path);
       const entry = report.meshes.find(m => m.analysis.path === input.path);
       if (!entry) return { sourceHash: hash, meshPaths: report.meshes.map(m => m.analysis.path), next: 'Choose an exact mesh path.' };
@@ -121,7 +127,7 @@ export function useReviewResolution(options: Options) {
         return [{ topicId: r.topicId, receiptRef: row.id, verificationRef: checked?.id, operation: r.operation, path: r.path, modelId: r.modelId, modelName: r.modelName, beforeHash: r.beforeHash, afterHash: r.afterHash, before: r.before, after: r.after, matches: v?.matches, loadedTriangles: v?.loadedTriangles, actual: v?.actual }];
       });
     }),
-    createReviewTool('review_geometry_inspect', 'Read one IFCX element using the geometryTarget returned by review_state (such as #176), or an exact mesh prim path returned by this tool. Never invent /IFCRoot/ paths. Report actual topology, mesh-local coordinates and transforms; persist a measured mesh-integrity candidate when exact zero-area or same-winding duplicate faces exist. Architectural holes are not automatically defects.', { modelId: id, path: id }, false, async input => {
+    createReviewTool('review_geometry_inspect', 'Read one IFCX element using the geometryTarget returned by review_state (such as #176), or an exact mesh prim path returned by this tool. Never invent /IFCRoot/ paths. Report actual topology, mesh-local coordinates and transforms; persist a measured mesh-integrity candidate when exact zero-area or same-winding duplicate faces exist. Also return composed model-space placement using the native viewer transform pipeline. Architectural holes are not automatically defects.', { modelId: id, path: id }, false, async input => {
       const { buffer, hash } = await actions.current.source(input.modelId as string);
       const path = resolveGeometryTarget(input.path as string, id => useViewerStore.getState().models.get(input.modelId as string)?.ifcDataStore?.entities.getGlobalId(id));
       const report = inspectIfcxGeometry(buffer, path);
@@ -135,8 +141,9 @@ export function useReviewResolution(options: Options) {
       const candidate: ReviewFinding = { schemaVersion: 1, id: crypto.randomUUID(), context, kind: defective.length ? 'candidate' : 'note', createdAt: new Date().toISOString(),
         text: defective.length ? `Mesh integrity: ${defective.map(m => `${m.analysis.path}: ${m.analysis.degenerateFaces.length} exact zero-area faces and ${m.analysis.duplicateFaces.length} same-winding duplicate faces`).join('; ')}. These are measured source mesh defects; removing them does not establish the architectural gap or fascia detail is wrong.` : `No exact zero-area or same-winding duplicate mesh faces at ${input.path}.` };
       await live.current.persist(candidate);
-      const evidenceRef = await actions.current.record({ kind: 'review.geometry.inspection', topicId: activeTopic.current, sourceHash: hash, modelId: input.modelId, report: concise(report) }, candidate);
-      return { sourceHash: hash, sourceHeader: JSON.parse(new TextDecoder().decode(buffer)).header, coordinateContract: 'Mesh-local Z-up. Source header is reported verbatim; a missing unit is unknown. Exact zero-area and duplicate-face cleanup is unit independent.', candidateId: defective.length ? candidate.id : null, evidenceRef, ...summarizeIfcxGeometry(report) };
+      const placement = entityId && entityId > 0 ? summarizeWorldGeometry(readIfcxWorldGeometry(buffer, path)) : { available: false, reason: 'Composed placement requires the owning entity geometryTarget, not a mesh path.' };
+      const evidenceRef = await actions.current.record({ kind: 'review.geometry.inspection', topicId: activeTopic.current, sourceHash: hash, modelId: input.modelId, report: concise(report), placement }, candidate);
+      return { placement, sourceHash: hash, sourceHeader: JSON.parse(new TextDecoder().decode(buffer)).header, coordinateContract: 'Mesh-local Z-up. Source header is reported verbatim; a missing unit is unknown. Exact zero-area and duplicate-face cleanup is unit independent.', candidateId: defective.length ? candidate.id : null, evidenceRef, ...summarizeIfcxGeometry(report) };
     }),
     createReviewTool('review_geometry_repair', 'Apply an evidence-backed exact-source IFCX geometry operation in the visible viewer and preserve original/corrected sources for restart-safe undo. operationJson: remove_defective_faces{meshPath}, remove_faces{meshPath,faceIndices}, translate_mesh_local{meshPath,delta:[x,y,z]}, replace_mesh{meshPath,mesh}, set_local_transform{path,transform:4x4}. All require kind. Coordinates are IFCX mesh-local Z-up in declared document units. Read geometry and units first. Never invent replacement geometry. Does not automatically resolve architectural concerns.', {
       topicId: id, modelId: id, expectedSourceHash: id, operationJson: { type: 'string', minLength: 1, maxLength: 1000000 }, diagnosis: { type: 'string', minLength: 1, maxLength: 8000 },
