@@ -11,6 +11,7 @@ import { toGlobalIdFromModels } from '@/store/globalId';
 import { createIssueWorkflow, createIssueWorkflowTools, type IssueUpdate } from '@/lib/review-companion/issue-workflow';
 import { createReviewTool } from '@/lib/review-companion/tools';
 import { inspectIfcxGeometry, patchIfcxGeometry, type IfcxGeometryOperation } from '@/lib/review-companion/ifcx-geometry';
+import { measureIfcxEntityDistance } from '@/lib/review-companion/geometry-distance';
 import { readIfcxWorldGeometry, summarizeWorldGeometry } from '@/lib/review-companion/ifcx-world-geometry';
 import { resolveGeometryTarget } from '@/lib/review-companion/geometry-target';
 import { summarizeIfcxGeometry } from '@/lib/review-companion/geometry-evidence';
@@ -91,6 +92,18 @@ export function useReviewResolution(options: Options) {
   const workspaceTools = useMemo(() => createWorkspaceTools({ record: event => actions.current.record({ ...event, topicId: activeTopic.current }) }), []);
   const id = { type: 'string' as const, minLength: 1, maxLength: 200 };
   const geometryTools = useMemo(() => [
+    createReviewTool('review_geometry_measure', 'Measure the native triangle-surface minimum distance between exactly two different entities in the same IFCX model. Use geometryTargets returned by review_state. Returns source hash, closest witness points and triangle/instance IDs. This is the global minimum, not a localized junction proof; zero can mean touching or intersection elsewhere. Does not edit geometry or close issues.', { modelId: id, targetA: id, targetB: id }, false, async input => {
+      const modelId = input.modelId as string;
+      const { buffer, hash } = await actions.current.source(modelId);
+      const resolve = (target: string) => resolveGeometryTarget(target, id => useViewerStore.getState().models.get(modelId)?.ifcDataStore?.entities.getGlobalId(id));
+      const result = measureIfcxEntityDistance(buffer, resolve(input.targetA as string), resolve(input.targetB as string));
+      const context = await live.current.capture();
+      if ((await actions.current.source(modelId)).hash !== hash) throw new Error('Source changed during measurement; measure the current revision again.');
+      const finding: ReviewFinding = { schemaVersion: 1, id: crypto.randomUUID(), context, kind: 'note', createdAt: new Date().toISOString(), text: `Native surface-distance measurement for ${result.pathA} and ${result.pathB}. No repair or architectural acceptance is claimed.` };
+      await live.current.persist(finding);
+      const evidenceRef = await actions.current.record({ kind: 'review.geometry.distance', topicId: activeTopic.current, modelId, sourceHash: hash, result }, finding);
+      return { sourceHash: hash, evidenceRef, ...result };
+    }),
     createReviewTool('review_geometry_read', 'Read exact source mesh arrays in pages for native geometric analysis and explicit replacement. No approximate image geometry. Use worldPoints with an entity geometryTarget (for example #17) for composed model-space Y-up points with source transforms applied; these are not georeferenced coordinates. Other components use an exact returned mesh path: points, faceVertexIndices, faceVertexCounts, normals, boundaryEdges, nonManifoldEdges, degenerateFaces or duplicateFaces; Request only the small page needed for the current question (at most 256 items). offset and limit address that exact source or topology array.', {
       modelId: id, path: id, component: { type: 'string', enum: ['worldPoints', 'points', 'faceVertexIndices', 'faceVertexCounts', 'normals', 'boundaryEdges', 'nonManifoldEdges', 'degenerateFaces', 'duplicateFaces'] }, offset: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER }, limit: { type: 'integer', minimum: 1, maximum: 256 },
     }, true, async input => {

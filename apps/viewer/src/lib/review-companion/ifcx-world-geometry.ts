@@ -5,13 +5,17 @@ import { StringTable } from '@ifc-lite/data';
 import { readIfcxGeometrySource } from './ifcx-geometry';
 type Point = [number, number, number];
 /** Use the viewer's canonical transform/instancing pipeline for one actual entity. */
-export function readIfcxWorldGeometry(buffer: ArrayBuffer, entityPath: string) {
+export function extractIfcxEntityGeometry(buffer: ArrayBuffer, entityPath: string) {
   const composed = composeIfcx(readIfcxGeometrySource(buffer));
   const { pathToId } = extractEntities(composed, new StringTable());
   const expressId = pathToId.get(entityPath);
   if (expressId === undefined) throw new Error('Composed placement requires an exact entity path, not a mesh path or label.');
   const meshes = extractGeometry(composed, pathToId, new Set([expressId]));
   if (!meshes.length) throw new Error('The entity has no visible composed mesh geometry.');
+  return meshes;
+}
+export function readIfcxWorldGeometry(buffer: ArrayBuffer, entityPath: string) {
+  const meshes = extractIfcxEntityGeometry(buffer, entityPath);
   const points: Point[] = [];
   const bounds = { min: [Infinity, Infinity, Infinity] as Point, max: [-Infinity, -Infinity, -Infinity] as Point };
   const instances = meshes.map((mesh, index) => {
