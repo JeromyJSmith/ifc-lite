@@ -10,7 +10,7 @@ import { reviewBcfViewpoint } from '@/lib/review-companion/bcf';
 import { saveIssueViewpoint, type RepairViewBinding } from '@/lib/review-companion/issue-viewpoint';
 import { reviewModels } from '@/lib/review-companion/context';
 import { toGlobalIdFromModels } from '@/store/globalId';
-import { createIssueWorkflow, createIssueWorkflowTools, recordGeometryApplication, recordContactMeasurement, saveIssueDiagnosis, type IssueUpdate } from '@/lib/review-companion/issue-workflow';
+import { createIssueWorkflow, createIssueWorkflowTools, recordGeometryApplication, recordContactMeasurement, recordPointCorrespondence, saveIssueDiagnosis, type IssueUpdate } from '@/lib/review-companion/issue-workflow';
 import { createReviewTool } from '@/lib/review-companion/tools';
 import { inspectIfcxGeometry, patchIfcxGeometry, type IfcxGeometryOperation } from '@/lib/review-companion/ifcx-geometry';
 import { measureIfcxPointCorrespondence } from '@/lib/review-companion/geometry-correspondence';
@@ -146,12 +146,21 @@ export function useReviewResolution(options: Options) {
       const evidenceRef = await actions.current.record({ kind: 'review.geometry.component', modelId, topicId: activeTopic.current, sourceHash: before.hash, result });
       return { sourceHash: before.hash, evidenceRef, ...result };
     }),
-    createReviewTool('review_geometry_correspondence', 'Measure 1–32 explicit native worldPoints pairs for a localized endpoint or junction check. pairsJson is an array of {pathA,pointIndexA,pathB,pointIndexB}; use exact entity paths and indices read from review_geometry_read worldPoints or a preserved source-backed plan. Never infer indices from rendered triangles. Returns canonical names/classes, coordinates, each distance and the maximum; does not edit or close the issue.', { modelId: id, pairsJson: { type: 'string', minLength: 1, maxLength: 8000 } }, false, async input => {
+    createReviewTool('review_geometry_correspondence', 'Measure 1–32 explicit native worldPoints pairs for a localized endpoint or junction check. pairsJson is an array of {pathA,pointIndexA,pathB,pointIndexB}; use exact entity paths and indices read from review_geometry_read worldPoints or a preserved source-backed plan. Never infer indices from rendered triangles. Returns canonical names/classes, coordinates, each distance and the maximum; does not edit or close the issue.', { modelId: id, pairsJson: { type: 'string', minLength: 1, maxLength: 8000 } }, false, async (input, execution) => {
       const modelId = input.modelId as string, before = await actions.current.source(modelId);
+      const topicId = execution?.issueTopicId ?? activeTopic.current;
+      const issue = execution?.issueTopicId ? (await workflow.list()).find(row => row.topicId === topicId) : undefined;
+      if (execution?.issueTopicId && !issue) throw new Error('Selected issue disappeared before endpoint measurement.');
+      if (issue) {
+        const bindings = await rebindReviewRevision(issue.context.models, useViewerStore.getState().models);
+        if (![...bindings.values()].includes(modelId)) throw new Error('The measured model does not belong to this saved issue.');
+      }
       const result = measureIfcxPointCorrespondence(before.buffer, JSON.parse(input.pairsJson as string));
       if ((await actions.current.source(modelId)).hash !== before.hash) throw new Error('Source changed during endpoint measurement.');
-      const evidenceRef = await actions.current.record({ kind: 'review.geometry.correspondence', topicId: activeTopic.current, modelId, sourceHash: before.hash, result });
-      return { sourceHash: before.hash, evidenceRef, ...result };
+      const evidenceRef = await actions.current.record({ kind: 'review.geometry.correspondence', topicId, modelId, sourceHash: before.hash, result });
+      execution?.signal?.throwIfAborted();
+      const issueRecord = issue ? await recordPointCorrespondence(workflow, { topicId: issue.topicId, expectedWorkflowRef: issue.workflowRef, evidenceRef, sourceHash: before.hash, distances: result.pairs.map(pair => pair.distance), entityNames: result.pairs.flatMap(pair => [pair.entityA.name, pair.entityB.name]) }) : null;
+      return { sourceHash: before.hash, evidenceRef, issueRecord, ...result };
     }),
     createReviewTool('review_geometry_measure', 'Measure the native triangle-surface minimum distance between exactly two different entities in the same IFCX model. Use geometryTargets returned by review_state. Returns source hash, canonical element names/classes, closest witness points and triangle/instance IDs. Use the returned identities; never infer element roles from selection order. This is the global minimum, not a localized junction proof; zero can mean touching or intersection elsewhere. Does not edit geometry or close issues.', { modelId: id, targetA: id, targetB: id }, false, async input => {
       const modelId = input.modelId as string;

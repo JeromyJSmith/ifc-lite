@@ -228,7 +228,7 @@ export async function runBonsaiDirective(connection: { endpoint: string; model: 
         steps.push(step);
         await options.onStep?.(step, call.id);
         signal.throwIfAborted();
-        if (options.singleStep && options.issueTopicId && call.tool.name === 'review_geometry_contact') {
+        if (options.singleStep && options.issueTopicId && ['review_geometry_contact', 'review_geometry_correspondence'].includes(call.tool.name)) {
           const text = recordedContactText(result, options.issueTopicId);
           if (text) return { text, steps };
         }

@@ -121,6 +121,20 @@ export async function recordContactMeasurement(workflow: Pick<ReturnType<typeof 
     diagnosis: `Native contact measurement of ${input.pathA} against ${input.pathB}, composed instance ${input.instanceA}, triangle ${input.triangleA}: ${input.contactCount} contact clusters; nearest distance ${input.distance ?? 'unavailable'} source units. Source ${input.sourceHash}. This records measured model surfaces; architectural intent and issue-specific repair acceptance remain unverified.`,
     evidenceRefs: [...new Set([input.evidenceRef, ...issue.evidenceRefs])].slice(0, 100) });
 }
+/** Persist exact endpoint facts in the issue before another model turn can fail. */
+export async function recordPointCorrespondence(workflow: Pick<ReturnType<typeof createIssueWorkflow>, 'list' | 'record'>, input: {
+  topicId: string; expectedWorkflowRef: string | undefined; evidenceRef: string; sourceHash: string;
+  distances: number[]; entityNames: string[];
+}) {
+  const issue = (await workflow.list()).find(row => row.topicId === input.topicId);
+  if (!issue || issue.workflowRef !== input.expectedWorkflowRef || issue.stage === 'fixed' || issue.stage === 'dismissed') throw new Error('Issue changed during endpoint measurement. Native evidence remains saved.');
+  if (!/^[a-f0-9]{64}$/.test(input.sourceHash) || !input.evidenceRef || !input.distances.length || input.distances.length > 32
+    || input.distances.some(distance => !Number.isFinite(distance) || distance < 0)) throw new Error('Invalid native endpoint facts.');
+  const names = [...new Set(input.entityNames)].slice(0, 8).map(name => name.slice(0, 160)).join('; ');
+  return workflow.record({ topicId: input.topicId, stage: 'needs-evidence',
+    diagnosis: `Native endpoint correspondence: ${input.distances.length} explicit point pairs; distances [${input.distances.join(', ')}]; maximum ${Math.max(...input.distances)} source units. Entities: ${names}. Source ${input.sourceHash}. Full pairs, indices and coordinates are preserved in evidence ${input.evidenceRef}. This verifies only those endpoints, not intermediate solid continuity, design intent or independent as-built accuracy.`,
+    evidenceRefs: [...new Set([input.evidenceRef, ...issue.evidenceRefs])].slice(0, 100) });
+}
 /** Record native effects before another model turn can fail or misstate them. */
 export async function recordGeometryApplication(workflow: Pick<ReturnType<typeof createIssueWorkflow>, 'list' | 'record'>, applied: {
   topicId: string; operation: string; receiptRef: string; verificationRef: string; sourceHash: string;

@@ -2,7 +2,7 @@
  * License, v. 2.0. https://mozilla.org/MPL/2.0/. */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createIssueWorkflow, createIssueWorkflowTools, recordGeometryApplication, recordContactMeasurement, saveIssueDiagnosis } from './issue-workflow';
+import { createIssueWorkflow, createIssueWorkflowTools, recordGeometryApplication, recordContactMeasurement, recordPointCorrespondence, saveIssueDiagnosis } from './issue-workflow';
 import type { ReviewFinding } from './types';
 function setup() {
   const context = { scopeId: 'original-source', models: [], elements: [], capturedAt: '2026-10-19T10:00:00Z', viewpoint: { guid: 'view', snapshot: 'original-image' } };
@@ -159,4 +159,18 @@ test('native projection receives the exact persisted event and never runs for a 
   mismatch = true;
   await assert.rejects(workflow.record({ topicId: 'topic', stage: 'dismissed', diagnosis: 'Not projected', evidenceRefs: [] }), /different record identity/);
   assert.equal(projected.length, 1);
+});
+
+test('endpoint facts persist as measured evidence and cannot overwrite a newer disposition', async () => {
+  const s = setup();
+  const facts = { topicId: 'topic', expectedWorkflowRef: undefined, evidenceRef: 'endpoint-evidence', sourceHash: 'a'.repeat(64), distances: [0,0,0,0], entityNames: ['Board', 'Roof'] };
+  s.rows.push(s.row('endpoint-evidence', { kind: 'review.geometry.correspondence' }));
+  const result = await recordPointCorrespondence(s.workflow, facts);
+  assert.equal(result.stage, 'needs-evidence');
+  assert.match(result.diagnosis, /4 explicit point pairs; distances \[0, 0, 0, 0\]; maximum 0/);
+  assert.ok(result.evidenceRefs.includes('endpoint-evidence'));
+  await assert.rejects(recordPointCorrespondence(s.workflow, facts), /Issue changed/);
+  const untouched = setup();
+  await assert.rejects(recordPointCorrespondence(untouched.workflow, { ...facts, distances: [NaN] }), /Invalid native/);
+  assert.equal((await untouched.workflow.list())[0].workflowRef, undefined);
 });
