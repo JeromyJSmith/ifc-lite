@@ -12,6 +12,7 @@ import { reviewModels, reviewScope, rebindReviewModels, candidateContext } from 
 import { saveFinding, listFindings, saveEvent, listEvents, listReviewScopes, exportReviewArchive, importReviewArchive } from '@/lib/review-companion/storage';
 import { startLocalDictation } from '@/lib/review-companion/speech';
 import { createConcernVisionTool } from '@/lib/review-companion/concern-vision-tool';
+import { createSurfaceOrbitTool } from '@/lib/review-companion/surface-orbit';
 import { createReviewTools, registerReviewWebMcp, runBonsaiDirective, BonsaiDirectiveError } from '@/lib/review-companion/tools';
 import { createReviewTool } from '@/lib/review-companion/tools';
 import { createReviewBcfBridge, createBcfReviewTools } from '@/lib/review-companion/bcf';
@@ -267,7 +268,8 @@ export function useReviewCompanion(active: boolean) {
     },
     inspect: (question, signal) => inspect(undefined, signal, question, 1),
   }), [resolution.workflow, inspect]);
-  const tools = useMemo(() => [...viewerTools, pickTool, concernVisionTool, ...properties.tools, ...bcfTools, ...resolution.tools], [viewerTools, pickTool, concernVisionTool, properties.tools, bcfTools, resolution.tools]);
+  const surfaceOrbitTool = useMemo(() => createSurfaceOrbitTool(getGlobalRenderer), []);
+  const tools = useMemo(() => [...viewerTools, surfaceOrbitTool, pickTool, concernVisionTool, ...properties.tools, ...bcfTools, ...resolution.tools], [viewerTools, surfaceOrbitTool, pickTool, concernVisionTool, properties.tools, bcfTools, resolution.tools]);
   const reviewHere = async (observation: string) => {
     if (!connection || running.current || directiveController.current || fast.running) throw new Error('Connect Bonsai and wait for the current action to finish.');
     const abort = new AbortController(); directiveController.current = abort; setDirecting(true); setMode('paused'); setError('');

@@ -63,6 +63,16 @@ interior/exterior stops come from actual captured viewpoints, never guessed room
 coordinates. Stop/hide/unmount cancels movement and inference, retains captures,
 and records interruption rather than successful review completion.
 
+For a close inspection after opening a BCF viewpoint, `viewer_rotate_at`
+anchors a 350 ms turn to a current normalized viewport point on the issue or
+its surroundings. The canonical presented frame supplies visibility and clipping;
+CPU surface intersection must agree with native GPU element picking. Blank or
+mismatched hits, cancellation before movement, and a camera changed during picking
+are rejected without moving. The orbit derives its angles from the actual eye
+offset around that surface, preserving radius and projection scale. The returned
+pivot, radius and native element identify what moved; they do not verify a defect.
+`viewer_rotate` continues to mean rotation around the existing camera target.
+
 
 ## Selected-region BCF mission
 
