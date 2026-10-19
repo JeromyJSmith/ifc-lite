@@ -72,7 +72,7 @@ export function createReviewTools(handlers: ReviewToolHandlers): ReviewTool[] {
       modelId: id, expressId: { type: 'integer', minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
     }, false, input => handlers.selectElement(input as { modelId: string; expressId: number })),
     tool('viewer_frame_selection', 'Move the camera to frame selected elements. Does not edit geometry.', {}, false, () => handlers.frameSelection()),
-    tool('viewer_rotate', 'Orbit the camera around its current target by bounded angles in degrees, then inspect the new view with review_inspect. Does not edit geometry.', {
+    tool('viewer_rotate', 'Orbit the camera around its current target by bounded angles in degrees. For close BCF inspection prefer viewer_rotate_at on the visible issue surroundings: a restored target can be far beyond the detail. Does not edit geometry.', {
       azimuthDegrees: { type: 'number', minimum: -90, maximum: 90 }, elevationDegrees: { type: 'number', minimum: -45, maximum: 45 },
     }, false, input => handlers.rotateView(input as { azimuthDegrees: number; elevationDegrees: number })),
     tool('viewer_zoom', 'Zoom around the current target: factor above 1 moves closer, below 1 moves farther away. Inspect the new view with review_inspect. Does not edit geometry.', {
