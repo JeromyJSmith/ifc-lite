@@ -16,3 +16,21 @@ test('touch is reported as zero without claiming a repair or an absence of other
   assert.throws(() => measureIfcxEntityDistance(source(1), 'a', 'a'), /distinct/);
   assert.throws(() => measureIfcxEntityDistance(source(1), 'a', 'unknown'), /entity path/);
 });
+
+test('measurement carries composed entity identities rather than guessed selection roles', () => {
+  const document = JSON.parse(new TextDecoder().decode(source(0)));
+  document.data[0].attributes['bsi::ifc::class'] = { code: 'IfcRoof' };
+  document.data[0].attributes['bsi::ifc::prop::Name'] = 'Old roof name';
+  document.data[1].attributes['bsi::ifc::class'] = { code: 'IfcMember' };
+  document.data[1].attributes['bsi::ifc::prop::Name'] = 'Rake board';
+  document.data.push({ path: 'a', attributes: { 'bsi::ifc::prop::Name': 'Corrected roof slope' } });
+  const result = measureIfcxEntityDistance(new TextEncoder().encode(JSON.stringify(document)).buffer, 'a', 'b');
+  assert.equal(result.entityA.name, 'Corrected roof slope');
+  assert.equal(result.entityA.ifcClass, 'IfcRoof');
+  assert.equal(result.entityB.name, 'Rake board');
+  assert.equal(result.entityB.ifcClass, 'IfcMember');
+  assert.equal(result.nearest.distance, 0);
+  const reversed = measureIfcxEntityDistance(new TextEncoder().encode(JSON.stringify(document)).buffer, 'b', 'a');
+  assert.deepEqual(reversed.entityA, result.entityB);
+  assert.deepEqual(reversed.entityB, result.entityA);
+});

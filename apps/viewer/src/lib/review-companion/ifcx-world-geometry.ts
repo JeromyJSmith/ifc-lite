@@ -36,3 +36,14 @@ export function summarizeWorldGeometry(report: ReturnType<typeof readIfcxWorldGe
   const { points, ...summary } = report;
   return { ...summary, pointCount: points.length };
 }
+
+/** Return the same composed names and declared classes used by the viewer. */
+export function readIfcxEntityIdentities(buffer: ArrayBuffer, paths: string[]) {
+  const composed = composeIfcx(readIfcxGeometrySource(buffer));
+  const { entities, pathToId } = extractEntities(composed, new StringTable());
+  return paths.map(path => {
+    const expressId = pathToId.get(path);
+    if (expressId === undefined) throw new Error('Identity requires an exact entity path.');
+    return { path, expressId, name: entities.getName(expressId), ifcClass: entities.getTypeName(expressId) };
+  });
+}

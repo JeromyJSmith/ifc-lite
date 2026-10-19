@@ -145,14 +145,14 @@ export function useReviewResolution(options: Options) {
       const evidenceRef = await actions.current.record({ kind: 'review.geometry.component', modelId, topicId: activeTopic.current, sourceHash: before.hash, result });
       return { sourceHash: before.hash, evidenceRef, ...result };
     }),
-    createReviewTool('review_geometry_measure', 'Measure the native triangle-surface minimum distance between exactly two different entities in the same IFCX model. Use geometryTargets returned by review_state. Returns source hash, closest witness points and triangle/instance IDs. This is the global minimum, not a localized junction proof; zero can mean touching or intersection elsewhere. Does not edit geometry or close issues.', { modelId: id, targetA: id, targetB: id }, false, async input => {
+    createReviewTool('review_geometry_measure', 'Measure the native triangle-surface minimum distance between exactly two different entities in the same IFCX model. Use geometryTargets returned by review_state. Returns source hash, canonical element names/classes, closest witness points and triangle/instance IDs. Use the returned identities; never infer element roles from selection order. This is the global minimum, not a localized junction proof; zero can mean touching or intersection elsewhere. Does not edit geometry or close issues.', { modelId: id, targetA: id, targetB: id }, false, async input => {
       const modelId = input.modelId as string;
       const { buffer, hash } = await actions.current.source(modelId);
       const resolve = (target: string) => resolveGeometryTarget(target, id => useViewerStore.getState().models.get(modelId)?.ifcDataStore?.entities.getGlobalId(id));
       const result = measureIfcxEntityDistance(buffer, resolve(input.targetA as string), resolve(input.targetB as string));
       const context = await live.current.capture();
       if ((await actions.current.source(modelId)).hash !== hash) throw new Error('Source changed during measurement; measure the current revision again.');
-      const finding: ReviewFinding = { schemaVersion: 1, id: crypto.randomUUID(), context, kind: 'note', createdAt: new Date().toISOString(), text: `Native surface-distance measurement for ${result.pathA} and ${result.pathB}. No repair or architectural acceptance is claimed.` };
+      const finding: ReviewFinding = { schemaVersion: 1, id: crypto.randomUUID(), context, kind: 'note', createdAt: new Date().toISOString(), text: `Native surface-distance measurement for ${result.entityA.name || result.pathA} (${result.entityA.ifcClass}, ${result.pathA}) and ${result.entityB.name || result.pathB} (${result.entityB.ifcClass}, ${result.pathB}). No repair or architectural acceptance is claimed.` };
       await live.current.persist(finding);
       const evidenceRef = await actions.current.record({ kind: 'review.geometry.distance', topicId: activeTopic.current, modelId, sourceHash: hash, result }, finding);
       return { sourceHash: hash, evidenceRef, ...result };
