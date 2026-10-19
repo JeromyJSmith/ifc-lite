@@ -77,6 +77,8 @@ test('review quantity correction preserves native type/unit, round-trips export 
   const result = await bridge.applyChanges({ previewId: proposal.id });
   assert.ok('applied' in result && result.applied && result.ok);
   const corrected = (await bridge.readElement({ modelId: 'A', expressId: 101 })).quantities[0].quantities[0];
+  assert.equal(result.readback[0].field, 'Qto_WallBaseQuantities.NetVolume');
+  assert.equal(result.readback[0].field, result.receipt.applied[0].field);
   assert.equal(corrected.value, 1);
   assert.equal(corrected.type, originalQuantity.type);
   assert.equal(corrected.unit, originalQuantity.unit);
@@ -85,6 +87,7 @@ test('review quantity correction preserves native type/unit, round-trips export 
   assert.equal(parsed.getQuantities(101)[0].quantities[0].value, 1);
   const undone = await bridge.undoChanges({ receiptId: result.receipt.id });
   assert.ok('undone' in undone && undone.undone && undone.ok);
+  assert.equal(undone.readback[0].field, 'Qto_WallBaseQuantities.NetVolume');
   assert.equal((await bridge.readElement({ modelId: 'A', expressId: 101 })).quantities[0].quantities[0].value, 999);
 });
 

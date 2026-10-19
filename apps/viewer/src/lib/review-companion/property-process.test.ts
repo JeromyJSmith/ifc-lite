@@ -57,6 +57,24 @@ test('standalone or unmapped proposals leave the process untouched', async () =>
   assert.deepEqual(f.current(), before);
 });
 
+test('quantity corrections retain set-qualified fields through preview, approval, readback and undo', async () => {
+  const f = fixture();
+  const change = { op: 'quantity.set' as const, target: { modelId: 'fixture:model', globalId: guid }, qset: 'Qto_WallBaseQuantities', name: 'NetVolume', expected: 3, value: 3.1 };
+  const proposal: ReviewPropertyProposal = { ...f.proposal, batch: { ...f.proposal.batch, changes: [change] },
+    preview: { ...f.proposal.preview, batch: { ...f.proposal.batch, changes: [change] }, rows: [{ index: 0, status: 'ready', modelId: 'fixture:model', expressId: 42, change, current: 3 }] } };
+  const field = 'Qto_WallBaseQuantities.NetVolume';
+  await f.events.preview(proposal, 'fixture:quantity-preview');
+  assert.deepEqual(f.current().findings[0].preview?.changes, [{ field, before: 3, after: 3.1 }]);
+  await f.events.approve(proposal, 'fixture:human-quantity-approval');
+  const receipt = { ...f.receipt, applied: [{ ...f.receipt.applied[0], field, before: 3, after: 3.1 }] };
+  await f.events.applied(proposal, { ok: true, applied: true, persisted: true, receipt, readback: [{ index: 0, field, actual: 3.1, matches: true }] }, 'fixture:quantity-apply');
+  assert.equal(f.current().findings[0].status, 'verified');
+  assert.deepEqual(f.current().findings[0].readback?.values, [{ field, value: 3.1 }]);
+  await f.events.undone(proposal, { ok: true, undone: true, persisted: true, receipt: { ...receipt, status: 'undone' }, readback: [{ index: 0, field, actual: 3, matches: true }] }, 'fixture:quantity-undo');
+  assert.equal(f.current().findings[0].status, 'undone');
+  assert.equal(validateReviewProcess(f.current()).ok, true);
+});
+
 test('conflicts and a different bound element are blocked rather than recorded as a ready preview', async () => {
   const f = fixture();
   const conflict = structuredClone(f.proposal); conflict.preview.rows[0].status = 'conflict';

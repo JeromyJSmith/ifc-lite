@@ -8,7 +8,7 @@ import { resolveEntityRefGlobalIdFromState } from '@/store/resolveEntityRef';
 import { resolveGlobalId } from '@/lib/actions/resolve-global-id';
 import { modelReader, currentValue, effectiveAttribute, sameValue, UNSUPPORTED_VALUE } from '@/lib/actions/model-change-values';
 import { previewModelChanges, type ModelChangePreview } from '@/lib/actions/model-change-preview';
-import { commitModelChanges, undoModelChanges, type ModelChangeReceipt } from '@/lib/actions/model-change-commit';
+import { changeField, commitModelChanges, undoModelChanges, type ModelChangeReceipt } from '@/lib/actions/model-change-commit';
 import { modelChangeLibrary } from '@/lib/actions/receipts';
 import { rebindReviewModels, reviewModels, reviewScope } from './context';
 import type { ReviewFinding } from './types';
@@ -111,7 +111,7 @@ export function createReviewPropertyBridge(options: {
       const reader = row.modelId && modelReader(store.getState(), row.modelId);
       const actual = reader && row.expressId !== null ? currentValue(reader, row.expressId, row.change) : UNSUPPORTED_VALUE;
       const expected = row.change.op === 'property.delete' ? null : row.change.value;
-      return { index: row.index, field: row.change.op === 'property.set' ? `${row.change.pset}.${row.change.name}` : row.change.name,
+      return { index: row.index, field: changeField(row.change),
         actual: actual === UNSUPPORTED_VALUE ? null : actual, matches: sameValue(actual, expected, row.change.op === 'attribute.set') };
     });
     if (readback.some(row => !row.matches)) {
@@ -138,7 +138,7 @@ export function createReviewPropertyBridge(options: {
     const readback = proposal.preview.rows.map(row => {
       const reader = row.modelId && modelReader(store.getState(), row.modelId);
       const actual = reader && row.expressId !== null ? currentValue(reader, row.expressId, row.change) : UNSUPPORTED_VALUE;
-      return { index: row.index, field: row.change.op === 'property.set' ? `${row.change.pset}.${row.change.name}` : row.change.name,
+      return { index: row.index, field: changeField(row.change),
         actual: actual === UNSUPPORTED_VALUE ? null : actual, matches: sameValue(actual, row.current ?? null, row.change.op === 'attribute.set') };
     });
     return { ok: persisted && readback.every(row => row.matches), undone: true, persisted, receipt: undone, readback };

@@ -170,3 +170,9 @@ values require measured evidence: IFC net wall volume includes openings and
 connection geometry; gross volume does not. A bounding-box or convex-hull volume
 must not be presented as an interchangeable gross or net measurement.
 Reference: buildingSMART IFC 4.3 `Qto_WallBaseQuantities`.
+
+Quantity changes use the same set-qualified field label (`Qto_*.Name`) in the
+native preview, application receipt, after-value readback and undo readback.
+The review-process adapter accepts these numeric corrections for a matching
+bound element and records the existing human approval and verification events;
+it does not substitute a metadata correction for geometry acceptance.

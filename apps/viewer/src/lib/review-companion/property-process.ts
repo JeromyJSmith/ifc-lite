@@ -32,8 +32,9 @@ export function createReviewPropertyProcessEvents(journal: Journal) {
     if (!finding.element || !rows.length || rows.length > 5 || rows.some(row => row.status !== 'ready'
       || row.modelId !== finding.element!.modelId || row.expressId !== finding.element!.expressId
       || row.change.target.globalId !== finding.element!.ifcGlobalId || !scalar(row.current)
-      || row.change.op !== 'property.set' && row.change.op !== 'attribute.set')) return null;
-    return rows.map(row => ({ field: row.change.op === 'property.set' ? `${row.change.pset}.${row.change.name}` : row.change.name,
+      || row.change.op !== 'property.set' && row.change.op !== 'attribute.set' && row.change.op !== 'quantity.set')) return null;
+    return rows.map(row => ({ field: row.change.op === 'property.set' ? `${row.change.pset}.${row.change.name}`
+      : row.change.op === 'quantity.set' ? `${row.change.qset}.${row.change.name}` : row.change.name,
       before: row.current as ReviewProcessScalar, after: row.change.op === 'property.delete' ? null : row.change.value }));
   }
   async function preview(proposal: ReviewPropertyProposal, recordId: string) {
