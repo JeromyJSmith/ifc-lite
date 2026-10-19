@@ -11,6 +11,7 @@ import { toGlobalIdFromModels } from '@/store/globalId';
 import { createIssueWorkflow, createIssueWorkflowTools, type IssueUpdate } from '@/lib/review-companion/issue-workflow';
 import { createReviewTool } from '@/lib/review-companion/tools';
 import { inspectIfcxGeometry, patchIfcxGeometry, type IfcxGeometryOperation } from '@/lib/review-companion/ifcx-geometry';
+import { summarizeIfcxGeometry } from '@/lib/review-companion/geometry-evidence';
 import { saveGeometrySource, readGeometrySource } from '@/lib/review-companion/geometry-sources';
 import { verifyGeometryCleanup } from '@/lib/review-companion/geometry-verification';
 import { listReviewScopes, listFindings, saveFinding } from '@/lib/review-companion/storage';
@@ -88,14 +89,16 @@ export function useReviewResolution(options: Options) {
   const workspaceTools = useMemo(() => createWorkspaceTools({ record: event => actions.current.record({ ...event, topicId: activeTopic.current }) }), []);
   const id = { type: 'string' as const, minLength: 1, maxLength: 200 };
   const geometryTools = useMemo(() => [
-    createReviewTool('review_geometry_read', 'Read exact source mesh arrays in pages for native geometric analysis and explicit replacement. No approximate image geometry. component chooses points, faceVertexIndices, faceVertexCounts or normals; offset and limit address that exact array.', {
-      modelId: id, path: id, component: { type: 'string', enum: ['points', 'faceVertexIndices', 'faceVertexCounts', 'normals'] }, offset: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER }, limit: { type: 'integer', minimum: 1, maximum: 10000 },
+    createReviewTool('review_geometry_read', 'Read exact source mesh arrays in pages for native geometric analysis and explicit replacement. No approximate image geometry. component chooses points, faceVertexIndices, faceVertexCounts, normals, boundaryEdges, nonManifoldEdges, degenerateFaces or duplicateFaces; Request only the small page needed for the current question (at most 256 items). offset and limit address that exact source or topology array.', {
+      modelId: id, path: id, component: { type: 'string', enum: ['points', 'faceVertexIndices', 'faceVertexCounts', 'normals', 'boundaryEdges', 'nonManifoldEdges', 'degenerateFaces', 'duplicateFaces'] }, offset: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER }, limit: { type: 'integer', minimum: 1, maximum: 256 },
     }, true, async input => {
       const { buffer, hash } = await actions.current.source(input.modelId as string);
       const report = inspectIfcxGeometry(buffer, input.path as string);
-      const mesh = report.meshes.find(m => m.analysis.path === input.path)?.mesh;
-      if (!mesh) return { sourceHash: hash, meshPaths: report.meshes.map(m => m.analysis.path), next: 'Choose an exact mesh path.' };
-      const data = mesh[input.component as keyof typeof mesh];
+      const entry = report.meshes.find(m => m.analysis.path === input.path);
+      if (!entry) return { sourceHash: hash, meshPaths: report.meshes.map(m => m.analysis.path), next: 'Choose an exact mesh path.' };
+      const component = input.component as string;
+      const data = ['boundaryEdges', 'nonManifoldEdges', 'degenerateFaces', 'duplicateFaces'].includes(component)
+        ? entry.analysis[component as keyof typeof entry.analysis] : entry.mesh[component as keyof typeof entry.mesh];
       if (!Array.isArray(data)) return { sourceHash: hash, component: input.component, present: false };
       return { sourceHash: hash, path: input.path, component: input.component, total: data.length, offset: input.offset, values: data.slice(input.offset as number, (input.offset as number) + (input.limit as number)), transform: report.transform, coordinateSpace: 'Source mesh-local IFCX Z-up; verify declared units before changing dimensions.' };
     }),
@@ -130,7 +133,7 @@ export function useReviewResolution(options: Options) {
         text: defective.length ? `Mesh integrity: ${defective.map(m => `${m.analysis.path}: ${m.analysis.degenerateFaces.length} exact zero-area faces and ${m.analysis.duplicateFaces.length} same-winding duplicate faces`).join('; ')}. These are measured source mesh defects; removing them does not establish the architectural gap or fascia detail is wrong.` : `No exact zero-area or same-winding duplicate mesh faces at ${input.path}.` };
       await live.current.persist(candidate);
       const evidenceRef = await actions.current.record({ kind: 'review.geometry.inspection', topicId: activeTopic.current, sourceHash: hash, modelId: input.modelId, report: concise(report) }, candidate);
-      return { sourceHash: hash, sourceHeader: JSON.parse(new TextDecoder().decode(buffer)).header, coordinateContract: 'Mesh-local Z-up. Source header is reported verbatim; a missing unit is unknown. Exact zero-area and duplicate-face cleanup is unit independent.', candidateId: defective.length ? candidate.id : null, evidenceRef, ...concise(report) };
+      return { sourceHash: hash, sourceHeader: JSON.parse(new TextDecoder().decode(buffer)).header, coordinateContract: 'Mesh-local Z-up. Source header is reported verbatim; a missing unit is unknown. Exact zero-area and duplicate-face cleanup is unit independent.', candidateId: defective.length ? candidate.id : null, evidenceRef, ...summarizeIfcxGeometry(report) };
     }),
     createReviewTool('review_geometry_repair', 'Apply an evidence-backed exact-source IFCX geometry operation in the visible viewer and preserve original/corrected sources for restart-safe undo. operationJson: remove_defective_faces{meshPath}, remove_faces{meshPath,faceIndices}, translate_mesh_local{meshPath,delta:[x,y,z]}, replace_mesh{meshPath,mesh}, set_local_transform{path,transform:4x4}. All require kind. Coordinates are IFCX mesh-local Z-up in declared document units. Read geometry and units first. Never invent replacement geometry. Does not automatically resolve architectural concerns.', {
       topicId: id, modelId: id, expectedSourceHash: id, operationJson: { type: 'string', minLength: 1, maxLength: 1000000 }, diagnosis: { type: 'string', minLength: 1, maxLength: 8000 },

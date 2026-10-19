@@ -335,9 +335,8 @@ export function useReviewCompanion(active: boolean) {
       const abort = new AbortController(); preparationController.current = abort; setDirecting(true); setMode('paused');
       try {
         return await prepareSavedIssue({ workflow: resolution.workflow,
-          geometryTool: resolution.tools.find(tool => tool.name === 'review_geometry_inspect')!,
           inspect: (signal, instruction) => inspect(undefined, signal, instruction),
-          models: () => useViewerStore.getState().models, onStatus: setStatus }, topicId, abort.signal);
+          onStatus: setStatus }, topicId, abort.signal);
       } finally { preparationController.current = null; setDirecting(false); }
     },
     setDirective: handlers.setDirective,
@@ -346,7 +345,7 @@ export function useReviewCompanion(active: boolean) {
     exportArchive: () => exportResolutionBundle(),
     importArchive: async (value: unknown) => { const result = await importResolutionBundle(value); await refresh(); return result; },
     cancel: () => { preparationController.current?.abort(); fast.stop(); controller.current?.abort(); directiveController.current?.abort(); setMode('paused'); setStatus('Review paused'); },
-    ask: async (prompt: string) => {
+    ask: async (prompt: string, evidence?: unknown) => {
       if (!connection) throw new Error('Connect Bonsai first.');
       if (running.current || directiveController.current || fast.running) throw new Error('A review is already running.');
       const abort = new AbortController(); directiveController.current = abort; setDirecting(true);
@@ -356,6 +355,7 @@ export function useReviewCompanion(active: boolean) {
       const context = await capture();
       input = { schemaVersion: 1, id: crypto.randomUUID(), context, kind: 'note', text: `Directive: ${prompt}`, createdAt: now() };
       await persist(input);
+      if (evidence !== undefined) await persistReviewJson({ ...input, id: crypto.randomUUID(), parentId: input.id }, { kind: 'review.directive.evidence', evidence }, persist);
       if (process.current()?.status === 'running') await process.interrupt('A new owner directive superseded this review run.');
       const started = await process.begin(context, prompt, input.id);
       setActivity([]);
@@ -366,7 +366,7 @@ export function useReviewCompanion(active: boolean) {
       } });
       await stream.start(); await stream.state({ scopeId: context.scopeId, processId: started.id, stage: 'inspecting' });
         setStatus('Bonsai is choosing its next viewer action…');
-        const result = await runBonsaiDirective(connection, prompt, tools, abort.signal, { maxTurns: 32, maxCalls: 48, onToolStart: call => stream!.toolStart(call.id, call.tool, call.args), onStep: async (step, toolCallId) => {
+        const result = await runBonsaiDirective(connection, prompt, tools, abort.signal, { evidence, maxTurns: 32, maxCalls: 48, onToolStart: call => stream!.toolStart(call.id, call.tool, call.args), onStep: async (step, toolCallId) => {
           await stream!.toolResult(toolCallId, step.result);
           await persistReviewJson({ ...input!, id: crypto.randomUUID(), provider: { model: connection.model, endpoint: connection.endpoint }, parentId: input!.id }, { stage: 'tool-completed', step }, persist);
         } });
