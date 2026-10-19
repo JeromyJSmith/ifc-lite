@@ -12,6 +12,7 @@ import { createIssueWorkflow, createIssueWorkflowTools, type IssueUpdate } from 
 import { createReviewTool } from '@/lib/review-companion/tools';
 import { inspectIfcxGeometry, patchIfcxGeometry, type IfcxGeometryOperation } from '@/lib/review-companion/ifcx-geometry';
 import { measureIfcxEntityDistance } from '@/lib/review-companion/geometry-distance';
+import { inspectGeometryComponent } from '@/lib/review-companion/geometry-component';
 import { readIfcxWorldGeometry, summarizeWorldGeometry } from '@/lib/review-companion/ifcx-world-geometry';
 import { resolveGeometryTarget } from '@/lib/review-companion/geometry-target';
 import { summarizeIfcxGeometry } from '@/lib/review-companion/geometry-evidence';
@@ -92,6 +93,13 @@ export function useReviewResolution(options: Options) {
   const workspaceTools = useMemo(() => createWorkspaceTools({ record: event => actions.current.record({ ...event, topicId: activeTopic.current }) }), []);
   const id = { type: 'string' as const, minLength: 1, maxLength: 200 };
   const geometryTools = useMemo(() => [
+    createReviewTool('review_geometry_component', 'Inspect one connected component of an exact IFCX source mesh by source face index. Exact coincident vertices connect faces. Returns bounds, face count, and a bounded remove_faces plan when this is a proper subset of the mesh. A rendered triangle index is not a source face index for polygon meshes. This analysis does not establish a defect or authorize a change.', { modelId: id, meshPath: id, seedFaceIndex: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER } }, false, async input => {
+      const modelId = input.modelId as string, before = await actions.current.source(modelId);
+      const result = inspectGeometryComponent(before.buffer, input.meshPath as string, input.seedFaceIndex as number);
+      if ((await actions.current.source(modelId)).hash !== before.hash) throw new Error('Source changed during component analysis. Inspect the current revision.');
+      const evidenceRef = await actions.current.record({ kind: 'review.geometry.component', modelId, topicId: activeTopic.current, sourceHash: before.hash, result });
+      return { sourceHash: before.hash, evidenceRef, ...result };
+    }),
     createReviewTool('review_geometry_measure', 'Measure the native triangle-surface minimum distance between exactly two different entities in the same IFCX model. Use geometryTargets returned by review_state. Returns source hash, closest witness points and triangle/instance IDs. This is the global minimum, not a localized junction proof; zero can mean touching or intersection elsewhere. Does not edit geometry or close issues.', { modelId: id, targetA: id, targetB: id }, false, async input => {
       const modelId = input.modelId as string;
       const { buffer, hash } = await actions.current.source(modelId);
