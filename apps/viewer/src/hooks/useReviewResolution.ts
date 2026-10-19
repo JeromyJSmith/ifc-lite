@@ -16,7 +16,7 @@ import { inspectIfcxGeometry, patchIfcxGeometry, type IfcxGeometryOperation } fr
 import { measureIfcxEntityDistance } from '@/lib/review-companion/geometry-distance';
 import { inspectIfcxContact } from '@/lib/review-companion/geometry-contact';
 import { inspectGeometryComponent } from '@/lib/review-companion/geometry-component';
-import { saveGeometryPlan, readGeometryPlan } from '@/lib/review-companion/geometry-plans';
+import { saveGeometryPlan, readGeometryPlan, listGeometryPlans } from '@/lib/review-companion/geometry-plans';
 import { readIfcxWorldGeometry, summarizeWorldGeometry } from '@/lib/review-companion/ifcx-world-geometry';
 import { resolveGeometryTarget } from '@/lib/review-companion/geometry-target';
 import { summarizeIfcxGeometry } from '@/lib/review-companion/geometry-evidence';
@@ -44,6 +44,7 @@ export function useReviewResolution(options: Options) {
   const { loadFile } = useIfcLoader();
   const loader = useRef(loadFile); loader.current = loadFile;
   const [issues, setIssues] = useState<Awaited<ReturnType<ReturnType<typeof createIssueWorkflow>['list']>>>([]);
+  const [plans, setPlans] = useState<ReturnType<typeof listGeometryPlans>>([]);
   const [repairs, setRepairs] = useState<Array<{ receiptRef: string; topicId: string; modelName: string; before: { faceCount: number } | null; after: { faceCount: number } | null }>>([]);
   const activeTopic = useRef<string | null>(null);
   const workflowRef = useRef<ReturnType<typeof createIssueWorkflow> | null>(null);
@@ -94,8 +95,8 @@ export function useReviewResolution(options: Options) {
   }), []);
   workflowRef.current = workflow;
   // Source chunks append hundreds of rows; they must not trigger full screenshot-journal reads.
-  const outcomeKey = options.findings.filter(row => /\"kind\":\"review\.(bcf\.(definition|workflow)|geometry\.applied)\"/.test(row.text)).map(row => row.id).join(',');
-  useEffect(() => { void workflow.list().then(setIssues); void allReviewRows().then(rows => setRepairs(rows.flatMap(row => { const p = payload(row); return p?.kind === 'review.geometry.applied' ? [{ receiptRef: row.id, topicId: String(p.topicId), modelName: String(p.modelName ?? 'Repaired model'), before: p.before as { faceCount: number } | null, after: p.after as { faceCount: number } | null }] : []; }))); }, [workflow, outcomeKey, options.scope]);
+  const outcomeKey = options.findings.filter(row => /\"kind\":\"review\.(bcf\.(definition|workflow)|geometry\.(applied|plan))\"/.test(row.text)).map(row => row.id).join(',');
+  useEffect(() => { void workflow.list().then(setIssues); void allReviewRows().then(rows => { setPlans(listGeometryPlans(rows)); setRepairs(rows.flatMap(row => { const p = payload(row); return p?.kind === 'review.geometry.applied' ? [{ receiptRef: row.id, topicId: String(p.topicId), modelName: String(p.modelName ?? 'Repaired model'), before: p.before as { faceCount: number } | null, after: p.after as { faceCount: number } | null }] : []; })); }); }, [workflow, outcomeKey, options.scope]);
   const saveView = async (topicId: string, note: string, repair?: Omit<RepairViewBinding, 'sourceIdentity'>) => {
     await live.current.open(topicId);
     const identity = repair ? (await reviewModels(useViewerStore.getState().models)).find(model => model.id === repair.modelId) : undefined;
@@ -309,8 +310,9 @@ export function useReviewResolution(options: Options) {
     const modelId = await resolveRepairModel(plan.sourceHash, useViewerStore.getState().models);
     return geometryTools.find(tool => tool.name === 'review_geometry_repair')!.execute({ topicId: input.topicId, modelId, expectedSourceHash: plan.sourceHash, operationJson: JSON.stringify(plan.operation), diagnosis: input.diagnosis }, execution);
   }), [geometryTools]);
-  const tools = useMemo(() => [...nativeTools, ...workspaceTools, ...geometryTools, planTool, ...issueTools], [nativeTools, workspaceTools, geometryTools, planTool, issueTools]);
-  return { issues, repairs, workflow, tools, saveView,
+  const planListTool = useMemo(() => createReviewTool('review_geometry_plans', 'List persisted geometry repair plans for a saved issue. Returns exact plan references, source hashes and mesh summaries without large payloads. Listing does not approve or apply a plan; use review_geometry_repair_plan for source-checked application.', { topicId: id }, true, async input => ({ plans: listGeometryPlans(await allReviewRows(), input.topicId as string) })), []);
+  const tools = useMemo(() => [...nativeTools, ...workspaceTools, ...geometryTools, planTool, planListTool, ...issueTools], [nativeTools, workspaceTools, geometryTools, planTool, planListTool, issueTools]);
+  return { issues, repairs, plans, workflow, tools, saveView,
     saveDiagnosis: (input: { topicId: string; expectedWorkflowRef: string | undefined; diagnosis: string }) => saveIssueDiagnosis(workflow, input),
     saveRepairView: async (receiptRef: string) => {
       const receipt = payload((await allReviewRows()).find(row => row.id === receiptRef));

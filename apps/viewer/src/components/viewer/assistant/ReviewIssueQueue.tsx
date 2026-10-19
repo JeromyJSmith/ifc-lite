@@ -75,6 +75,10 @@ export function ReviewIssueQueue({ review, run }: { review: Review; run(action: 
         const file = event.target.files?.[0]; event.target.value = '';
         if (file) run(async () => { const plan = await review.resolution.importPlan(issue.topicId, file); setPlanRef(plan.planRef); review.setStatus(`Geometry plan saved: ${plan.planRef}. Faces ${plan.beforeFaces} → ${plan.afterFaces}. Ready for Bonsai to apply; no model change yet.`); });
       }} /></label>
+      <label className="block">Saved plans for this issue<select aria-label="Saved plans for this issue" disabled={review.busy} value={planRef} className="w-full rounded border bg-background p-2" onChange={event => setPlanRef(event.target.value)}>
+        <option value="">Choose a saved repair plan</option>
+        {review.resolution.plans.filter(plan => plan.topicId === issue.topicId).map(plan => <option key={plan.planRef} value={plan.planRef}>{plan.operation} · {plan.meshPath} · faces {plan.beforeFaces ?? '?'} → {plan.afterFaces ?? '?'} · {plan.createdAt}</option>)}
+      </select></label>
       <label className="block">Saved repair plan reference<input aria-label="Saved repair plan reference" value={planRef} onChange={event => setPlanRef(event.target.value)} className="w-full rounded border bg-background p-2" /></label>
       <Button size="sm" disabled={review.busy || !planRef.trim()} onClick={() => run(async () => {
         const tool = review.resolution.tools.find(tool => tool.name === 'review_geometry_repair_plan')!;

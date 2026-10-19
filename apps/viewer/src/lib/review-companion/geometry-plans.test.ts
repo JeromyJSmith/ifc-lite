@@ -2,7 +2,7 @@
  * License, v. 2.0. https://mozilla.org/MPL/2.0/. */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { saveGeometryPlan, readGeometryPlan } from './geometry-plans';
+import { saveGeometryPlan, readGeometryPlan, listGeometryPlans } from './geometry-plans';
 import { sha256Hex } from '@/utils/sourceContentHash';
 import type { ReviewFinding } from './types';
 const bytes = (v: unknown) => new TextEncoder().encode(JSON.stringify(v)).buffer;
@@ -25,4 +25,23 @@ test('stale or invalid repair plans fail before any persistence', async () => {
   await assert.rejects(saveGeometryPlan(bytes({ sourceHash: 'wrong', operation: {} }), source(), base, 'issue', persist), /different source/);
   await assert.rejects(saveGeometryPlan(bytes({ sourceHash: await sha256Hex(source()), operation: { kind: 'unknown' } }), source(), base, 'issue', persist), /Unknown IFCX/);
   assert.equal(saved, 0);
+});
+
+test('plan discovery survives persisted journal reload and keeps issue payloads separated', async () => {
+  const input = source(), rows: ReviewFinding[] = [];
+  const persist = async (row: ReviewFinding) => { rows.push(row); return row.id; };
+  const plan = bytes({ sourceHash: await sha256Hex(input), operation: { kind: 'remove_faces', meshPath: 'body', faceIndices: [1] } });
+  const first = await saveGeometryPlan(plan, input, base, 'first', persist);
+  await saveGeometryPlan(plan, input, base, 'second', persist);
+  rows.push({ ...base, id: 'unrelated', text: 'not JSON' });
+  const reloaded = JSON.parse(JSON.stringify(rows)) as ReviewFinding[];
+  const listed = listGeometryPlans(reloaded, 'first');
+  assert.equal(listed.length, 1);
+  assert.equal(listed[0].planRef, first.planRef);
+  assert.equal(listed[0].beforeFaces, 2);
+  assert.equal(listed[0].afterFaces, 1);
+  assert.equal('operationJson' in listed[0], false);
+  assert.equal(listGeometryPlans(reloaded, 'missing').length, 0);
+  assert.equal(listGeometryPlans(reloaded).length, 2);
+  assert.equal((await readGeometryPlan(listed[0].planRef, 'first', reloaded)).sourceHash, first.sourceHash);
 });

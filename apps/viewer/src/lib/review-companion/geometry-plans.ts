@@ -26,3 +26,17 @@ export async function readGeometryPlan(planRef: string, topicId: string, rows: R
   if (plan.sourceHash !== record.sourceHash || plan.operation?.kind !== record.operation) throw new Error('Geometry plan metadata differs from its preserved payload.');
   return { sourceHash: record.sourceHash as string, operation: plan.operation as IfcxGeometryOperation };
 }
+
+/** Discovery is metadata only; application still verifies the preserved payload and live source. */
+export function listGeometryPlans(rows: ReviewFinding[], topicId?: string) {
+  return rows.flatMap(row => {
+    let value: Record<string, unknown>;
+    try { value = JSON.parse(row.text); } catch { return []; }
+    if (!value || value.kind !== 'review.geometry.plan' || typeof value.topicId !== 'string'
+      || (topicId !== undefined && value.topicId !== topicId) || typeof value.sourceHash !== 'string'
+      || typeof value.meshPath !== 'string' || typeof value.operation !== 'string') return [];
+    return [{ planRef: row.id, topicId: value.topicId, sourceHash: value.sourceHash, meshPath: value.meshPath,
+      operation: value.operation, beforeFaces: typeof value.beforeFaces === 'number' ? value.beforeFaces : null,
+      afterFaces: typeof value.afterFaces === 'number' ? value.afterFaces : null, createdAt: row.createdAt }];
+  }).sort((a, b) => b.createdAt.localeCompare(a.createdAt) || a.planRef.localeCompare(b.planRef));
+}
