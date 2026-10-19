@@ -38,3 +38,24 @@ test('missing or corrupted originals and unqualified operations cannot close iss
   await assert.rejects(verifyGeometryCleanup({...s.receipt,operation:'translate_mesh_local'},s.verification,s.rows,s.after),/no qualified issue-specific postcondition/);
   await assert.rejects(verifyGeometryCleanup(s.receipt,{...s.verification,matches:false},s.rows,s.after),/does not match/);
 });
+
+test('normalization verifies the exact wall body while preserving descendant geometry and metadata', async () => {
+  const points = [[0,0,0],[1,0,0],[0,1,0],[0,0,1],[0.5,0,0]];
+  const old = {points,faceVertexIndices:[0,2,4,4,2,1,0,1,3,1,2,3,2,0,3,0,4,1]};
+  const replacement = {points:points.slice(0,4),faceVertexIndices:[0,2,1,0,1,3,1,2,3,2,0,3]};
+  const before = new TextEncoder().encode(JSON.stringify({header:{ifcxVersion:'ifcx_alpha'},imports:[],schemas:{},data:[
+    {path:'wall',attributes:{'usd::usdgeom::mesh':old,'bsi::ifc::prop::Name':'retain'},children:{detail:'detail'}},
+    {path:'detail',attributes:{'usd::usdgeom::mesh':replacement}}
+  ]})).buffer;
+  const base = (await setup()).rows[0], rows:ReviewFinding[]=[];
+  const stored = await saveGeometrySource(before,base,async row=>{rows.push(row);return row.id;});
+  const patched = patchIfcxGeometry(before,{kind:'replace_mesh',meshPath:'wall',mesh:replacement});
+  const afterHash = await sha256Hex(patched.correctedBuffer);
+  const receipt = {operation:'replace_mesh',path:'wall',beforeSource:stored,beforeHash:stored.hash,afterHash,before:{faceCount:6},after:{faceCount:4}};
+  const checked = await verifyGeometryCleanup(receipt,{matches:true,afterHash},rows,patched.correctedBuffer);
+  assert.equal(checked.beforeFaceCount,6);assert.equal(checked.afterFaceCount,4);assert.equal(checked.solid?.verified,true);
+  const altered = JSON.parse(new TextDecoder().decode(patched.correctedBuffer));
+  altered.data[1].attributes['bsi::ifc::prop::Name']='unrelated edit';
+  const bytes = new TextEncoder().encode(JSON.stringify(altered)).buffer, hash = await sha256Hex(bytes);
+  await assert.rejects(verifyGeometryCleanup({...receipt,afterHash:hash},{matches:true,afterHash:hash},rows,bytes),/independently recomputed/);
+});

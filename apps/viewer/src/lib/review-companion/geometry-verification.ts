@@ -15,14 +15,18 @@ export async function verifyGeometryCleanup(receipt: Record<string, unknown>, ve
   const beforeBuffer = await readGeometrySource(source.manifestRef, rows);
   const beforeHash = await sha256Hex(beforeBuffer);
   if (!beforeHash || beforeHash !== receipt.beforeHash) throw new Error('The preserved original source does not match the cleanup receipt.');
-  const afterReport = inspectIfcxGeometry(currentBuffer, receipt.path);
+  const exact = (buffer: ArrayBuffer) => {
+    const report = inspectIfcxGeometry(buffer, receipt.path as string);
+    return receipt.operation === 'replace_mesh' ? { ...report, meshes: report.meshes.filter(mesh => mesh.analysis.path === receipt.path) } : report;
+  };
+  const afterReport = exact(currentBuffer);
   if (receipt.operation === 'replace_mesh' && (afterReport.meshes.length !== 1 || afterReport.meshes[0].analysis.path !== receipt.path)) throw new Error('Topology normalization verification requires one exact body mesh.');
   const expected = patchIfcxGeometry(beforeBuffer, receipt.operation === 'replace_mesh'
     ? { kind: 'replace_mesh', meshPath: receipt.path, mesh: afterReport.meshes[0].mesh }
     : { kind: 'remove_defective_faces', meshPath: receipt.path });
   const expectedHash = await sha256Hex(expected.correctedBuffer), actualHash = await sha256Hex(currentBuffer);
   if (!expectedHash || expectedHash !== receipt.afterHash || actualHash !== expectedHash) throw new Error('The current source is not the independently recomputed exact cleanup revision.');
-  const before = inspectIfcxGeometry(beforeBuffer, receipt.path), after = inspectIfcxGeometry(currentBuffer, receipt.path);
+  const before = exact(beforeBuffer), after = exact(currentBuffer);
   if (!before.meshes.length || !after.meshes.length || after.meshes.some(mesh => mesh.analysis.faceCount < 1 || mesh.analysis.degenerateFaces.length || mesh.analysis.duplicateFaces.length)) throw new Error('The actual corrected mesh still has defective faces or no retained geometry.');
   const beforeFaceCount = before.meshes.reduce((count, mesh) => count + mesh.analysis.faceCount, 0);
   const afterFaceCount = after.meshes.reduce((count, mesh) => count + mesh.analysis.faceCount, 0);

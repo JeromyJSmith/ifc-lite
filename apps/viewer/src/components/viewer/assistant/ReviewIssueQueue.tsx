@@ -11,13 +11,14 @@ type Review = ReturnType<typeof useReviewCompanion>;
 export function ReviewIssueQueue({ review, run }: { review: Review; run(action: () => Promise<unknown>): void }) {
   const [selected, setSelected] = useState('');
   const [nextAction, setNextAction] = useState('');
+  const [planRef, setPlanRef] = useState('');
   const [outcome, setOutcome] = useState<{ topicId: string; workflowRef: string | undefined; text: string } | null>(null);
   const issue = review.resolution.issues.find(row => row.topicId === selected) ?? review.resolution.issues[0];
   return <section className="rounded border border-primary p-3 space-y-2" aria-label="Saved issue work queue">
     <strong>Saved issue work queue · {review.resolution.issues.length}</strong>
     <Button size="sm" variant="outline" onClick={() => downloadBlob(new Blob([JSON.stringify(REVIEW_RESOLUTION_SCHEMA, null, 2)], { type: 'application/schema+json' }), 'ifc-review-resolution.schema.json')}>Export resolution schema</Button>
     <p>Use the saved BCF evidence. Take one action, record its result, then continue toward a verified fix.</p>
-    <label className="block">Saved issue<select aria-label="Issue to investigate" disabled={review.busy} className="w-full rounded border bg-background p-2" value={issue?.topicId ?? ''} onChange={e => { setSelected(e.target.value); setNextAction(''); }}>
+    <label className="block">Saved issue<select aria-label="Issue to investigate" disabled={review.busy} className="w-full rounded border bg-background p-2" value={issue?.topicId ?? ''} onChange={e => { setSelected(e.target.value); setNextAction(''); setPlanRef(''); }}>
       {!issue && <option value="">No saved BCF issues</option>}
       {review.resolution.issues.map(row => <option key={row.topicId} value={row.topicId}>{row.stage} · {row.title}</option>)}
     </select></label>
@@ -72,15 +73,22 @@ export function ReviewIssueQueue({ review, run }: { review: Review; run(action: 
       </form>
       <label className="block">Import geometry repair plan<input aria-label="Import geometry repair plan" type="file" accept="application/json,.json" disabled={review.busy} onChange={event => {
         const file = event.target.files?.[0]; event.target.value = '';
-        if (file) run(async () => { const plan = await review.resolution.importPlan(issue.topicId, file); review.setStatus(`Geometry plan saved: ${plan.planRef}. Faces ${plan.beforeFaces} → ${plan.afterFaces}. Ready for Bonsai to apply; no model change yet.`); });
+        if (file) run(async () => { const plan = await review.resolution.importPlan(issue.topicId, file); setPlanRef(plan.planRef); review.setStatus(`Geometry plan saved: ${plan.planRef}. Faces ${plan.beforeFaces} → ${plan.afterFaces}. Ready for Bonsai to apply; no model change yet.`); });
       }} /></label>
+      <label className="block">Saved repair plan reference<input aria-label="Saved repair plan reference" value={planRef} onChange={event => setPlanRef(event.target.value)} className="w-full rounded border bg-background p-2" /></label>
+      <Button size="sm" disabled={review.busy || !planRef.trim()} onClick={() => run(async () => {
+        const tool = review.resolution.tools.find(tool => tool.name === 'review_geometry_repair_plan')!;
+        await tool.execute({ topicId: issue.topicId, planRef: planRef.trim(), diagnosis: `Apply saved source-bound repair plan ${planRef.trim()} for this issue under the owner's authorization. Preserve both source revisions and actual readback.` });
+        await review.resolution.refresh(); review.setStatus('Saved repair applied and source read back. Use Verify saved repair to check and resolve its mesh issue.');
+      })}>Apply saved repair plan</Button>
+      <p className="text-muted-foreground">Executes the saved plan directly with source checks, preserved revisions and native readback. A model connection is not needed.</p>
       <p className="text-muted-foreground">Original images stay unchanged. Repairs keep both source revisions and an Undo receipt. Unresolved architectural questions stay open.</p>
     </>}
     {review.resolution.repairs.map(repair => <div key={repair.receiptRef} className="rounded border p-2 space-y-2">
       <strong>Saved geometry repair · {repair.modelName}</strong>
       {repair.before && repair.after && <p>Faces: {repair.before.faceCount} → {repair.after.faceCount}</p>}
-      <div className="flex flex-wrap gap-2">{([['Resume repaired model', 'review_geometry_resume'], ['Undo this repair', 'review_geometry_undo']] as const).map(([label, name]) => <Button key={name} size="sm" variant="outline" disabled={review.busy} onClick={() => run(async () => {
-        await review.resolution.tools.find(t => t.name === name)!.execute({ receiptRef: repair.receiptRef }); review.setStatus(name === 'review_geometry_resume' ? 'Repaired model restored and source verified' : 'Original model restored; repair undone and issue reopened'); await review.resolution.refresh();
+      <div className="flex flex-wrap gap-2">{([['Resume repaired model', 'review_geometry_resume'], ['Verify saved repair', 'review_geometry_verify'], ['Undo this repair', 'review_geometry_undo']] as const).map(([label, name]) => <Button key={name} size="sm" variant="outline" disabled={review.busy} onClick={() => run(async () => {
+        await review.resolution.tools.find(t => t.name === name)!.execute({ receiptRef: repair.receiptRef }); review.setStatus(name === 'review_geometry_resume' ? 'Repaired model restored and source verified' : name === 'review_geometry_verify' ? 'Mesh repair independently verified and its issue resolved' : 'Original model restored; repair undone and issue reopened'); await review.resolution.refresh();
       })}>{label}</Button>)}<Button size="sm" variant="outline" disabled={review.busy} onClick={() => run(async () => {
         await review.resolution.saveRepairView(repair.receiptRef); review.setStatus('Repaired image and camera saved with matching source and application');
       })}>Save repaired view</Button></div>
