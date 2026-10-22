@@ -30,6 +30,11 @@ import { FederationSetupControls } from '../FederationSetupControls';
 import { FILE_ACCEPT, isModelSidecarFile, isSupportedModelFile } from '@/services/supported-model-files';
 import { captureModelTags, restoreModelTags } from '@/lib/model-tags/carry-over';
 import { getGlobalRenderer } from '@/hooks/useBCF';
+import {
+  configureGaussianSplatSpecs,
+  setGaussianSplatEnabled,
+  type GaussianSplatSpec,
+} from '@/components/viewer/splat/gaussianSplatOverlay';
 
 // FILE_ACCEPT offers `.dxf` while `isSupportedModelFile` rejects it: DXF
 // files are 2D reference underlays, not models, and split off to the DXF
@@ -158,12 +163,18 @@ export function useFileCommands(): FileCommands {
         if (!res.ok) return;
         const manifest = (await res.json()) as {
           project?: string;
+          title?: string;
           ifcx_layers?: Array<{ file: string; color?: string; label?: string }>;
           ifcxLayers?: Array<{ name?: string; file?: string; url?: string }>;
           point_clouds?: Array<{ id: string; name: string; file: string; visible?: boolean }>;
           scans?: Array<{ id: string; name: string; filename?: string; file?: string; url?: string; visible?: boolean }>;
+          gaussianSplats?: GaussianSplatSpec[];
           contextModels?: Array<{ id: string; name: string; url: string; visible?: boolean }>;
         };
+        if (manifest.title || manifest.project) {
+          document.title = `IFC-Lite — ${manifest.title ?? manifest.project}`;
+        }
+        const chosenSplat = configureGaussianSplatSpecs(manifest.gaussianSplats);
         const layerSpecs = manifest.ifcx_layers ?? manifest.ifcxLayers ?? [];
         if (layerSpecs.length > 0) {
           const layerFiles = await Promise.all(
@@ -224,6 +235,9 @@ export function useFileCommands(): FileCommands {
           useViewerStore.getState().openWorkspacePanel('layers', 'programmatic');
           useViewerStore.getState().setSidebarSecondaryPanel('properties');
           useViewerStore.getState().setSidebarSplitRatio(0.42);
+        }
+        if (chosenSplat?.visible && params.get('splat') !== '0') {
+          void setGaussianSplatEnabled(true);
         }
       } catch (err) {
         console.warn('[workbench-autoload] Auto-load skipped or failed:', err);

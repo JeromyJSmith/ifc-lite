@@ -42,6 +42,7 @@ import { applyWheelZoom, createFineZoomModifierTracker } from './wheelZoom.js';
 import { createZoomSurfacePicker } from './zoomSurface.js';
 import { createFlyController } from './flyControls.js';
 import { flyLook } from './flyNavigation.js';
+import { getGaussianSplatState } from './splat/gaussianSplatOverlay.js';
 
 export interface MouseState {
   isDragging: boolean;
@@ -504,56 +505,52 @@ export function useMouseControls(params: UseMouseControlsParams): void {
       }
 
       const willOrbit = gesture === 'orbit';
+      const splatOverlayActive = getGaussianSplatState().enabled;
 
-      // Set orbit pivot to the 3D point under the cursor so rotation feels anchored
-      // to what the user is looking at. On miss, place pivot at current distance along
-      // the cursor ray so orbit always feels connected to where you're pointing.
-      // A focused clash with nothing selected orbits around the clashing pair (#4806).
-      const clashPivot = willOrbit
-        ? focusedClashOrbitPivot(useViewerStore.getState(), selectedEntityIdRef.current) : null;
-      let orbitPivot = clashPivot;
-      if (willOrbit && !clashPivot) {
-        const rect = canvas.getBoundingClientRect();
-        const cx = e.clientX - rect.left;
-        const cy = e.clientY - rect.top;
+      // When the photorealistic 3DGS / Surface Mesh overlay is active (centered near Y=0),
+      // do not anchor orbit to the +1,628m NAVD88 IFCX storey bounds; orbit directly
+      // around camera.target in pure turntable spherical coordinates.
+      if (willOrbit && splatOverlayActive) {
+        camera.setOrbitCenter(null);
+        orbitPivotStore.begin({ point: camera.getTarget(), camera, canvas });
+      } else {
+        // Set orbit pivot to the 3D point under the cursor so rotation feels anchored
+        // to what the user is looking at. On miss, place pivot at current distance along
+        // the cursor ray so orbit always feels connected to where you're pointing.
+        // A focused clash with nothing selected orbits around the clashing pair (#4806).
+        const clashPivot = willOrbit
+          ? focusedClashOrbitPivot(useViewerStore.getState(), selectedEntityIdRef.current) : null;
+        let orbitPivot = clashPivot;
+        if (willOrbit && !clashPivot) {
+          const rect = canvas.getBoundingClientRect();
+          const cx = e.clientX - rect.left;
+          const cy = e.clientY - rect.top;
 
-        // For large models, skip the expensive CPU raycast (collectVisibleMeshData +
-        // BVH build over 200K+ meshes can block the main thread for seconds).
-        // Instead, project the camera target onto the cursor ray for a fast pivot.
-        // The census counts GPU-instanced entities and triangles too — see
-        // orbitPivotCensus.ts for why flat entities alone undercount
-        // CATIA-class models (input-to-first-orbit-frame stall on pointer down).
-        const scene = renderer.getScene();
-        const isLargeModel = isPivotRaycastTooExpensive(scene);
-        // Outlier/sparse models (issue #1394) already carry a robust orbit
-        // anchor that gives an instant, good pivot. Skip the CPU raycast for
-        // them too: the first-orbit BVH build can stall the main thread for
-        // ~1s (the reported "model only appears after ~1s of dragging"), and
-        // orbiting around the model centre is the better behaviour anyway.
-        const hasRobustAnchor = camera.getOrbitAnchorBounds() !== null;
+          const scene = renderer.getScene();
+          const isLargeModel = isPivotRaycastTooExpensive(scene);
+          const hasRobustAnchor = camera.getOrbitAnchorBounds() !== null;
 
-        let hit: { intersection: { point: { x: number; y: number; z: number } } } | null = null;
-        if (!isLargeModel && !hasRobustAnchor) {
-          hit = renderer.raycastScene(cx, cy, {
-            hiddenIds: hiddenEntitiesRef.current,
-            isolatedIds: isolatedEntitiesRef.current,
-          });
+          let hit: { intersection: { point: { x: number; y: number; z: number } } } | null = null;
+          if (!isLargeModel && !hasRobustAnchor) {
+            hit = renderer.raycastScene(cx, cy, {
+              hiddenIds: hiddenEntitiesRef.current,
+              isolatedIds: isolatedEntitiesRef.current,
+            });
+          }
+
+          if (hit?.intersection) {
+            orbitPivot = hit.intersection.point;
+          } else if (selectedEntityIdRef.current) {
+            const center = getEntityCenter(geometryRef.current, selectedEntityIdRef.current);
+            orbitPivot = center;
+          } else {
+            orbitPivot = sceneAnchorOrbitPivot(camera, cx, cy, rect.width, rect.height);
+          }
         }
-
-        if (hit?.intersection) {
-          orbitPivot = hit.intersection.point;
-        } else if (selectedEntityIdRef.current) {
-          // No geometry under cursor but object selected — use its center
-          const center = getEntityCenter(geometryRef.current, selectedEntityIdRef.current);
-          orbitPivot = center;
-        } else {
-          // No geometry hit or large model — anchor the pivot to the scene centre.
-          orbitPivot = sceneAnchorOrbitPivot(camera, cx, cy, rect.width, rect.height);
+        if (willOrbit) {
+          camera.setOrbitCenter(orbitPivot);
+          orbitPivotStore.begin({ point: orbitPivot ?? camera.getTarget(), camera, canvas });
         }
-      }
-      if (willOrbit) {
-        camera.setOrbitCenter(orbitPivot);
-        orbitPivotStore.begin({ point: orbitPivot ?? camera.getTarget(), camera, canvas });
       }
 
       if (gesture === 'pan' || gesture === 'fly') {

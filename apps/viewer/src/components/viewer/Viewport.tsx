@@ -58,6 +58,14 @@ import { RectSelectionOverlay, type RectSelectionRect } from './RectSelectionOve
 import { SceneOverlayRoot } from '@/components/viewport-ui/scene';
 import { useTouchControls, type TouchState } from './useTouchControls.js';
 import { useKeyboardControls } from './useKeyboardControls.js';
+import {
+  applyCadCanvasOpacity,
+  getGaussianSplatState,
+  subscribeGaussianSplat,
+  setGaussianSplatSpec,
+  setGaussianSplatEnabled,
+  setCadOverlayOpacity,
+} from './splat/gaussianSplatOverlay.js';
 import { useSpaceMouseControls } from './useSpaceMouseControls.js';
 import { useAnimationLoop, type SunShadowSettings } from './useAnimationLoop.js';
 import { useGeometryStreaming } from './useGeometryStreaming.js';
@@ -1482,34 +1490,42 @@ export function Viewport({
   // canvas element.  The gradient is the *CSS background* of the <canvas>;
   // premultiplied-alpha compositing shows it through transparent clear-colour
   // regions while opaque model fragments (alpha=1) stay fully visible.
+  const [navHelpExpanded, setNavHelpExpanded] = useState(true);
+  const [splatUi, setSplatUi] = useState(getGaussianSplatState);
+
+  useEffect(() => {
+    return subscribeGaussianSplat(() => {
+      setSplatUi(getGaussianSplatState());
+    });
+  }, []);
+
+  useEffect(() => {
+    applyCadCanvasOpacity(cesiumActive ? 0 : 1);
+  }, [cesiumActive]);
+
   const canvasStyle = cesiumActive
     ? { opacity: 0 }
-    : theme === 'colorful'
-      ? { background: COLORFUL_CANVAS_GRADIENT }
-      : undefined;
+    : splatUi.enabled
+      ? {
+          opacity: splatUi.cadOpacity,
+          ...(theme === 'colorful' ? { background: COLORFUL_CANVAS_GRADIENT } : {}),
+        }
+      : theme === 'colorful'
+        ? { background: COLORFUL_CANVAS_GRADIENT }
+        : undefined;
 
-  const [navHelpExpanded, setNavHelpExpanded] = useState(true);
-
-  const teleportCameraUVZ = useCallback(
-    (eyeU: number, eyeV: number, eyeZ: number, tgtU: number, tgtV: number, tgtZ: number) => {
+  const teleportCameraGL = useCallback(
+    (eyeX: number, eyeY: number, eyeZ: number, tgtX: number, tgtY: number, tgtZ: number) => {
       const renderer = rendererRef.current;
       if (!renderer) return;
       const cam = renderer.getCamera();
-      const ang = (-14.6547 * Math.PI) / 180;
-      const c = Math.cos(ang);
-      const s = Math.sin(ang);
-      const toGL = (u: number, v: number, z: number) => {
-        const xIfc = c * u + s * v;
-        const yIfc = -s * u + c * v;
-        return { x: xIfc, y: z, z: -yIfc };
-      };
-      const p = toGL(eyeU, eyeV, eyeZ);
-      const tPos = toGL(tgtU, tgtV, tgtZ);
+      const p = { x: eyeX, y: eyeY, z: eyeZ };
+      const tPos = { x: tgtX, y: tgtY, z: tgtZ };
       cam.stopInertia();
       cam.setUp(0, 1, 0);
       cam.setPosition(p.x, p.y, p.z);
       cam.setTarget(tPos.x, tPos.y, tPos.z);
-      cam.setOrbitCenter(tPos);
+      cam.setOrbitCenter(null);
       renderer.requestRender();
       updateCameraRotationRealtime(cam.getRotation());
       calculateScale();
@@ -1517,6 +1533,20 @@ export function Viewport({
     },
     [calculateScale, focusViewportForKeyboardShortcuts, updateCameraRotationRealtime],
   );
+
+  // Frame the active reality capture only; a BIM review owns its own camera.
+  useEffect(() => {
+    if (!isInitialized || !splatUi.enabled) return;
+    const t = setTimeout(() => {
+      teleportCameraGL(0.0, 7.5, 21.0, -2.0, 1.0, 0.0);
+    }, 1800);
+    return () => clearTimeout(t);
+  }, [isInitialized, splatUi.enabled, teleportCameraGL]);
+
+  const selectRealityLayer = useCallback(async (specId: string) => {
+    await setGaussianSplatSpec(specId);
+    await setGaussianSplatEnabled(true);
+  }, []);
 
   return (
     <div className="relative w-full h-full">
@@ -1528,74 +1558,154 @@ export function Viewport({
         style={{ touchAction: 'none', ...canvasStyle }}
         onPointerDown={focusViewportForKeyboardShortcuts}
       />
-      {/* Quick-Teleport & Collision-Free Navigation HUD */}
+      {/* Solomon [2605] · 2500 Linden Ave — Photorealistic 3DGS + Spirula Mesh + Zone HUD */}
       <div
         data-testid="marpa-nav-hud"
-        className="absolute top-2.5 left-2.5 z-20 flex flex-col gap-1.5 rounded-lg border border-white/15 bg-slate-950/85 px-2.5 py-2 text-[11px] text-slate-100 shadow-lg backdrop-blur-md select-none max-w-[540px]"
+        className="absolute top-2.5 left-2.5 z-20 flex flex-col gap-1.5 rounded-lg border border-white/15 bg-slate-950/90 px-2.5 py-2 text-[11px] text-slate-100 shadow-lg backdrop-blur-md select-none max-w-[680px]"
       >
         <div className="flex flex-wrap items-center gap-1">
-          <span className="font-semibold text-emerald-400 mr-1">Go To:</span>
+          <span className="font-semibold text-amber-400 mr-1">Reality Capture:</span>
           <button
             type="button"
-            onClick={() => teleportCameraUVZ(-1.35, -21.0, 3.8, -1.35, -6.3, 3.8)}
+            onClick={() => void selectRealityLayer('solomon-full-estate-3dgs')}
+            className={`rounded px-2 py-0.5 font-medium transition-colors ${
+              splatUi.enabled && splatUi.spec?.id === 'solomon-full-estate-3dgs'
+                ? 'bg-emerald-600 text-white'
+                : 'bg-slate-800 hover:bg-emerald-600/80 text-slate-200'
+            }`}
+            title="Full 2500 Linden Estate 3D Gaussian Splatting (Photorealistic 3DGS)"
+          >
+            3DGS Full
+          </button>
+          <button
+            type="button"
+            onClick={() => void selectRealityLayer('solomon-ground-hardscape-3dgs')}
+            className={`rounded px-2 py-0.5 font-medium transition-colors ${
+              splatUi.enabled && splatUi.spec?.id === 'solomon-ground-hardscape-3dgs'
+                ? 'bg-emerald-600 text-white'
+                : 'bg-slate-800 hover:bg-emerald-600/80 text-slate-200'
+            }`}
+            title="Hardscape & Residence Cutaway 3DGS with upper tree canopy sliced"
+          >
+            3DGS Hardscape
+          </button>
+          <button
+            type="button"
+            onClick={() => void selectRealityLayer('solomon-photoreal-hardscape-mesh')}
+            className={`rounded px-2 py-0.5 font-medium transition-colors ${
+              splatUi.enabled && splatUi.spec?.id === 'solomon-photoreal-hardscape-mesh'
+                ? 'bg-amber-600 text-white'
+                : 'bg-slate-800 hover:bg-amber-600/80 text-slate-200'
+            }`}
+            title="Spirula Studio Photorealistic Hardscape Surface Mesh (1.97M Triangles GLB)"
+          >
+            Photoreal Mesh: Hardscape
+          </button>
+          <button
+            type="button"
+            onClick={() => void selectRealityLayer('solomon-photoreal-full-mesh')}
+            className={`rounded px-2 py-0.5 font-medium transition-colors ${
+              splatUi.enabled && splatUi.spec?.id === 'solomon-photoreal-full-mesh'
+                ? 'bg-amber-600 text-white'
+                : 'bg-slate-800 hover:bg-amber-600/80 text-slate-200'
+            }`}
+            title="Spirula Studio Photorealistic Full Surface Mesh (1.97M Triangles GLB)"
+          >
+            Photoreal Mesh: Full
+          </button>
+          <span className="ml-1 text-[10px] text-emerald-300 font-mono">
+            {splatUi.message || 'Ready'}
+          </span>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-1 border-t border-white/10 pt-1">
+          <span className="font-semibold text-emerald-400 mr-1">2500 Linden Zones:</span>
+          <button
+            type="button"
+            onClick={() => teleportCameraGL(0.0, 7.5, 21.0, -2.0, 1.0, 0.0)}
             className="rounded bg-slate-800 hover:bg-emerald-600/80 px-2 py-0.5 font-medium transition-colors"
-            title="Look perpendicular to South Gable & East Wing"
+            title="Courtyard & Residence Overview"
           >
-            South Gable (Front)
+            Courtyard & Breezeway
           </button>
           <button
             type="button"
-            onClick={() => teleportCameraUVZ(-2.03, -8.8, 1.65, -2.03, -2.0, 1.65)}
+            onClick={() => teleportCameraGL(0.0, 22.0, 24.0, 0.0, 0.5, 0.0)}
             className="rounded bg-slate-800 hover:bg-emerald-600/80 px-2 py-0.5 font-medium transition-colors"
-            title="Stand outside the Front Entry Door looking inside"
+            title="Full Estate Aerial View"
           >
-            Front Door
+            Estate Aerial
           </button>
           <button
             type="button"
-            onClick={() => teleportCameraUVZ(-4.2, -5.2, 1.65, -4.0, 1.5, 1.65)}
+            onClick={() => teleportCameraGL(-10.0, 6.0, 16.0, -2.0, 0.5, 2.0)}
             className="rounded bg-slate-800 hover:bg-emerald-600/80 px-2 py-0.5 font-medium transition-colors"
-            title="Teleport inside the Main Level Living Room (no wall collision)"
+            title="Zone 01: North Linden Driveway & Flagstone Entry Walk"
           >
-            Inside Living (L1)
+            Zone 01: Driveway
           </button>
           <button
             type="button"
-            onClick={() => teleportCameraUVZ(-2.1, -3.7, 1.65, 0.4, -4.2, 1.85)}
+            onClick={() => teleportCameraGL(12.0, 6.5, -14.0, 0.0, 0.5, -3.0)}
             className="rounded bg-slate-800 hover:bg-emerald-600/80 px-2 py-0.5 font-medium transition-colors"
-            title="Teleport inside the Stairwell looking at the flights & windows"
+            title="Zone 03: South Patio, Pool & Firepit Lounge"
           >
-            Inside Stairwell
+            Zone 03: South Patio
           </button>
           <button
             type="button"
-            onClick={() => teleportCameraUVZ(-2.9, -4.8, 4.5, -2.9, 1.0, 4.5)}
+            onClick={() => teleportCameraGL(20.0, 6.5, 8.0, 6.0, 1.0, 0.0)}
             className="rounded bg-slate-800 hover:bg-emerald-600/80 px-2 py-0.5 font-medium transition-colors"
-            title="Teleport inside the Upper Level under the Gable Roof"
+            title="Zone 04: West Raised Planters & Detached Greenhouse"
           >
-            Inside Upper (L2)
+            Zone 04: Planters & Greenhouse
           </button>
-          <button
-            type="button"
-            onClick={() => teleportCameraUVZ(10.5, -3.1, 3.5, 1.5, -3.1, 3.5)}
-            className="rounded bg-slate-800 hover:bg-emerald-600/80 px-2 py-0.5 font-medium transition-colors"
-            title="Look at the East Cross-Gable Wing"
-          >
-            East Wing
-          </button>
-          <button
-            type="button"
-            onClick={() => setNavHelpExpanded((v) => !v)}
-            className="ml-auto rounded bg-slate-800/70 hover:bg-slate-700 px-1.5 py-0.5 text-[10px] text-slate-300"
-            title="Toggle controls legend"
-          >
-            {navHelpExpanded ? 'Hide Keys' : 'Controls ?'}
-          </button>
+          <span className="ml-auto flex items-center gap-1">
+            <span className="text-[10px] text-slate-400">BIM CAD:</span>
+            <button
+              type="button"
+              onClick={() => setCadOverlayOpacity(0.0)}
+              className={`rounded px-1.5 py-0.5 text-[10px] ${
+                splatUi.cadOpacity === 0 ? 'bg-sky-600 text-white' : 'bg-slate-800 text-slate-300'
+              }`}
+              title="Hide flat CAD extrusions so Photoreal 3DGS / Mesh is 100% unobstructed"
+            >
+              Off
+            </button>
+            <button
+              type="button"
+              onClick={() => setCadOverlayOpacity(0.25)}
+              className={`rounded px-1.5 py-0.5 text-[10px] ${
+                splatUi.cadOpacity === 0.25 ? 'bg-sky-600 text-white' : 'bg-slate-800 text-slate-300'
+              }`}
+              title="Show 25% Ghost BIM CAD overlay behind Photorealistic 3DGS / Mesh"
+            >
+              25%
+            </button>
+            <button
+              type="button"
+              onClick={() => setCadOverlayOpacity(1.0)}
+              className={`rounded px-1.5 py-0.5 text-[10px] ${
+                splatUi.cadOpacity === 1.0 ? 'bg-sky-600 text-white' : 'bg-slate-800 text-slate-300'
+              }`}
+              title="Show 100% BIM CAD solids"
+            >
+              100%
+            </button>
+            <button
+              type="button"
+              onClick={() => setNavHelpExpanded((v) => !v)}
+              className="rounded bg-slate-800/70 hover:bg-slate-700 px-1.5 py-0.5 text-[10px] text-slate-300"
+              title="Toggle controls legend"
+            >
+              {navHelpExpanded ? 'Hide Keys' : '?'}
+            </button>
+          </span>
         </div>
         {navHelpExpanded && (
           <div className="flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-[10px] text-slate-300 border-t border-white/10 pt-1">
-            <span><strong className="text-white">Scroll:</strong> Zoom Through Any Door/Wall</span>
-            <span><strong className="text-white">W/S or ↑/↓:</strong> Move Forward/Back</span>
+            <span><strong className="text-white">Scroll:</strong> Zoom</span>
+            <span><strong className="text-white">W/S or ↑/↓:</strong> Forward/Back</span>
             <span><strong className="text-white">A/D or ←/→:</strong> Left/Right</span>
             <span><strong className="text-white">Q/E:</strong> Down/Up</span>
             <span><strong className="text-white">Shift:</strong> Fast</span>
