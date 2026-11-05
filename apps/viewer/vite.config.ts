@@ -214,8 +214,22 @@ const appVersion = viewerPkg.version || rootPkg.version;
 // GITHUB_SHA; falls back to 'dev' for local builds.
 const buildSha = (process.env.VERCEL_GIT_COMMIT_SHA || process.env.GITHUB_SHA || 'dev').slice(0, 12);
 
+// The projects folder is the one this machine's data-root override names (paths.projects
+// in ~/Library/Application Support/MARPA/data_root.local.json), so the viewer reads the
+// same volume the desk does. Without that file it falls back to the MARPA volume path.
+function marpaProjectsRoot(): string {
+  const overridePath = path.join(process.env.HOME ?? '', 'Library/Application Support/MARPA/data_root.local.json');
+  try {
+    const override = JSON.parse(fs.readFileSync(overridePath, 'utf8'));
+    if (typeof override?.paths?.projects === 'string') return override.paths.projects;
+  } catch {
+    // No override on this machine.
+  }
+  return '/Volumes/MARPA/projects/marpa';
+}
+
 const MARPA_IFCX_MODEL_DIR = process.env.MARPA_IFCX_MODEL_DIR
-  || '/Volumes/MARPA/projects/marpa/0001-401-pearl/02_extract/building-model/ifcx-model';
+  || path.join(marpaProjectsRoot(), '0001-401-pearl/02_extract/building-model/ifcx-model');
 
 function marpaIfcxModelStatic() {
   return {
